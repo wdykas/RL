@@ -24,11 +24,14 @@ GIT_URL=${1:-https://github.com/CentML/vllm}
 GIT_REF=${2:-nemotron-h-rl-2-mtp-fix-2}
 # NOTE: VLLM_USE_PRECOMPILED=1 didn't always seem to work since the wheels were sometimes built against an incompatible torch/cuda combo.
 # You need to export VLLM_PRECOMPILED_WHEEL_LOCATION to the full path of the wheel file.
-if [[ "$(uname -m)" == "aarch64" ]]; then
-  export VLLM_PRECOMPILED_WHEEL_LOCATION="https://github.com/vllm-project/vllm/releases/download/v0.13.0/vllm-0.13.0-cp38-abi3-manylinux_2_31_aarch64.whl"
+if [[ -n "${3:-}" ]]; then
+  VLLM_PRECOMPILED_WHEEL_LOCATION="$3"
+elif [[ "$(uname -m)" == "aarch64" ]]; then
+  VLLM_PRECOMPILED_WHEEL_LOCATION="https://github.com/vllm-project/vllm/releases/download/v0.13.0/vllm-0.13.0-cp38-abi3-manylinux_2_31_aarch64.whl"
 else
-  export VLLM_PRECOMPILED_WHEEL_LOCATION="https://github.com/vllm-project/vllm/releases/download/v0.13.0/vllm-0.13.0-cp38-abi3-manylinux_2_31_x86_64.whl"
+  VLLM_PRECOMPILED_WHEEL_LOCATION="https://github.com/vllm-project/vllm/releases/download/v0.13.0/vllm-0.13.0-cp38-abi3-manylinux_2_31_x86_64.whl"
 fi
+export VLLM_PRECOMPILED_WHEEL_LOCATION
 
 BUILD_DIR=$(realpath "$SCRIPT_DIR/../3rdparty/vllm")
 if [[ -e "$BUILD_DIR" ]]; then
