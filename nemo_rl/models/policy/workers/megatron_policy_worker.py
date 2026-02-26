@@ -877,6 +877,39 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         await self.dynamic_inference_engine.running.wait()
         self.dynamic_inference_engine.resume()
 
+    def suspend_for_refit(self) -> None:
+        """Pause engine between decode iterations for safe weight update.
+        Uses pause_engines() (not suspend_engines()) — preserves KV cache and CUDA graphs.
+        """
+        if not self._inference_engine_initialized:
+            return
+        future = asyncio.run_coroutine_threadsafe(
+            self._pause_engine_for_refit(), self._inference_loop
+        )
+        future.result()
+        torch.distributed.barrier()
+
+    async def _pause_engine_for_refit(self):
+        if torch.distributed.get_rank() == 0:
+            await self.inference_client.pause_engines()
+        else:
+            await self.dynamic_inference_engine.paused.wait()
+
+    def resume_after_refit(self) -> None:
+        """Unpause engine — in-progress generations continue with new weights."""
+        if not self._inference_engine_initialized:
+            return
+        future = asyncio.run_coroutine_threadsafe(
+            self._unpause_engine_after_refit(), self._inference_loop
+        )
+        future.result()
+        torch.distributed.barrier()
+
+    async def _unpause_engine_after_refit(self):
+        if torch.distributed.get_rank() == 0:
+            self.inference_client.unpause_engines()
+        await self.dynamic_inference_engine.running.wait()
+
     def _log_gpu_memory(self, tag: str):
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         allocated = torch.cuda.memory_allocated() / (1024 ** 3)

@@ -179,6 +179,14 @@ class MegatronGeneration(GenerationInterface):
         """
         return self._policy.finish_generation(*args, **kwargs)
 
+    def suspend_for_refit(self) -> None:
+        """Suspend the inference engine for safe weight updates."""
+        return self._policy.suspend_for_refit()
+
+    def resume_after_refit(self) -> None:
+        """Resume the inference engine after weight updates."""
+        return self._policy.resume_after_refit()
+
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         """Prepare state dict metadata for weight refitting.
 

@@ -118,6 +118,17 @@ mcore = [
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
   "torch-memory-saver",
 ]
+# nvshmem refit backend — install the extra matching your CUDA major version.
+# Usage: uv sync --extra mcore --extra nvshmem-cu12
+nvshmem-cu12 = [
+  "nvshmem4py-cu12>=0.2.1",
+  "cupy-cuda12x",
+]
+# Uncomment for CUDA 13 systems and install with --extra nvshmem-cu13 instead:
+# nvshmem-cu13 = [
+#   "nvshmem4py-cu13>=0.2.1",
+#   "cupy-cuda13x",
+# ]
 nemo_gym = ["nemo_gym"]
 
 [dependency-groups]
@@ -252,6 +263,8 @@ override-dependencies = [
   "llguidance>=1.3.0,<1.4.0",
   # Override setuptools range in other dependencies to address CVE GHSA-58pv-8j8x-9vj2
   "setuptools>=80.10.2",
+  # nvshmem4py-cu12 pins cuda-core==0.4 but nccl4py needs >=0.4.1; cap at <0.5 to keep compatible API
+  "cuda-core>=0.4,<0.5",
 ]
 # CVE fixes
 constraint-dependencies = [

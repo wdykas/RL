@@ -2483,18 +2483,9 @@ def async_grpo_train(
         start_step=step,
     )
 
-    # Start trajectory collection in background
-    collection_task = trajectory_collector.start_collection.remote(dataloader)
-
-    # Ensure collector knows initial weight version
-    trajectory_collector.set_weight_version.remote(weight_version)
-
-    print("📦 Started continuous background trajectory collection")
-
-    print(
-        f"🚀 Starting async GRPO training with buffer_size={optimal_buffer_size}, max_age={max_trajectory_age_steps} steps"
-    )
-
+    # Align generation engine weights with training model BEFORE starting
+    # trajectory collection.  This eliminates the race where the collector
+    # generates trajectories with the engine's independently-loaded weights
     print("⏳ Preparing policy generation for training...")
     if NEED_REFIT and POLICY_GENERATION_STALE:
         print("🔄 Refitting policy generation with actual model weights...")
@@ -2519,6 +2510,13 @@ def async_grpo_train(
 
             traceback.print_exc()
             return
+
+    # Start trajectory collection in background (after refit so the engine
+    # already has the correct training weights).
+    collection_task = trajectory_collector.start_collection.remote(dataloader)
+
+    # Ensure collector knows initial weight version
+    trajectory_collector.set_weight_version.remote(weight_version)
 
     print("✅ Policy generation setup complete, proceeding to validation...")
 
@@ -2820,6 +2818,11 @@ def async_grpo_train(
                             policy_generation.get_logger_metrics()
                         )
 
+                    # Pause megatron engine loop before weight transfer (preserves KV cache / CUDA graphs)
+                    is_megatron = master_config["policy"]["generation"]["backend"] == "megatron"
+                    if is_megatron and hasattr(policy_generation, "suspend_for_refit"):
+                        policy_generation.suspend_for_refit()
+
                     # Only the actual refit/weight transfer should be counted as weight_sync
                     print("🔄 Performing policy generation refit...")
                     with timer.time("weight_sync"):
@@ -2828,10 +2831,14 @@ def async_grpo_train(
                         )
                         POLICY_GENERATION_STALE = False
 
-                        # Update weight version before resuming trajectory collection so that all trajectories are updated with the new correct weight version
-                        weight_version += 1
-                        trajectory_collector.set_weight_version.remote(weight_version)
-                        trajectory_collector.resume_after_refit.remote()
+                    # Resume megatron engine loop after weight transfer
+                    if is_megatron and hasattr(policy_generation, "resume_after_refit"):
+                        policy_generation.resume_after_refit()
+
+                    # Update weight version before resuming trajectory collection so that all trajectories are updated with the new correct weight version
+                    weight_version += 1
+                    trajectory_collector.set_weight_version.remote(weight_version)
+                    trajectory_collector.resume_after_refit.remote()
 
                 # Clear logger metrics after each refit (weight sync), starting a new logging cycle
                 if policy_generation is not None:

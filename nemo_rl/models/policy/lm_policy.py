@@ -825,6 +825,16 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         futures = self.worker_group.run_all_workers_single_data("prepare_for_generation")
         ray.get(futures)
 
+    def suspend_for_refit(self) -> None:
+        if self.cfg.get("generation", {}).get("backend") == "megatron":
+            futures = self.worker_group.run_all_workers_single_data("suspend_for_refit")
+            ray.get(futures)
+
+    def resume_after_refit(self) -> None:
+        if self.cfg.get("generation", {}).get("backend") == "megatron":
+            futures = self.worker_group.run_all_workers_single_data("resume_after_refit")
+            ray.get(futures)
+
     def prepare_for_training(self, *args: Any, **kwargs: Any) -> None:
         # onload everything to the GPU
         futures = self.worker_group.run_all_workers_single_data("prepare_for_training")
