@@ -825,14 +825,18 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         futures = self.worker_group.run_all_workers_single_data("prepare_for_generation")
         ray.get(futures)
 
-    def suspend_for_refit(self) -> None:
+    def suspend_for_refit(self, recompute_kv_cache: bool = False) -> None:
         if self.cfg.get("generation", {}).get("backend") == "megatron":
-            futures = self.worker_group.run_all_workers_single_data("suspend_for_refit")
+            futures = self.worker_group.run_all_workers_single_data(
+                "suspend_for_refit", recompute_kv_cache=recompute_kv_cache
+            )
             ray.get(futures)
 
-    def resume_after_refit(self) -> None:
+    def resume_after_refit(self, recompute_kv_cache: bool = False) -> None:
         if self.cfg.get("generation", {}).get("backend") == "megatron":
-            futures = self.worker_group.run_all_workers_single_data("resume_after_refit")
+            futures = self.worker_group.run_all_workers_single_data(
+                "resume_after_refit", recompute_kv_cache=recompute_kv_cache
+            )
             ray.get(futures)
 
     def prepare_for_training(self, *args: Any, **kwargs: Any) -> None:

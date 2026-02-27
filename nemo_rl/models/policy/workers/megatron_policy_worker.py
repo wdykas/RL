@@ -59,7 +59,6 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.models.megatron.common import get_moe_metrics
-from nemo_rl.models.megatron.config import MegatronGenerationConfig
 from nemo_rl.models.megatron.data import (
     get_microbatch_iterator,
     process_global_batch,
@@ -793,7 +792,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         self._inference_engine_alseep = False
 
     def _sleep(self):
-        """pause the inference engine to free GPU memory for training.
+        """Pause the inference engine to free GPU memory for training.
         
         This method should be called before training to:
         1. Deallocate KV cache and other inference-specific GPU memory
@@ -808,7 +807,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         - The coordinator broadcasts to all DP engines
         - Non-rank-0 workers wait for their engine to be paused via the event loop
         """
-
         future = asyncio.run_coroutine_threadsafe(
             self._sleep_engine(),
             self._inference_loop
@@ -850,7 +848,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         - The coordinator broadcasts to all DP engines
         - Non-rank-0 workers wait for their engine to be running via the event loop
         """
-        
         # Use the coordinator-based resume mechanism
         # Only rank 0 sends the signal - coordinator broadcasts to all DP engines
         future = asyncio.run_coroutine_threadsafe(
@@ -877,17 +874,33 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         await self.dynamic_inference_engine.running.wait()
         self.dynamic_inference_engine.resume()
 
-    def suspend_for_refit(self) -> None:
-        """Pause engine between decode iterations for safe weight update.
-        Uses pause_engines() (not suspend_engines()) — preserves KV cache and CUDA graphs.
+    def suspend_for_refit(self, recompute_kv_cache: bool = False) -> None:
+        """Pause or suspend engine for safe weight update.
+
+        When recompute_kv_cache is False (default), uses pause_engines() which
+        preserves KV cache and CUDA graphs (Magistral-style).
+
+        When recompute_kv_cache is True, uses suspend_engines() which
+        checkpoints in-flight requests and pauses the engine. Uses the
+        default PERSIST kv_cache_management_mode so CUDA graphs are
+        preserved. On resume, checkpointed requests are replayed with
+        fresh prefill using the new weights (AREAL-style).
         """
         if not self._inference_engine_initialized:
             return
-        future = asyncio.run_coroutine_threadsafe(
-            self._pause_engine_for_refit(), self._inference_loop
-        )
+        if recompute_kv_cache:
+            future = asyncio.run_coroutine_threadsafe(
+                self._sleep_engine(), self._inference_loop
+            )
+        else:
+            future = asyncio.run_coroutine_threadsafe(
+                self._pause_engine_for_refit(), self._inference_loop
+            )
         future.result()
         torch.distributed.barrier()
+        if recompute_kv_cache:
+            self._inference_engine_alseep = True
+            print(f"[Rank {self.rank}] Suspended inference engine for refit (KV cache will be recomputed)")
 
     async def _pause_engine_for_refit(self):
         if torch.distributed.get_rank() == 0:
@@ -895,15 +908,32 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         else:
             await self.dynamic_inference_engine.paused.wait()
 
-    def resume_after_refit(self) -> None:
-        """Unpause engine — in-progress generations continue with new weights."""
+    def resume_after_refit(self, recompute_kv_cache: bool = False) -> None:
+        """Resume engine after weight update.
+
+        When recompute_kv_cache is False (default), uses unpause_engines() —
+        in-progress generations continue with new weights and existing KV cache.
+
+        When recompute_kv_cache is True, uses resume_engines() which
+        reallocates state and replays checkpointed requests. Since
+        PERSIST mode is used, CUDA graphs remain valid and don't
+        need to be recaptured.
+        """
         if not self._inference_engine_initialized:
             return
-        future = asyncio.run_coroutine_threadsafe(
-            self._unpause_engine_after_refit(), self._inference_loop
-        )
+        if recompute_kv_cache:
+            future = asyncio.run_coroutine_threadsafe(
+                self._wake_engine(), self._inference_loop
+            )
+        else:
+            future = asyncio.run_coroutine_threadsafe(
+                self._unpause_engine_after_refit(), self._inference_loop
+            )
         future.result()
         torch.distributed.barrier()
+        if recompute_kv_cache:
+            self._inference_engine_alseep = False
+            print(f"[Rank {self.rank}] Resumed inference engine after refit (KV cache recomputed)")
 
     async def _unpause_engine_after_refit(self):
         if torch.distributed.get_rank() == 0:
@@ -1073,7 +1103,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 - logprobs: Log probabilities for each token
                 - generation_lengths: Lengths of each response
         """
-        
         with torch.no_grad():
 
             prompt_tokens_tensor, prompt_lengths_tensor, sampling_params = self._prepare_data_for_generation(data, greedy)
@@ -1117,8 +1146,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         This is called once during the first generate() call to initialize
         the persistent inference infrastructure.
         """
-        import concurrent.futures
-        
         # Start the background thread with the event loop if not already running
         if self._inference_loop is None:
             self._start_inference_loop_thread()

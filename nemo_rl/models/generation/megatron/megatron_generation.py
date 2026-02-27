@@ -179,13 +179,24 @@ class MegatronGeneration(GenerationInterface):
         """
         return self._policy.finish_generation(*args, **kwargs)
 
-    def suspend_for_refit(self) -> None:
-        """Suspend the inference engine for safe weight updates."""
-        return self._policy.suspend_for_refit()
+    def suspend_for_refit(self, recompute_kv_cache: bool = False) -> None:
+        """Suspend the inference engine for safe weight updates.
 
-    def resume_after_refit(self) -> None:
-        """Resume the inference engine after weight updates."""
-        return self._policy.resume_after_refit()
+        Args:
+            recompute_kv_cache: If True, fully suspends the engine to
+                invalidate KV cache (AREAL-style). If False, pauses between
+                decode iterations preserving KV cache (Magistral-style).
+        """
+        return self._policy.suspend_for_refit(recompute_kv_cache=recompute_kv_cache)
+
+    def resume_after_refit(self, recompute_kv_cache: bool = False) -> None:
+        """Resume the inference engine after weight updates.
+
+        Args:
+            recompute_kv_cache: Must match the value passed to suspend_for_refit.
+                If True, performs a full resume reallocating KV cache.
+        """
+        return self._policy.resume_after_refit(recompute_kv_cache=recompute_kv_cache)
 
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         """Prepare state dict metadata for weight refitting.

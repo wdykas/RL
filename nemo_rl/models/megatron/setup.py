@@ -319,7 +319,7 @@ def setup_model_config(
     _apply_performance_config(model_cfg, config)
 
     # Apply generation settings
-    if config["generation"][f"backend"] == "megatron":
+    if config["generation"]["backend"] == "megatron":
         _apply_cuda_graph_and_rng_tracker_config(model_cfg, config)
 
     # Validate optimizer configuration

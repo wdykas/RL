@@ -2818,10 +2818,15 @@ def async_grpo_train(
                             policy_generation.get_logger_metrics()
                         )
 
-                    # Pause megatron engine loop before weight transfer (preserves KV cache / CUDA graphs)
+                    # Pause megatron engine loop before weight transfer
                     is_megatron = master_config["policy"]["generation"]["backend"] == "megatron"
+                    recompute_kv_cache = (
+                        master_config.get("grpo", {})
+                        .get("async_grpo", {})
+                        .get("recompute_kv_cache_after_weight_updates", False)
+                    )
                     if is_megatron and hasattr(policy_generation, "suspend_for_refit"):
-                        policy_generation.suspend_for_refit()
+                        policy_generation.suspend_for_refit(recompute_kv_cache=recompute_kv_cache)
 
                     # Only the actual refit/weight transfer should be counted as weight_sync
                     print("🔄 Performing policy generation refit...")
@@ -2833,7 +2838,7 @@ def async_grpo_train(
 
                     # Resume megatron engine loop after weight transfer
                     if is_megatron and hasattr(policy_generation, "resume_after_refit"):
-                        policy_generation.resume_after_refit()
+                        policy_generation.resume_after_refit(recompute_kv_cache=recompute_kv_cache)
 
                     # Update weight version before resuming trajectory collection so that all trajectories are updated with the new correct weight version
                     weight_version += 1
