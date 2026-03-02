@@ -13,11 +13,17 @@ set -euo pipefail
 # Usage:
 #   ./launch_ultra_v3_pipeclean.sh                                   # batch, bare container
 #   USE_WORKTREE=1 ./launch_ultra_v3_pipeclean.sh                    # batch, overlay local code
+#   WALLTIME=4:00:00 ./launch_ultra_v3_pipeclean.sh
 #   NUM_ACTOR_NODES=116 INFERENCE_NUM_NODES=52 ./launch_ultra_v3_pipeclean.sh
 #
 # Interactive debugging (reuse allocation across runs):
-#   INTERACTIVE=1 ./launch_ultra_v3_pipeclean.sh                     # submits, waits, attaches
-#   INTERACTIVE=1 INTERACTIVE_WAIT=0 ./launch_ultra_v3_pipeclean.sh  # submit only
+#   INTERACTIVE=1 ./launch_ultra_v3_pipeclean.sh                     # submits, auto-runs, waits
+#   INTERACTIVE=1 INTERACTIVE_WAIT=0 ./launch_ultra_v3_pipeclean.sh  # submit only (no foreground wait)
+#   INTERACTIVE=1 INTERACTIVE_WALLTIME=8:0:0 ./launch_ultra_v3_pipeclean.sh  # longer allocation
+#
+#   A background watcher auto-runs the training command as soon as Ray is ready,
+#   so GPUs are never idle waiting for you to type. After training finishes the
+#   allocation stays alive — re-attach and iterate without requeueing.
 #
 #   Once Ray is up, you can:
 #     # Run non-interactively from login node
@@ -40,11 +46,19 @@ USE_WORKTREE="${USE_WORKTREE:-0}"
 INTERACTIVE="${INTERACTIVE:-0}"
 INTERACTIVE_WAIT="${INTERACTIVE_WAIT:-1}"
 
+# ---------- SLURM configuration ----------
 SLURM_ACCOUNT="${SLURM_ACCOUNT:-llmservice_nemotron_ultra}"
+PARTITION="${PARTITION:-batch}"
+WALLTIME="${WALLTIME:-1:00:00}"
+
 
 # ---------- Container & mounts ----------
 export CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/llmservice/users/ansubramania/containers/nemo-rl-ultra-20260226-428eb84dd-custom-vllm-arm.sqsh}"
 MOUNTS="/lustre:/lustre"
+
+# GB200 NVL72: 4 GPUs/node. Must match --gres=gpu:4 passed to sbatch.
+export GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
+export CPUS_PER_WORKER="${CPUS_PER_WORKER:-144}"
 
 # ---------- HuggingFace Configuration ----------
 export HF_HOME="${HF_HOME:-}"
@@ -239,20 +253,25 @@ fi
 #   1. Attach interactively and source/paste it
 #   2. Run non-interactively: COMMAND="$(cat <jobid>-run-cmd.sh)" bash <jobid>-attach.sh
 #   3. Edit and re-run without requeueing
+#
+# A background watcher auto-runs the training command as soon as Ray is ready,
+# so the scheduler never preempts the job for idle GPUs. After training finishes
+# the allocation stays alive — re-attach and iterate without requeueing.
 # =============================================================================
 if [[ "${INTERACTIVE}" == "1" ]]; then
   # Ensure COMMAND is not in the environment. ray.sub does COMMAND=${COMMAND:-}
   # so unset → empty string → idle mode (creates attach script, sleeps forever).
   unset COMMAND 2>/dev/null || true
 
-  INTERACTIVE_WALLTIME="${INTERACTIVE_WALLTIME:-4:0:0}"
+  # Interactive allocations default to 1h; INTERACTIVE_WALLTIME overrides.
+  WALLTIME="${INTERACTIVE_WALLTIME:-1:0:0}"
 
   echo ""
   echo "================================================================"
   echo "  INTERACTIVE MODE"
   echo "================================================================"
-  echo "  Submitting ${NUM_TOTAL_NODES}-node allocation (walltime: ${INTERACTIVE_WALLTIME})"
-  echo "  Ray cluster will start without running any command."
+  echo "  Submitting ${NUM_TOTAL_NODES}-node allocation (walltime: ${WALLTIME})"
+  echo "  Ray cluster will start; training auto-runs when ready."
   echo ""
 
   submission_output=$(sbatch \
@@ -260,7 +279,7 @@ if [[ "${INTERACTIVE}" == "1" ]]; then
     --account="${SLURM_ACCOUNT}" \
     --job-name="interactive-${WANDB_NAME}" \
     --partition=batch \
-    --time="${INTERACTIVE_WALLTIME}" \
+    --time="${WALLTIME}" \
     --gres=gpu:4 \
     --exclusive \
     "${RAY_SUB}")
@@ -288,48 +307,89 @@ ${TRAIN_CMD}
 CMDEOF
   chmod +x "${CMD_FILE}"
 
+  # -----------------------------------------------------------------
+  # Background watcher — auto-runs training so GPUs are never idle
+  # waiting for a human to type the first command.
+  # Polls for the attach script, then fires the training command.
+  # After training finishes the allocation stays alive (ray.sub idles)
+  # so the user can re-attach and iterate.
+  # -----------------------------------------------------------------
+  WATCHER_LOG="${LAUNCH_DIR}/${JOB_ID}-watcher.log"
+
+  nohup bash -c '
+    set -euo pipefail
+    ATTACH_SCRIPT="'"${ATTACH_SCRIPT}"'"
+    CMD_FILE="'"${CMD_FILE}"'"
+    JOB_ID="'"${JOB_ID}"'"
+
+    echo "[$(date)] Watcher started for job ${JOB_ID}"
+    echo "[$(date)] Polling for attach script: ${ATTACH_SCRIPT}"
+
+    while [[ ! -f "${ATTACH_SCRIPT}" ]]; do
+      state=$(squeue -j "${JOB_ID}" -h -o "%T" 2>/dev/null || true)
+      if [[ -z "${state}" ]]; then
+        echo "[$(date)] Job ${JOB_ID} is no longer in the queue. Exiting watcher."
+        exit 1
+      fi
+      echo "[$(date)] Job state: ${state}"
+      sleep 15
+    done
+
+    echo "[$(date)] Ray cluster ready. Auto-running training command..."
+    COMMAND="$(cat "${CMD_FILE}")" bash "${ATTACH_SCRIPT}"
+    rc=$?
+    echo "[$(date)] Training command finished (exit code: ${rc})."
+    echo "[$(date)] Allocation is still alive — re-attach with:"
+    echo "  bash ${ATTACH_SCRIPT}"
+  ' > "${WATCHER_LOG}" 2>&1 &
+
+  WATCHER_PID=$!
+  disown "${WATCHER_PID}"
+
   echo ""
   echo "  Saved training command to:"
   echo "    ${CMD_FILE}"
   echo ""
-  echo "  Once Ray is up, you can:"
+  echo "  Background watcher running (PID: ${WATCHER_PID})"
+  echo "    Log: ${WATCHER_LOG}"
+  echo "    tail -f ${WATCHER_LOG}"
   echo ""
-  echo "    # Option 1: Run non-interactively from login node"
-  echo "    COMMAND=\"\$(cat ${CMD_FILE})\" bash ${ATTACH_SCRIPT}"
+  echo "  Training will auto-start when Ray is ready, even if you're away."
   echo ""
-  echo "    # Option 2: Attach interactively, then run inside the container"
+  echo "  After training finishes, the allocation stays alive. Re-attach with:"
   echo "    bash ${ATTACH_SCRIPT}"
-  echo "    source ${CMD_FILE}   # or paste/edit the command"
-  echo ""
-  echo "    # Re-run after editing (no requeue needed):"
-  echo "    vim ${CMD_FILE}"
-  echo "    COMMAND=\"\$(cat ${CMD_FILE})\" bash ${ATTACH_SCRIPT}"
+  echo "    source ${CMD_FILE}   # edit and re-run"
   echo ""
   echo "  Cancel: scancel ${JOB_ID}"
+  echo "  Kill watcher: kill ${WATCHER_PID}"
 
   if [[ "${INTERACTIVE_WAIT}" == "1" ]]; then
     echo ""
-    echo "  Waiting for job ${JOB_ID} to start..."
-    echo "  (Ctrl+C to stop waiting — use the commands above once the job starts)"
+    echo "  Also waiting in foreground (Ctrl+C is safe — watcher continues)..."
     echo ""
 
-    # Poll until attach script appears. ray.sub creates it after all Ray workers
-    # have connected and the cluster is fully up.
+    # Foreground poll — purely for UX. The watcher handles the real work.
+    prev_state=""
     while [[ ! -f "${ATTACH_SCRIPT}" ]]; do
       state=$(squeue -j "${JOB_ID}" -h -o "%T" 2>/dev/null || true)
       if [[ -z "${state}" ]]; then
         echo "  Job ${JOB_ID} is no longer in the queue. Check: sacct -j ${JOB_ID}"
+        echo "  (Watcher may have already handled this — check ${WATCHER_LOG})"
         exit 1
       fi
-      echo "  [$(date +%H:%M:%S)] Job state: ${state} — waiting for Ray cluster..."
+      if [[ "${state}" != "${prev_state}" ]]; then
+        echo "  [$(date +%H:%M:%S)] Job state: ${state}"
+        prev_state="${state}"
+      fi
       sleep 15
     done
 
     echo ""
-    echo "  Ray cluster is ready! Attaching to head node..."
-    echo "  (Run 'source ${CMD_FILE}' once inside, or exit and use Option 1 above)"
+    echo "  Ray cluster is ready! Watcher is auto-running the training command."
+    echo "  You can attach to monitor:"
+    echo "    bash ${ATTACH_SCRIPT}"
+    echo "    tail -f ${WATCHER_LOG}"
     echo ""
-    exec bash "${ATTACH_SCRIPT}"
   fi
 
   exit 0
@@ -344,8 +404,8 @@ sbatch \
   --nodes="${NUM_TOTAL_NODES}" \
   --account="${SLURM_ACCOUNT}" \
   --job-name="${WANDB_NAME}" \
-  --partition=batch \
-  --time=4:00:00 \
+  --partition="${PARTITION}" \
+  --time="${WALLTIME}" \
   --gres=gpu:4 \
   --exclusive \
   --dependency=singleton \
