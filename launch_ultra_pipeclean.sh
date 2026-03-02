@@ -14,7 +14,6 @@ set -euo pipefail
 #   ./launch_ultra_v3_pipeclean.sh                                   # batch, bare container
 #   USE_WORKTREE=1 ./launch_ultra_v3_pipeclean.sh                    # batch, overlay local code
 #   WALLTIME=4:00:00 ./launch_ultra_v3_pipeclean.sh
-#   NUM_ACTOR_NODES=116 INFERENCE_NUM_NODES=52 ./launch_ultra_v3_pipeclean.sh
 #
 # Interactive debugging (reuse allocation across runs):
 #   INTERACTIVE=1 ./launch_ultra_v3_pipeclean.sh                     # submits, auto-runs, waits
@@ -49,7 +48,7 @@ INTERACTIVE_WAIT="${INTERACTIVE_WAIT:-1}"
 # ---------- SLURM configuration ----------
 SLURM_ACCOUNT="${SLURM_ACCOUNT:-llmservice_nemotron_ultra}"
 PARTITION="${PARTITION:-batch}"
-WALLTIME="${WALLTIME:-1:00:00}"
+WALLTIME="${WALLTIME:-4:00:00}"
 
 
 # ---------- Container & mounts ----------
@@ -174,9 +173,6 @@ TRAIN_CMD="cd ${CODE_ROOT} && date ; \
 ${VLLM_ENV_SOURCE}\
 OMP_NUM_THREADS=16 \
 RAY_DEDUP_LOGS=1 \
-UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py && \
-OMP_NUM_THREADS=16 \
-RAY_DEDUP_LOGS=1 \
 NRL_VLLM_USE_V1=1 \
 VLLM_ATTENTION_BACKEND=FLASH_ATTN \
 VLLM_CACHE_ROOT=${VLLM_CACHE_DIR} \
@@ -193,7 +189,7 @@ FLASHINFER_CUBIN_DIR=${FLASHINFER_CUBIN_CACHE} \
 FLASHINFER_WORKSPACE_BASE=${FLASHINFER_WS_BASE} \
 NRL_VLLM_ASYNC_TIMEOUT_SECONDS=1800 \
 uv run ./examples/nemo_gym/run_grpo_nemo_gym.py \
---config examples/configs/grpo_ultra_v3.yaml \
+--config examples/configs/grpo_ultrav3_pipeclean.yaml \
 policy.model_name=${NRL_MODEL_PATH} \
 cluster.gpus_per_node=4 \
 cluster.num_nodes=${NUM_TOTAL_NODES} \
@@ -220,6 +216,9 @@ ${WORKTREE_ROOT}/3rdparty/Gym-workspace/Gym:/opt/nemo-rl/3rdparty/Gym-workspace/
 ${WORKTREE_ROOT}/3rdparty/Megatron-LM-workspace/Megatron-LM:/opt/nemo-rl/3rdparty/Megatron-LM-workspace/Megatron-LM,\
 ${MAIN_REPO_ROOT}/3rdparty/vllm:/opt/nemo-rl/3rdparty/vllm"
 fi
+
+# Always overlay local configs into the container so we pick up custom yaml files
+MOUNTS="${MOUNTS},${PROJECT_ROOT}/examples/configs:/opt/nemo-rl/examples/configs"
 
 if [[ -n "${EXTRA_MOUNTS:-}" ]]; then
   MOUNTS="${MOUNTS},${EXTRA_MOUNTS}"
@@ -264,7 +263,7 @@ if [[ "${INTERACTIVE}" == "1" ]]; then
   unset COMMAND 2>/dev/null || true
 
   # Interactive allocations default to 1h; INTERACTIVE_WALLTIME overrides.
-  WALLTIME="${INTERACTIVE_WALLTIME:-1:0:0}"
+  WALLTIME="${INTERACTIVE_WALLTIME:-4:0:0}"
 
   echo ""
   echo "================================================================"
