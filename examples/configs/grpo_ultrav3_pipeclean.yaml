@@ -279,8 +279,8 @@ policy:
       tensor_parallel_size: 8
       pipeline_parallel_size: 1
       expert_parallel_size: 1
-      gpu_memory_utilization: 0.7
-      max_model_len: ${policy.max_total_sequence_length}
+      gpu_memory_utilization: 0.92
+      max_model_len: 32768
       enforce_eager: false
       use_deep_gemm: false
       num_last_layers_in_bf16: 0
@@ -314,8 +314,10 @@ data:
   max_input_seq_length: null
   shuffle: false
   num_workers: 1
-  train_jsonl_fpath: null   # Set by launch script
-  validation_jsonl_fpath: null   # Set by launch script
+  train:
+    data_path: null   # Set by launch script
+  validation:
+    data_path: null   # Set by launch script
   default:
     dataset_name: NemoGymDataset
     env_name: "nemo_gym"
