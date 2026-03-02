@@ -329,6 +329,10 @@ def setup_model_config(
     if "layernorm_epsilon" in config["megatron_cfg"]:
         model_cfg.layernorm_epsilon = config["megatron_cfg"]["layernorm_epsilon"]
 
+    # Optional transformer implementation override (e.g. "inference_optimized" for MXFP8)
+    if "transformer_impl" in config["megatron_cfg"]:
+        model_cfg.transformer_impl = config["megatron_cfg"]["transformer_impl"]
+
     # Validate chunking configuration
     _validate_chunking_config(config)
 
