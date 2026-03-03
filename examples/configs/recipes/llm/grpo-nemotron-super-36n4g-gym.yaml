@@ -1,13 +1,5 @@
 defaults: ./grpo-nemotron-super-20n8g-gym.yaml
 
-checkpointing:
-  checkpoint_dir: results/grpo-nemotron-super-36n4g-gym
-
-logger:
-  wandb:
-    name: ananthsub-grpo-nemotron-super-36n4g-gym-gb200-hsg
-    run_name: grpo-nemotron-super-36n4g-gym
-
 policy:
   generation:
     colocated:

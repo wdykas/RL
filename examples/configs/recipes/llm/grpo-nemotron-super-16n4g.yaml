@@ -7,13 +7,6 @@ policy:
         num_nodes: 8
         gpus_per_node: 4
 
-checkpointing:
-  checkpoint_dir: results/grpo-nemotron-super-16n4g
-
-logger:
-  wandb:
-    name: grpo-nemotron-super-16n4g
-
 cluster:
   gpus_per_node: 4
   num_nodes: 16
