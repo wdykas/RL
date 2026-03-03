@@ -1,6 +1,9 @@
 # =============================================================================
-# GRPO Ultra V3 — GB200 NVL72 Pipeclean Config
+# GRPO Ultra V3 — 64-node GB200 NVL72 Pipeclean Config
 # =============================================================================
+# Toy config for validating end-to-end pipeline on 64 nodes × 4 GPUs/node.
+# Generation and training batch sizes are intentionally small to get through
+# a single train step quickly.
 #
 #   - gpus_per_node: 4
 #   - TP: 8
@@ -34,8 +37,8 @@ checkpointing:
 # GRPO Algorithm
 # =============================================================================
 grpo:
-  num_prompts_per_step: 128
-  num_generations_per_prompt: 16
+  num_prompts_per_step: 16       # Pipeclean: reduced from 128
+  num_generations_per_prompt: 4   # Pipeclean: reduced from 16
   num_val_generations_per_prompt: 2
   max_rollout_turns: 1
   max_num_epochs: 1
@@ -124,11 +127,11 @@ policy:
     chat_template_kwargs: null
   hf_config_overrides: {}
 
-  train_global_batch_size: 2048
+  train_global_batch_size: 64    # Pipeclean: num_prompts × num_generations = 16 × 4
   train_micro_batch_size: 1
   generation_batch_size: 64
   logprob_batch_size: 1
-  max_total_sequence_length: 65536
+  max_total_sequence_length: 20480   # Pipeclean: reduced from 65536
   precision: "bfloat16"
   logprob_chunk_size: 2048
   offload_optimizer_for_logprob: false
@@ -266,7 +269,7 @@ policy:
     port_range_low: 11001
     port_range_high: 15000
     backend: "vllm"
-    max_new_tokens: ${policy.max_total_sequence_length}
+    max_new_tokens: 20480              # Pipeclean: reduced from 65536
     temperature: 1.0
     top_p: 1.0
     top_k: null

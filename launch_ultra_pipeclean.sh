@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =============================================================================
-# launch_ultra_v3_pipeclean.sh
+# launch_ultra_pipeclean.sh
 #
 # GRPO Ultra V3 pipe-cleaning on GB200 NVL72 with NeMo Gym
 #
@@ -11,14 +11,15 @@ set -euo pipefail
 # Set INTERACTIVE=1 to get a persistent allocation in slurm for iterative debugging.
 #
 # Usage:
-#   ./launch_ultra_v3_pipeclean.sh                                   # batch, bare container
-#   USE_WORKTREE=1 ./launch_ultra_v3_pipeclean.sh                    # batch, overlay local code
-#   WALLTIME=4:00:00 ./launch_ultra_v3_pipeclean.sh
+#   ./launch_ultra_pipeclean.sh                                   # batch, bare container
+#   USE_WORKTREE=1 ./launch_ultra_pipeclean.sh                    # batch, overlay local code
+#   WALLTIME=4:00:00 ./launch_ultra_pipeclean.sh
 #
 # Interactive debugging (reuse allocation across runs):
-#   INTERACTIVE=1 ./launch_ultra_v3_pipeclean.sh                     # submits, auto-runs, waits
-#   INTERACTIVE=1 INTERACTIVE_WAIT=0 ./launch_ultra_v3_pipeclean.sh  # submit only (no foreground wait)
-#   INTERACTIVE=1 INTERACTIVE_WALLTIME=8:0:0 ./launch_ultra_v3_pipeclean.sh  # longer allocation
+#   INTERACTIVE=1 ./launch_ultra_pipeclean.sh                     # submits, auto-runs, waits
+#   INTERACTIVE=1 INTERACTIVE_WAIT=0 ./launch_ultra_pipeclean.sh  # submit only (no foreground wait)
+#   INTERACTIVE=1 INTERACTIVE_WALLTIME=2:0:0 SLURM_QOS=short ./launch_ultra_pipeclean.sh  # submit and wait in foreground
+#   INTERACTIVE=1 INTERACTIVE_WALLTIME=8:0:0 ./launch_ultra_pipeclean.sh  # longer allocation
 #
 #   A background watcher auto-runs the training command as soon as Ray is ready,
 #   so GPUs are never idle waiting for you to type. After training finishes the
@@ -51,13 +52,12 @@ PARTITION="${PARTITION:-batch}"
 SLURM_QOS="${SLURM_QOS:-}"
 WALLTIME="${WALLTIME:-4:00:00}"
 
-
 # ---------- Container & mounts ----------
 export CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/llmservice/users/ansubramania/containers/nemo-rl-ultra-20260226-428eb84dd-custom-vllm-arm.sqsh}"
 MOUNTS="/lustre:/lustre"
 
-# GB200 NVL72: 4 GPUs/node. Must match --gres=gpu:4 passed to sbatch.
-export GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
+# GB200 NVL72: fixed at 4 GPUs/node. Must match --gres=gpu:4 passed to sbatch.
+export GPUS_PER_NODE=4
 export CPUS_PER_WORKER="${CPUS_PER_WORKER:-144}"
 
 # ---------- HuggingFace Configuration ----------
@@ -102,6 +102,47 @@ FLASHINFER_WS_BASE="${PERSISTENT_CACHE}/flashinfer_workspace"
 mkdir -p "${VLLM_CACHE_DIR}" "${FLASHINFER_CUBIN_CACHE}" "${FLASHINFER_WS_BASE}"
 
 VLLM_PRECOMPILED_WHEEL_LOCATION="${VLLM_PRECOMPILED_WHEEL_LOCATION:-https://github.com/vllm-project/vllm/releases/download/v0.13.0/vllm-0.13.0-cp38-abi3-manylinux_2_31_aarch64.whl}"
+
+# =============================================================================
+# Validation
+# =============================================================================
+
+# Walltime cap: Slurm partitions typically enforce <=4h; fail early.
+_walltime_secs() {
+  local t="$1" h m s
+  IFS=: read -r h m s <<< "${t}"
+  echo $(( 10#${h} * 3600 + 10#${m} * 60 + 10#${s} ))
+}
+
+if (( $(_walltime_secs "${WALLTIME}") > 4 * 3600 )); then
+  echo "ERROR: WALLTIME=${WALLTIME} exceeds the 4-hour maximum."
+  exit 1
+fi
+
+# QOS=interactive caps walltime at 2 hours.
+if [[ "${SLURM_QOS}" == "interactive" ]]; then
+  if (( $(_walltime_secs "${INTERACTIVE_WALLTIME:-${WALLTIME}}") > 2 * 3600 )); then
+    echo "ERROR: SLURM_QOS=interactive requires walltime <= 2 hours."
+    echo "  Set INTERACTIVE_WALLTIME=2:0:0 or use a different QOS (e.g. SLURM_QOS=short)."
+    exit 1
+  fi
+fi
+
+# W&B: warn (but don't fail) if WANDB_API_KEY is unset — runs will log locally only.
+if [[ -z "${WANDB_API_KEY:-}" ]]; then
+  echo "WARNING: WANDB_API_KEY is not set. W&B logging will fail or fall back to offline mode."
+  echo "  export WANDB_API_KEY=<your-key> to enable cloud logging."
+fi
+
+# HF_TOKEN: required when loading models from the HuggingFace Hub (not local paths).
+# Hub IDs look like "org/model-name" (no leading slash). Local paths start with "/".
+if [[ "${NRL_MODEL_PATH}" =~ ^[a-zA-Z0-9_-]+/[a-zA-Z0-9_./-]+$ ]]; then
+  if [[ -z "${HF_TOKEN:-}" ]]; then
+    echo "ERROR: NRL_MODEL_PATH (${NRL_MODEL_PATH}) looks like a HuggingFace Hub model ID"
+    echo "  but HF_TOKEN is not set. Export HF_TOKEN to authenticate with the Hub."
+    exit 1
+  fi
+fi
 
 # =============================================================================
 # Worktree setup (only when USE_WORKTREE=1)
@@ -192,7 +233,7 @@ NRL_VLLM_ASYNC_TIMEOUT_SECONDS=1800 \
 HF_HOME=${HF_HOME} \
 HF_TOKEN=${HF_TOKEN:-} \
 uv run ./examples/nemo_gym/run_grpo_nemo_gym.py \
---config examples/configs/grpo_ultrav3_pipeclean.yaml \
+--config examples/configs/grpo_ultra_64n4g_pipeclean.yaml \
 policy.model_name=${NRL_MODEL_PATH} \
 cluster.gpus_per_node=4 \
 cluster.num_nodes=${NUM_TOTAL_NODES} \
@@ -212,19 +253,55 @@ logger.wandb.name=${WANDB_NAME} \
 logger.wandb.project=${WANDB_PROJ}"
 
 
-if [[ "${USE_WORKTREE}" == "1" ]]; then
-  MOUNTS="${MOUNTS},\
-${WORKTREE_ROOT}:${WORKTREE_ROOT},\
-${WORKTREE_ROOT}/3rdparty/Gym-workspace/Gym:/opt/nemo-rl/3rdparty/Gym-workspace/Gym,\
-${WORKTREE_ROOT}/3rdparty/Megatron-LM-workspace/Megatron-LM:/opt/nemo-rl/3rdparty/Megatron-LM-workspace/Megatron-LM,\
-${MAIN_REPO_ROOT}/3rdparty/vllm:/opt/nemo-rl/3rdparty/vllm"
-fi
+# =============================================================================
+# Overlay mounts
+# =============================================================================
+# Local source directories are bind-mounted into the container so edits on
+# Lustre take effect without rebuilding the container. Each mount can be
+# overridden via an env var or disabled by setting it to empty string.
+#
+#   NRL_NEMO_RL_DIR      → /opt/nemo-rl/nemo_rl          (Python package)
+#   NRL_CONFIGS_DIR      → /opt/nemo-rl/examples/configs  (YAML configs)
+#   NRL_MEGATRON_LM_DIR  → /opt/nemo-rl/3rdparty/Megatron-LM-workspace/Megatron-LM
+#   NRL_MEGATRON_BRIDGE_DIR → /opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge
+#   NRL_GYM_DIR          → /opt/nemo-rl/3rdparty/Gym-workspace/Gym
+#   NRL_VLLM_DIR         → /opt/nemo-rl/3rdparty/vllm
+#
+# Paths that don't exist on disk are silently skipped (container built-ins
+# are used instead). Set any var to "" to explicitly skip that mount.
+# =============================================================================
+NRL_NEMO_RL_DIR="${NRL_NEMO_RL_DIR:-${PROJECT_ROOT}/nemo_rl}"
+NRL_CONFIGS_DIR="${NRL_CONFIGS_DIR:-${PROJECT_ROOT}/examples/configs}"
+NRL_MEGATRON_LM_DIR="${NRL_MEGATRON_LM_DIR:-${PROJECT_ROOT}/3rdparty/Megatron-LM-workspace/Megatron-LM}"
+NRL_MEGATRON_BRIDGE_DIR="${NRL_MEGATRON_BRIDGE_DIR:-${PROJECT_ROOT}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge}"
+NRL_GYM_DIR="${NRL_GYM_DIR:-${PROJECT_ROOT}/3rdparty/Gym-workspace/Gym}"
+NRL_VLLM_DIR="${NRL_VLLM_DIR:-}"  # No default; vLLM from container unless explicitly set
 
-# Always overlay local source into the container so Lustre edits take effect
-MOUNTS="${MOUNTS},${PROJECT_ROOT}/nemo_rl:/opt/nemo-rl/nemo_rl"
-MOUNTS="${MOUNTS},${PROJECT_ROOT}/examples/configs:/opt/nemo-rl/examples/configs"
-MOUNTS="${MOUNTS},${PROJECT_ROOT}/3rdparty/Megatron-LM-workspace/Megatron-LM:/opt/nemo-rl/3rdparty/Megatron-LM-workspace/Megatron-LM"
-MOUNTS="${MOUNTS},${PROJECT_ROOT}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge:/opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge"
+_maybe_mount() {
+  local src="$1" dst="$2" label="$3"
+  if [[ -z "${src}" ]]; then
+    return
+  fi
+  if [[ -d "${src}" ]]; then
+    MOUNTS="${MOUNTS},${src}:${dst}"
+    echo "  Mount: ${label} → ${dst}"
+  else
+    echo "  Skip:  ${label} (${src} not found on disk, using container built-in)"
+  fi
+}
+
+echo ""
+echo "Overlay mounts:"
+_maybe_mount "${NRL_NEMO_RL_DIR}" "/opt/nemo-rl/nemo_rl" "nemo_rl"
+_maybe_mount "${NRL_CONFIGS_DIR}" "/opt/nemo-rl/examples/configs" "configs"
+_maybe_mount "${NRL_MEGATRON_LM_DIR}" "/opt/nemo-rl/3rdparty/Megatron-LM-workspace/Megatron-LM" "Megatron-LM"
+_maybe_mount "${NRL_MEGATRON_BRIDGE_DIR}" "/opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge" "Megatron-Bridge"
+_maybe_mount "${NRL_GYM_DIR}" "/opt/nemo-rl/3rdparty/Gym-workspace/Gym" "NeMo-Gym"
+_maybe_mount "${NRL_VLLM_DIR}" "/opt/nemo-rl/3rdparty/vllm" "vLLM"
+
+if [[ "${USE_WORKTREE}" == "1" ]]; then
+  MOUNTS="${MOUNTS},${WORKTREE_ROOT}:${WORKTREE_ROOT}"
+fi
 
 if [[ -n "${EXTRA_MOUNTS:-}" ]]; then
   MOUNTS="${MOUNTS},${EXTRA_MOUNTS}"
