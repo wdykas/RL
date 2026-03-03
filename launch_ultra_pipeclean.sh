@@ -48,6 +48,7 @@ INTERACTIVE_WAIT="${INTERACTIVE_WAIT:-1}"
 # ---------- SLURM configuration ----------
 SLURM_ACCOUNT="${SLURM_ACCOUNT:-llmservice_nemotron_ultra}"
 PARTITION="${PARTITION:-batch}"
+SLURM_QOS="${SLURM_QOS:-}"
 WALLTIME="${WALLTIME:-4:00:00}"
 
 
@@ -106,7 +107,7 @@ VLLM_PRECOMPILED_WHEEL_LOCATION="${VLLM_PRECOMPILED_WHEEL_LOCATION:-https://gith
 # Worktree setup (only when USE_WORKTREE=1)
 # =============================================================================
 if [[ "${USE_WORKTREE}" == "1" ]]; then
-  WORKTREE_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+  WORKTREE_ROOT="$(cd "${SCRIPT_DIR}" && pwd)"
   MAIN_REPO_ROOT="${MAIN_REPO_ROOT:-$(git -C "${WORKTREE_ROOT}" worktree list --porcelain | awk '/^worktree /{print $2}' | grep -v '/.worktrees/' | head -n1)}"
 
   if [[ -z "${MAIN_REPO_ROOT}" || ! -d "${MAIN_REPO_ROOT}" ]]; then
@@ -188,6 +189,8 @@ VLLM_FLASHINFER_MOE_BACKEND=latency \
 FLASHINFER_CUBIN_DIR=${FLASHINFER_CUBIN_CACHE} \
 FLASHINFER_WORKSPACE_BASE=${FLASHINFER_WS_BASE} \
 NRL_VLLM_ASYNC_TIMEOUT_SECONDS=1800 \
+HF_HOME=${HF_HOME} \
+HF_TOKEN=${HF_TOKEN:-} \
 uv run ./examples/nemo_gym/run_grpo_nemo_gym.py \
 --config examples/configs/grpo_ultrav3_pipeclean.yaml \
 policy.model_name=${NRL_MODEL_PATH} \
@@ -217,8 +220,11 @@ ${WORKTREE_ROOT}/3rdparty/Megatron-LM-workspace/Megatron-LM:/opt/nemo-rl/3rdpart
 ${MAIN_REPO_ROOT}/3rdparty/vllm:/opt/nemo-rl/3rdparty/vllm"
 fi
 
-# Always overlay local configs into the container so we pick up custom yaml files
+# Always overlay local source into the container so Lustre edits take effect
+MOUNTS="${MOUNTS},${PROJECT_ROOT}/nemo_rl:/opt/nemo-rl/nemo_rl"
 MOUNTS="${MOUNTS},${PROJECT_ROOT}/examples/configs:/opt/nemo-rl/examples/configs"
+MOUNTS="${MOUNTS},${PROJECT_ROOT}/3rdparty/Megatron-LM-workspace/Megatron-LM:/opt/nemo-rl/3rdparty/Megatron-LM-workspace/Megatron-LM"
+MOUNTS="${MOUNTS},${PROJECT_ROOT}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge:/opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge"
 
 if [[ -n "${EXTRA_MOUNTS:-}" ]]; then
   MOUNTS="${MOUNTS},${EXTRA_MOUNTS}"
@@ -281,6 +287,7 @@ if [[ "${INTERACTIVE}" == "1" ]]; then
     --time="${WALLTIME}" \
     --gres=gpu:4 \
     --exclusive \
+    ${SLURM_QOS:+--qos="${SLURM_QOS}"} \
     "${RAY_SUB}")
 
   echo "${submission_output}"
@@ -357,7 +364,14 @@ CMDEOF
   echo ""
   echo "  After training finishes, the allocation stays alive. Re-attach with:"
   echo "    bash ${ATTACH_SCRIPT}"
-  echo "    source ${CMD_FILE}   # edit and re-run"
+  echo ""
+  echo "  Between runs (clean up GPUs, clear caches, re-run):"
+  echo "    python ${PROJECT_ROOT}/reset_ray_cluster.py"
+  echo "    source ${CMD_FILE}"
+  echo ""
+  echo "  Edit the command and re-run without requeueing:"
+  echo "    vim ${CMD_FILE}"
+  echo "    source ${CMD_FILE}"
   echo ""
   echo "  Cancel: scancel ${JOB_ID}"
   echo "  Kill watcher: kill ${WATCHER_PID}"
@@ -408,4 +422,5 @@ sbatch \
   --gres=gpu:4 \
   --exclusive \
   --dependency=singleton \
+  ${SLURM_QOS:+--qos="${SLURM_QOS}"} \
   "${RAY_SUB}"

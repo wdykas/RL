@@ -315,6 +315,12 @@ ray start --head \
 EOFINNER
 chmod +x /launch-head.sh
 
+ray stop --force 2>/dev/null || true
+
+echo "[PORT-DIAG] before ray start (head):"
+ss -tlnp sport ge :${MIN_WORKER_PORT} and sport le :${MAX_WORKER_PORT} 2>/dev/null || true
+echo "[PORT-DIAG] ip_local_port_range: \$(cat /proc/sys/net/ipv4/ip_local_port_range)"
+
 count=0
 while [[ \$count -lt $num_retries ]]; do
   if [[ -n "$SETUP_COMMAND_FILE" ]] && [[ -f "$SETUP_COMMAND_FILE" ]]; then
@@ -324,6 +330,7 @@ while [[ \$count -lt $num_retries ]]; do
   bash /launch-head.sh
   count=\$((count+1))
   echo "Head node failed \$count/$num_retries times, restarting in 5 seconds..."
+  ss -tlnp sport ge :${MIN_WORKER_PORT} and sport le :${MAX_WORKER_PORT} 2>/dev/null || true
   sleep 5
 done
 touch $LOG_DIR/ENDED
@@ -428,6 +435,7 @@ while [[ \$count -lt $num_retries ]]; do
   bash /launch-worker.sh
   count=\$((count+1))
   echo "Worker failed \$count/$num_retries times, restarting in 5 seconds..."
+  ss -tlnp sport ge :${MIN_WORKER_PORT} and sport le :${MAX_WORKER_PORT} 2>/dev/null || true
   sleep 5
 done
 touch $LOG_DIR/ENDED
