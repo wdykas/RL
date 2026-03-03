@@ -1094,7 +1094,16 @@ def run_async_nemo_gym_rollout(
     # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
     with timer.time(f"{timer_prefix}/prepare_for_metrics_calculation"):
         batch_size = len(nemo_gym_rows)
-        max_total_tokens_per_sample = policy_generation.cfg["vllm_cfg"]["max_model_len"]
+        generation_config = policy_generation.cfg
+        if "generation" in generation_config:
+            generation_config = generation_config["generation"]
+        if generation_config["backend"] == "vllm":
+            max_total_tokens_per_sample = generation_config["vllm_cfg"]["max_model_len"]
+        elif generation_config["backend"] == "megatron":
+            max_total_tokens_per_sample = generation_config["mcore_generation_config"]["max_tokens"]
+        else:
+            raise ValueError(f"Invalid generation backend: {generation_config['backend']}, expected 'vllm' or 'megatron'")
+
         all_sample_metrics = [
             {
                 "total_reward": r["full_result"]["reward"],

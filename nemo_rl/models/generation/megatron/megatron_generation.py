@@ -88,6 +88,8 @@ class MegatronGeneration(GenerationInterface):
             weights_path=weights_path,
         )
 
+        self.dp_openai_server_base_urls = self._policy.report_dp_openai_server_base_urls()
+
     def init_collective(
         self, ip: str, port: int, world_size: int, *, train_world_size: int,
         refit_backend: str = "gloo",

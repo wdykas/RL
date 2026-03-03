@@ -653,6 +653,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         return aggregated_results
 
+    def report_dp_openai_server_base_urls(self) -> list[Optional[str]]:
+        futures = self.worker_group.run_all_workers_single_data(
+            "report_dp_openai_server_base_url",
+            run_rank_0_only_axes=["data_parallel", "tensor_parallel", "pipeline_parallel"],
+        )
+        return ray.get(futures)
+
     async def generate_async(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
