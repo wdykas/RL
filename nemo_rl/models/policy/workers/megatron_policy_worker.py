@@ -235,14 +235,12 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         self.inference_client = None
         self.inference_context = None
         self.inference_wrapped_model = None
+        self.base_url = None
         self._inference_engine_initialized = False
         self._inference_engine_alseep = True  # Start paused since we begin with training
         self._inference_loop = None  # Event loop for inference operations
         self._inference_thread = None  # Thread running the event loop
 
-        # Doing Dummy generation loop to start up the engines
-        self.prepare_for_generation()
-        self.finish_generation()
 
     def enable_forward_pre_hook(self):
         assert isinstance(self.model, DistributedDataParallel)
