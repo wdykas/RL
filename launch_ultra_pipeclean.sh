@@ -95,6 +95,9 @@ export SANDBOX_CONTAINER="${SANDBOX_CONTAINER:-/lustre/fsw/portfolios/llmservice
 export SANDBOX_COMMAND="${SANDBOX_COMMAND:-/start-with-nginx.sh}"
 export NEMO_SKILLS_SANDBOX_PORT="${NEMO_SKILLS_SANDBOX_PORT:-6000}"
 
+# ---------- Ray log sync (copy actor logs from /tmp/ray to $LOG_DIR/ray/) ----------
+export RAY_LOG_SYNC_FREQUENCY="${RAY_LOG_SYNC_FREQUENCY:-60}"
+
 EXP_SUFFIX="${EXP_SUFFIX:-ultra-v3-grpo-pipeclean}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-results/${EXP_SUFFIX}}"
 mkdir -p "${CHECKPOINT_DIR}"
