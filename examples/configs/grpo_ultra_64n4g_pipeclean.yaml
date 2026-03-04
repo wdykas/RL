@@ -368,7 +368,8 @@ env:
       - resources_servers/reasoning_gym/configs/reasoning_gym.yaml
       - resources_servers/terminal_pivot/configs/terminal_pivot.yaml
       - resources_servers/ns_tools/configs/ns_tools.yaml
-      - resources_servers/math_formal_lean/configs/math_formal_lean_multi_turn.yaml
+      # Disabled for pipeclean — Lean sandbox often unreachable, blocks scoring
+      # - resources_servers/math_formal_lean/configs/math_formal_lean_multi_turn.yaml
       - resources_servers/swerl_gen/configs/swerl_gen.yaml
       - resources_servers/jailbreak_detection/configs/jailbreak_detection_nemotron_combined_reward_tp8.yaml
       - resources_servers/over_refusal_detection/configs/over_refusal_detection_nemotron_tp8.yaml
