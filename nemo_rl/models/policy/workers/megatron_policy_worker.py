@@ -160,6 +160,16 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
         # Step 3: Setup model configuration
+        # Training workers must not use inference_optimized transformer spec:
+        # InferenceLayerNormColumnParallelLinear requires DynamicInferenceEngine's
+        # symmetric memory buffer and has @torch.no_grad(), both incompatible with training.
+        # Set transformer_impl=inference_optimized via policy.generation.mcore_generation_config
+        # instead, which is automatically scoped to generation workers only.
+        if init_optimizer:
+            assert config["megatron_cfg"].get("transformer_impl") != "inference_optimized", (
+                "transformer_impl=inference_optimized must not be set on training workers. "
+                "Use policy.generation.mcore_generation_config.transformer_impl=inference_optimized instead."
+            )
         runtime_config = validate_and_set_config(
             config,
             self.rank,
@@ -167,7 +177,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             pretrained_path,
             weights_path,
             tokenizer,
-            is_inference_only=not init_optimizer,
         )
 
         self.megatron_cfg = runtime_config.megatron_cfg

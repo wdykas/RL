@@ -195,7 +195,6 @@ def validate_and_set_config(
     pretrained_path,
     weights_path,
     tokenizer,
-    is_inference_only: bool = False,
 ):
     # Handle generation colocation
     is_generation_colocated = None
@@ -228,7 +227,6 @@ def validate_and_set_config(
 
     megatron_cfg, model_cfg = setup_model_config(
         config, rank, dtype, hf_model_name, pretrained_path, weights_path,
-        is_inference_only=is_inference_only,
     )
 
     final_padded_vocab_size = calculate_padded_vocab_size(
@@ -273,7 +271,6 @@ def setup_model_config(
     hf_model_name: str,
     pretrained_path: str,
     weights_path: Optional[str] = None,
-    is_inference_only: bool = False,
 ) -> tuple[ConfigContainer, Any]:
     """Handle all the model configuration logic."""
     # Load pretrained run config
@@ -333,15 +330,13 @@ def setup_model_config(
         model_cfg.layernorm_epsilon = config["megatron_cfg"]["layernorm_epsilon"]
 
     # Optional transformer implementation override (e.g. "inference_optimized" for MXFP8).
-    # Only apply to inference-only workers: InferenceLayerNormColumnParallelLinear requires
-    # a global symmetric memory buffer initialized by DynamicInferenceEngine, and has
-    # @torch.no_grad() on forward(), both of which are incompatible with training.
-    if "transformer_impl" in config["megatron_cfg"] and is_inference_only:
+    # For generation workers, this is set via mcore_generation_config which is merged into
+    # megatron_cfg by megatron_generation.py. Training workers assert it is not set.
+    if "transformer_impl" in config["megatron_cfg"]:
         model_cfg.transformer_impl = config["megatron_cfg"]["transformer_impl"]
-        # For inference-only workers with inference_optimized spec, also propagate
-        # fp8_recipe even when fp8_cfg.enabled=False (BF16 training + MXFP8 inference).
-        # This allows _needs_mxfp8_conversion to trigger FlashInfer weight quantization
-        # without enabling the TE FP8 context on the training worker.
+        # When using inference_optimized spec, also propagate fp8_recipe even when
+        # fp8_cfg.enabled=False (BF16 training + MXFP8 inference). This allows
+        # _needs_mxfp8_conversion to trigger FlashInfer weight quantization.
         fp8_cfg_for_infer = config["megatron_cfg"].get("fp8_cfg", None)
         if (
             fp8_cfg_for_infer is not None
