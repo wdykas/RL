@@ -39,6 +39,7 @@ from megatron.core.distributed import DistributedDataParallel
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
     FullyShardedDataParallel as custom_FSDP,
 )
+from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.config import InferenceConfig, KVCacheManagementMode
 from megatron.core.optimizer import ChainedOptimizer
@@ -793,25 +794,20 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         if dist_rank == 0:
             from megatron.core.inference.inference_client import InferenceClient
             self.inference_client = InferenceClient(inference_coordinator_address=dp_addr)
-            await self.inference_client.start()
+            self.inference_client.start()
         
         self._inference_engine_alseep = False
 
     def _sleep(self):
         """Pause the inference engine to free GPU memory for training.
         
-        This method should be called before training to:
-        1. Deallocate KV cache and other inference-specific GPU memory
-        2. Disable CUDA graphs for inference
-        3. Toggle model configuration for training mode
+        Uses the coordinator's pause+suspend mechanism:
+        1. Rank 0 sends PAUSE → all ranks wait for engine to reach PAUSED
+        2. Rank 0 sends SUSPEND → all ranks wait for engine to reach SUSPENDED
         
-        Uses the coordinator's pause mechanism to properly pause the engine loop
-        and then pause the engine (deallocate tensors, etc.).
-        
-        For coordinator-based inference:
-        - Only rank 0 sends pause signals via the coordinator
-        - The coordinator broadcasts to all DP engines
-        - Non-rank-0 workers wait for their engine to be paused via the event loop
+        The engine internally handles GPU state deallocation (KV cache, CUDA
+        graphs, etc.) during the SUSPENDED transition, so no explicit
+        engine.suspend() call is needed.
         """
         future = asyncio.run_coroutine_threadsafe(
             self._sleep_engine(),
@@ -825,34 +821,34 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         print(f"[Rank {self.rank}] paused inference engine")
 
     async def _sleep_engine(self):
-        """Send suspend signals via the coordinator and wait for acknowledgment.
-        
-        Mirrors MegatronLocal.suspend() from megatron/rl/inference/megatron.py:
-        1. Rank 0 sends suspend (PAUSE + SUSPEND) to coordinator
-        2. All ranks wait for engine to be paused
-        3. All ranks call engine.suspend() to deallocate GPU state
-        """ 
+        """Send pause+suspend signals via the coordinator and wait for each state.
+
+         Mirrors MegatronLocal.suspend() from megatron/rl/inference/megatron.py:
+
+        1. Rank 0 sends PAUSE to coordinator
+        2. All ranks wait for engine to reach PAUSED state
+        3. Rank 0 sends SUSPEND to coordinator
+        4. All ranks wait for engine to reach SUSPENDED state
+        """
+
         if torch.distributed.get_rank() == 0:
-            # Send PAUSE  signals
+            self.inference_client.pause_engines()
+        await self.dynamic_inference_engine.wait_until(EngineState.PAUSED)
+
+        if torch.distributed.get_rank() == 0:
             self.inference_client.suspend_engines()
-            # Wait for the engine to acknowledge the pause
-        await self.dynamic_inference_engine.paused.wait()
-        self.dynamic_inference_engine.suspend()
+        await self.dynamic_inference_engine.wait_until(EngineState.SUSPENDED)
 
     def _wake(self):
         """Resume the inference engine after training.
         
-        This method should be called before generation to:
-        1. Reallocate KV cache and inference-specific GPU memory
-        2. Enable CUDA graphs for inference
-        3. Toggle model configuration for inference mode
-        
-        Uses the coordinator's resume mechanism to properly resume the engine loop.
-        
-        For coordinator-based inference:
-        - Only rank 0 sends resume signals via the coordinator
-        - The coordinator broadcasts to all DP engines
-        - Non-rank-0 workers wait for their engine to be running via the event loop
+        Uses the coordinator's resume+unpause mechanism:
+        1. Rank 0 sends RESUME → engine reallocates GPU state internally
+        2. Rank 0 sends UNPAUSE → all ranks wait for engine to reach RUNNING
+
+        The engine internally handles GPU state reallocation (KV cache, CUDA
+        graphs, etc.) during the RESUMING transition, so no explicit
+        engine.resume() call is needed.
         """
         # Use the coordinator-based resume mechanism
         # Only rank 0 sends the signal - coordinator broadcasts to all DP engines
@@ -868,17 +864,22 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         print(f"[Rank {self.rank}] Resumed inference engine")
 
     async def _wake_engine(self):
-        """Send resume signals via the coordinator and wait for acknowledgment.
-        
-        Mirrors MegatronLocal.resume() from megatron/rl/inference/megatron.py:
-        1. Rank 0 sends resume (RESUME + UNPAUSE) to coordinator
-        2. All ranks wait for engine to be running
-        3. All ranks call engine.resume() to reallocate GPU state
-        """
+        """Send resume+unpause signals via the coordinator and wait for RUNNING.
+
+         Mirrors MegatronLocal.resume() from megatron/rl/inference/megatron.py:
+        1. Early return if engine is already running (no-op)
+        2. Rank 0 sends RESUME then UNPAUSE to coordinator
+        3. All ranks wait for engine to reach RUNNING state
+         """
+
+        if self.dynamic_inference_engine.running.is_set():
+            return
+
         if torch.distributed.get_rank() == 0:
             self.inference_client.resume_engines()
-        await self.dynamic_inference_engine.running.wait()
-        self.dynamic_inference_engine.resume()
+            self.inference_client.unpause_engines()
+
+        await self.dynamic_inference_engine.wait_until(EngineState.RUNNING)
 
     def suspend_for_refit(self, recompute_kv_cache: bool = False) -> None:
         """Pause or suspend engine for safe weight update.
@@ -1190,7 +1191,8 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         print(f"[Rank {torch.distributed.get_rank()}] Coordinator started")
 
         # Start the HTTP Server
-        if self.cfg["generation"]["mcore_generation_config"]["expose_http_server"] and torch.distributed.get_rank() == 0:
+
+        if self.cfg["generation"]["mcore_generation_config"].get("expose_http_server", False) and torch.distributed.get_rank() == 0:
             print(f"[Rank {torch.distributed.get_rank()}] Starting HTTP Server")
             self.base_url = (
                 self._setup_openai_api_server()

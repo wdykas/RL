@@ -20,7 +20,6 @@ from collections import defaultdict
 from io import BytesIO
 from typing import Any, Optional, Union
 
-import decord
 import requests
 import torch
 from PIL import Image
@@ -358,7 +357,8 @@ def load_media_from_message(
                     )
                 except (RuntimeError, FileNotFoundError, OSError) as e:
                     logger.warning("Audio loading failed. Fall back to decord.")
-                    # use decord
+                    import decord
+
                     loaded_audio = decord.AudioReader(
                         aud,
                         sample_rate=multimodal_load_kwargs["audio"]["sampling_rate"],
@@ -379,9 +379,15 @@ def load_media_from_message(
                     if "video" in multimodal_load_kwargs
                     else {}
                 )
-                # seems decord backend loads video faster with multithread ffmpeg and it is easier to install
+                # decord backend loads video faster with multithread ffmpeg, but is only available on x86_64
+                try:
+                    import decord as _decord  # noqa: F401
+
+                    video_backend = "decord"
+                except ImportError:
+                    video_backend = "pyav"
                 loaded_media["video"].append(
-                    load_video(vid, backend="decord", **load_video_kwargs)[0]
+                    load_video(vid, backend=video_backend, **load_video_kwargs)[0]
                 )
             else:
                 loaded_media["video"].append(vid)
