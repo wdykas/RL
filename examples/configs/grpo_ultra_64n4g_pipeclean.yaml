@@ -314,7 +314,7 @@ policy:
 # Data
 # =============================================================================
 data:
-  max_input_seq_length: null
+  max_input_seq_length: 16384   # Pipeclean: filter prompts that won't fit in max_model_len=20480
   shuffle: false
   num_workers: 1
   train:
