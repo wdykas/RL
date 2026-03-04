@@ -369,7 +369,8 @@ env:
       - resources_servers/terminal_pivot/configs/terminal_pivot.yaml
       - resources_servers/ns_tools/configs/ns_tools.yaml
       - resources_servers/math_formal_lean/configs/math_formal_lean_multi_turn.yaml
-      - resources_servers/swerl_gen/configs/swerl_gen.yaml
+      # swerl_gen disabled: requires Apptainer/Singularity (not available on aarch64)
+      # - resources_servers/swerl_gen/configs/swerl_gen.yaml
       - resources_servers/jailbreak_detection/configs/jailbreak_detection_nemotron_combined_reward_tp8.yaml
       - resources_servers/over_refusal_detection/configs/over_refusal_detection_nemotron_tp8.yaml
       - resources_servers/multichallenge/configs/multichallenge.yaml
