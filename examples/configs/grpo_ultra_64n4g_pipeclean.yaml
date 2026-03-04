@@ -410,12 +410,6 @@ env:
           server_env:
             VLLM_ATTENTION_BACKEND: TRITON_ATTN
 
-    # Pipeclean: disable Lean proof self-correction retries (sandbox not available)
-    math_formal_lean_refinement_agent:
-      responses_api_agents:
-        proof_refinement_agent:
-          max_correction_turns: 0
-
     terminal_pivot_simple_agent:
       responses_api_agents:
         simple_agent:
