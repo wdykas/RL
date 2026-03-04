@@ -118,6 +118,8 @@ mcore = [
   "flash-attn==2.8.1",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
   "torch-memory-saver",
+  # Required for MXFP8 inference-optimized transformer (FlashInfer MXFP8 quantization via mm_mxfp8)
+  "flashinfer-python~=0.6.4",
 ]
 # nvshmem refit backend — install the extra matching your CUDA major version.
 # Usage: uv sync --extra mcore --extra nvshmem-cu12
@@ -295,6 +297,10 @@ conflicts = [
   [
     { extra = "vllm" },
     { extra = "sglang" },
+  ],
+  [
+    { extra = "mcore" },
+    { extra = "vllm" },
   ],
 ]
 

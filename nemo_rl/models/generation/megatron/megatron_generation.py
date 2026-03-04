@@ -179,6 +179,15 @@ class MegatronGeneration(GenerationInterface):
         """
         return self._policy.finish_generation(*args, **kwargs)
 
+    def preinit_nvshmem_collective(self) -> list[ray.ObjectRef]:
+        """Pre-initialize NVShmem collectively after CUDA graph capture.
+
+        Must be called simultaneously on both training and inference workers
+        (both sides call it at the same time so NVShmem collective barriers
+        inside init() are satisfied).  No-op for non-NVShmem backends.
+        """
+        return self._policy.preinit_nvshmem_collective()
+
     def suspend_for_refit(self, recompute_kv_cache: bool = False) -> None:
         """Suspend the inference engine for safe weight updates.
 

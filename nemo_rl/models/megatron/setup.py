@@ -195,6 +195,7 @@ def validate_and_set_config(
     pretrained_path,
     weights_path,
     tokenizer,
+    is_inference_only: bool = False,
 ):
     # Handle generation colocation
     is_generation_colocated = None
@@ -226,7 +227,8 @@ def validate_and_set_config(
         )
 
     megatron_cfg, model_cfg = setup_model_config(
-        config, rank, dtype, hf_model_name, pretrained_path, weights_path
+        config, rank, dtype, hf_model_name, pretrained_path, weights_path,
+        is_inference_only=is_inference_only,
     )
 
     final_padded_vocab_size = calculate_padded_vocab_size(
@@ -271,6 +273,7 @@ def setup_model_config(
     hf_model_name: str,
     pretrained_path: str,
     weights_path: Optional[str] = None,
+    is_inference_only: bool = False,
 ) -> tuple[ConfigContainer, Any]:
     """Handle all the model configuration logic."""
     # Load pretrained run config
@@ -319,7 +322,7 @@ def setup_model_config(
     _apply_performance_config(model_cfg, config)
 
     # Apply generation settings
-    if config["generation"]["backend"] == "megatron":
+    if "generation" in config and config["generation"] is not None and config["generation"]["backend"] == "megatron":
         _apply_cuda_graph_and_rng_tracker_config(model_cfg, config)
 
     # Validate optimizer configuration
@@ -329,9 +332,23 @@ def setup_model_config(
     if "layernorm_epsilon" in config["megatron_cfg"]:
         model_cfg.layernorm_epsilon = config["megatron_cfg"]["layernorm_epsilon"]
 
-    # Optional transformer implementation override (e.g. "inference_optimized" for MXFP8)
-    if "transformer_impl" in config["megatron_cfg"]:
+    # Optional transformer implementation override (e.g. "inference_optimized" for MXFP8).
+    # Only apply to inference-only workers: InferenceLayerNormColumnParallelLinear requires
+    # a global symmetric memory buffer initialized by DynamicInferenceEngine, and has
+    # @torch.no_grad() on forward(), both of which are incompatible with training.
+    if "transformer_impl" in config["megatron_cfg"] and is_inference_only:
         model_cfg.transformer_impl = config["megatron_cfg"]["transformer_impl"]
+        # For inference-only workers with inference_optimized spec, also propagate
+        # fp8_recipe even when fp8_cfg.enabled=False (BF16 training + MXFP8 inference).
+        # This allows _needs_mxfp8_conversion to trigger FlashInfer weight quantization
+        # without enabling the TE FP8 context on the training worker.
+        fp8_cfg_for_infer = config["megatron_cfg"].get("fp8_cfg", None)
+        if (
+            fp8_cfg_for_infer is not None
+            and not fp8_cfg_for_infer.get("enabled", False)
+            and fp8_cfg_for_infer.get("fp8_recipe") is not None
+        ):
+            model_cfg.fp8_recipe = fp8_cfg_for_infer["fp8_recipe"]
 
     # Validate chunking configuration
     _validate_chunking_config(config)
@@ -389,44 +406,36 @@ def _apply_cuda_graph_and_rng_tracker_config(model_cfg: Any, config: PolicyConfi
 
 def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
     """Apply Mixture of Experts configuration."""
-    model_cfg.expert_tensor_parallel_size = config["megatron_cfg"][
-        "expert_tensor_parallel_size"
-    ]
-    model_cfg.expert_model_parallel_size = config["megatron_cfg"][
-        "expert_model_parallel_size"
-    ]
+    mcfg = config["megatron_cfg"]
+    model_cfg.expert_tensor_parallel_size = mcfg.get("expert_tensor_parallel_size", 1)
+    model_cfg.expert_model_parallel_size = mcfg.get("expert_model_parallel_size", 1)
 
     # MoE stability settings
 
     # Setting moe_router_dtype to higher precision (e.g. fp64) can improve numerical stability,
     # especially when using many experts.
-    model_cfg.moe_router_dtype = config["megatron_cfg"]["moe_router_dtype"]
+    model_cfg.moe_router_dtype = mcfg.get("moe_router_dtype", None)
 
     # The below two configs (and "freeze_moe_router") are used to stabilize moe training
     # by preventing updates to the moe router. We found that this is helpful in reducing
     # logprob error during training.
 
     # Set this to "none" to disable load balancing loss.
-    model_cfg.moe_router_load_balancing_type = config["megatron_cfg"][
-        "moe_router_load_balancing_type"
-    ]
+    model_cfg.moe_router_load_balancing_type = mcfg.get(
+        "moe_router_load_balancing_type", "none"
+    )
     # Set this to 0.0 to disable updates to the moe router expert bias
-    model_cfg.moe_router_bias_update_rate = config["megatron_cfg"][
-        "moe_router_bias_update_rate"
-    ]
+    model_cfg.moe_router_bias_update_rate = mcfg.get("moe_router_bias_update_rate", 0.0)
 
-    model_cfg.moe_enable_deepep = config["megatron_cfg"]["moe_enable_deepep"]
-    model_cfg.moe_token_dispatcher_type = config["megatron_cfg"][
-        "moe_token_dispatcher_type"
-    ]
-    model_cfg.moe_pad_experts_for_cuda_graph_inference = config["megatron_cfg"][
-        "moe_pad_experts_for_cuda_graph_inference"
-    ]
-    model_cfg.moe_shared_expert_overlap = config["megatron_cfg"][
-        "moe_shared_expert_overlap"
-    ]
-
-    model_cfg.moe_permute_fusion = config["megatron_cfg"]["moe_permute_fusion"]
+    model_cfg.moe_enable_deepep = mcfg.get("moe_enable_deepep", False)
+    model_cfg.moe_token_dispatcher_type = mcfg.get(
+        "moe_token_dispatcher_type", "allgather"
+    )
+    model_cfg.moe_pad_experts_for_cuda_graph_inference = mcfg.get(
+        "moe_pad_experts_for_cuda_graph_inference", False
+    )
+    model_cfg.moe_shared_expert_overlap = mcfg.get("moe_shared_expert_overlap", False)
+    model_cfg.moe_permute_fusion = mcfg.get("moe_permute_fusion", False)
 
 
 def _apply_precision_config(

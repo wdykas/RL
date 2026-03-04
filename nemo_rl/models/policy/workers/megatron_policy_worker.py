@@ -125,6 +125,15 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         **kwargs: Any,
     ):
         """Initialize the MegatronPolicyWorker."""
+        # Ensure the venv's bin directory is in PATH so tools like ninja (used by
+        # FlashInfer JIT compilation) can be found when called via subprocess.
+        # Ray actor venvs set sys.executable to the venv Python but do not update
+        # PATH, so subprocess.run(["ninja", ...]) fails with FileNotFoundError.
+        import sys
+        _venv_bin = os.path.dirname(sys.executable)
+        if _venv_bin and _venv_bin not in os.environ.get("PATH", "").split(os.pathsep):
+            os.environ["PATH"] = _venv_bin + os.pathsep + os.environ.get("PATH", "")
+
         # Apply patch from https://github.com/NVIDIA/TransformerEngine/pull/2286/files
         apply_transformer_engine_patch()
 
@@ -158,6 +167,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             pretrained_path,
             weights_path,
             tokenizer,
+            is_inference_only=not init_optimizer,
         )
 
         self.megatron_cfg = runtime_config.megatron_cfg
@@ -1586,12 +1596,41 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         if refit_backend == "nvshmem":
             from megatron.core.resharding.copy_services.nvshmem_copy_service import NVSHMEMCopyService
             self.refit_copy_service = NVSHMEMCopyService(group=self.refit_pg)
-            self.refit_copy_service._ensure_initialized()
+            # NOTE: Do NOT eagerly call _ensure_initialized() here.
+            # NVShmem initialization (nvshmem.core.init + buffer allocation) can
+            # interfere with Transformer Engine FP8 setup when called before the
+            # first model forward pass. With lazy init, NVShmem initializes on
+            # the first weight transfer (after TE FP8 has already run forward
+            # passes and calibrated its internal state). Both training and
+            # generation workers call swap_weights_via_reshard() simultaneously,
+            # so the collective barriers inside init() are still satisfied.
         else:
             from megatron.core.resharding.copy_services.gloo_copy_service import GlooCopyService
             self.refit_copy_service = GlooCopyService(group=self.refit_pg)
 
         print(f"[REFIT] rank={global_rank} init_refit_collective complete", flush=True)
+
+    def preinit_nvshmem_collective(self) -> None:
+        """Initialize NVShmem collectively without transferring weights.
+
+        Must be called on ALL participating ranks (training + inference)
+        simultaneously, after prepare_for_generation() has completed and the
+        CUDA graph has been captured.
+
+        Calling _ensure_initialized() here (after TE FP8 + CUDA graph are
+        fully set up) avoids the race where nvshmem.core.init() runs in the
+        middle of a live CUDA graph, potentially corrupting FP8 workspace
+        tensor addresses baked into the graph.  Subsequent weight transfers
+        then proceed without any NVShmem initialization side-effects.
+
+        For non-NVShmem backends this is a no-op.
+        """
+        if not hasattr(self, "refit_copy_service"):
+            return
+        if not hasattr(self.refit_copy_service, "_ensure_initialized"):
+            return
+        self.refit_copy_service._ensure_initialized()
+        print(f"[REFIT] rank={torch.distributed.get_rank()} NVShmem pre-initialized", flush=True)
 
     @torch.no_grad()
     def swap_weights_via_reshard(self, is_source: bool, dst_rank_offset: int = 0) -> bool:
@@ -1705,7 +1744,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         return True
 
-    def prepare_for_generation(self) -> None:
+    def prepare_for_generation(self, tags=None, **kwargs) -> None:
         print(f"[Rank {self.rank}] preparing for generation", flush=True)
         self._log_gpu_memory("prepare_for_generation START")
         # Get the generation config
@@ -1755,8 +1794,13 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             )
             self._run_async_coordinator_start(coordinator_port)
 
-        if self._inference_engine_alseep:
-            self._wake()
+        # When tags include "weights", we are inside refit_policy_generation and the
+        # engine was intentionally suspended before refit. Do NOT wake the engine
+        # here, or NVSHMEM init/weight transfer can race with CUDA graph replay and
+        # corrupt TE FP8 state, causing high log-prob error for the first 1-2 steps.
+        if tags is None or "weights" not in tags:
+            if self._inference_engine_alseep:
+                self._wake()
         self._log_gpu_memory("prepare_for_generation END")
 
     def finish_generation(self) -> None:
@@ -1830,6 +1874,19 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             self.model, "cuda", move_grads=True, move_params=True
         )
         self.model.train()
+
+        # Clear any cached FP8 weight workspaces from the previous generation
+        # phase.  The inference engine (TextGenerationController) runs forward
+        # passes inside torch.inference_mode(), which marks any newly-created
+        # tensors as "inference tensors".  TE caches the quantized FP8 weight
+        # tensor in module._fp8_workspaces during the first forward pass; if
+        # that happens inside inference_mode the cached tensor is an inference
+        # tensor and cannot be saved for backward during training.  Clearing
+        # the cache here forces TE to re-quantize the weights during the
+        # training forward pass, which runs outside inference_mode.
+        for module in self.model.modules():
+            if hasattr(module, "_fp8_workspaces"):
+                module._fp8_workspaces.clear()
 
         # Move optimizer state to CUDA if it exists
         # colocated generation will always offload optimizer to cuda before refit
