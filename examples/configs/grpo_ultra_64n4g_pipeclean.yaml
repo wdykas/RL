@@ -131,7 +131,7 @@ policy:
   train_micro_batch_size: 1
   generation_batch_size: 64
   logprob_batch_size: 1
-  max_total_sequence_length: 20480   # Pipeclean: reduced from 65536
+  max_total_sequence_length: 32768   # Pipeclean: reduced from 65536
   precision: "bfloat16"
   logprob_chunk_size: 2048
   offload_optimizer_for_logprob: false
@@ -269,7 +269,7 @@ policy:
     port_range_low: 11001
     port_range_high: 15000
     backend: "vllm"
-    max_new_tokens: 20480              # Pipeclean: reduced from 65536
+    max_new_tokens: 32768              # Pipeclean: reduced from 65536
     temperature: 1.0
     top_p: 1.0
     top_k: null
@@ -283,7 +283,7 @@ policy:
       pipeline_parallel_size: 1
       expert_parallel_size: 1
       gpu_memory_utilization: 0.92
-      max_model_len: 20480              # Must be <= policy.max_total_sequence_length
+      max_model_len: 32768              # Must be <= policy.max_total_sequence_length
       enforce_eager: false
       use_deep_gemm: false
       num_last_layers_in_bf16: 0
@@ -314,7 +314,7 @@ policy:
 # Data
 # =============================================================================
 data:
-  max_input_seq_length: 16384   # Pipeclean: filter prompts that won't fit in max_model_len=20480
+  max_input_seq_length: 16384   # NOTE: no-op for NemoGymDataset (processor ignores max_seq_length)
   shuffle: false
   num_workers: 1
   train:
