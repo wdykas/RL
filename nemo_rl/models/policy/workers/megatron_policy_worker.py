@@ -245,6 +245,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         self.inference_client = None
         self.inference_context = None
         self.inference_wrapped_model = None
+        self.base_url = None
         self._inference_engine_initialized = False
         self._inference_engine_alseep = True  # Start paused since we begin with training
         self._inference_loop = None  # Event loop for inference operations
@@ -856,6 +857,9 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         model_config = self.model.config
 
+        from megatron.core.inference.config import MambaInferenceStateConfig
+        mamba_inference_state_config = MambaInferenceStateConfig.from_model(self.model)
+
         inference_config = InferenceConfig(
             block_size_tokens=block_size_tokens,
             buffer_size_gb=buffer_size_gb,
@@ -869,6 +873,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             materialize_only_last_token_logits=materialize_only_last_token_logits,
             enable_chunked_prefill=enable_chunked_prefill,
             pg_collection=pg_collection,
+            mamba_inference_state_config=mamba_inference_state_config,
          )
 
         # Create inference context
@@ -1263,6 +1268,29 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         while self._inference_loop is None:
             time.sleep(0.001)
 
+    def report_dp_openai_server_base_url(self) -> Optional[str]:
+        return self.base_url
+
+    def _setup_openai_api_server(self) -> str:
+        from megatron.core.inference.text_generation_server.dynamic_text_gen_server.flask_server import run_flask_server_on_client
+
+        from nemo_rl.distributed.virtual_cluster import _get_node_ip_local, _get_free_port_local
+        ip = _get_node_ip_local()
+        free_port = _get_free_port_local()
+
+        server_task = asyncio.create_task(
+            run_flask_server_on_client(
+                client=self.inference_client,
+                tokenizer=self.megatron_tokenizer,
+                parsers=self.cfg["generation"]["mcore_generation_config"].get("parsers", []),
+                flask_port=free_port,
+                verbose=True,
+            )
+        )
+
+        time.sleep(10)
+        return f"http://{ip}:{free_port}/v1"
+
     def _run_async_coordinator_start(self, coordinator_port: int):
         """Start the coordinator and engine loop in the background thread.
         
@@ -1278,8 +1306,22 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             self._start_inference_coordinator(coordinator_port),
             self._inference_loop
         )
-        # Wait for completion
-        return future.result()
+
+        # Wait for coordinator to start
+        future.result()
+        print(f"[Rank {torch.distributed.get_rank()}] Coordinator started")
+
+        # Start the HTTP Server
+        if self.cfg["generation"]["mcore_generation_config"].get("expose_http_server", False) and torch.distributed.get_rank() == 0:
+            print(f"[Rank {torch.distributed.get_rank()}] Starting HTTP Server")
+            self.base_url = (
+                self._setup_openai_api_server()
+            )
+        else:
+            print(f"[Rank {torch.distributed.get_rank()}] HTTP Server not started")
+            self.base_url = None
+        
+        return 
 
     def _run_async_generation_with_persistent_engine(
         self,

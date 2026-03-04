@@ -74,6 +74,9 @@ class MegatronGeneration(GenerationInterface):
 
         self.cfg = config
 
+        # We're in Generation, so we need to update the megatron_cfg with the mcore_generation_config parameters.
+        self.cfg['megatron_cfg'].update(config['generation']['mcore_generation_config'])
+
         # Create a Policy object configured for inference only:
         # - No optimizer (not training on this cluster)
         # - No reference model (not needed for generation)
@@ -87,6 +90,10 @@ class MegatronGeneration(GenerationInterface):
             init_reference_model=False,
             weights_path=weights_path,
         )
+
+    @property
+    def dp_openai_server_base_urls(self) -> list[Optional[str]]:
+        return self._policy.report_dp_openai_server_base_urls()
 
     def init_collective(
         self, ip: str, port: int, world_size: int, *, train_world_size: int,
