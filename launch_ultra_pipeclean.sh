@@ -102,6 +102,31 @@ EXP_SUFFIX="${EXP_SUFFIX:-ultra-v3-grpo-pipeclean}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-results/${EXP_SUFFIX}}"
 mkdir -p "${CHECKPOINT_DIR}"
 
+# ---------- Code snapshot (frozen copy for reproducibility) ----------
+# Batch mode: snapshot by default so code is frozen at submission time.
+# Interactive mode: live directory by default for fast iteration.
+# Override with USE_SNAPSHOT=0 or USE_SNAPSHOT=1 to force either behavior.
+if [[ "${INTERACTIVE}" == "1" ]]; then
+  USE_SNAPSHOT="${USE_SNAPSHOT:-0}"
+else
+  USE_SNAPSHOT="${USE_SNAPSHOT:-1}"
+fi
+
+if [[ "${USE_SNAPSHOT}" == "1" ]]; then
+  SNAPSHOT_DIR=$(bash "${PROJECT_ROOT}/tools/code_snapshot.sh" "${EXP_SUFFIX}")
+
+  # Symlink 3rdparty/vllm if present (large, not git-tracked in all setups)
+  if [[ -d "${PROJECT_ROOT}/3rdparty/vllm" ]] && [[ ! -e "${SNAPSHOT_DIR}/3rdparty/vllm" ]]; then
+    mkdir -p "${SNAPSHOT_DIR}/3rdparty"
+    ln -s "${PROJECT_ROOT}/3rdparty/vllm" "${SNAPSHOT_DIR}/3rdparty/vllm"
+  fi
+
+  echo "Code snapshot: ${SNAPSHOT_DIR}"
+  OVERLAY_SOURCE="${SNAPSHOT_DIR}"
+else
+  OVERLAY_SOURCE="${PROJECT_ROOT}"
+fi
+
 # ---------- Persistent cache directories ----------
 PERSISTENT_CACHE="${PERSISTENT_CACHE:-/lustre/fsw/portfolios/llmservice/users/ansubramania/.cache}"
 VLLM_CACHE_DIR="${PERSISTENT_CACHE}/vllm_compile_cache"
@@ -278,11 +303,11 @@ logger.wandb.project=${WANDB_PROJ}"
 # Paths that don't exist on disk are silently skipped (container built-ins
 # are used instead). Set any var to "" to explicitly skip that mount.
 # =============================================================================
-NRL_NEMO_RL_DIR="${NRL_NEMO_RL_DIR:-${PROJECT_ROOT}/nemo_rl}"
-NRL_CONFIGS_DIR="${NRL_CONFIGS_DIR:-${PROJECT_ROOT}/examples/configs}"
-NRL_MEGATRON_LM_DIR="${NRL_MEGATRON_LM_DIR:-${PROJECT_ROOT}/3rdparty/Megatron-LM-workspace/Megatron-LM}"
-NRL_MEGATRON_BRIDGE_DIR="${NRL_MEGATRON_BRIDGE_DIR:-${PROJECT_ROOT}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge}"
-NRL_GYM_DIR="${NRL_GYM_DIR:-${PROJECT_ROOT}/3rdparty/Gym-workspace/Gym}"
+NRL_NEMO_RL_DIR="${NRL_NEMO_RL_DIR:-${OVERLAY_SOURCE}/nemo_rl}"
+NRL_CONFIGS_DIR="${NRL_CONFIGS_DIR:-${OVERLAY_SOURCE}/examples/configs}"
+NRL_MEGATRON_LM_DIR="${NRL_MEGATRON_LM_DIR:-${OVERLAY_SOURCE}/3rdparty/Megatron-LM-workspace/Megatron-LM}"
+NRL_MEGATRON_BRIDGE_DIR="${NRL_MEGATRON_BRIDGE_DIR:-${OVERLAY_SOURCE}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge}"
+NRL_GYM_DIR="${NRL_GYM_DIR:-${OVERLAY_SOURCE}/3rdparty/Gym-workspace/Gym}"
 NRL_VLLM_DIR="${NRL_VLLM_DIR:-}"  # No default; vLLM from container unless explicitly set
 
 _maybe_mount() {
@@ -309,6 +334,10 @@ _maybe_mount "${NRL_VLLM_DIR}" "/opt/nemo-rl/3rdparty/vllm" "vLLM"
 
 if [[ "${USE_WORKTREE}" == "1" ]]; then
   MOUNTS="${MOUNTS},${WORKTREE_ROOT}:${WORKTREE_ROOT}"
+fi
+
+if [[ "${USE_SNAPSHOT}" == "1" ]]; then
+  MOUNTS="${MOUNTS},${SNAPSHOT_DIR}:${SNAPSHOT_DIR}"
 fi
 
 if [[ -n "${EXTRA_MOUNTS:-}" ]]; then
