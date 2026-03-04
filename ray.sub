@@ -466,7 +466,6 @@ if [[ -n "${SANDBOX_CONTAINER:-}" ]] && [[ -n "${SANDBOX_COMMAND:-}" ]]; then
     --overlap \
     --nodes="$SLURM_JOB_NUM_NODES" \
     --ntasks-per-node=1 \
-    -w "$head_node" \
     --export=ALL,SANDBOX_PORTS_DIR=$SANDBOX_PORTS_DIR \
     bash -c "$SANDBOX_COMMAND" &
   SRUN_PIDS["sandbox"]=$!
