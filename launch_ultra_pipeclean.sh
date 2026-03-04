@@ -102,7 +102,7 @@ EXP_SUFFIX="${EXP_SUFFIX:-ultra-v3-grpo-pipeclean}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-results/${EXP_SUFFIX}}"
 mkdir -p "${CHECKPOINT_DIR}"
 
-# ---------- Code snapshot (frozen copy for reproducibility) ----------
+# ---------- Code snapshot ----------
 # Batch mode: snapshot by default so code is frozen at submission time.
 # Interactive mode: live directory by default for fast iteration.
 # Override with USE_SNAPSHOT=0 or USE_SNAPSHOT=1 to force either behavior.
