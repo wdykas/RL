@@ -16,5 +16,5 @@
 [submodule "3rdparty/Gym-workspace/Gym"]
 	path = 3rdparty/Gym-workspace/Gym
 	url = https://github.com/NVIDIA-NeMo/Gym.git
-	branch = main
+	branch = rkirby/minor_changes_for_megatron_inference_in_nemorl
 	shallow = true
