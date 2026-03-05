@@ -2585,12 +2585,14 @@ def async_grpo_train(
             refit_policy_generation(policy, policy_generation, colocated_inference)
             if is_megatron and hasattr(policy_generation, "resume_after_refit"):
                 policy_generation.resume_after_refit(recompute_kv_cache=False)
-            # Second weight transfer: CUDA graph warmup during _initialize_inference_engine
-            # (inside the first refit_policy_generation above) may use different tensor
-            # address paths than the established refit hooks.  A second suspend+refit+resume
-            # goes through the normal refit path (engine already initialized, hooks active)
-            # and ensures the generation engine starts with the correct training weights.
-            # This is a one-time cost at startup; regular per-step refits are unaffected.
+            # Second weight transfer: the first refit above initializes the
+            # inference engine (CUDA graph warmup).  TE caches quantized FP8
+            # weights in _fp8_workspaces during warmup.  If the first NVShmem
+            # transfer had any data corruption (rare, affects only chunked
+            # params >256MB), the cached workspaces hold corrupt values.
+            # The second transfer delivers correct weights AND the
+            # _fp8_workspaces.clear() in swap_weights_via_reshard forces
+            # TE to re-quantize from the fresh BF16 parameters.
             if is_megatron and hasattr(policy_generation, "suspend_for_refit"):
                 policy_generation.suspend_for_refit(recompute_kv_cache=False)
                 refit_policy_generation(policy, policy_generation, colocated_inference)

@@ -336,7 +336,7 @@ def setup_model_config(
         model_cfg.transformer_impl = config["megatron_cfg"]["transformer_impl"]
         # When using inference_optimized spec, also propagate fp8_recipe even when
         # fp8_cfg.enabled=False (BF16 training + MXFP8 inference). This allows
-        # _needs_mxfp8_conversion to trigger FlashInfer weight quantization.
+        # Megatron-LM's prepare_swap_model_weights to auto-detect MXFP8 needs.
         fp8_cfg_for_infer = config["megatron_cfg"].get("fp8_cfg", None)
         if (
             fp8_cfg_for_infer is not None
