@@ -125,15 +125,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         **kwargs: Any,
     ):
         """Initialize the MegatronPolicyWorker."""
-        # Ensure the venv's bin directory is in PATH so tools like ninja (used by
-        # FlashInfer JIT compilation) can be found when called via subprocess.
-        # Ray actor venvs set sys.executable to the venv Python but do not update
-        # PATH, so subprocess.run(["ninja", ...]) fails with FileNotFoundError.
-        import sys
-        _venv_bin = os.path.dirname(sys.executable)
-        if _venv_bin and _venv_bin not in os.environ.get("PATH", "").split(os.pathsep):
-            os.environ["PATH"] = _venv_bin + os.pathsep + os.environ.get("PATH", "")
-
         # Apply patch from https://github.com/NVIDIA/TransformerEngine/pull/2286/files
         apply_transformer_engine_patch()
 
@@ -265,16 +256,22 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         self._mxfp8_persistent_buffers = None  # Dict of persistent MXFP8Tensor objects
         self._mxfp8_param_metadata = None  # Dict of (shape, dtype, device) per param
 
-        # Refit hooks: pluggable pre/post-swap conversion functions.
-        # _refit_pre_swap_fn is called before swap to restore weights to a writable format.
-        # _refit_post_swap_fn is called after swap (or on initial prepare) to quantize weights.
-        # _refit_weights_converted tracks whether post_swap conversion has been applied.
-        self._refit_pre_swap_fn: Optional[Callable] = None
+        # Refit hooks: pluggable post-swap conversion function.
+        # _refit_post_swap_fn is called in prepare_for_generation() to do the initial
+        # BF16 -> MXFP8 quantization and create persistent buffers.  Override this
+        # before prepare_for_generation() to support custom weight formats.
+        # _refit_weights_converted guards against re-running quantization on repeated calls.
         self._refit_post_swap_fn: Optional[Callable] = None
         self._refit_weights_converted = False
         self._refit_hooks_initialized = False
-        self._mxfp8_plan_cached = False  # True after first reshard plan is built
-        self._mxfp8_convertible_params: Optional[set] = None  # cached convertible param names
+
+        # MXFP8 reshard transform and convertible-param names.
+        # _mxfp8_convertible_params: pre-computed before MXFP8 conversion (requires BF16
+        #   named_parameters()), populated in init_refit_collective().
+        # _mxfp8_transform: MXFP8ReshardTransform created in prepare_for_generation() after
+        #   persistent buffers exist.  Used by swap_weights_via_reshard() on every call.
+        self._mxfp8_convertible_params: Optional[set] = None
+        self._mxfp8_transform = None  # MXFP8ReshardTransform; None for BF16 workers
 
     def enable_forward_pre_hook(self):
         assert isinstance(self.model, DistributedDataParallel)
@@ -732,25 +729,19 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         )
 
     def _setup_refit_hooks(self) -> None:
-        """Register refit pre/post-swap hooks based on model configuration.
+        """Register the post-swap conversion function based on model configuration.
 
-        Called lazily on first use. Checks the model config and registers the
-        appropriate conversion functions. New conversion formats can be supported
-        by adding additional branches here or by setting _refit_pre_swap_fn /
-        _refit_post_swap_fn directly before the first prepare_for_generation call.
+        Called lazily from prepare_for_generation(). Checks the model config and
+        registers the appropriate initial-quantization function.  New weight formats
+        can be supported by adding additional branches here or by setting
+        _refit_post_swap_fn directly before the first prepare_for_generation() call.
         """
         if self._refit_hooks_initialized:
             return
         self._refit_hooks_initialized = True
 
         if self._needs_mxfp8_conversion:
-            self._refit_pre_swap_fn = self._restore_params_from_flashinfer_mxfp8
             self._refit_post_swap_fn = self._quantize_weights_to_flashinfer_mxfp8
-
-    @property
-    def _has_refit_hooks(self) -> bool:
-        """Return True if refit conversion hooks are configured."""
-        return self._refit_post_swap_fn is not None
 
     def _compute_mxfp8_convertible_params(self) -> set[str]:
         """Return the set of core-module-level param names eligible for MXFP8 conversion.
@@ -910,23 +901,33 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
     async def _start_inference_coordinator(self, coordinator_port: int):
         """Start the inference coordinator and engine loop.
-        
+
         This is called once when the inference infrastructure is first needed.
         The engine's start_listening_to_data_parallel_coordinator returns the
         actual coordinator address (dp_addr) which is used to create the client.
         """
+        import time as _time
+        _t0 = _time.time()
+        rank = torch.distributed.get_rank()
+        print(f"[Rank {rank}] _start_inference_coordinator: starting engine loop", flush=True)
         dp_addr = await self.dynamic_inference_engine.start_listening_to_data_parallel_coordinator(
             inference_coordinator_port=coordinator_port,
             launch_inference_coordinator=True,
         )
+        print(f"[Rank {rank}] _start_inference_coordinator: engine loop started ({_time.time()-_t0:.2f}s)", flush=True)
+        # NOTE: CUDA-graph warmup happens synchronously inside DynamicInferenceEngine.__init__()
+        # (called from _initialize_inference_engine), so warmup is already complete here.
+        # start_listening_to_data_parallel_coordinator() handles TP-rank sync via the
+        # internal mp_group barrier before returning, so no extra wait is needed.
 
         dist_rank = torch.distributed.get_rank()
         if dist_rank == 0:
             from megatron.core.inference.inference_client import InferenceClient
             self.inference_client = InferenceClient(inference_coordinator_address=dp_addr)
             await self.inference_client.start()
-        
+
         self._inference_engine_alseep = False
+        print(f"[Rank {rank}] _start_inference_coordinator: done ({_time.time()-_t0:.2f}s)", flush=True)
 
     def _sleep(self):
         """Pause the inference engine to free GPU memory for training.
@@ -1023,7 +1024,11 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         preserved. On resume, checkpointed requests are replayed with
         fresh prefill using the new weights (AREAL-style).
         """
+        import time as _time
+        _t0 = _time.time()
+        print(f"[Rank {self.rank}] suspend_for_refit START (recompute_kv_cache={recompute_kv_cache})", flush=True)
         if not self._inference_engine_initialized:
+            print(f"[Rank {self.rank}] suspend_for_refit: engine not initialized, returning early", flush=True)
             return
         if recompute_kv_cache:
             future = asyncio.run_coroutine_threadsafe(
@@ -1034,16 +1039,24 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 self._pause_engine_for_refit(), self._inference_loop
             )
         future.result()
-        torch.distributed.barrier()
+        print(f"[Rank {self.rank}] suspend_for_refit: future.result() done ({_time.time()-_t0:.2f}s)", flush=True)
         if recompute_kv_cache:
             self._inference_engine_alseep = True
             print(f"[Rank {self.rank}] Suspended inference engine for refit (KV cache will be recomputed)")
 
     async def _pause_engine_for_refit(self):
-        if torch.distributed.get_rank() == 0:
+        import time as _time
+        _t0 = _time.time()
+        rank = torch.distributed.get_rank()
+        print(f"[Rank {rank}] _pause_engine_for_refit: START", flush=True)
+        if rank == 0:
             await self.inference_client.pause_engines()
+            print(f"[Rank {rank}] _pause_engine_for_refit: pause_engines() sent ({_time.time()-_t0:.2f}s)", flush=True)
         else:
+            # Non-rank-0 workers wait for their local engine to confirm pause.
             await self.dynamic_inference_engine.paused.wait()
+            print(f"[Rank {rank}] _pause_engine_for_refit: paused confirmed ({_time.time()-_t0:.2f}s)", flush=True)
+        print(f"[Rank {rank}] _pause_engine_for_refit: DONE ({_time.time()-_t0:.2f}s)", flush=True)
 
     def resume_after_refit(self, recompute_kv_cache: bool = False) -> None:
         """Resume engine after weight update.
@@ -1056,7 +1069,11 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         PERSIST mode is used, CUDA graphs remain valid and don't
         need to be recaptured.
         """
+        import time as _time
+        _t0 = _time.time()
+        print(f"[Rank {self.rank}] resume_after_refit START (recompute_kv_cache={recompute_kv_cache})", flush=True)
         if not self._inference_engine_initialized:
+            print(f"[Rank {self.rank}] resume_after_refit: engine not initialized, returning early", flush=True)
             return
         if recompute_kv_cache:
             future = asyncio.run_coroutine_threadsafe(
@@ -1067,13 +1084,14 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 self._unpause_engine_after_refit(), self._inference_loop
             )
         future.result()
-        torch.distributed.barrier()
+        print(f"[Rank {self.rank}] resume_after_refit: future.result() done ({_time.time()-_t0:.2f}s)", flush=True)
         if recompute_kv_cache:
             self._inference_engine_alseep = False
             print(f"[Rank {self.rank}] Resumed inference engine after refit (KV cache recomputed)")
 
     async def _unpause_engine_after_refit(self):
-        if torch.distributed.get_rank() == 0:
+        rank = torch.distributed.get_rank()
+        if rank == 0:
             self.inference_client.unpause_engines()
         await self.dynamic_inference_engine.running.wait()
 
@@ -1316,9 +1334,14 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             self._inference_loop
         )
 
-        # Wait for coordinator to start
+        # Wait for coordinator start AND CUDA-graph warmup to complete.
+        # _start_inference_coordinator awaits running.wait() so future.result()
+        # only returns once this rank's engine is fully warmed up.
+        # Cross-rank sync is handled by Ray's actor group semantics: the caller
+        # (refit_policy_generation) waits for ALL generation workers to return from
+        # prepare_for_generation() before proceeding, so no explicit barrier needed.
         future.result()
-        print(f"[Rank {torch.distributed.get_rank()}] Coordinator started")
+        print(f"[Rank {torch.distributed.get_rank()}] Coordinator started and engine warmed up")
 
         # Start the HTTP Server
         if self.cfg["generation"]["mcore_generation_config"].get("expose_http_server", False) and torch.distributed.get_rank() == 0:
@@ -1647,32 +1670,49 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         if refit_backend == "nvshmem":
             from megatron.core.resharding.copy_services.nvshmem_copy_service import NVSHMEMCopyService
             self.refit_copy_service = NVSHMEMCopyService(group=self.refit_pg)
-            # NOTE: Do NOT eagerly call _ensure_initialized() here.
-            # NVShmem initialization (nvshmem.core.init + buffer allocation) can
-            # interfere with Transformer Engine FP8 setup when called before the
-            # first model forward pass. With lazy init, NVShmem initializes on
-            # the first weight transfer (after TE FP8 has already run forward
-            # passes and calibrated its internal state). Both training and
-            # generation workers call swap_weights_via_reshard() simultaneously,
-            # so the collective barriers inside init() are still satisfied.
         else:
             from megatron.core.resharding.copy_services.gloo_copy_service import GlooCopyService
             self.refit_copy_service = GlooCopyService(group=self.refit_pg)
 
+        from megatron.core.resharding.refit import prepare_swap_model_weights
+
+        is_source = (rank_offset == 0)
+        dst_rank_offset = torch.distributed.get_world_size() if is_source else rank_offset
+
+        # For MXFP8 generation workers: pre-compute convertible param names now,
+        # while the model still has BF16 named_parameters().  After
+        # prepare_for_generation() converts them to MXFP8Tensor (stored in
+        # module.__dict__, not _parameters), named_parameters() won't see them.
+        if not is_source and self._needs_mxfp8_conversion:
+            self._compute_mxfp8_convertible_params()
+
+        # Build and cache the reshard plan collectively while all workers are
+        # alive and models are in BF16 format.  All participating ranks (training
+        # + generation) call this simultaneously.  Subsequent swap_model_weights
+        # calls reuse the cached plan without re-inspecting named_parameters().
+        prepare_swap_model_weights(
+            src_model=self.model if is_source else None,
+            target_model=None if is_source else self.model,
+            group=self.refit_pg,
+            src_rank_offset=0,
+            dst_rank_offset=dst_rank_offset,
+        )
+
         print(f"[REFIT] rank={global_rank} init_refit_collective complete", flush=True)
 
     def preinit_nvshmem_collective(self) -> None:
-        """Initialize NVShmem collectively without transferring weights.
+        """Initialize the NVShmem copy service collectively before any weight transfer.
 
         Must be called on ALL participating ranks (training + inference)
         simultaneously, after prepare_for_generation() has completed and the
-        CUDA graph has been captured.
+        CUDA graph has been captured but before any weight transfer.
 
-        Calling _ensure_initialized() here (after TE FP8 + CUDA graph are
-        fully set up) avoids the race where nvshmem.core.init() runs in the
-        middle of a live CUDA graph, potentially corrupting FP8 workspace
-        tensor addresses baked into the graph.  Subsequent weight transfers
-        then proceed without any NVShmem initialization side-effects.
+        The NVSHMEMCopyService lazy init (nvshmem.core.init + symmetric heap
+        allocation) can corrupt MXFP8 CUDA graph state baked into device memory
+        even when the engine is paused (CUDA graphs preserved). Running the init
+        here — after suspend_for_refit() but before swap_weights_via_reshard() —
+        ensures initialization completes without interfering with any active CUDA
+        operations. Subsequent transfers are no-ops for initialization.
 
         For non-NVShmem backends this is a no-op.
         """
@@ -1681,32 +1721,25 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         if not hasattr(self.refit_copy_service, "_ensure_initialized"):
             return
         self.refit_copy_service._ensure_initialized()
-        print(f"[REFIT] rank={torch.distributed.get_rank()} NVShmem pre-initialized", flush=True)
 
     @torch.no_grad()
     def swap_weights_via_reshard(self, is_source: bool, dst_rank_offset: int = 0) -> bool:
         """Transfer weights using Megatron's swap_model_weights resharding API.
 
-        Uses the CopyService initialized in init_refit_collective for data
-        transfer and the refit ProcessGroup for metadata exchange.
+        Uses the CopyService and ProcessGroup initialized in init_refit_collective.
 
-        When MXFP8 conversion is enabled, uses a two-phase approach:
-          - **First call**: Standard BF16 path (the reshard plan is built
-            collectively and requires nn.Parameters to be visible via
-            ``named_parameters()``).  The post-swap hook converts weights to
-            MXFP8 format and creates persistent buffers.
-          - **Subsequent calls (receiver only)**: An ``MXFP8ReshardTransform``
-            receives BF16 data and converts it to MXFP8 directly in
-            ``finalize_recv``, writing into the persistent buffers.  This
-            skips the costly restore / BF16-copy / re-convert cycle.
-            The sender is unaffected — it sends BF16 via the default path.
+        Training workers (is_source=True) always send BF16 weights.  Inference
+        workers (is_source=False) receive directly into persistent MXFP8 buffers
+        via MXFP8ReshardTransform (if MXFP8 is enabled) or into standard BF16
+        parameters otherwise.
 
-        For non-MXFP8 models the behaviour is unchanged: pre-swap hook →
-        BF16 copy → post-swap hook on every call.
+        The reshard plan is pre-built in init_refit_collective() and the MXFP8
+        transform is created in prepare_for_generation(), so this method has no
+        first-call special-casing — every call follows the same code path.
 
         Args:
-            is_source: True for training workers (weight source), False for
-                       inference workers (weight destination).
+            is_source: True for training workers (senders), False for inference
+                       workers (receivers).
             dst_rank_offset: Rank offset of the inference (destination) side.
 
         Returns:
@@ -1714,85 +1747,21 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         """
         from megatron.core.resharding.refit import swap_model_weights
 
-        if not self._refit_hooks_initialized:
-            self._setup_refit_hooks()
-
-        # Build MXFP8 recv-side transform for subsequent calls on the
-        # receiver.  On the first call the plan must be built (needs
-        # nn.Parameters visible), so we use the default BF16 path.
-        # The sender never uses a transform — it always sends BF16.
-        transform = None
-        if (
-            not is_source
-            and self._needs_mxfp8_conversion
-            and self._mxfp8_plan_cached
-        ):
-            from megatron.core.resharding.execution import MXFP8ReshardTransform
-
-            assert self._mxfp8_persistent_buffers is not None, (
-                "MXFP8 persistent buffers must exist before using the transform "
-                "(ensure prepare_for_generation or _refit_post_swap_fn ran first)"
-            )
-            convertible = self._compute_mxfp8_convertible_params()
-            transform = MXFP8ReshardTransform(
-                convertible_params=convertible,
-                persistent_buffers=self._mxfp8_persistent_buffers,
-                buffer_key_prefix="decoder.",
-            )
-
-        if is_source:
-            src_model, dst_model = self.model, None
-        else:
-            if transform is not None:
-                # Subsequent calls: transform receives BF16 and converts to
-                # MXFP8 directly into persistent buffers.
-                pass
-            else:
-                # First call (or non-MXFP8): use existing pre/post-swap hooks.
-                if self._refit_weights_converted and self._refit_pre_swap_fn is not None:
-                    self._refit_pre_swap_fn()
-                    self._refit_weights_converted = False
-            src_model, dst_model = None, self.model
-
-        # Cache convertible param names while they are visible as
-        # nn.Parameters (first call only, on the receiver side).
-        if (
-            not is_source
-            and self._needs_mxfp8_conversion
-            and self._mxfp8_convertible_params is None
-        ):
-            self._compute_mxfp8_convertible_params()
+        src_model = self.model if is_source else None
+        dst_model = None if is_source else self.model
+        # Receivers use the pre-built MXFP8 transform (None for BF16 workers
+        # or if init_refit_collective has not been called).
+        transform = self._mxfp8_transform if not is_source else None
 
         swap_model_weights(
-            src_model, dst_model,
+            src_model,
+            dst_model,
             refit_method=self.refit_copy_service,
             group=self.refit_pg,
             src_rank_offset=0,
             dst_rank_offset=dst_rank_offset,
             transform=transform,
         )
-
-        if not is_source:
-            if transform is not None:
-                # Transform wrote into persistent buffers; model attrs
-                # already reference those same MXFP8Tensor objects.
-                self._refit_weights_converted = True
-            else:
-                # First call: post-swap hook converts to MXFP8 format and
-                # creates/updates persistent buffers.
-                if self._refit_post_swap_fn is not None:
-                    self._refit_post_swap_fn()
-                    self._refit_weights_converted = True
-
-        # After the first successful receiver call, mark plan as cached
-        # so subsequent calls use the transform.
-        if (
-            not is_source
-            and self._needs_mxfp8_conversion
-            and not self._mxfp8_plan_cached
-        ):
-            self._mxfp8_plan_cached = True
-
         return True
 
     def prepare_for_generation(self, tags=None, **kwargs) -> None:
@@ -1827,17 +1796,32 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         if cuda_graph_impl != "none":
             toggle_cuda_graphs(lang_module, set_to=cuda_graph_impl)
 
-        # 4. Set up refit hooks (lazy, first call only) and run post-swap
-        #    conversion if needed (before engine init so CUDA graphs capture
-        #    the correct memory addresses, e.g. MXFP8Tensor buffers)
-        if not self._refit_hooks_initialized:
-            self._setup_refit_hooks()
+        # 4. Set up refit hooks (lazy, first call only) and run initial weight
+        #    conversion if needed.  This must happen before engine init so that
+        #    CUDA graphs capture the correct MXFP8Tensor buffer addresses.
+        self._setup_refit_hooks()
         if self._refit_post_swap_fn is not None and not self._refit_weights_converted:
             self._refit_post_swap_fn()
             self._refit_weights_converted = True
+            # Persistent buffers now exist.  Build the MXFP8ReshardTransform so
+            # that every swap_weights_via_reshard() call writes directly into them,
+            # bypassing any BF16 restore / re-quantize cycle.
+            # _mxfp8_convertible_params was pre-computed in init_refit_collective()
+            # while params were still BF16; it is None for non-refit workers.
+            if self._mxfp8_convertible_params is not None:
+                from megatron.core.resharding.execution import MXFP8ReshardTransform
+                self._mxfp8_transform = MXFP8ReshardTransform(
+                    convertible_params=self._mxfp8_convertible_params,
+                    persistent_buffers=self._mxfp8_persistent_buffers,
+                    buffer_key_prefix="decoder.",
+                )
 
-        # 5. Initialize inference engine if not already done
-        if not self._inference_engine_initialized:
+        # 5. Initialize inference engine if not already done.
+        # Skip engine start when called with tags=["weights"] (inside refit_policy_generation
+        # before the first generation).  Weights are about to be transferred, and we want the
+        # engine's CUDA-graph warmup to capture the already-correct post-transfer weights.
+        # The engine will be started by the subsequent prepare_for_generation(tags=["kv_cache"]).
+        if not self._inference_engine_initialized and (tags is None or "weights" not in tags):
             self._initialize_inference_engine(mcore_generation_config)
             # Start the coordinator and engine loop (first time only)
             coordinator_port = self.cfg["generation"].get(

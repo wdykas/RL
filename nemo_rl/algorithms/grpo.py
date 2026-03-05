@@ -1208,20 +1208,11 @@ def refit_policy_generation(
                 raise NotImplementedError(
                     "SGLang haven't implemented non-colocated inference mode. "
                 )
-            # internal barriers.  If init() fires lazily inside
-            # swap_model_weights() (the default), it runs concurrently with
-            # active CUDA-graph replay on the inference side.  For TE/MXFP8
-            # models this can corrupt FP8 workspace tensor state baked into
-            # the CUDA graph, causing nan/inf in the first generation pass
-            # (high token_mult_prob_error for the first 1-2 iterations).
-            #
-            # Calling preinit_nvshmem_collective() here — after
-            # prepare_for_generation() has captured the CUDA graph but before
-            # any weights are transferred — ensures NVShmem is fully
-            # initialized with no interference from live CUDA graphs.
-            #
-            # This is a no-op for Gloo/vLLM backends (either the method is
-            # absent or the worker-level implementation is a no-op).
+            # Pre-initialize NVShmem copy service collectively before weight transfer.
+            # The lazy init (nvshmem.core.init + symmetric heap allocation) can corrupt
+            # MXFP8 CUDA graph state in device memory even with the engine paused.
+            # Running init here — after suspend_for_refit but before the transfer —
+            # avoids this race. No-op for Gloo/vLLM backends.
             if hasattr(policy, "preinit_nvshmem_collective") and hasattr(
                 policy_generation, "preinit_nvshmem_collective"
             ):
@@ -1229,10 +1220,6 @@ def refit_policy_generation(
                     policy.preinit_nvshmem_collective()
                     + policy_generation.preinit_nvshmem_collective()
                 )
-            futures_train = policy.broadcast_weights_for_collective(kv_scales=kv_scales)
-            futures_inference = policy_generation.update_weights_from_collective()
-            # wait for all futures to complete
-            ray.get(futures_train)
             futures_train = policy.broadcast_weights_for_collective(kv_scales=kv_scales)
             futures_inference = policy_generation.update_weights_from_collective()
             # wait for all futures to complete
@@ -2594,14 +2581,19 @@ def async_grpo_train(
         try:
             is_megatron = master_config["policy"]["generation"]["backend"] == "megatron"
             if is_megatron and hasattr(policy_generation, "suspend_for_refit"):
-                # Wake the engine first so its CUDA-graph warmup can run, then
-                # suspend (which waits for warmup to fully complete and pauses
-                # the engine loop), then perform the weight transfer with the
-                # engine safely paused, then resume.
-                policy_generation.prepare_for_generation()
                 policy_generation.suspend_for_refit(recompute_kv_cache=False)
             refit_policy_generation(policy, policy_generation, colocated_inference)
             if is_megatron and hasattr(policy_generation, "resume_after_refit"):
+                policy_generation.resume_after_refit(recompute_kv_cache=False)
+            # Second weight transfer: CUDA graph warmup during _initialize_inference_engine
+            # (inside the first refit_policy_generation above) may use different tensor
+            # address paths than the established refit hooks.  A second suspend+refit+resume
+            # goes through the normal refit path (engine already initialized, hooks active)
+            # and ensures the generation engine starts with the correct training weights.
+            # This is a one-time cost at startup; regular per-step refits are unaffected.
+            if is_megatron and hasattr(policy_generation, "suspend_for_refit"):
+                policy_generation.suspend_for_refit(recompute_kv_cache=False)
+                refit_policy_generation(policy, policy_generation, colocated_inference)
                 policy_generation.resume_after_refit(recompute_kv_cache=False)
             print("✅ Policy generation refit completed successfully")
             POLICY_GENERATION_STALE = False
@@ -2623,12 +2615,13 @@ def async_grpo_train(
             traceback.print_exc()
             return
 
+    # Set collector weight version before starting collection so the first
+    # batches use the correct version (avoid Ray reorder race).
+    ray.get(trajectory_collector.set_weight_version.remote(weight_version))
+
     # Start trajectory collection in background (after refit so the engine
     # already has the correct training weights).
     collection_task = trajectory_collector.start_collection.remote(dataloader)
-
-    # Ensure collector knows initial weight version
-    trajectory_collector.set_weight_version.remote(weight_version)
 
     print("✅ Policy generation setup complete, proceeding to validation...")
 
@@ -2808,7 +2801,7 @@ def async_grpo_train(
 
                 # Prepare training data (same as sync version)
                 with timer.time("data_processing"):
-                    # Add loss mask to each message
+                    # Add loss mask to each message; track logprob coverage
                     for i, message_log in enumerate(repeated_batch["message_log"]):
                         for j, message in enumerate(message_log):
                             if message["role"] == "assistant":
