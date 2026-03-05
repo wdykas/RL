@@ -71,9 +71,13 @@ from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_
 from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_PORT_RANGE_HIGH,
     DEFAULT_PORT_RANGE_LOW,
+    NVLINK_DOMAIN_UNKNOWN,
+    TOPO_RANK_UNKNOWN,
     ClusterConfig,
     RayClusterSetupHelper,
     RayVirtualCluster,
+    get_ray_cluster_topology,
+    select_segment_nodes,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import (
@@ -425,85 +429,10 @@ def setup(
     ray_cur_node_id = ray_runtime_ctx.get_node_id()
     ray_namespace = ray_runtime_ctx.namespace
 
-    all_node_infos = {}
+    segment_size = cluster_config.get("segment_size")
 
-    if nemo_gym_num_nodes:
-        # Reserve the nemo_gym node(s) here before actually starting nemo_gym.
-
-        ray_nodes = ray.util.state.list_nodes(limit=10000)
-        for node in ray_nodes:
-            assert node.node_ip not in all_node_infos
-            all_node_infos[node.node_ip] = {
-                "node_id": node.node_id,
-                "node_ip": node.node_ip,
-            }
-        del ray_nodes
-
-        helper_pgs = []
-
-        for nemo_gym_node_idx in range(nemo_gym_num_nodes):
-            helper_bundles = [{"GPU": nemo_gym_num_gpus_per_node, "CPU": 1}]
-            helper_pg = placement_group(
-                bundles=helper_bundles,
-                strategy="STRICT_PACK",
-                name=f"nemo_gym-pnode{nemo_gym_node_idx}",
-            )
-            try:
-                ray.get(helper_pg.ready(), timeout=30)
-            except (TimeoutError, ray.exceptions.GetTimeoutError):
-                try:
-                    remove_placement_group(helper_pg)
-                except Exception:
-                    pass
-                raise TimeoutError(
-                    "Timed out waiting for placement groups to be ready. The cluster may not have enough resources "
-                    "to satisfy the requested configuration, or the resources may be busy with other tasks."
-                )
-            helper_pgs.append(helper_pg)
-
-        helpers = []
-        nemo_gym_nodes = []
-
-        for nemo_gym_node_idx in range(nemo_gym_num_nodes):
-            helper_pg = helper_pgs[nemo_gym_node_idx]
-            helper_options = {}
-            helper_options["num_gpus"] = nemo_gym_num_gpus_per_node
-            helper_options["scheduling_strategy"] = PlacementGroupSchedulingStrategy(
-                placement_group=helper_pg,
-                placement_group_capture_child_tasks=True,
-            )
-            helper = RayClusterSetupHelper.options(**helper_options).remote()
-            helper_node_info = ray.get(helper._get_node_info.remote())
-            helpers.append(helper)
-            nemo_gym_nodes.append(helper_node_info)
-
-        # Resolve any missing node IDs
-        for nemo_gym_node_idx in range(nemo_gym_num_nodes):
-            node_id = nemo_gym_nodes[nemo_gym_node_idx]["node_id"]
-            node_ip = nemo_gym_nodes[nemo_gym_node_idx]["node_ip"]
-            if not node_id:
-                node_id = all_node_infos[node_ip]["node_id"]
-                assert node_id
-                nemo_gym_nodes[nemo_gym_node_idx]["node_id"] = node_id
-
-        for helper in helpers:
-            ray.kill(helper, no_restart=True)
-
-        nemo_gym_judge_pgs = helper_pgs
-
-        print(
-            f"  ✓ Ray cluster for NeMo Gym reserved with {nemo_gym_num_nodes} nodes",
-            flush=True,
-        )
-        print(f"DEBUG: grpo setup: nemo_gym_num_nodes = {nemo_gym_num_nodes}", flush=True)
-        print(f"DEBUG: grpo setup: nemo_gym_nodes     = {nemo_gym_nodes}", flush=True)
-        assert len(nemo_gym_nodes) == nemo_gym_num_nodes, (
-            f"expected {nemo_gym_num_nodes} nemo gym nodes, actual: {nemo_gym_nodes}"
-        )
-
-    else:
-        nemo_gym_nodes = []
-        nemo_gym_judge_pgs = []
+    nemo_gym_nodes: list[dict] = []
+    nemo_gym_judge_pgs: list = []
 
     if colocated_inference:
         if total_nodes == 1:
@@ -526,6 +455,7 @@ def setup(
             else 2,
             port_range_low=generation_config.get("port_range_low", DEFAULT_PORT_RANGE_LOW),
             port_range_high=generation_config.get("port_range_high", DEFAULT_PORT_RANGE_HIGH),
+            segment_size=cluster_config.get("segment_size"),
         )
         train_cluster = cluster
         inference_cluster = cluster
@@ -596,7 +526,67 @@ def setup(
             )
             train_nodes -= inference_nodes
 
-        # initialize train cluster
+        assert train_nodes > 0 and inference_nodes > 0, (
+            f"Non-colocated mode requires train_nodes > 0 and inference_nodes > 0, "
+            f"got train_nodes={train_nodes}, inference_nodes={inference_nodes}"
+        )
+
+        # Build topology-aware domain constraints for training placement groups.
+        # Each training node's bundles are pinned to a specific NVLink domain so
+        # that EP groups stay within high-bandwidth switch fabrics.
+        #
+        # NOTE: segment_size is also passed to RayVirtualCluster and used later
+        # by _sort_bundle_indices_by_topology to trim incomplete domain segments
+        # when ordering ranks. When constraints successfully pin training to
+        # complete segments, that post-placement trimming is a no-op. It serves
+        # as defense-in-depth for the fallback path where constraints are absent.
+        node_resource_constraints = None
+        if segment_size is not None:
+            topology = get_ray_cluster_topology()
+            num_alive_nodes = len(topology)
+            required_nodes = train_nodes + inference_nodes + nemo_gym_num_nodes
+            assert num_alive_nodes >= required_nodes, (
+                f"Not enough alive Ray nodes for all roles: "
+                f"need {required_nodes} (train={train_nodes} + inference={inference_nodes} "
+                f"+ judges={nemo_gym_num_nodes}), but only {num_alive_nodes} alive nodes found"
+            )
+            has_topology = any(
+                domain != NVLINK_DOMAIN_UNKNOWN for domain, _ in topology.values()
+            )
+            if has_topology:
+                training_node_ids, _ = select_segment_nodes(
+                    topology, segment_size, train_nodes
+                )
+                # Each node has 1.0 of its domain resource (per-node, not shared).
+                # 0.001 per bundle * gpus_per_node bundles = negligible consumption.
+                node_resource_constraints = [
+                    {topology[nid][0]: 0.001} for nid in training_node_ids
+                ]
+                # Warn if any selected node lacks topo_rank -- domain pinning
+                # still works but intra-domain rank ordering will be arbitrary.
+                nodes_missing_topo_rank = [
+                    nid for nid in training_node_ids
+                    if topology[nid][1] == TOPO_RANK_UNKNOWN
+                ]
+                if nodes_missing_topo_rank:
+                    print(
+                        f"  ⚠ {len(nodes_missing_topo_rank)} training nodes have NVLink domain "
+                        f"info but no topo_rank; intra-domain rank ordering may be suboptimal",
+                        flush=True,
+                    )
+                print(
+                    f"  ✓ Topology-aware allocation: {train_nodes} training nodes in "
+                    f"{len(set(topology[nid][0] for nid in training_node_ids))} NVLink domains "
+                    f"(segment_size={segment_size})",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"  ⚠ segment_size={segment_size} is set but no NVLink domain info "
+                    f"available from Ray nodes; falling back to unconstrained allocation",
+                    flush=True,
+                )
+
         train_cluster = RayVirtualCluster(
             name="grpo_train_cluster",
             bundle_ct_per_node_list=[train_gpus_per_node] * train_nodes,
@@ -605,13 +595,90 @@ def setup(
             max_colocated_worker_groups=1,
             port_range_low=generation_config.get("port_range_low", DEFAULT_PORT_RANGE_LOW),
             port_range_high=generation_config.get("port_range_high", DEFAULT_PORT_RANGE_HIGH),
+            segment_size=segment_size,
+            node_resource_constraints=node_resource_constraints,
         )
+        # When domain constraints are set, eagerly create placement groups
+        # so training claims the constrained nodes before gym or inference can grab them.
+        if node_resource_constraints is not None:
+            train_cluster.get_placement_groups()
         print(
             f"  ✓ Ray train cluster initialized with {train_nodes} nodes with {train_gpus_per_node} GPUs per node",
             flush=True,
         )
 
-        # initialize inference cluster
+    # Reserve nemo_gym judge nodes after training cluster is created (so
+    # domain-constrained training PGs claim topology-aligned nodes first)
+    # and before inference cluster (which gets whatever nodes remain).
+    if nemo_gym_num_nodes:
+        node_infos: dict[str, dict] = {}
+        ray_nodes = ray.util.state.list_nodes(limit=10000)
+        for node in ray_nodes:
+            assert node.node_ip not in node_infos
+            node_infos[node.node_ip] = {
+                "node_id": node.node_id,
+                "node_ip": node.node_ip,
+            }
+        del ray_nodes
+
+        nemo_gym_judge_pgs = []
+        for nemo_gym_node_idx in range(nemo_gym_num_nodes):
+            helper_bundles = [{"GPU": nemo_gym_num_gpus_per_node, "CPU": 1}]
+            helper_pg = placement_group(
+                bundles=helper_bundles,
+                strategy="STRICT_PACK",
+                name=f"nemo_gym-pnode{nemo_gym_node_idx}",
+            )
+            try:
+                ray.get(helper_pg.ready(), timeout=30)
+            except (TimeoutError, ray.exceptions.GetTimeoutError):
+                try:
+                    remove_placement_group(helper_pg)
+                except Exception:
+                    pass
+                raise TimeoutError(
+                    "Timed out waiting for placement groups to be ready. The cluster may not have enough resources "
+                    "to satisfy the requested configuration, or the resources may be busy with other tasks."
+                )
+            nemo_gym_judge_pgs.append(helper_pg)
+
+        helpers = []
+        for nemo_gym_node_idx in range(nemo_gym_num_nodes):
+            helper_pg = nemo_gym_judge_pgs[nemo_gym_node_idx]
+            helper_options = {}
+            helper_options["num_gpus"] = nemo_gym_num_gpus_per_node
+            helper_options["scheduling_strategy"] = PlacementGroupSchedulingStrategy(
+                placement_group=helper_pg,
+                placement_group_capture_child_tasks=True,
+            )
+            helper = RayClusterSetupHelper.options(**helper_options).remote()
+            helper_node_info = ray.get(helper._get_node_info.remote())
+            helpers.append(helper)
+            nemo_gym_nodes.append(helper_node_info)
+
+        for nemo_gym_node_idx in range(nemo_gym_num_nodes):
+            node_id = nemo_gym_nodes[nemo_gym_node_idx]["node_id"]
+            node_ip = nemo_gym_nodes[nemo_gym_node_idx]["node_ip"]
+            if not node_id:
+                node_id = node_infos[node_ip]["node_id"]
+                assert node_id
+                nemo_gym_nodes[nemo_gym_node_idx]["node_id"] = node_id
+
+        for helper in helpers:
+            ray.kill(helper, no_restart=True)
+
+        print(
+            f"  ✓ Ray cluster for NeMo Gym reserved with {nemo_gym_num_nodes} nodes",
+            flush=True,
+        )
+        print(f"DEBUG: grpo setup: nemo_gym_num_nodes = {nemo_gym_num_nodes}", flush=True)
+        print(f"DEBUG: grpo setup: nemo_gym_nodes     = {nemo_gym_nodes}", flush=True)
+        assert len(nemo_gym_nodes) == nemo_gym_num_nodes, (
+            f"expected {nemo_gym_num_nodes} nemo gym nodes, actual: {nemo_gym_nodes}"
+        )
+
+    if not colocated_inference:
+        # Initialize inference cluster (gets remaining nodes after training and gym have claimed theirs).
         inference_cluster = RayVirtualCluster(
             name="grpo_inference_cluster",
             bundle_ct_per_node_list=[inference_gpus_per_node] * inference_nodes,

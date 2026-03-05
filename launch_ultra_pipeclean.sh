@@ -82,6 +82,23 @@ NUM_GYM_EXTRA_NODES="${NUM_GYM_EXTRA_NODES:-1}"
 NUM_JUDGE_NODES=$((NUM_GENRM_NODES + NUM_LLMJUDGE_NODES + NUM_SAFETY_NODES + NUM_GYM_EXTRA_NODES))
 NUM_TOTAL_NODES=$((NUM_ACTOR_NODES + NUM_JUDGE_NODES))
 
+# GB200 NVL72: each rack has 18 nodes sharing an NVLink domain.
+# --segment tells SLURM to allocate nodes in groups of this size from
+# the same topology block, guaranteeing complete rack-aligned segments for
+# training EP. Inference and judges inherit the constraint but don't require it.
+# Must stay in sync with cluster.segment_size in the YAML config.
+#
+# When SEGMENT_SIZE is unset, default to 16 if NUM_TOTAL_NODES >= 16.
+# When NUM_TOTAL_NODES < segment size, skip --segment to avoid sbatch failures.
+SEGMENT_SIZE="${SEGMENT_SIZE:-}"
+if [ -z "${SEGMENT_SIZE}" ] && [ "${NUM_TOTAL_NODES}" -ge 16 ]; then
+  SEGMENT_SIZE=16
+fi
+if [ -n "${SEGMENT_SIZE}" ] && [ "${NUM_TOTAL_NODES}" -lt "${SEGMENT_SIZE}" ]; then
+  echo "ERROR: NUM_TOTAL_NODES=${NUM_TOTAL_NODES} < SEGMENT_SIZE=${SEGMENT_SIZE}" >&2
+  exit 1
+fi
+
 # ---------- Model and data paths ----------
 NRL_TRAIN_PATH="${NRL_TRAIN_PATH:-/lustre/fsw/portfolios/llmservice/users/ansubramania/data/gym/rl-data-tools/blends/curriculum_v29_warping-muskox.no-swerl.max16k.train.jsonl}"
 NRL_VAL_PATH="${NRL_VAL_PATH:-/lustre/fsw/portfolios/llmservice/users/ansubramania/data/gym/rl-data-tools/blends/curriculum_v29_warping-muskox.no-swerl.max16k.val.jsonl}"
@@ -401,6 +418,7 @@ if [[ "${INTERACTIVE}" == "1" ]]; then
     --time="${WALLTIME}" \
     --gres=gpu:4 \
     --exclusive \
+    ${SEGMENT_SIZE:+--segment="${SEGMENT_SIZE}"} \
     ${SLURM_QOS:+--qos="${SLURM_QOS}"} \
     "${RAY_SUB}")
 
@@ -536,5 +554,6 @@ sbatch \
   --gres=gpu:4 \
   --exclusive \
   --dependency=singleton \
+  ${SEGMENT_SIZE:+--segment="${SEGMENT_SIZE}"} \
   ${SLURM_QOS:+--qos="${SLURM_QOS}"} \
   "${RAY_SUB}"
