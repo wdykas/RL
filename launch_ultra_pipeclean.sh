@@ -57,7 +57,7 @@ SLURM_QOS="${SLURM_QOS:-}"
 WALLTIME="${WALLTIME:-4:00:00}"
 
 # ---------- Container & mounts ----------
-export CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/llmservice/users/ansubramania/containers/nemo-rl-ultra-vllm016-pipe45428502.sqsh}"
+export CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/llmservice/users/ansubramania/containers/nemo-rl-ultra-20260226-428eb84dd-custom-vllm-arm.sqsh}"
 MOUNTS="/lustre:/lustre"
 
 # GB200 NVL72: fixed at 4 GPUs/node. Must match --gres=gpu:4 passed to sbatch.
@@ -162,7 +162,7 @@ FLASHINFER_WS_BASE="${PERSISTENT_CACHE}/flashinfer_workspace"
 (umask 002 && mkdir -p "${VLLM_CACHE_DIR}" "${FLASHINFER_CUBIN_CACHE}" "${FLASHINFER_WS_BASE}")
 chmod g+rwxs "${PERSISTENT_CACHE}" "${VLLM_CACHE_DIR}" "${FLASHINFER_CUBIN_CACHE}" "${FLASHINFER_WS_BASE}" 2>/dev/null || true
 
-VLLM_PRECOMPILED_WHEEL_LOCATION="${VLLM_PRECOMPILED_WHEEL_LOCATION:-https://github.com/vllm-project/vllm/releases/download/v0.16.0/vllm-0.16.0-cp38-abi3-manylinux_2_31_aarch64.whl}"
+VLLM_PRECOMPILED_WHEEL_LOCATION="${VLLM_PRECOMPILED_WHEEL_LOCATION:-https://github.com/vllm-project/vllm/releases/download/v0.13.0/vllm-0.13.0-cp38-abi3-manylinux_2_31_aarch64.whl}"
 
 # =============================================================================
 # Validation
