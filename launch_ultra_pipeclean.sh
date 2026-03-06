@@ -11,13 +11,9 @@ set -euo pipefail
 # Set INTERACTIVE=1 to get a persistent allocation in slurm for iterative debugging.
 #
 # Usage:
-#   ./launch_ultra_pipeclean.sh                                   # batch, bare container (10 steps)
-#   NRL_MAX_STEPS=4 ./launch_ultra_pipeclean.sh                   # CI: fewer steps
+#   ./launch_ultra_pipeclean.sh                                   # batch, bare container
 #   USE_WORKTREE=1 ./launch_ultra_pipeclean.sh                    # batch, overlay local code
 #   WALLTIME=4:00:00 ./launch_ultra_pipeclean.sh
-#
-# Extra positional arguments are forwarded as Hydra overrides:
-#   ./launch_ultra_pipeclean.sh grpo.max_num_steps=2 policy.precision=float32
 #
 # Interactive debugging (reuse allocation across runs):
 #   INTERACTIVE=1 ./launch_ultra_pipeclean.sh                     # submits, auto-runs, waits
@@ -73,9 +69,6 @@ export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-}"
 WANDB_PROJ="${WANDB_PROJ:-grpo-ultra-v3-pipeclean}"
 WANDB_NAME="${WANDB_NAME:-ultra-v3-grpo-$(date +%m%d-%H%M)}"
 export WANDB_API_KEY="${WANDB_API_KEY:-}"
-
-# ---------- Training ----------
-NRL_MAX_STEPS="${NRL_MAX_STEPS:-}"
 
 # ---------- Job Shape ----------
 GENERATION_NUM_NODES="${GENERATION_NUM_NODES:-26}"
@@ -311,9 +304,7 @@ checkpointing.checkpoint_dir=${CHECKPOINT_DIR} \
 logger.log_dir=${CHECKPOINT_DIR}/logs \
 logger.wandb_enabled=True \
 logger.wandb.name=${WANDB_NAME} \
-logger.wandb.project=${WANDB_PROJ} \
-${NRL_MAX_STEPS:+grpo.max_num_steps=${NRL_MAX_STEPS}} \
-${*}"
+logger.wandb.project=${WANDB_PROJ}"
 
 
 # =============================================================================

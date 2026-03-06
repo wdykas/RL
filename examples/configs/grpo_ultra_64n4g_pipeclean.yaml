@@ -1,11 +1,9 @@
 # =============================================================================
 # GRPO Ultra V3 — 64-node GB200 NVL72 Pipeclean Config
 # =============================================================================
-# Pipeclean config for validating the end-to-end GRPO pipeline on
-# 64 nodes × 4 GPUs/node. Batch sizes and sequence lengths are
-# intentionally small to complete steps quickly.
-#
-# Defaults to 10 training steps.
+# Toy config for validating end-to-end pipeline on 64 nodes × 4 GPUs/node.
+# Generation and training batch sizes are intentionally small to get through
+# a single train step quickly.
 #
 #   - gpus_per_node: 4
 #   - TP: 8
@@ -45,7 +43,7 @@ grpo:
   num_val_generations_per_prompt: 2
   max_rollout_turns: 1
   max_num_epochs: 1
-  max_num_steps: 10                # Pipeclean: reduced from 1000000; override via NRL_MAX_STEPS
+  max_num_steps: 1000000
   normalize_rewards: true
   use_leave_one_out_baseline: true
   advantage_clip_low: -50
