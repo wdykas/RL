@@ -1780,18 +1780,13 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         )
         self.model.train()
 
-        # Clear any cached FP8 weight workspaces from the previous generation
-        # phase.  The inference engine (TextGenerationController) runs forward
-        # passes inside torch.inference_mode(), which marks any newly-created
-        # tensors as "inference tensors".  TE caches the quantized FP8 weight
-        # tensor in module._fp8_workspaces during the first forward pass; if
-        # that happens inside inference_mode the cached tensor is an inference
-        # tensor and cannot be saved for backward during training.  Clearing
-        # the cache here forces TE to re-quantize the weights during the
-        # training forward pass, which runs outside inference_mode.
-        for module in self.model.modules():
-            if hasattr(module, "_fp8_workspaces"):
-                module._fp8_workspaces.clear()
+        # NOTE: We intentionally do NOT clear _fp8_workspaces here.
+        # In colocated FP8 mode, persisted CUDA graphs reference the
+        # workspace tensor GPU addresses. Clearing the dict would
+        # invalidate those addresses, causing nan/inf on the next
+        # generation. TE re-quantizes into the existing workspace
+        # tensors on the first training forward (is_first_microbatch=True),
+        # so the stale data is overwritten before use.
 
         # Move optimizer state to CUDA if it exists
         # colocated generation will always offload optimizer to cuda before refit
