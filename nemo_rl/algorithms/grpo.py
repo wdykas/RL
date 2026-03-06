@@ -2581,22 +2581,20 @@ def async_grpo_train(
         try:
             is_megatron = master_config["policy"]["generation"]["backend"] == "megatron"
             if is_megatron and hasattr(policy_generation, "suspend_for_refit"):
-                policy_generation.suspend_for_refit(recompute_kv_cache=False)
-            refit_policy_generation(policy, policy_generation, colocated_inference)
-            if is_megatron and hasattr(policy_generation, "resume_after_refit"):
-                policy_generation.resume_after_refit(recompute_kv_cache=False)
-            # Second weight transfer: the first refit above initializes the
-            # inference engine (CUDA graph warmup).  TE caches quantized FP8
-            # weights in _fp8_workspaces during warmup.  If the first NVShmem
-            # transfer had any data corruption (rare, affects only chunked
-            # params >256MB), the cached workspaces hold corrupt values.
-            # The second transfer delivers correct weights AND the
-            # _fp8_workspaces.clear() in swap_weights_via_reshard forces
-            # TE to re-quantize from the fresh BF16 parameters.
-            if is_megatron and hasattr(policy_generation, "suspend_for_refit"):
+                # Double refit at startup. The first refit initializes the
+                # engine (CUDA graph warmup). The second refit updates
+                # weights again, working around NVShmem first-transfer
+                # RDMA corruption (~40% of runs). For Gloo, both transfers
+                # deliver correct weights so the double refit is redundant
+                # but harmless.
                 policy_generation.suspend_for_refit(recompute_kv_cache=False)
                 refit_policy_generation(policy, policy_generation, colocated_inference)
                 policy_generation.resume_after_refit(recompute_kv_cache=False)
+                policy_generation.suspend_for_refit(recompute_kv_cache=False)
+                refit_policy_generation(policy, policy_generation, colocated_inference)
+                policy_generation.resume_after_refit(recompute_kv_cache=False)
+            else:
+                refit_policy_generation(policy, policy_generation, colocated_inference)
             print("✅ Policy generation refit completed successfully")
             POLICY_GENERATION_STALE = False
         except Exception as e:
@@ -2870,6 +2868,7 @@ def async_grpo_train(
                             "seq_logprob_error_threshold"
                         ],
                     )
+
                 # Compute advantages with adv_estimator using correct mask and logprobs
                 with timer.time("advantage_calculation"):
                     print("▶ Computing advantages...", flush=True)

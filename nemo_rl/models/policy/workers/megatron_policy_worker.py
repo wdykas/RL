@@ -973,6 +973,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         if not self._inference_engine_initialized:
             print(f"[Rank {self.rank}] resume_after_refit: engine not initialized, returning early", flush=True)
             return
+
         if recompute_kv_cache:
             future = asyncio.run_coroutine_threadsafe(
                 self._wake_engine(), self._inference_loop
