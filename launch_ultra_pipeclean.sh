@@ -11,9 +11,13 @@ set -euo pipefail
 # Set INTERACTIVE=1 to get a persistent allocation in slurm for iterative debugging.
 #
 # Usage:
-#   ./launch_ultra_pipeclean.sh                                   # batch, bare container
+#   ./launch_ultra_pipeclean.sh                                   # batch, bare container (10 steps)
+#   NRL_MAX_STEPS=4 ./launch_ultra_pipeclean.sh                   # CI: fewer steps
 #   USE_WORKTREE=1 ./launch_ultra_pipeclean.sh                    # batch, overlay local code
 #   WALLTIME=4:00:00 ./launch_ultra_pipeclean.sh
+#
+# Extra positional arguments are forwarded as Hydra overrides:
+#   ./launch_ultra_pipeclean.sh grpo.max_num_steps=2 policy.precision=float32
 #
 # Interactive debugging (reuse allocation across runs):
 #   INTERACTIVE=1 ./launch_ultra_pipeclean.sh                     # submits, auto-runs, waits
@@ -53,7 +57,7 @@ SLURM_QOS="${SLURM_QOS:-}"
 WALLTIME="${WALLTIME:-4:00:00}"
 
 # ---------- Container & mounts ----------
-export CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/llmservice/users/ansubramania/containers/nemo-rl-ultra-20260226-428eb84dd-custom-vllm-arm.sqsh}"
+export CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/llmservice/users/ansubramania/containers/nemo-rl-ultra-vllm016-pipe45428502.sqsh}"
 MOUNTS="/lustre:/lustre"
 
 # GB200 NVL72: fixed at 4 GPUs/node. Must match --gres=gpu:4 passed to sbatch.
@@ -69,6 +73,9 @@ export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-}"
 WANDB_PROJ="${WANDB_PROJ:-grpo-ultra-v3-pipeclean}"
 WANDB_NAME="${WANDB_NAME:-ultra-v3-grpo-$(date +%m%d-%H%M)}"
 export WANDB_API_KEY="${WANDB_API_KEY:-}"
+
+# ---------- Training ----------
+NRL_MAX_STEPS="${NRL_MAX_STEPS:-}"
 
 # ---------- Job Shape ----------
 GENERATION_NUM_NODES="${GENERATION_NUM_NODES:-26}"
@@ -155,7 +162,7 @@ FLASHINFER_WS_BASE="${PERSISTENT_CACHE}/flashinfer_workspace"
 (umask 002 && mkdir -p "${VLLM_CACHE_DIR}" "${FLASHINFER_CUBIN_CACHE}" "${FLASHINFER_WS_BASE}")
 chmod g+rwxs "${PERSISTENT_CACHE}" "${VLLM_CACHE_DIR}" "${FLASHINFER_CUBIN_CACHE}" "${FLASHINFER_WS_BASE}" 2>/dev/null || true
 
-VLLM_PRECOMPILED_WHEEL_LOCATION="${VLLM_PRECOMPILED_WHEEL_LOCATION:-https://github.com/vllm-project/vllm/releases/download/v0.13.0/vllm-0.13.0-cp38-abi3-manylinux_2_31_aarch64.whl}"
+VLLM_PRECOMPILED_WHEEL_LOCATION="${VLLM_PRECOMPILED_WHEEL_LOCATION:-https://github.com/vllm-project/vllm/releases/download/v0.16.0/vllm-0.16.0-cp38-abi3-manylinux_2_31_aarch64.whl}"
 
 # =============================================================================
 # Validation
@@ -304,7 +311,9 @@ checkpointing.checkpoint_dir=${CHECKPOINT_DIR} \
 logger.log_dir=${CHECKPOINT_DIR}/logs \
 logger.wandb_enabled=True \
 logger.wandb.name=${WANDB_NAME} \
-logger.wandb.project=${WANDB_PROJ}"
+logger.wandb.project=${WANDB_PROJ} \
+${NRL_MAX_STEPS:+grpo.max_num_steps=${NRL_MAX_STEPS}} \
+${*}"
 
 
 # =============================================================================
