@@ -812,7 +812,9 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         if dist_rank == 0:
             from megatron.core.inference.inference_client import InferenceClient
             self.inference_client = InferenceClient(inference_coordinator_address=dp_addr)
-            await self.inference_client.start()
+            result = self.inference_client.start()
+            if result is not None:
+                await result
 
         self._inference_engine_alseep = False
         print(f"[Rank {rank}] _start_inference_coordinator: done ({_time.time()-_t0:.2f}s)", flush=True)
@@ -845,18 +847,11 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         print(f"[Rank {self.rank}] paused inference engine")
 
     async def _sleep_engine(self):
-        """Send suspend signals via the coordinator and wait for acknowledgment.
-        
-        Mirrors MegatronLocal.suspend() from megatron/rl/inference/megatron.py:
-        1. Rank 0 sends suspend (PAUSE + SUSPEND) to coordinator
-        2. All ranks wait for engine to be paused
-        3. All ranks call engine.suspend() to deallocate GPU state
-        """ 
+        """Send suspend signals via the coordinator and wait for acknowledgment."""
+        from megatron.core.inference.engines.dynamic_engine import EngineState
         if torch.distributed.get_rank() == 0:
-            # Send PAUSE  signals
             self.inference_client.suspend_engines()
-            # Wait for the engine to acknowledge the pause
-        await self.dynamic_inference_engine.paused.wait()
+        await self.dynamic_inference_engine.wait_until(EngineState.PAUSED)
         self.dynamic_inference_engine.suspend()
 
     def _wake(self):
@@ -888,16 +883,11 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         print(f"[Rank {self.rank}] Resumed inference engine")
 
     async def _wake_engine(self):
-        """Send resume signals via the coordinator and wait for acknowledgment.
-        
-        Mirrors MegatronLocal.resume() from megatron/rl/inference/megatron.py:
-        1. Rank 0 sends resume (RESUME + UNPAUSE) to coordinator
-        2. All ranks wait for engine to be running
-        3. All ranks call engine.resume() to reallocate GPU state
-        """
+        """Send resume signals via the coordinator and wait for acknowledgment."""
+        from megatron.core.inference.engines.dynamic_engine import EngineState
         if torch.distributed.get_rank() == 0:
             self.inference_client.resume_engines()
-        await self.dynamic_inference_engine.running.wait()
+        await self.dynamic_inference_engine.wait_until(EngineState.RUNNING)
         self.dynamic_inference_engine.resume()
 
     def suspend_for_refit(self, recompute_kv_cache: bool = False) -> None:
@@ -939,22 +929,17 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             print(f"[Rank {self.rank}] Suspended inference engine for refit (KV cache will be recomputed)")
 
     async def _pause_engine_for_refit(self):
+        from megatron.core.inference.engines.dynamic_engine import EngineState
         import time as _time
         _t0 = _time.time()
         rank = torch.distributed.get_rank()
-        print(f"[Rank {rank}] _pause_engine_for_refit: START (paused.is_set={self.dynamic_inference_engine.paused.is_set()})", flush=True)
-        # Clear stale paused event so wait() blocks until the engine ACTUALLY
-        # processes this new pause request.  Without this, a leftover set()
-        # from a previous pause/unpause cycle makes wait() return immediately
-        # while the engine loop is still running CUDA graph replays.
-        self.dynamic_inference_engine.paused.clear()
+        print(f"[Rank {rank}] _pause_engine_for_refit: START", flush=True)
         if rank == 0:
-            await self.inference_client.pause_engines()
+            self.inference_client.pause_engines()
             print(f"[Rank {rank}] _pause_engine_for_refit: pause_engines() sent ({_time.time()-_t0:.2f}s)", flush=True)
         # ALL ranks wait for the local engine to confirm pause.
-        await self.dynamic_inference_engine.paused.wait()
+        await self.dynamic_inference_engine.wait_until(EngineState.PAUSED)
         print(f"[Rank {rank}] _pause_engine_for_refit: paused confirmed ({_time.time()-_t0:.2f}s)", flush=True)
-        print(f"[Rank {rank}] _pause_engine_for_refit: DONE ({_time.time()-_t0:.2f}s)", flush=True)
 
     def resume_after_refit(self, recompute_kv_cache: bool = False) -> None:
         """Resume engine after weight update.
@@ -989,10 +974,11 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             print(f"[Rank {self.rank}] Resumed inference engine after refit (KV cache recomputed)")
 
     async def _unpause_engine_after_refit(self):
+        from megatron.core.inference.engines.dynamic_engine import EngineState
         rank = torch.distributed.get_rank()
         if rank == 0:
             self.inference_client.unpause_engines()
-        await self.dynamic_inference_engine.running.wait()
+        await self.dynamic_inference_engine.wait_until(EngineState.RUNNING)
 
     def _log_gpu_memory(self, tag: str):
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
