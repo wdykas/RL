@@ -329,22 +329,6 @@ def setup_model_config(
     if "layernorm_epsilon" in config["megatron_cfg"]:
         model_cfg.layernorm_epsilon = config["megatron_cfg"]["layernorm_epsilon"]
 
-    # Optional transformer implementation override (e.g. "inference_optimized" for MXFP8).
-    # For generation workers, this is set via mcore_generation_config which is merged into
-    # megatron_cfg by megatron_generation.py. Training workers assert it is not set.
-    if "transformer_impl" in config["megatron_cfg"]:
-        model_cfg.transformer_impl = config["megatron_cfg"]["transformer_impl"]
-        # When using inference_optimized spec, also propagate fp8_recipe even when
-        # fp8_cfg.enabled=False (BF16 training + MXFP8 inference). This allows
-        # Megatron-LM's prepare_swap_model_weights to auto-detect MXFP8 needs.
-        fp8_cfg_for_infer = config["megatron_cfg"].get("fp8_cfg", None)
-        if (
-            fp8_cfg_for_infer is not None
-            and not fp8_cfg_for_infer.get("enabled", False)
-            and fp8_cfg_for_infer.get("fp8_recipe") is not None
-        ):
-            model_cfg.fp8_recipe = fp8_cfg_for_infer["fp8_recipe"]
-
     # Validate chunking configuration
     _validate_chunking_config(config)
 
@@ -489,6 +473,12 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
             model_cfg.fp8_param = fp8_cfg.get("fp8_param", False)
         except KeyError as e:
             raise KeyError(f"Missing key in fp8_cfg: {e}")
+
+        if model_cfg.fp8_param:
+            warnings.warn(
+                "Setting fp8_param=True sometimes causes NaN token_mult_prob_error, please use with caution. "
+                "Refer to https://github.com/NVIDIA-NeMo/RL/issues/1164 for latest updates with this issue."
+            )
 
 
 def _validate_optimizer_config(config: PolicyConfig) -> None:

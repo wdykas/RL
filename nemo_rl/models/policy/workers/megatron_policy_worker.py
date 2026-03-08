@@ -1632,8 +1632,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             dst_rank_offset=dst_rank_offset,
         )
 
-        torch.cuda.synchronize()
-
         return True
 
     def prepare_for_generation(self, tags=None, **kwargs) -> None:

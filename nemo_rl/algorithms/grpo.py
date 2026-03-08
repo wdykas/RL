@@ -2581,20 +2581,10 @@ def async_grpo_train(
         try:
             is_megatron = master_config["policy"]["generation"]["backend"] == "megatron"
             if is_megatron and hasattr(policy_generation, "suspend_for_refit"):
-                # Double refit at startup. The first refit initializes the
-                # engine (CUDA graph warmup). The second refit updates
-                # weights again, working around NVShmem first-transfer
-                # RDMA corruption (~40% of runs). For Gloo, both transfers
-                # deliver correct weights so the double refit is redundant
-                # but harmless.
                 policy_generation.suspend_for_refit(recompute_kv_cache=False)
-                refit_policy_generation(policy, policy_generation, colocated_inference)
+            refit_policy_generation(policy, policy_generation, colocated_inference)
+            if is_megatron and hasattr(policy_generation, "resume_after_refit"):
                 policy_generation.resume_after_refit(recompute_kv_cache=False)
-                policy_generation.suspend_for_refit(recompute_kv_cache=False)
-                refit_policy_generation(policy, policy_generation, colocated_inference)
-                policy_generation.resume_after_refit(recompute_kv_cache=False)
-            else:
-                refit_policy_generation(policy, policy_generation, colocated_inference)
             print("✅ Policy generation refit completed successfully")
             POLICY_GENERATION_STALE = False
         except Exception as e:
