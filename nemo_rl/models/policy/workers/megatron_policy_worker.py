@@ -785,7 +785,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         self._inference_engine_initialized = True
         self._inference_engine_alseep = True  # Engine starts in paused state
-        print(f"[Rank {self.rank}] Initialized persistent inference engine")
 
     async def _start_inference_coordinator(self, coordinator_port: int):
         """Start the inference coordinator and engine loop.
@@ -794,22 +793,12 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         The engine's start_listening_to_data_parallel_coordinator returns the
         actual coordinator address (dp_addr) which is used to create the client.
         """
-        import time as _time
-        _t0 = _time.time()
-        rank = torch.distributed.get_rank()
-        print(f"[Rank {rank}] _start_inference_coordinator: starting engine loop", flush=True)
         dp_addr = await self.dynamic_inference_engine.start_listening_to_data_parallel_coordinator(
             inference_coordinator_port=coordinator_port,
             launch_inference_coordinator=True,
         )
-        print(f"[Rank {rank}] _start_inference_coordinator: engine loop started ({_time.time()-_t0:.2f}s)", flush=True)
-        # NOTE: CUDA-graph warmup happens synchronously inside DynamicInferenceEngine.__init__()
-        # (called from _initialize_inference_engine), so warmup is already complete here.
-        # start_listening_to_data_parallel_coordinator() handles TP-rank sync via the
-        # internal mp_group barrier before returning, so no extra wait is needed.
-
-        dist_rank = torch.distributed.get_rank()
-        if dist_rank == 0:
+        rank = torch.distributed.get_rank()
+        if rank == 0:
             from megatron.core.inference.inference_client import InferenceClient
             self.inference_client = InferenceClient(inference_coordinator_address=dp_addr)
             result = self.inference_client.start()
@@ -817,7 +806,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 await result
 
         self._inference_engine_alseep = False
-        print(f"[Rank {rank}] _start_inference_coordinator: done ({_time.time()-_t0:.2f}s)", flush=True)
 
     def _sleep(self):
         """Pause the inference engine to free GPU memory for training.
@@ -844,7 +832,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         torch.distributed.barrier()
         
         self._inference_engine_alseep = True
-        print(f"[Rank {self.rank}] paused inference engine")
 
     async def _sleep_engine(self):
         """Send suspend signals via the coordinator and wait for acknowledgment."""
@@ -880,7 +867,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         torch.distributed.barrier()
         
         self._inference_engine_alseep = False
-        print(f"[Rank {self.rank}] Resumed inference engine")
 
     async def _wake_engine(self):
         """Send resume signals via the coordinator and wait for acknowledgment."""
@@ -902,11 +888,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         preserved. On resume, checkpointed requests are replayed with
         fresh prefill using the new weights (AREAL-style).
         """
-        import time as _time
-        _t0 = _time.time()
-        print(f"[Rank {self.rank}] suspend_for_refit START (recompute_kv_cache={recompute_kv_cache})", flush=True)
         if not self._inference_engine_initialized:
-            print(f"[Rank {self.rank}] suspend_for_refit: engine not initialized, returning early", flush=True)
             return
         if recompute_kv_cache:
             future = asyncio.run_coroutine_threadsafe(
@@ -917,29 +899,19 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 self._pause_engine_for_refit(), self._inference_loop
             )
         future.result()
-        print(f"[Rank {self.rank}] suspend_for_refit: future.result() done ({_time.time()-_t0:.2f}s)", flush=True)
 
-        # Drain in-flight CUDA graph replays.  _pause_engine_for_refit stops the
-        # engine's Python loop, but CUDA graph replays already submitted to the
-        # GPU may still be reading weight buffers.
+        # Drain in-flight CUDA graph replays.
         torch.cuda.synchronize()
 
         if recompute_kv_cache:
             self._inference_engine_alseep = True
-            print(f"[Rank {self.rank}] Suspended inference engine for refit (KV cache will be recomputed)")
 
     async def _pause_engine_for_refit(self):
         from megatron.core.inference.engines.dynamic_engine import EngineState
-        import time as _time
-        _t0 = _time.time()
         rank = torch.distributed.get_rank()
-        print(f"[Rank {rank}] _pause_engine_for_refit: START", flush=True)
         if rank == 0:
             self.inference_client.pause_engines()
-            print(f"[Rank {rank}] _pause_engine_for_refit: pause_engines() sent ({_time.time()-_t0:.2f}s)", flush=True)
-        # ALL ranks wait for the local engine to confirm pause.
         await self.dynamic_inference_engine.wait_until(EngineState.PAUSED)
-        print(f"[Rank {rank}] _pause_engine_for_refit: paused confirmed ({_time.time()-_t0:.2f}s)", flush=True)
 
     def resume_after_refit(self, recompute_kv_cache: bool = False) -> None:
         """Resume engine after weight update.
@@ -952,11 +924,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         PERSIST mode is used, CUDA graphs remain valid and don't
         need to be recaptured.
         """
-        import time as _time
-        _t0 = _time.time()
-        print(f"[Rank {self.rank}] resume_after_refit START (recompute_kv_cache={recompute_kv_cache})", flush=True)
         if not self._inference_engine_initialized:
-            print(f"[Rank {self.rank}] resume_after_refit: engine not initialized, returning early", flush=True)
             return
 
         if recompute_kv_cache:
@@ -968,10 +936,8 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 self._unpause_engine_after_refit(), self._inference_loop
             )
         future.result()
-        print(f"[Rank {self.rank}] resume_after_refit: future.result() done ({_time.time()-_t0:.2f}s)", flush=True)
         if recompute_kv_cache:
             self._inference_engine_alseep = False
-            print(f"[Rank {self.rank}] Resumed inference engine after refit (KV cache recomputed)")
 
     async def _unpause_engine_after_refit(self):
         from megatron.core.inference.engines.dynamic_engine import EngineState
@@ -1226,7 +1192,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         # (refit_policy_generation) waits for ALL generation workers to return from
         # prepare_for_generation() before proceeding, so no explicit barrier needed.
         future.result()
-        print(f"[Rank {torch.distributed.get_rank()}] Coordinator started and engine warmed up")
 
         # Start the HTTP Server
         if self.cfg["generation"]["mcore_generation_config"].get("expose_http_server", False) and torch.distributed.get_rank() == 0:
@@ -1576,8 +1541,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             dst_rank_offset=dst_rank_offset,
         )
 
-        print(f"[REFIT] rank={global_rank} init_refit_collective complete", flush=True)
-
     def preinit_nvshmem_collective(self) -> None:
         """Initialize the NVShmem copy service collectively before any weight transfer.
 
@@ -1635,7 +1598,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         return True
 
     def prepare_for_generation(self, tags=None, **kwargs) -> None:
-        print(f"[Rank {self.rank}] preparing for generation", flush=True)
         self._log_gpu_memory("prepare_for_generation START")
         # Get the generation config
         mcore_generation_config = self.cfg["generation"]["mcore_generation_config"]
@@ -1666,11 +1628,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         if cuda_graph_impl != "none":
             toggle_cuda_graphs(lang_module, set_to=cuda_graph_impl)
 
-        # 4. MXFP8 weight conversion and transform creation are now handled
-        #    automatically inside prepare_swap_model_weights() in Megatron-LM.
-        #    No NeMo-RL-side hooks needed.
-
-        # 5. Initialize inference engine if not already done.
+        # 4. Initialize inference engine if not already done.
         # Skip engine start when called with tags=["weights"] (inside refit_policy_generation
         # before the first generation).  Weights are about to be transferred, and we want the
         # engine's CUDA-graph warmup to capture the already-correct post-transfer weights.
@@ -1693,7 +1651,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         self._log_gpu_memory("prepare_for_generation END")
 
     def finish_generation(self) -> None:
-        print(f"[Rank {self.rank}] finishing generation", flush=True)
         self._log_gpu_memory("finish_generation START")
         # Get the generation config
         mcore_generation_config = self.cfg["generation"]["mcore_generation_config"]  
@@ -1763,14 +1720,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             self.model, "cuda", move_grads=True, move_params=True
         )
         self.model.train()
-
-        # NOTE: We intentionally do NOT clear _fp8_workspaces here.
-        # In colocated FP8 mode, persisted CUDA graphs reference the
-        # workspace tensor GPU addresses. Clearing the dict would
-        # invalidate those addresses, causing nan/inf on the next
-        # generation. TE re-quantizes into the existing workspace
-        # tensors on the first training forward (is_first_microbatch=True),
-        # so the stale data is overwritten before use.
 
         # Move optimizer state to CUDA if it exists
         # colocated generation will always offload optimizer to cuda before refit
