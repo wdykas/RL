@@ -1208,6 +1208,18 @@ def refit_policy_generation(
                 raise NotImplementedError(
                     "SGLang haven't implemented non-colocated inference mode. "
                 )
+            # Pre-initialize NVShmem copy service collectively before weight transfer.
+            # The lazy init (nvshmem.core.init + symmetric heap allocation) can corrupt
+            # MXFP8 CUDA graph state in device memory even with the engine paused.
+            # Running init here — after suspend_for_refit but before the transfer —
+            # avoids this race. No-op for Gloo/vLLM backends.
+            if hasattr(policy, "preinit_nvshmem_collective") and hasattr(
+                policy_generation, "preinit_nvshmem_collective"
+            ):
+                ray.get(
+                    policy.preinit_nvshmem_collective()
+                    + policy_generation.preinit_nvshmem_collective()
+                )
             futures_train = policy.broadcast_weights_for_collective(kv_scales=kv_scales)
             futures_inference = policy_generation.update_weights_from_collective()
             # wait for all futures to complete
@@ -2567,7 +2579,12 @@ def async_grpo_train(
     if NEED_REFIT and POLICY_GENERATION_STALE:
         print("🔄 Refitting policy generation with actual model weights...")
         try:
+            is_megatron = master_config["policy"]["generation"]["backend"] == "megatron"
+            if is_megatron and hasattr(policy_generation, "suspend_for_refit"):
+                policy_generation.suspend_for_refit(recompute_kv_cache=False)
             refit_policy_generation(policy, policy_generation, colocated_inference)
+            if is_megatron and hasattr(policy_generation, "resume_after_refit"):
+                policy_generation.resume_after_refit(recompute_kv_cache=False)
             print("✅ Policy generation refit completed successfully")
             POLICY_GENERATION_STALE = False
         except Exception as e:
@@ -2588,12 +2605,13 @@ def async_grpo_train(
             traceback.print_exc()
             return
 
+    # Set collector weight version before starting collection so the first
+    # batches use the correct version (avoid Ray reorder race).
+    ray.get(trajectory_collector.set_weight_version.remote(weight_version))
+
     # Start trajectory collection in background (after refit so the engine
     # already has the correct training weights).
     collection_task = trajectory_collector.start_collection.remote(dataloader)
-
-    # Ensure collector knows initial weight version
-    trajectory_collector.set_weight_version.remote(weight_version)
 
     print("✅ Policy generation setup complete, proceeding to validation...")
 
@@ -2840,6 +2858,7 @@ def async_grpo_train(
                             "seq_logprob_error_threshold"
                         ],
                     )
+
                 # Compute advantages with adv_estimator using correct mask and logprobs
                 with timer.time("advantage_calculation"):
                     print("▶ Computing advantages...", flush=True)

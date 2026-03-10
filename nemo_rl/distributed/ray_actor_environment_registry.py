@@ -17,6 +17,9 @@ import os
 from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
 
 USE_SYSTEM_EXECUTABLE = os.environ.get("NEMO_RL_PY_EXECUTABLES_SYSTEM", "0") == "1"
+# Set NRL_MCORE_USE_NVSHMEM=1 to install nvshmem4py-cu12 in the Megatron worker venv,
+# which is required when using +policy.megatron_cfg.refit_backend=nvshmem.
+USE_MCORE_NVSHMEM = os.environ.get("NRL_MCORE_USE_NVSHMEM", "0") == "1"
 VLLM_EXECUTABLE = (
     PY_EXECUTABLES.SYSTEM if USE_SYSTEM_EXECUTABLE else PY_EXECUTABLES.VLLM
 )
@@ -24,7 +27,9 @@ SGLANG_EXECUTABLE = (
     PY_EXECUTABLES.SYSTEM if USE_SYSTEM_EXECUTABLE else PY_EXECUTABLES.SGLANG
 )
 MCORE_EXECUTABLE = (
-    PY_EXECUTABLES.SYSTEM if USE_SYSTEM_EXECUTABLE else PY_EXECUTABLES.MCORE
+    PY_EXECUTABLES.SYSTEM
+    if USE_SYSTEM_EXECUTABLE
+    else (PY_EXECUTABLES.MCORE_NVSHMEM if USE_MCORE_NVSHMEM else PY_EXECUTABLES.MCORE)
 )
 
 ACTOR_ENVIRONMENT_REGISTRY: dict[str, str] = {

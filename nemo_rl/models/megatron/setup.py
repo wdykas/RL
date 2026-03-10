@@ -226,7 +226,7 @@ def validate_and_set_config(
         )
 
     megatron_cfg, model_cfg = setup_model_config(
-        config, rank, dtype, hf_model_name, pretrained_path, weights_path
+        config, rank, dtype, hf_model_name, pretrained_path, weights_path,
     )
 
     final_padded_vocab_size = calculate_padded_vocab_size(
@@ -319,7 +319,7 @@ def setup_model_config(
     _apply_performance_config(model_cfg, config)
 
     # Apply generation settings
-    if config["generation"]["backend"] == "megatron":
+    if "generation" in config and config["generation"] is not None and config["generation"]["backend"] == "megatron":
         _apply_cuda_graph_and_rng_tracker_config(model_cfg, config)
 
     # Validate optimizer configuration
@@ -478,7 +478,7 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
         try:
             model_cfg.fp8 = fp8_cfg["fp8"]
             model_cfg.fp8_recipe = fp8_cfg["fp8_recipe"]
-            model_cfg.fp8_param = fp8_cfg["fp8_param"]
+            model_cfg.fp8_param = fp8_cfg.get("fp8_param", False)
         except KeyError as e:
             raise KeyError(f"Missing key in fp8_cfg: {e}")
 
@@ -590,6 +590,66 @@ def _validate_dtype_config(
         )
 
 
+def _build_optimizer_config(config: PolicyConfig) -> OptimizerConfig:
+    """Build OptimizerConfig with FP8 recipe propagation.
+
+    Always pass fp8_recipe when FP8 is enabled so the distributed optimizer
+    knows the recipe (affects use_precision_aware_optimizer_no_fp8_or_ds_fp8
+    evaluation). Also pass reuse_grad_buf_for_mxfp8_param_ag when needed.
+    """
+    opt_kwargs = dict(config["megatron_cfg"]["optimizer"])
+    fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
+    if fp8_cfg is not None and fp8_cfg.get("enabled", False):
+        fp8_recipe = fp8_cfg.get("fp8_recipe")
+        if fp8_recipe is not None:
+            opt_kwargs["fp8_recipe"] = fp8_recipe
+        if fp8_cfg.get("fp8_param", False) and fp8_recipe == "mxfp8":
+            opt_kwargs["reuse_grad_buf_for_mxfp8_param_ag"] = True
+    return OptimizerConfig(**opt_kwargs)
+
+
+def _build_ddp_config(config: PolicyConfig) -> DistributedDataParallelConfig:
+    """Build DistributedDataParallelConfig with FP8 param gather support.
+
+    fp8_param_gather is enabled when fp8_param=true is set in fp8_cfg.
+    This is needed on inference workers where fp8_param=true creates
+    MXFP8Tensor params — DDP's standard buffer packing (replace_raw_data)
+    is not implemented for MXFP8Tensor. fp8_param_gather bypasses it.
+
+    On training workers, HF checkpoint import forces fp8_param=False
+    (model_load_save.py:392), so even though fp8_param_gather is set in
+    DDP config, the model's actual BF16 params won't trigger the MXFP8
+    code paths.
+    """
+    ddp_cfg = config["megatron_cfg"]["distributed_data_parallel_config"]
+    fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
+
+    fp8_param_gather = ddp_cfg.get("fp8_param_gather", False)
+    reuse_grad_buf = ddp_cfg.get("reuse_grad_buf_for_mxfp8_param_ag", False)
+    if (
+        fp8_cfg is not None
+        and fp8_cfg.get("enabled", False)
+        and fp8_cfg.get("fp8_param", False)
+    ):
+        fp8_param_gather = True
+        if fp8_cfg.get("fp8_recipe") == "mxfp8":
+            reuse_grad_buf = True
+
+    return DistributedDataParallelConfig(
+        check_for_nan_in_grad=True,
+        grad_reduce_in_fp32=ddp_cfg["grad_reduce_in_fp32"],
+        overlap_grad_reduce=ddp_cfg["overlap_grad_reduce"],
+        overlap_param_gather=ddp_cfg["overlap_param_gather"],
+        average_in_collective=False,  # Required with calculate_per_token_loss=True
+        use_distributed_optimizer=config["megatron_cfg"]["optimizer"][
+            "use_distributed_optimizer"
+        ],
+        data_parallel_sharding_strategy=ddp_cfg["data_parallel_sharding_strategy"],
+        fp8_param_gather=fp8_param_gather,
+        reuse_grad_buf_for_mxfp8_param_ag=reuse_grad_buf,
+    )
+
+
 def _create_megatron_config(
     model_cfg: Any,
     checkpoint_config: CheckpointConfig,
@@ -607,28 +667,8 @@ def _create_megatron_config(
             global_batch_size=config["train_global_batch_size"],  # ignored
             train_iters=config["megatron_cfg"]["train_iters"],
         ),
-        optimizer=OptimizerConfig(**config["megatron_cfg"]["optimizer"]),
-        ddp=DistributedDataParallelConfig(
-            check_for_nan_in_grad=True,
-            grad_reduce_in_fp32=config["megatron_cfg"][
-                "distributed_data_parallel_config"
-            ]["grad_reduce_in_fp32"],
-            overlap_grad_reduce=config["megatron_cfg"][
-                "distributed_data_parallel_config"
-            ]["overlap_grad_reduce"],
-            overlap_param_gather=config["megatron_cfg"][
-                "distributed_data_parallel_config"
-            ]["overlap_param_gather"],
-            # we need to set average_in_collective=False with calculate_per_token_loss=T
-            # otherwise, mcore throws an assertion error.
-            average_in_collective=False,  # Required with calculate_per_token_loss=True
-            use_distributed_optimizer=config["megatron_cfg"]["optimizer"][
-                "use_distributed_optimizer"
-            ],
-            data_parallel_sharding_strategy=config["megatron_cfg"][
-                "distributed_data_parallel_config"
-            ]["data_parallel_sharding_strategy"],
-        ),
+        optimizer=_build_optimizer_config(config),
+        ddp=_build_ddp_config(config),
         scheduler=SchedulerConfig(**config["megatron_cfg"]["scheduler"]),
         dataset=None,
         tokenizer=TokenizerConfig(

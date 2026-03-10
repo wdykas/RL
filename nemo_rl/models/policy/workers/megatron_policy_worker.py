@@ -152,6 +152,16 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
         # Step 3: Setup model configuration
+        # Training workers must not use inference_optimized transformer spec:
+        # InferenceLayerNormColumnParallelLinear requires DynamicInferenceEngine's
+        # symmetric memory buffer and has @torch.no_grad(), both incompatible with training.
+        # Set transformer_impl=inference_optimized via policy.generation.mcore_generation_config
+        # instead, which is automatically scoped to generation workers only.
+        if init_optimizer:
+            assert config["megatron_cfg"].get("transformer_impl") != "inference_optimized", (
+                "transformer_impl=inference_optimized must not be set on training workers. "
+                "Use policy.generation.mcore_generation_config.transformer_impl=inference_optimized instead."
+            )
         runtime_config = validate_and_set_config(
             config,
             self.rank,
@@ -691,7 +701,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
     def _initialize_inference_engine(self, mcore_generation_config: dict):
         """Initialize the persistent inference engine and client.
-        
+
         This method sets up the DynamicInferenceEngine, DynamicInferenceContext,
         and InferenceClient for coordinator-based inference. The engine is created
         once and reused across multiple generate() calls.
@@ -780,7 +790,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
     async def _start_inference_coordinator(self, coordinator_port: int):
         """Start the inference coordinator and engine loop.
-        
+
         This is called once when the inference infrastructure is first needed.
         The engine's start_listening_to_data_parallel_coordinator returns the
         actual coordinator address (dp_addr) which is used to create the client.
@@ -789,13 +799,14 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             inference_coordinator_port=coordinator_port,
             launch_inference_coordinator=True,
         )
-
-        dist_rank = torch.distributed.get_rank()
-        if dist_rank == 0:
+        rank = torch.distributed.get_rank()
+        if rank == 0:
             from megatron.core.inference.inference_client import InferenceClient
             self.inference_client = InferenceClient(inference_coordinator_address=dp_addr)
-            self.inference_client.start()
-        
+            result = self.inference_client.start()
+            if result is not None:
+                await result
+
         self._inference_engine_alseep = False
 
     def _sleep(self):
@@ -821,23 +832,12 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         print(f"[Rank {self.rank}] paused inference engine")
 
     async def _sleep_engine(self):
-        """Send pause+suspend signals via the coordinator and wait for each state.
-
-         Mirrors MegatronLocal.suspend() from megatron/rl/inference/megatron.py:
-
-        1. Rank 0 sends PAUSE to coordinator
-        2. All ranks wait for engine to reach PAUSED state
-        3. Rank 0 sends SUSPEND to coordinator
-        4. All ranks wait for engine to reach SUSPENDED state
-        """
-
-        if torch.distributed.get_rank() == 0:
-            self.inference_client.pause_engines()
-        await self.dynamic_inference_engine.wait_until(EngineState.PAUSED)
-
+        """Send suspend signals via the coordinator and wait for acknowledgment."""
+        from megatron.core.inference.engines.dynamic_engine import EngineState
         if torch.distributed.get_rank() == 0:
             self.inference_client.suspend_engines()
-        await self.dynamic_inference_engine.wait_until(EngineState.SUSPENDED)
+        await self.dynamic_inference_engine.wait_until(EngineState.PAUSED)
+        self.dynamic_inference_engine.suspend()
 
     def _wake(self):
         """Resume the inference engine after training.
@@ -861,25 +861,14 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         torch.distributed.barrier()
         
         self._inference_engine_alseep = False
-        print(f"[Rank {self.rank}] Resumed inference engine")
 
     async def _wake_engine(self):
-        """Send resume+unpause signals via the coordinator and wait for RUNNING.
-
-         Mirrors MegatronLocal.resume() from megatron/rl/inference/megatron.py:
-        1. Early return if engine is already running (no-op)
-        2. Rank 0 sends RESUME then UNPAUSE to coordinator
-        3. All ranks wait for engine to reach RUNNING state
-         """
-
-        if self.dynamic_inference_engine.running.is_set():
-            return
-
+        """Send resume signals via the coordinator and wait for acknowledgment."""
+        from megatron.core.inference.engines.dynamic_engine import EngineState
         if torch.distributed.get_rank() == 0:
             self.inference_client.resume_engines()
-            self.inference_client.unpause_engines()
-
         await self.dynamic_inference_engine.wait_until(EngineState.RUNNING)
+        self.dynamic_inference_engine.resume()
 
     def suspend_for_refit(self, recompute_kv_cache: bool = False) -> None:
         """Pause or suspend engine for safe weight update.
@@ -904,16 +893,19 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 self._pause_engine_for_refit(), self._inference_loop
             )
         future.result()
-        torch.distributed.barrier()
+
+        # Drain in-flight CUDA graph replays.
+        torch.cuda.synchronize()
+
         if recompute_kv_cache:
             self._inference_engine_alseep = True
-            print(f"[Rank {self.rank}] Suspended inference engine for refit (KV cache will be recomputed)")
 
     async def _pause_engine_for_refit(self):
-        if torch.distributed.get_rank() == 0:
-            await self.inference_client.pause_engines()
-        else:
-            await self.dynamic_inference_engine.paused.wait()
+        from megatron.core.inference.engines.dynamic_engine import EngineState
+        rank = torch.distributed.get_rank()
+        if rank == 0:
+            self.inference_client.pause_engines()
+        await self.dynamic_inference_engine.wait_until(EngineState.PAUSED)
 
     def resume_after_refit(self, recompute_kv_cache: bool = False) -> None:
         """Resume engine after weight update.
@@ -928,6 +920,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         """
         if not self._inference_engine_initialized:
             return
+
         if recompute_kv_cache:
             future = asyncio.run_coroutine_threadsafe(
                 self._wake_engine(), self._inference_loop
@@ -937,15 +930,15 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 self._unpause_engine_after_refit(), self._inference_loop
             )
         future.result()
-        torch.distributed.barrier()
         if recompute_kv_cache:
             self._inference_engine_alseep = False
-            print(f"[Rank {self.rank}] Resumed inference engine after refit (KV cache recomputed)")
 
     async def _unpause_engine_after_refit(self):
-        if torch.distributed.get_rank() == 0:
+        from megatron.core.inference.engines.dynamic_engine import EngineState
+        rank = torch.distributed.get_rank()
+        if rank == 0:
             self.inference_client.unpause_engines()
-        await self.dynamic_inference_engine.running.wait()
+        await self.dynamic_inference_engine.wait_until(EngineState.RUNNING)
 
     def _log_gpu_memory(self, tag: str):
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
@@ -1186,12 +1179,16 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             self._inference_loop
         )
 
-        # Wait for coordinator to start
+        # Wait for coordinator start AND CUDA-graph warmup to complete.
+        # _start_inference_coordinator awaits running.wait() so future.result()
+        # only returns once this rank's engine is fully warmed up.
+        # Cross-rank sync is handled by Ray's actor group semantics: the caller
+        # (refit_policy_generation) waits for ALL generation workers to return from
+        # prepare_for_generation() before proceeding, so no explicit barrier needed.
         future.result()
         print(f"[Rank {torch.distributed.get_rank()}] Coordinator started")
 
         # Start the HTTP Server
-
         if self.cfg["generation"]["mcore_generation_config"].get("expose_http_server", False) and torch.distributed.get_rank() == 0:
             print(f"[Rank {torch.distributed.get_rank()}] Starting HTTP Server")
             self.base_url = (
@@ -1333,6 +1330,8 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                     torch.bfloat16: 2,
                     torch.float16: 2,
                     torch.float32: 4,
+                    torch.float8_e4m3fn: 1,
+                    torch.float8_e5m2: 1,
                 }
                 scale = prec_to_bytes[self.dtype] / prec_to_bytes[param.dtype]
                 size_in_bytes = (
@@ -1516,23 +1515,60 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         if refit_backend == "nvshmem":
             from megatron.core.resharding.copy_services.nvshmem_copy_service import NVSHMEMCopyService
             self.refit_copy_service = NVSHMEMCopyService(group=self.refit_pg)
-            self.refit_copy_service._ensure_initialized()
         else:
             from megatron.core.resharding.copy_services.gloo_copy_service import GlooCopyService
             self.refit_copy_service = GlooCopyService(group=self.refit_pg)
 
-        print(f"[REFIT] rank={global_rank} init_refit_collective complete", flush=True)
+        from megatron.core.resharding.refit import prepare_swap_model_weights
+
+        is_source = (rank_offset == 0)
+        dst_rank_offset = torch.distributed.get_world_size() if is_source else rank_offset
+
+        # Build and cache the reshard plan (and any MXFP8 transforms) collectively.
+        # All participating ranks (training + generation) call this simultaneously.
+        # prepare_swap_model_weights auto-detects if the target model needs MXFP8
+        # conversion and handles quantization + transform creation transparently.
+        prepare_swap_model_weights(
+            src_model=self.model if is_source else None,
+            target_model=None if is_source else self.model,
+            group=self.refit_pg,
+            src_rank_offset=0,
+            dst_rank_offset=dst_rank_offset,
+        )
+
+    def preinit_nvshmem_collective(self) -> None:
+        """Initialize the NVShmem copy service collectively before any weight transfer.
+
+        Must be called on ALL participating ranks (training + inference)
+        simultaneously, after prepare_for_generation() has completed and the
+        CUDA graph has been captured but before any weight transfer.
+
+        The NVSHMEMCopyService lazy init (nvshmem.core.init + symmetric heap
+        allocation) can corrupt MXFP8 CUDA graph state baked into device memory
+        even when the engine is paused (CUDA graphs preserved). Running the init
+        here — after suspend_for_refit() but before swap_weights_via_reshard() —
+        ensures initialization completes without interfering with any active CUDA
+        operations. Subsequent transfers are no-ops for initialization.
+
+        For non-NVShmem backends this is a no-op.
+        """
+        if not hasattr(self, "refit_copy_service"):
+            return
+        if not hasattr(self.refit_copy_service, "_ensure_initialized"):
+            return
+        self.refit_copy_service._ensure_initialized()
 
     @torch.no_grad()
     def swap_weights_via_reshard(self, is_source: bool, dst_rank_offset: int = 0) -> bool:
         """Transfer weights using Megatron's swap_model_weights resharding API.
 
-        Uses the CopyService initialized in init_refit_collective for data
-        transfer and the refit ProcessGroup for metadata exchange.
+        Uses the CopyService and ProcessGroup initialized in init_refit_collective.
+        Any MXFP8 format conversion is handled automatically by Megatron-LM
+        (set up during prepare_swap_model_weights in init_refit_collective).
 
         Args:
-            is_source: True for training workers (weight source), False for inference
-                       workers (weight destination).
+            is_source: True for training workers (senders), False for inference
+                       workers (receivers).
             dst_rank_offset: Rank offset of the inference (destination) side.
 
         Returns:
@@ -1540,24 +1576,23 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         """
         from megatron.core.resharding.refit import swap_model_weights
 
-        if is_source:
-            src_model = self.model
-            dst_model = None
-        else:
-            src_model = None
-            dst_model = self.model
+        src_model = self.model if is_source else None
+        dst_model = None if is_source else self.model
 
+        # swap_model_weights auto-resolves the cached MXFP8 transform
+        # (created by prepare_swap_model_weights) for receivers that need it.
         swap_model_weights(
-            src_model, dst_model,
+            src_model,
+            dst_model,
             refit_method=self.refit_copy_service,
             group=self.refit_pg,
             src_rank_offset=0,
             dst_rank_offset=dst_rank_offset,
         )
+
         return True
 
-    def prepare_for_generation(self) -> None:
-        print(f"[Rank {self.rank}] preparing for generation", flush=True)
+    def prepare_for_generation(self, tags=None, **kwargs) -> None:
         self._log_gpu_memory("prepare_for_generation START")
         # Get the generation config
         mcore_generation_config = self.cfg["generation"]["mcore_generation_config"]
@@ -1588,8 +1623,12 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         if cuda_graph_impl != "none":
             toggle_cuda_graphs(lang_module, set_to=cuda_graph_impl)
 
-        # 4. Initialize inference engine if not already done
-        if not self._inference_engine_initialized:
+        # 4. Initialize inference engine if not already done.
+        # Skip engine start when called with tags=["weights"] (inside refit_policy_generation
+        # before the first generation).  Weights are about to be transferred, and we want the
+        # engine's CUDA-graph warmup to capture the already-correct post-transfer weights.
+        # The engine will be started by the subsequent prepare_for_generation(tags=["kv_cache"]).
+        if not self._inference_engine_initialized and (tags is None or "weights" not in tags):
             self._initialize_inference_engine(mcore_generation_config)
             # Start the coordinator and engine loop (first time only)
             coordinator_port = self.cfg["generation"].get(
@@ -1597,8 +1636,13 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             )
             self._run_async_coordinator_start(coordinator_port)
 
-        if self._inference_engine_alseep:
-            self._wake()
+        # When tags include "weights", we are inside refit_policy_generation and the
+        # engine was intentionally suspended before refit. Do NOT wake the engine
+        # here, or NVSHMEM init/weight transfer can race with CUDA graph replay and
+        # corrupt TE FP8 state, causing high log-prob error for the first 1-2 steps.
+        if tags is None or "weights" not in tags:
+            if self._inference_engine_alseep:
+                self._wake()
         self._log_gpu_memory("prepare_for_generation END")
 
     def finish_generation(self) -> None:

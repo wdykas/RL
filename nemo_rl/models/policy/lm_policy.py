@@ -829,8 +829,21 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         return result
 
     def prepare_for_generation(self, *args: Any, **kwargs: Any) -> None:
-        futures = self.worker_group.run_all_workers_single_data("prepare_for_generation")
+        futures = self.worker_group.run_all_workers_single_data(
+            "prepare_for_generation", **kwargs
+        )
         ray.get(futures)
+
+    def preinit_nvshmem_collective(self) -> list[ray.ObjectRef]:
+        """Pre-initialize NVShmem collectively without transferring weights.
+
+        Returns futures so the caller can launch training and inference sides
+        simultaneously and wait for both with ray.get().
+        """
+        futures = self.worker_group.run_all_workers_single_data(
+            "preinit_nvshmem_collective"
+        )
+        return futures
 
     def suspend_for_refit(self, recompute_kv_cache: bool = False) -> None:
         if self.cfg.get("generation", {}).get("backend") == "megatron":
