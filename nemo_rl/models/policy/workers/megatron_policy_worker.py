@@ -786,6 +786,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         self._inference_engine_initialized = True
         self._inference_engine_alseep = True  # Engine starts in paused state
+        print(f"[Rank {self.rank}] Initialized persistent inference engine")
 
     async def _start_inference_coordinator(self, coordinator_port: int):
         """Start the inference coordinator and engine loop.
@@ -828,6 +829,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         torch.distributed.barrier()
         
         self._inference_engine_alseep = True
+        print(f"[Rank {self.rank}] paused inference engine")
 
     async def _sleep_engine(self):
         """Send suspend signals via the coordinator and wait for acknowledgment."""
