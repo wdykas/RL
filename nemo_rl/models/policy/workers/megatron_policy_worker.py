@@ -1184,6 +1184,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         # (refit_policy_generation) waits for ALL generation workers to return from
         # prepare_for_generation() before proceeding, so no explicit barrier needed.
         future.result()
+        print(f"[Rank {torch.distributed.get_rank()}] Coordinator started")
 
         # Start the HTTP Server
         if self.cfg["generation"]["mcore_generation_config"].get("expose_http_server", False) and torch.distributed.get_rank() == 0:
@@ -1643,6 +1644,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         self._log_gpu_memory("prepare_for_generation END")
 
     def finish_generation(self) -> None:
+        print(f"[Rank {self.rank}] finishing generation", flush=True)
         self._log_gpu_memory("finish_generation START")
         # Get the generation config
         mcore_generation_config = self.cfg["generation"]["mcore_generation_config"]  

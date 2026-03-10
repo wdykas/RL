@@ -385,36 +385,44 @@ def _apply_cuda_graph_and_rng_tracker_config(model_cfg: Any, config: PolicyConfi
 
 def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
     """Apply Mixture of Experts configuration."""
-    mcfg = config["megatron_cfg"]
-    model_cfg.expert_tensor_parallel_size = mcfg.get("expert_tensor_parallel_size", 1)
-    model_cfg.expert_model_parallel_size = mcfg.get("expert_model_parallel_size", 1)
+    model_cfg.expert_tensor_parallel_size = config["megatron_cfg"][
+        "expert_tensor_parallel_size"
+    ]
+    model_cfg.expert_model_parallel_size = config["megatron_cfg"][
+        "expert_model_parallel_size"
+    ]
 
     # MoE stability settings
 
     # Setting moe_router_dtype to higher precision (e.g. fp64) can improve numerical stability,
     # especially when using many experts.
-    model_cfg.moe_router_dtype = mcfg.get("moe_router_dtype", None)
+    model_cfg.moe_router_dtype = config["megatron_cfg"]["moe_router_dtype"]
 
     # The below two configs (and "freeze_moe_router") are used to stabilize moe training
     # by preventing updates to the moe router. We found that this is helpful in reducing
     # logprob error during training.
 
     # Set this to "none" to disable load balancing loss.
-    model_cfg.moe_router_load_balancing_type = mcfg.get(
-        "moe_router_load_balancing_type", "none"
-    )
+    model_cfg.moe_router_load_balancing_type = config["megatron_cfg"][
+        "moe_router_load_balancing_type"
+    ]
     # Set this to 0.0 to disable updates to the moe router expert bias
-    model_cfg.moe_router_bias_update_rate = mcfg.get("moe_router_bias_update_rate", 0.0)
+    model_cfg.moe_router_bias_update_rate = config["megatron_cfg"][
+        "moe_router_bias_update_rate"
+    ]
 
-    model_cfg.moe_enable_deepep = mcfg.get("moe_enable_deepep", False)
-    model_cfg.moe_token_dispatcher_type = mcfg.get(
-        "moe_token_dispatcher_type", "allgather"
-    )
-    model_cfg.moe_pad_experts_for_cuda_graph_inference = mcfg.get(
-        "moe_pad_experts_for_cuda_graph_inference", False
-    )
-    model_cfg.moe_shared_expert_overlap = mcfg.get("moe_shared_expert_overlap", False)
-    model_cfg.moe_permute_fusion = mcfg.get("moe_permute_fusion", False)
+    model_cfg.moe_enable_deepep = config["megatron_cfg"]["moe_enable_deepep"]
+    model_cfg.moe_token_dispatcher_type = config["megatron_cfg"][
+        "moe_token_dispatcher_type"
+    ]
+    model_cfg.moe_pad_experts_for_cuda_graph_inference = config["megatron_cfg"][
+        "moe_pad_experts_for_cuda_graph_inference"
+    ]
+    model_cfg.moe_shared_expert_overlap = config["megatron_cfg"][
+        "moe_shared_expert_overlap"
+    ]
+
+    model_cfg.moe_permute_fusion = config["megatron_cfg"]["moe_permute_fusion"]
 
 
 def _apply_precision_config(
