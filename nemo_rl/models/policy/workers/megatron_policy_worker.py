@@ -39,6 +39,7 @@ from megatron.core.distributed import DistributedDataParallel
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
     FullyShardedDataParallel as custom_FSDP,
 )
+from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.config import InferenceConfig, KVCacheManagementMode
 from megatron.core.optimizer import ChainedOptimizer
@@ -810,18 +811,13 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
     def _sleep(self):
         """Pause the inference engine to free GPU memory for training.
         
-        This method should be called before training to:
-        1. Deallocate KV cache and other inference-specific GPU memory
-        2. Disable CUDA graphs for inference
-        3. Toggle model configuration for training mode
+        Uses the coordinator's pause+suspend mechanism:
+        1. Rank 0 sends PAUSE → all ranks wait for engine to reach PAUSED
+        2. Rank 0 sends SUSPEND → all ranks wait for engine to reach SUSPENDED
         
-        Uses the coordinator's pause mechanism to properly pause the engine loop
-        and then pause the engine (deallocate tensors, etc.).
-        
-        For coordinator-based inference:
-        - Only rank 0 sends pause signals via the coordinator
-        - The coordinator broadcasts to all DP engines
-        - Non-rank-0 workers wait for their engine to be paused via the event loop
+        The engine internally handles GPU state deallocation (KV cache, CUDA
+        graphs, etc.) during the SUSPENDED transition, so no explicit
+        engine.suspend() call is needed.
         """
         future = asyncio.run_coroutine_threadsafe(
             self._sleep_engine(),
@@ -844,17 +840,13 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
     def _wake(self):
         """Resume the inference engine after training.
         
-        This method should be called before generation to:
-        1. Reallocate KV cache and inference-specific GPU memory
-        2. Enable CUDA graphs for inference
-        3. Toggle model configuration for inference mode
-        
-        Uses the coordinator's resume mechanism to properly resume the engine loop.
-        
-        For coordinator-based inference:
-        - Only rank 0 sends resume signals via the coordinator
-        - The coordinator broadcasts to all DP engines
-        - Non-rank-0 workers wait for their engine to be running via the event loop
+        Uses the coordinator's resume+unpause mechanism:
+        1. Rank 0 sends RESUME → engine reallocates GPU state internally
+        2. Rank 0 sends UNPAUSE → all ranks wait for engine to reach RUNNING
+
+        The engine internally handles GPU state reallocation (KV cache, CUDA
+        graphs, etc.) during the RESUMING transition, so no explicit
+        engine.resume() call is needed.
         """
         # Use the coordinator-based resume mechanism
         # Only rank 0 sends the signal - coordinator broadcasts to all DP engines

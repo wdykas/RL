@@ -1,7 +1,7 @@
 [submodule "3rdparty/Megatron-LM"]
 	path = 3rdparty/Megatron-LM-workspace/Megatron-LM
-	url = https://github.com/NVIDIA/Megatron-LM.git
-	branch = main
+	url = https://github.com/shanmugamr1992/Megatron-LM.git
+	branch = megatron_inference_ultra
 	shallow = true
 [submodule "3rdparty/Megatron-Bridge"]
 	path = 3rdparty/Megatron-Bridge-workspace/Megatron-Bridge
@@ -16,5 +16,5 @@
 [submodule "3rdparty/Gym-workspace/Gym"]
 	path = 3rdparty/Gym-workspace/Gym
 	url = https://github.com/NVIDIA-NeMo/Gym.git
-	branch = main
+	branch = rkirby/minor_changes_for_megatron_inference_in_nemorl
 	shallow = true
