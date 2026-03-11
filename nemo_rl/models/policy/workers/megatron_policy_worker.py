@@ -749,6 +749,14 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         from megatron.core.inference.config import MambaInferenceStateConfig
         mamba_inference_state_config = MambaInferenceStateConfig.from_model(self.model)
 
+        if mcore_generation_config.get("mamba_inference_ssm_states_dtype", None) is not None:
+            dtype_val = mcore_generation_config["mamba_inference_ssm_states_dtype"]
+            mamba_inference_state_config.ssm_states_dtype = self._resolve_torch_dtype(dtype_val)
+        
+        if mcore_generation_config.get("mamba_inference_conv_states_dtype", None) is not None:
+            dtype_val = mcore_generation_config["mamba_inference_conv_states_dtype"]
+            mamba_inference_state_config.conv_states_dtype = self._resolve_torch_dtype(dtype_val)
+
         inference_config = InferenceConfig(
             block_size_tokens=block_size_tokens,
             buffer_size_gb=buffer_size_gb,
@@ -787,6 +795,21 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         self._inference_engine_initialized = True
         self._inference_engine_alseep = True  # Engine starts in paused state
         print(f"[Rank {self.rank}] Initialized persistent inference engine")
+
+    @staticmethod
+    def _resolve_torch_dtype(val):
+        """Convert a value to torch.dtype, accepting both torch.dtype and string forms like 'torch.float32' or 'float32'."""
+        if isinstance(val, torch.dtype):
+            return val
+        if isinstance(val, str):
+            name = val.replace("torch.", "")
+            dtype = getattr(torch, name, None)
+            if isinstance(dtype, torch.dtype):
+                return dtype
+        raise ValueError(
+            f"Cannot resolve torch dtype from {val!r} (type {type(val).__name__}). "
+            f"Expected a torch.dtype or a string like 'torch.float32' / 'float32'."
+        )
 
     async def _start_inference_coordinator(self, coordinator_port: int):
         """Start the inference coordinator and engine loop.
@@ -832,12 +855,19 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         print(f"[Rank {self.rank}] paused inference engine")
 
     async def _sleep_engine(self):
-        """Send suspend signals via the coordinator and wait for acknowledgment."""
+        """Send pause + suspend signals via the coordinator and wait for acknowledgment.
+
+        Follows the coordinator state machine: RUNNING → PAUSED → SUSPENDED.
+        The coordinator requires engines to be PAUSED before accepting SUSPEND.
+        """
         from megatron.core.inference.engines.dynamic_engine import EngineState
         if torch.distributed.get_rank() == 0:
-            self.inference_client.suspend_engines()
+            self.inference_client.pause_engines()
         await self.dynamic_inference_engine.wait_until(EngineState.PAUSED)
-        self.dynamic_inference_engine.suspend()
+
+        if torch.distributed.get_rank() == 0:
+            self.inference_client.suspend_engines()
+        await self.dynamic_inference_engine.wait_until(EngineState.SUSPENDED)
 
     def _wake(self):
         """Resume the inference engine after training.
@@ -863,12 +893,20 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         self._inference_engine_alseep = False
 
     async def _wake_engine(self):
-        """Send resume signals via the coordinator and wait for acknowledgment."""
+        """Send resume + unpause signals via the coordinator and wait for acknowledgment.
+
+        Follows the coordinator state machine: SUSPENDED → RESUMED → RUNNING.
+        The engine reallocates GPU state during the RESUMED transition, then
+        UNPAUSE brings it back to the RUNNING state.
+        """
         from megatron.core.inference.engines.dynamic_engine import EngineState
         if torch.distributed.get_rank() == 0:
             self.inference_client.resume_engines()
+        await self.dynamic_inference_engine.wait_until(EngineState.RESUMED)
+
+        if torch.distributed.get_rank() == 0:
+            self.inference_client.unpause_engines()
         await self.dynamic_inference_engine.wait_until(EngineState.RUNNING)
-        self.dynamic_inference_engine.resume()
 
     def suspend_for_refit(self, recompute_kv_cache: bool = False) -> None:
         """Pause or suspend engine for safe weight update.

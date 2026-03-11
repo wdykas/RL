@@ -62,16 +62,16 @@ CACHED_DEPENDENCIES = [
     "nv-grouped-gemm~=1.1",
     "megatron-energon[av_decode]~=6.0",
     "av",
-    "flashinfer-python~=0.5.0",
     "wget",
     "onnxscript",
     # VCS dependency - must match pyproject.toml [tool.uv.sources]
     "emerging_optimizers @ git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git@v0.1.0",
     "datasets",
     "fastapi~=0.50",
-    "flask[async]",
     "hypercorn",
-    "openai",
+    "quart",
+    "openai[aiohttp]",
+    "orjson",
 ]
 
 
