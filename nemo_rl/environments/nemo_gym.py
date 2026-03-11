@@ -196,7 +196,7 @@ Depending on your data shape, you may want to change these values."""
         timer_prefix: str,
         genrm_config: Optional[GenRMCompareConfig] = None,
     ) -> list[dict]:
-        timer = Timer()
+        timer = Timer(context={"worker": "nemo_gym"})
 
         # Build comparison strategy if GenRM is enabled
         comparison_strategy = None
