@@ -286,7 +286,7 @@ policy:
       tensor_parallel_size: 8
       pipeline_parallel_size: 1
       expert_parallel_size: 1
-      gpu_memory_utilization: 0.92
+      gpu_memory_utilization: 0.85
       max_model_len: 32768              # Must be <= policy.max_total_sequence_length
       enforce_eager: false
       use_deep_gemm: false
@@ -303,10 +303,19 @@ policy:
         reasoning_parser_plugin: nemo_rl/utils/nano_v3_reasoning_parser.py
 
     vllm_kwargs:
+      attention_backend: FLASH_ATTN
       max_num_seqs: 16
       mamba_ssm_cache_dtype: "float32"
       compilation_config:
         cudagraph_capture_sizes: [1,2,4,8,16,32,64]
+        pass_config:
+          # Disable FlashInfer TRTLLM AllReduce fusion.  It requires
+          # SymmDeviceMemory (MNNVL IPC) to initialise successfully on every TP
+          # rank.  When TP spans multiple nodes some ranks succeed while others
+          # fail (CUDA_ERROR_INVALID_DEVICE), causing a split-brain: half the TP
+          # group uses the MNNVL-based TRTLLM allreduce path while the other half
+          # falls back to standard NCCL.  They never rendezvous → permanent hang.
+          fuse_allreduce_rms: false
 
     colocated:
       enabled: false
@@ -402,6 +411,7 @@ env:
           spinup_server: true
           router_dp_size: 4
           server_args:
+            attention_backend: TRITON_ATTN
             tensor_parallel_size: 1
             gpu_memory_utilization: 0.85
             max_model_len: 96000
@@ -411,8 +421,6 @@ env:
               num_threads: 2
             compilation_config:
               cudagraph_capture_sizes: [1,2,4,8,16]
-          server_env:
-            VLLM_ATTENTION_BACKEND: TRITON_ATTN
 
     terminal_pivot_simple_agent:
       responses_api_agents:
@@ -433,6 +441,7 @@ env:
           spinup_server: true
           router_dp_size: 2
           server_args:
+            attention_backend: FLASH_ATTN
             tensor_parallel_size: 4
             data_parallel_size: 1
             enable_expert_parallel: true
@@ -446,6 +455,8 @@ env:
               num_threads: 112
             compilation_config:
               cudagraph_capture_sizes: [1,2,4,8,16,32]
+          server_env:
+            NCCL_MNNVL_ENABLE: "0"
 
     inverse_if:
       resources_servers:
@@ -508,6 +519,7 @@ env:
           spinup_server: true
           router_dp_size: 2
           server_args:
+            attention_backend: FLASH_ATTN
             tensor_parallel_size: 4
             reasoning_parser: deepseek_r1
             gpu_memory_utilization: 0.85
@@ -518,6 +530,8 @@ env:
               num_threads: 112
             compilation_config:
               cudagraph_capture_sizes: [1,2,4,8,16,32]
+          server_env:
+            NCCL_MNNVL_ENABLE: "0"
 
     lc_judge:
       resources_servers:

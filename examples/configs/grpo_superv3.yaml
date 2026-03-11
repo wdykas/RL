@@ -254,6 +254,7 @@ policy:
 
 
     vllm_kwargs:
+      attention_backend: FLASH_ATTN
       mamba_ssm_cache_dtype: "float32"
 # compilation_config:
 # mode: 0
@@ -342,14 +343,13 @@ env:
           spinup_server: true
           router_dp_size: 8
           server_args:
+            attention_backend: TRITON_ATTN
             tensor_parallel_size: 1
             gpu_memory_utilization: 0.85
             max_model_len: 96000
             model_loader_extra_config:
               enable_multithread_load: true
               num_threads: 2
-          server_env:
-            VLLM_ATTENTION_BACKEND: TRITON_ATTN
 
     terminal_pivot_simple_agent:
       responses_api_agents:

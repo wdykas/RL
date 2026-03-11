@@ -53,6 +53,7 @@ CONTAINER=$CONTAINER
 MOUNTS=$MOUNTS
 COMMAND=${COMMAND:-}  # This is a script relative to the SLURM_SUBMIT_DIR. If left empty, it will leave the cluster idle after it's brought up.
 SETUP_COMMAND=${SETUP_COMMAND:-}  # Setup commands to run on all nodes before starting Ray
+TEARDOWN_COMMAND=${TEARDOWN_COMMAND:-}  # Teardown commands to run on all nodes after COMMAND finishes
 ########################################################
 # Ports for all nodes (should be odd numbers since we place head/worker[0] on the same node) so all workers get the odd ports, but the head will get +1 the ports
 NODE_MANAGER_PORT=${NODE_MANAGER_PORT:-53001}
@@ -129,6 +130,14 @@ if [[ -n "$SETUP_COMMAND" ]]; then
   SETUP_COMMAND_FILE="$LOG_DIR/setup_command.sh"
   echo "$SETUP_COMMAND" > "$SETUP_COMMAND_FILE"
   chmod +x "$SETUP_COMMAND_FILE"
+fi
+
+# Write TEARDOWN_COMMAND to a file (mirrors SETUP_COMMAND pattern)
+TEARDOWN_COMMAND_FILE=""
+if [[ -n "$TEARDOWN_COMMAND" ]]; then
+  TEARDOWN_COMMAND_FILE="$LOG_DIR/teardown_command.sh"
+  echo "$TEARDOWN_COMMAND" > "$TEARDOWN_COMMAND_FILE"
+  chmod +x "$TEARDOWN_COMMAND_FILE"
 fi
 
 # Number of GPUs per worker node
@@ -606,6 +615,19 @@ if [[ -n "$COMMAND" ]]; then
   # Get container PID and execute command inside it
   head_container_pid=$(get_container_pid "$head_node")
   srun --overlap --nodes=1 -w "$head_node" -o $LOG_DIR/ray-driver.log enroot exec "$head_container_pid" bash -c "cd $CONTAINER_CWD && $COMMAND"
+
+  # Run teardown command on all nodes after COMMAND finishes (containers are still alive)
+  if [[ -n "${TEARDOWN_COMMAND_FILE}" ]] && [[ -f "${TEARDOWN_COMMAND_FILE}" ]]; then
+    echo "[INFO] Running teardown command on all ${#nodes_array[@]} nodes..."
+    for node in "${nodes_array[@]}"; do
+      container_pid=$(get_container_pid "$node")
+      srun --overlap --nodes=1 -w "$node" -o $LOG_DIR/teardown-${node}.log \
+        enroot exec "$container_pid" \
+        bash "$TEARDOWN_COMMAND_FILE" &
+    done
+    wait
+    echo "[INFO] Teardown complete on all nodes."
+  fi
 else
   echo "[INFO]: Ray Cluster is idled, run this on the slurm head node to get a shell to the head node:"
   cat <<EOF >$SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh
