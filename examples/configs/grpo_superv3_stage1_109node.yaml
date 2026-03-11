@@ -255,6 +255,7 @@ policy:
 
 
     vllm_kwargs:
+      attention_backend: FLASH_ATTN
       mamba_ssm_cache_dtype: "float32"
       compilation_config:
         cudagraph_capture_sizes: [1,2,4,8,16,32,64]
@@ -344,6 +345,7 @@ env:
           spinup_server: true
           router_dp_size: 8
           server_args:
+            attention_backend: TRITON_ATTN
             tensor_parallel_size: 1
             gpu_memory_utilization: 0.85
             max_model_len: 96000
@@ -352,8 +354,6 @@ env:
               num_threads: 2
             compilation_config:
               cudagraph_capture_sizes: [1,2,4,8,16]
-          server_env:
-            VLLM_ATTENTION_BACKEND: TRITON_ATTN
 
     terminal_pivot_simple_agent:
       responses_api_agents:

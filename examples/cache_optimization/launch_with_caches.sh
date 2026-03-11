@@ -159,7 +159,6 @@ export COMMAND="cd ${WORKTREE_ROOT} && date ; \
 source ${MAIN_REPO_ROOT}/3rdparty/vllm/nemo-rl.env && \
 UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py && \
 NRL_VLLM_USE_V1=1 \
-VLLM_ATTENTION_BACKEND=FLASH_ATTN \
 VLLM_CACHE_ROOT=${VLLM_CACHE_DIR} \
 DG_JIT_CACHE_DIR=${VLLM_CACHE_DIR}/deep_gemm \
 UV_CACHE_DIR=${PERSISTENT_CACHE}/uv \

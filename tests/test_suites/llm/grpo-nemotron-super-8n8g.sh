@@ -18,10 +18,10 @@ exit_if_max_steps_reached
 cd $PROJECT_ROOT
 
 export NRL_VLLM_USE_V1=1
-export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 
 uv run examples/run_grpo.py \
     --config $CONFIG_PATH \
+    policy.generation.vllm_kwargs.attention_backend=FLASH_ATTN \
     policy.model_name=$MODEL_NAME \
     grpo.max_num_steps=$MAX_STEPS \
     logger.log_dir=$LOG_DIR \

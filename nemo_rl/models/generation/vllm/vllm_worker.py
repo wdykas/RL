@@ -129,6 +129,13 @@ class BaseVllmGenerationWorker:
         env_vars["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         # Skip vllm P2P check and rely on driver to report peer to peer capability.
         env_vars["VLLM_SKIP_P2P_CHECK"] = "1"
+        # Force all TP ranks onto standard NCCL for allreduce.  When TP spans
+        # multiple nodes some ranks may fail to initialise SymmMem (e.g. due to a
+        # missing or undecodable NVML fabric clusterUuid) while others succeed,
+        # producing a split-brain where half the ring enters the SymmMem path and
+        # half enters the NCCL path -- causing a permanent hang after torch.compile.
+        # Setting this to "0" makes every rank skip SymmMem and use NCCL uniformly.
+        env_vars["VLLM_ALLREDUCE_USE_SYMM_MEM"] = "0"
 
         return resources, env_vars, init_kwargs
 
@@ -196,7 +203,7 @@ class BaseVllmGenerationWorker:
         self.world_size = 1
 
     def _apply_vllm_patches(self):
-        """Apply file-on-disk patches to vLLM source files.
+        """Apply file-on-disk patches to vLLM and flashinfer source files.
 
         These patches are idempotent (check before writing) and applied
         early during ``_init_config`` so that **all** workers -- including
@@ -272,98 +279,252 @@ class BaseVllmGenerationWorker:
             with open(file_to_patch, "w") as f:
                 f.write(content)
 
-        def _patch_vllm_vit_flash_attn_backend():
-            """Patch vLLM vision attention backend selection logic.
+ 
+        def _patch_vllm_hermes_tool_parser_thread_safety():
+            """Patch Hermes2ProToolParser.__init__ to cache tokenizer calls.
 
-            Modify the CUDA branch of maybe_get_vit_flash_attn_backend in
-            vllm.attention.layer to avoid overriding the backend when it
-            is already set to XFORMERS. This avoids flash attention related
-            errors when the ViT head dimension is not a multiple of 32.
+            The HuggingFace tokenizer's Rust backend does not support concurrent
+            access. When multiple async requests call _preprocess_chat concurrently,
+            each one constructs a new Hermes2ProToolParser which calls
+            tokenizer.encode() and tokenizer.decode() in __init__, causing
+            "RuntimeError: Already borrowed".
 
-            Related issues:
-            - https://github.com/vllm-project/vllm/issues/27562
-            - https://github.com/vllm-project/vllm/issues/26989
+            This patch caches the encode/decode results so only the first
+            instantiation (protected by a lock) touches the tokenizer. All
+            subsequent instantiations read from cache without any tokenizer
+            access.
 
-            This is properly fixed in https://github.com/vllm-project/vllm/pull/28763. We can remove this patch once we upgrade to a version of vllm that contains this fix.
+            Related:
+            - https://github.com/vllm-project/vllm/pull/30264
+            - https://github.com/huggingface/tokenizers/issues/537
+            - https://github.com/PrimeIntellect-ai/prime-rl/pull/1837
             """
-            file_to_patch = _get_vllm_file("attention/layer.py")
+            file_to_patch = _get_vllm_file("tool_parsers/hermes_tool_parser.py")
+
             with open(file_to_patch, "r") as f:
                 content = f.read()
 
+            if "_tokenizer_cache" in content:
+                logger.info("Hermes tool parser thread-safety patch already applied.")
+                return
+
+            old_import = (
+                "import json\n"
+                "from collections.abc import Sequence"
+            )
+            new_import = (
+                "import json\n"
+                "import threading\n"
+                "from collections.abc import Sequence"
+            )
+
+            old_class_line = "class Hermes2ProToolParser(ToolParser):"
+            new_class_line = (
+                "class Hermes2ProToolParser(ToolParser):\n"
+                "    _tokenizer_lock = threading.Lock()\n"
+                "    _tokenizer_cache = {}"
+            )
+
+            old_init_snippet = (
+                "        self.tool_call_start_token_ids = self.model_tokenizer.encode(\n"
+                "            self.tool_call_start_token, add_special_tokens=False\n"
+                "        )\n"
+                "        self.tool_call_end_token_ids = self.model_tokenizer.encode(\n"
+                "            self.tool_call_end_token, add_special_tokens=False\n"
+                "        )\n"
+                "\n"
+                "        self.tool_call_start_token_array = [\n"
+                "            self.model_tokenizer.decode([token_id])\n"
+                "            for token_id in self.tool_call_start_token_ids\n"
+                "        ]\n"
+                "\n"
+                "        self.tool_call_end_token_array = [\n"
+                "            self.model_tokenizer.decode([token_id])\n"
+                "            for token_id in self.tool_call_end_token_ids\n"
+                "        ]"
+            )
+
+            new_init_snippet = (
+                "        _tid = id(self.model_tokenizer)\n"
+                "        if _tid in Hermes2ProToolParser._tokenizer_cache:\n"
+                "            _cached = Hermes2ProToolParser._tokenizer_cache[_tid]\n"
+                "            self.tool_call_start_token_ids = _cached['start_ids']\n"
+                "            self.tool_call_end_token_ids = _cached['end_ids']\n"
+                "            self.tool_call_start_token_array = _cached['start_array']\n"
+                "            self.tool_call_end_token_array = _cached['end_array']\n"
+                "        else:\n"
+                "            with Hermes2ProToolParser._tokenizer_lock:\n"
+                "                if _tid in Hermes2ProToolParser._tokenizer_cache:\n"
+                "                    _cached = Hermes2ProToolParser._tokenizer_cache[_tid]\n"
+                "                    self.tool_call_start_token_ids = _cached['start_ids']\n"
+                "                    self.tool_call_end_token_ids = _cached['end_ids']\n"
+                "                    self.tool_call_start_token_array = _cached['start_array']\n"
+                "                    self.tool_call_end_token_array = _cached['end_array']\n"
+                "                else:\n"
+                "                    self.tool_call_start_token_ids = "
+                "self.model_tokenizer.encode(\n"
+                "                        self.tool_call_start_token, "
+                "add_special_tokens=False\n"
+                "                    )\n"
+                "                    self.tool_call_end_token_ids = "
+                "self.model_tokenizer.encode(\n"
+                "                        self.tool_call_end_token, "
+                "add_special_tokens=False\n"
+                "                    )\n"
+                "                    self.tool_call_start_token_array = [\n"
+                "                        self.model_tokenizer.decode([token_id])\n"
+                "                        for token_id in self.tool_call_start_token_ids\n"
+                "                    ]\n"
+                "                    self.tool_call_end_token_array = [\n"
+                "                        self.model_tokenizer.decode([token_id])\n"
+                "                        for token_id in self.tool_call_end_token_ids\n"
+                "                    ]\n"
+                "                    Hermes2ProToolParser._tokenizer_cache[_tid] = {\n"
+                "                        'start_ids': self.tool_call_start_token_ids,\n"
+                "                        'end_ids': self.tool_call_end_token_ids,\n"
+                "                        'start_array': self.tool_call_start_token_array,\n"
+                "                        'end_array': self.tool_call_end_token_array,\n"
+                "                    }"
+            )
+
+            if old_init_snippet not in content:
+                logger.warning(
+                    "Could not apply hermes tool parser thread-safety patch: "
+                    "expected code snippet not found in %s. "
+                    "The vLLM version may have changed.",
+                    file_to_patch,
+                )
+                return
+
+            content = content.replace(old_import, new_import, 1)
+            content = content.replace(old_class_line, new_class_line, 1)
+            content = content.replace(old_init_snippet, new_init_snippet, 1)
+
+            with open(file_to_patch, "w") as f:
+                f.write(content)
+
+            logger.info("Successfully patched hermes tool parser for thread-safety.")
+
+        def _patch_flashinfer_mnnvl_cluster_uuid():
+            """Patch flashinfer mnnvl.py to guard against empty/undecodable clusterUuid.
+
+            On single-node NVSwitch clusters, clusterUuid is all-zero bytes
+            (no multi-node NVLink domain). ctypes truncates at the first null
+            byte, producing an empty string — then ``clusterUuid[0]`` raises
+            ``IndexError``. On some hardware the raw bytes are not valid UTF-8,
+            causing ``UnicodeDecodeError`` in pynvml's ``__getattribute__``
+            before the index is even reached.
+
+            Fix: wrap the clusterUuid access in a try/except so that either
+            failure safely returns ``False`` (falling back to
+            PosixFDHandleExchanger for single-node topologies).
+
+            Upstream fix: https://github.com/flashinfer-ai/flashinfer/pull/2626
+            Related issue: https://github.com/flashinfer-ai/flashinfer/issues/2633
+            """
+            spec = find_spec("flashinfer")
+            if spec is None or not spec.submodule_search_locations:
+                return
+
+            base_dir = next(iter(spec.submodule_search_locations))
+            file_path = os.path.join(base_dir, "comm", "mnnvl.py")
+
+            if not os.path.exists(file_path):
+                return
+
+            with open(file_path, "r") as f:
+                content = f.read()
+
             old_snippet = (
-                "    elif current_platform.is_cuda():\n"
                 "        if (\n"
-                "            attn_backend != AttentionBackendEnum.FLASH_ATTN\n"
-                "            and check_upstream_fa_availability(torch.get_default_dtype())\n"
+                "            fabric_info.state >= pynvml.NVML_GPU_FABRIC_STATE_COMPLETED\n"
+                "            and fabric_info.clusterUuid[0] != 0\n"
                 "        ):\n"
-                "            attn_backend = AttentionBackendEnum.FLASH_ATTN\n"
-                "            use_upstream_fa = True\n"
+                "            return True\n"
+                "        return False\n"
             )
 
             new_snippet = (
-                "    elif current_platform.is_cuda():\n"
-                "        if (\n"
-                "            attn_backend != AttentionBackendEnum.FLASH_ATTN\n"
-                "            and attn_backend != AttentionBackendEnum.XFORMERS\n"
-                "            and check_upstream_fa_availability(torch.get_default_dtype())\n"
-                "        ):\n"
-                "            attn_backend = AttentionBackendEnum.FLASH_ATTN\n"
-                "            use_upstream_fa = True\n"
+                "        try:\n"
+                "            return (\n"
+                "                fabric_info.state >= pynvml.NVML_GPU_FABRIC_STATE_COMPLETED\n"
+                "                and fabric_info.clusterUuid\n"
+                "                and fabric_info.clusterUuid[0] != 0\n"
+                "            )\n"
+                "        except (UnicodeDecodeError, IndexError):\n"
+                "            return False\n"
             )
 
-            # Only patch if the file still has the old snippet and
-            # hasn't been patched already.
             if new_snippet in content or old_snippet not in content:
                 return
 
             content = content.replace(old_snippet, new_snippet)
 
-            with open(file_to_patch, "w") as f:
+            with open(file_path, "w") as f:
                 f.write(content)
-
-        def _patch_vllm_speculative_decoding_post_step():
-            """Patch vLLM speculative decoding post_step call.
-
-            Related PR:
-            - https://github.com/vllm-project/vllm/pull/30319
-
-            This patch fixes the InprocessClient.get_output method to properly
-            call post_step with the model_executed flag from step_fn.
-            """
-            file_to_patch = _get_vllm_file("v1/engine/core_client.py")
-
-            with open(file_to_patch, "r") as f:
-                content = f.read()
-
-            old_snippet = (
-                "    def get_output(self) -> EngineCoreOutputs:\n"
-                "        outputs, _ = self.engine_core.step_fn()\n"
-                "        return outputs and outputs.get(0) or EngineCoreOutputs()"
-            )
-
-            new_snippet = (
-                "    def get_output(self) -> EngineCoreOutputs:\n"
-                "        outputs, model_executed = self.engine_core.step_fn()\n"
-                "        self.engine_core.post_step(model_executed=model_executed)\n"
-                "        return outputs and outputs.get(0) or EngineCoreOutputs()"
-            )
-
-            if new_snippet in content or old_snippet not in content:
-                return
-
-            content = content.replace(old_snippet, new_snippet)
-
-            with open(file_to_patch, "w") as f:
-                f.write(content)
-            logger.info("Successfully patched vllm speculative decoding post_step.")
 
         _patch_vllm_init_workers_ray()
         logger.info("Successfully patched vllm _init_workers_ray.")
 
-        _patch_vllm_vit_flash_attn_backend()
-        logger.info("Successfully patched vllm vit flash attention backend.")
+        _patch_vllm_hermes_tool_parser_thread_safety()
 
-        _patch_vllm_speculative_decoding_post_step()
+        _patch_flashinfer_mnnvl_cluster_uuid()
+        logger.info("Successfully patched flashinfer mnnvl clusterUuid guard.")
+
+        def _patch_nemotron_h_isinstance_check():
+            """Remove the no-op isinstance branch in NemotronHModel.forward.
+
+            Tomer's vLLM fork added an ``isinstance(layer, NemotronHMoEDecoderLayer)``
+            check inside the layer loop where both branches are identical.  This
+            confuses torch.compile graph tracing on Blackwell GPUs, causing Triton
+            to fail with ``KeyError: "Unknown key: 'cubin'"`` during autotuning of
+            the Mamba SSM kernels.  Reverting to the original simple loop fixes it.
+            """
+            file_path = _get_vllm_file("model_executor/models/nemotron_h.py")
+
+            with open(file_path, "r") as f:
+                content = f.read()
+
+            old_snippet = (
+                "            if isinstance(layer, NemotronHMoEDecoderLayer):\n"
+                "                hidden_states, residual = layer(\n"
+                "                    positions=positions,\n"
+                "                    hidden_states=hidden_states,\n"
+                "                    residual=residual,\n"
+                "                )\n"
+                "            else:\n"
+                "                hidden_states, residual = layer(\n"
+                "                    positions=positions,\n"
+                "                    hidden_states=hidden_states,\n"
+                "                    residual=residual,\n"
+                "                )"
+            )
+
+            new_snippet = (
+                "            hidden_states, residual = layer(\n"
+                "                positions=positions,\n"
+                "                hidden_states=hidden_states,\n"
+                "                residual=residual,\n"
+                "            )"
+            )
+
+            if old_snippet not in content:
+                logger.warning(
+                    "Could not apply nemotron_h isinstance patch: "
+                    "expected code snippet not found in %s. "
+                    "The vLLM version may not contain this change.",
+                    file_path,
+                )
+                return
+
+            content = content.replace(old_snippet, new_snippet, 1)
+
+            with open(file_path, "w") as f:
+                f.write(content)
+
+            logger.info("Successfully patched nemotron_h.py: removed isinstance branch.")
+
+        _patch_nemotron_h_isinstance_check()
 
     def _load_model(self, bundle_indices, seed):
         """Perform model loading and engine creation."""

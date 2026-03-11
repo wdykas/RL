@@ -57,7 +57,7 @@ SLURM_QOS="${SLURM_QOS:-}"
 WALLTIME="${WALLTIME:-4:00:00}"
 
 # ---------- Container & mounts ----------
-export CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/llmservice/users/ansubramania/containers/nemo-rl-ultra-20260226-428eb84dd-custom-vllm-arm.sqsh}"
+export CONTAINER="${CONTAINER:-/lustre/fs1/portfolios/llmservice/projects/llmservice_nemotron_ultra/users/ansubramania/containers/nemo-rl-ultra-vllm017-pipe45807540.sqsh}"
 MOUNTS="/lustre:/lustre"
 
 # GB200 NVL72: fixed at 4 GPUs/node. Must match --gres=gpu:4 passed to sbatch.
@@ -91,8 +91,8 @@ NUM_TOTAL_NODES=$((NUM_ACTOR_NODES + NUM_JUDGE_NODES))
 
 # GB200 NVL72: each rack has 18 nodes sharing an NVLink domain.
 # --segment tells SLURM to allocate nodes in groups of this size from
-# the same topology block, guaranteeing complete rack-aligned segments for
-# training EP. Inference and judges inherit the constraint but don't require it.
+# the same topology block, guaranteeing complete rack-aligned segments for training EP.
+# Inference and judges inherit the constraint but don't require it.
 # Must stay in sync with cluster.segment_size in the YAML config.
 #
 # When SEGMENT_SIZE is unset, default to 16 if NUM_TOTAL_NODES >= 16.
@@ -153,16 +153,43 @@ fi
 
 # ---------- Persistent cache directories ----------
 # Shared project-level cache so all team members reuse compiled artifacts
-# (vLLM, FlashInfer cubins, Deep Gemm JIT, uv). Directories use setgid
-# (g+rwxs) so new files inherit the llmservice group and stay group-writable.
+# (vLLM, FlashInfer cubins, Deep Gemm JIT, Triton, Inductor, uv).
+#
+# Permissions strategy:
+#   - setgid (g+s) on directories → new entries inherit the project group
+#   - Default POSIX ACLs (setfacl -d) → new files/dirs get group rwx regardless of the creating process's umask
+#   - umask 002 for mkdir -p → top-level dirs are group-writable immediately
 PERSISTENT_CACHE="${PERSISTENT_CACHE:-/lustre/fsw/portfolios/llmservice/projects/llmservice_nemotron_ultra/nemo_rl/persistent_cache}"
 VLLM_CACHE_DIR="${PERSISTENT_CACHE}/vllm_compile_cache"
 FLASHINFER_CUBIN_CACHE="${PERSISTENT_CACHE}/flashinfer_cubins"
 FLASHINFER_WS_BASE="${PERSISTENT_CACHE}/flashinfer_workspace"
-(umask 002 && mkdir -p "${VLLM_CACHE_DIR}" "${FLASHINFER_CUBIN_CACHE}" "${FLASHINFER_WS_BASE}")
-chmod g+rwxs "${PERSISTENT_CACHE}" "${VLLM_CACHE_DIR}" "${FLASHINFER_CUBIN_CACHE}" "${FLASHINFER_WS_BASE}" 2>/dev/null || true
+LUSTRE_INDUCTOR_CACHE="${PERSISTENT_CACHE}/inductor_cache"
+LUSTRE_TRITON_CACHE="${PERSISTENT_CACHE}/triton_cache"
+INDUCTOR_CACHE_DIR="/tmp/nemo_rl_inductor_cache"
+TRITON_CACHE_DIR="/tmp/nemo_rl_triton_cache"
 
-VLLM_PRECOMPILED_WHEEL_LOCATION="${VLLM_PRECOMPILED_WHEEL_LOCATION:-https://github.com/vllm-project/vllm/releases/download/v0.13.0/vllm-0.13.0-cp38-abi3-manylinux_2_31_aarch64.whl}"
+# Validate group write access before proceeding.
+if ! touch "${PERSISTENT_CACHE}/.cache_write_test" 2>/dev/null; then
+  echo "ERROR: Cannot write to PERSISTENT_CACHE=${PERSISTENT_CACHE}"
+  echo "  You are likely not a member of the project access group."
+  echo "  Request access to join the llmservice DL, or override the cache directory with:"
+  echo "    PERSISTENT_CACHE=/path/to/your/cache bash ${0}"
+  exit 1
+fi
+rm -f "${PERSISTENT_CACHE}/.cache_write_test"
+
+(umask 002 && mkdir -p "${VLLM_CACHE_DIR}" "${FLASHINFER_CUBIN_CACHE}" "${FLASHINFER_WS_BASE}" \
+  "${LUSTRE_INDUCTOR_CACHE}" "${LUSTRE_TRITON_CACHE}")
+chmod g+rwxs "${PERSISTENT_CACHE}" "${VLLM_CACHE_DIR}" "${FLASHINFER_CUBIN_CACHE}" "${FLASHINFER_WS_BASE}" \
+  "${LUSTRE_INDUCTOR_CACHE}" "${LUSTRE_TRITON_CACHE}" 2>/dev/null || true
+# Default ACLs ensure any new file/dir created by any process (even with umask 022) inherits group rwx. 
+# This fixes the vLLM per-rank cache dirs (vllm_compile_cache_XXXX) that were being created without group write.
+for _d in "${PERSISTENT_CACHE}" "${VLLM_CACHE_DIR}" "${FLASHINFER_CUBIN_CACHE}" \
+          "${FLASHINFER_WS_BASE}" "${LUSTRE_INDUCTOR_CACHE}" "${LUSTRE_TRITON_CACHE}"; do
+  setfacl -d -m g::rwx "${_d}" 2>/dev/null || true
+done
+
+VLLM_PRECOMPILED_WHEEL_LOCATION="${VLLM_PRECOMPILED_WHEEL_LOCATION:-https://github.com/vllm-project/vllm/releases/download/v0.17.0/vllm-0.17.0-cp38-abi3-manylinux_2_31_aarch64.whl}"
 
 # =============================================================================
 # Validation
@@ -272,14 +299,15 @@ echo "Persistent cache root: ${PERSISTENT_CACHE}"
 # All static config (parallelism, vLLM kwargs, judge server_args, sequence
 # packing, etc.) lives in grpo_ultra_v3.yaml. Only per-run variables are
 # overridden here.
-TRAIN_CMD="cd ${CODE_ROOT} && date ; \
+TRAIN_CMD="cd ${CODE_ROOT} && umask 002 && date ; \
 ${VLLM_ENV_SOURCE}\
 OMP_NUM_THREADS=16 \
 RAY_DEDUP_LOGS=1 \
 NRL_VLLM_USE_V1=1 \
-VLLM_ATTENTION_BACKEND=FLASH_ATTN \
 VLLM_CACHE_ROOT=${VLLM_CACHE_DIR} \
 DG_JIT_CACHE_DIR=${VLLM_CACHE_DIR}/deep_gemm \
+TORCHINDUCTOR_CACHE_DIR=${INDUCTOR_CACHE_DIR} \
+TRITON_CACHE_DIR=${TRITON_CACHE_DIR} \
 UV_CACHE_DIR=${PERSISTENT_CACHE}/uv \
 NEMO_GYM_SKIP_VENV_IF_PRESENT=1 \
 RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 \
@@ -338,7 +366,7 @@ NRL_CONFIGS_DIR="${NRL_CONFIGS_DIR:-${OVERLAY_SOURCE}/examples/configs}"
 NRL_MEGATRON_LM_DIR="${NRL_MEGATRON_LM_DIR:-${OVERLAY_SOURCE}/3rdparty/Megatron-LM-workspace/Megatron-LM}"
 NRL_MEGATRON_BRIDGE_DIR="${NRL_MEGATRON_BRIDGE_DIR:-${OVERLAY_SOURCE}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge}"
 NRL_GYM_DIR="${NRL_GYM_DIR:-${OVERLAY_SOURCE}/3rdparty/Gym-workspace/Gym}"
-NRL_VLLM_DIR="${NRL_VLLM_DIR:-}"  # No default; vLLM from container unless explicitly set
+NRL_VLLM_DIR="${NRL_VLLM_DIR:-${OVERLAY_SOURCE}/3rdparty/vllm}"
 
 _maybe_mount() {
   local src="$1" dst="$2" label="$3"
@@ -388,6 +416,70 @@ if [[ ! -f "${RAY_SUB}" ]]; then
   echo "Set RAY_SUB=/path/to/ray.sub or use USE_WORKTREE=1"
   exit 1
 fi
+
+# =================================================================================================================
+# Per-node cache seeding / sync-back
+# =================================================================================================================
+# Triton and Inductor compile to node-local /tmp to avoid Lustre race conditions during concurrent JIT compilation.
+# To avoid cold-start penalties, we seed /tmp from a warm Lustre cache before Ray starts (SETUP_COMMAND)
+# and sync new artifacts back afterwards (TEARDOWN_COMMAND).
+# Both commands run on every node via ray.sub.
+# =================================================================================================================
+read -r -d '' SETUP_COMMAND <<SETUPEOF || true
+echo "[CACHE SEED] Seeding Triton/Inductor caches from Lustre..."
+LOCAL_IND="${INDUCTOR_CACHE_DIR}"
+LOCAL_TRI="${TRITON_CACHE_DIR}"
+LUSTRE_IND="${LUSTRE_INDUCTOR_CACHE}"
+LUSTRE_TRI="${LUSTRE_TRITON_CACHE}"
+mkdir -p "\$LOCAL_IND" "\$LOCAL_TRI"
+if [ -d "\$LUSTRE_IND" ] && [ "\$(ls -A "\$LUSTRE_IND" 2>/dev/null)" ]; then
+  cp -a "\$LUSTRE_IND/." "\$LOCAL_IND/" && echo "[CACHE SEED] Inductor: seeded from Lustre" \
+    || echo "[CACHE SEED] Inductor: seed failed (non-fatal)"
+else
+  echo "[CACHE SEED] Inductor: no warm cache on Lustre yet"
+fi
+if [ -d "\$LUSTRE_TRI" ] && [ "\$(ls -A "\$LUSTRE_TRI" 2>/dev/null)" ]; then
+  cp -a "\$LUSTRE_TRI/." "\$LOCAL_TRI/" && echo "[CACHE SEED] Triton: seeded from Lustre" \
+    || echo "[CACHE SEED] Triton: seed failed (non-fatal)"
+else
+  echo "[CACHE SEED] Triton: no warm cache on Lustre yet"
+fi
+echo "[CACHE SEED] Done."
+SETUPEOF
+export SETUP_COMMAND
+
+read -r -d '' TEARDOWN_COMMAND <<TEARDOWNEOF || true
+echo "[CACHE SYNC] Syncing Triton/Inductor caches back to Lustre..."
+LOCAL_IND="${INDUCTOR_CACHE_DIR}"
+LOCAL_TRI="${TRITON_CACHE_DIR}"
+LUSTRE_IND="${LUSTRE_INDUCTOR_CACHE}"
+LUSTRE_TRI="${LUSTRE_TRITON_CACHE}"
+CACHE_ROOT="${PERSISTENT_CACHE}"
+if [ -d "\$LOCAL_IND" ] && [ "\$(ls -A "\$LOCAL_IND" 2>/dev/null)" ]; then
+  rsync -a --ignore-errors "\$LOCAL_IND/" "\$LUSTRE_IND/" && echo "[CACHE SYNC] Inductor: synced to Lustre" \
+    || echo "[CACHE SYNC] Inductor: sync failed (non-fatal)"
+else
+  echo "[CACHE SYNC] Inductor: nothing to sync"
+fi
+if [ -d "\$LOCAL_TRI" ] && [ "\$(ls -A "\$LOCAL_TRI" 2>/dev/null)" ]; then
+  rsync -a --ignore-errors "\$LOCAL_TRI/" "\$LUSTRE_TRI/" && echo "[CACHE SYNC] Triton: synced to Lustre" \
+    || echo "[CACHE SYNC] Triton: sync failed (non-fatal)"
+else
+  echo "[CACHE SYNC] Triton: nothing to sync"
+fi
+# Fix group permissions on any dirs created at runtime (e.g. vllm_compile_cache_XXXX).
+# Only one node needs to do this; use a lock file so the rest skip it.
+_lock="\$CACHE_ROOT/.perm_fix_lock_\$\$"
+if ( set -o noclobber; echo "\$(hostname)" > "\$_lock" ) 2>/dev/null; then
+  echo "[CACHE SYNC] Fixing group permissions on cache tree..."
+  chmod -R g+rwX "\$CACHE_ROOT" 2>/dev/null || true
+  find "\$CACHE_ROOT" -type d ! -perm -g+s -exec chmod g+s {} + 2>/dev/null || true
+  rm -f "\$_lock"
+  echo "[CACHE SYNC] Permissions fixed."
+fi
+echo "[CACHE SYNC] Done."
+TEARDOWNEOF
+export TEARDOWN_COMMAND
 
 # =============================================================================
 # Interactive mode

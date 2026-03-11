@@ -94,7 +94,6 @@ from nemo_rl.models.policy.interfaces import (
 )
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
-from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
@@ -130,9 +129,6 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
     ):
         """Initialize the MegatronPolicyWorker."""
         log_gpu_memory_diagnostics(label="init_start", worker_type="MegatronPolicyWorker")
-
-        # Apply patch from https://github.com/NVIDIA/TransformerEngine/pull/2286/files
-        apply_transformer_engine_patch()
 
         self.cfg = config
 

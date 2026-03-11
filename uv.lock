@@ -203,9 +203,16 @@ constraints = [
     { name = "wheel", specifier = ">=0.46.2" },
 ]
 overrides = [
+    { name = "flashinfer-python", specifier = "==0.6.4" },
     { name = "llguidance", specifier = ">=1.3.0,<1.4.0" },
+    { name = "nvidia-cutlass-dsl", specifier = ">=4.3.4" },
     { name = "nvidia-modelopt", extras = ["torch"], specifier = ">=0.39.0" },
     { name = "opencv-python-headless", specifier = ">=4.11.0" },
+    { name = "opentelemetry-api", specifier = "==1.39.1" },
+    { name = "opentelemetry-exporter-otlp", specifier = "==1.39.1" },
+    { name = "opentelemetry-exporter-otlp-proto-grpc", specifier = "==1.39.1" },
+    { name = "opentelemetry-proto", specifier = "==1.39.1" },
+    { name = "opentelemetry-sdk", specifier = "==1.39.1" },
     { name = "setuptools", specifier = ">=80.10.2" },
     { name = "timm", specifier = "<=1.0.22" },
     { name = "torch", marker = "sys_platform != 'darwin'", specifier = "==2.9.0", index = "https://download.pytorch.org/whl/cu129" },
@@ -534,25 +541,25 @@ wheels = [
 
 [[package]]
 name = "apache-tvm-ffi"
-version = "0.1.4"
+version = "0.1.8.post2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/3c/60/3282f2ba28fbd1e60dabfa244e61b40a237ccf76986772879d17d9cc5102/apache_tvm_ffi-0.1.4.tar.gz", hash = "sha256:1a6e635b671e962bbc3bf1bc97bfd82e4c0f1bedf27c8d183bb282664974d0d3", size = 1325200, upload-time = "2025-11-30T07:21:43.769Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/e3/e9/a13952726228fa6282154ecf927092396bc759739e5e045019f6ab92f3ca/apache_tvm_ffi-0.1.8.post2.tar.gz", hash = "sha256:4513e38852894f290172ecfefcbc18d34e817fd29c16a0f1770e130c82b4067e", size = 2441111, upload-time = "2026-01-13T18:11:27.864Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/95/05/2cfdeac3c5c8468f313d4262c9253e5661904447d9801a95d2e71cb666c2/apache_tvm_ffi-0.1.4-cp312-abi3-macosx_11_0_arm64.whl", hash = "sha256:28e182e21010c7554b90fa4a43e101dffd3962de6ff0ebf71eee09a6e909034f", size = 1754878, upload-time = "2025-11-30T07:21:09.096Z" },
-    { url = "https://files.pythonhosted.org/packages/f8/b4/27b932ebb2ccfa6f26048a472de87c9b9860d3fd36cc4ec627900c8c42dd/apache_tvm_ffi-0.1.4-cp312-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:a5842c53c1618e2266e6fbbb723fe823136fa0510448682e6990bb119042dee8", size = 1910199, upload-time = "2025-11-30T07:21:10.819Z" },
-    { url = "https://files.pythonhosted.org/packages/6f/5f/deba40bc0d799b3282ad2b70843cade9da45242002ffef945409ca50063f/apache_tvm_ffi-0.1.4-cp312-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:0ef5b108285aa80e37e2510bf60c4fd6a2a53a382fb4b1fc0da9a2fa8d93c14b", size = 1984480, upload-time = "2025-11-30T07:21:12.463Z" },
-    { url = "https://files.pythonhosted.org/packages/7f/f6/4c200bae5136497710bc912414a4661d5a0316ae87cd796255cfd47c1bc5/apache_tvm_ffi-0.1.4-cp312-abi3-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:ce70e2763fc4ba160230cecd5e16d0cfde8d95330fd7f0ef82e2fa88aee28103", size = 1857622, upload-time = "2025-11-30T07:21:13.927Z" },
-    { url = "https://files.pythonhosted.org/packages/1e/b7/eb2371395e41c1a60418affbecaea2fc9324e908eea1abcac1cce60097cd/apache_tvm_ffi-0.1.4-cp312-abi3-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:92ed50530973203b6860178927943689a7189af4c8a054ef6c4197678aa698ef", size = 1966156, upload-time = "2025-11-30T07:21:15.416Z" },
-    { url = "https://files.pythonhosted.org/packages/29/71/12f7f25bb1ac90d91e09d6d825a5816846b1ae70ff9c3aae5721de92c37f/apache_tvm_ffi-0.1.4-cp312-abi3-win_amd64.whl", hash = "sha256:442bd6d80eafefbf455cd845684c454f472598e20afcc9e42c3ddfbe7eb6b136", size = 1734522, upload-time = "2025-11-30T07:21:16.711Z" },
-    { url = "https://files.pythonhosted.org/packages/64/ad/26f0e1d5229a406c41bb4ad9dd941d19ab681ff30c65efb8e08538f0f232/apache_tvm_ffi-0.1.4-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:12d92917748ee437ec3f6a67a602c4f60149b1b4f40558950b7a04477d623b5a", size = 1785538, upload-time = "2025-11-30T07:21:18.135Z" },
-    { url = "https://files.pythonhosted.org/packages/d8/b9/642b1ae04af630e70e2ac9b84ed2f33cbdd5e2661eb63aebb32782664f4b/apache_tvm_ffi-0.1.4-cp314-cp314t-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:5b95979ecf950a9147786c936c99fa119ea2493e2fd642ce10ac6ef22e857d47", size = 1923008, upload-time = "2025-11-30T07:21:19.44Z" },
-    { url = "https://files.pythonhosted.org/packages/32/d3/f27d99099d0977306f39e79607b69072d4806ce075da43d173a751e0ff19/apache_tvm_ffi-0.1.4-cp314-cp314t-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:08d4accc0d1aa4bde4f81d55e37c4cfa449d23b4f2871c87c24a0ac0eb93fe9e", size = 1991960, upload-time = "2025-11-30T07:21:21.022Z" },
-    { url = "https://files.pythonhosted.org/packages/bc/e3/befab77a55638394246bc0804cdb2d36222d78cf1ed9d4486b23a06ad2e3/apache_tvm_ffi-0.1.4-cp314-cp314t-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:e8f09299294b702c6cd381d098330db83590c2faf981342954711fdd02659c34", size = 1869760, upload-time = "2025-11-30T07:21:22.34Z" },
-    { url = "https://files.pythonhosted.org/packages/1b/b3/2920bf4fee6db0086a6bad438371fc3d68fb625891f0130fe205063f3c6d/apache_tvm_ffi-0.1.4-cp314-cp314t-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:d3a2c45c74ddc85c8d55dd927deae10fbaadaebcb1943ce6052cdb2223b056f5", size = 1976158, upload-time = "2025-11-30T07:21:23.949Z" },
-    { url = "https://files.pythonhosted.org/packages/ae/69/fe387b0f70ed608a363a90036e08ef8c1e844e5c98145502160661012dc0/apache_tvm_ffi-0.1.4-cp314-cp314t-win_amd64.whl", hash = "sha256:1bceda57240d03a3cf026334521c0595d097ab92b6d0df7485cbb37b2c056c27", size = 1794928, upload-time = "2025-11-30T07:21:25.234Z" },
+    { url = "https://files.pythonhosted.org/packages/12/8b/a39d6c6eb1a87f6003e2717695cc6d44cc65ccd57dae5a0af944c0d25751/apache_tvm_ffi-0.1.8.post2-cp312-abi3-macosx_11_0_arm64.whl", hash = "sha256:c13ec7fc8f255767998b301ace0cd1e7d17ba76b48ffeb97ca9eb22a3314e250", size = 1811882, upload-time = "2026-01-13T18:10:46.317Z" },
+    { url = "https://files.pythonhosted.org/packages/8e/3a/7b1c9edcaeaebb945038144896cf17eb828a40b6ace0371823e133132664/apache_tvm_ffi-0.1.8.post2-cp312-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:8c78b4caf17304a1f47881bccdb2f9ac24d98b3b7fbe761a6dd4fd0585934d96", size = 1967259, upload-time = "2026-01-13T18:10:47.851Z" },
+    { url = "https://files.pythonhosted.org/packages/6c/b6/463602f57dda2e1c69165c044c07061cd59404593f313a427a3ad9c02cf3/apache_tvm_ffi-0.1.8.post2-cp312-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:4a48da3fa8f47130f3502134f01e97044388c5217e7b91be4b0acec4feab81a0", size = 2044821, upload-time = "2026-01-13T18:10:49.396Z" },
+    { url = "https://files.pythonhosted.org/packages/fe/e6/9cdc7f4814b2fbdfceba5dc640c3704d07d8db18e3d1aef5aa49bbf1ba7e/apache_tvm_ffi-0.1.8.post2-cp312-abi3-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:61cc98e489ebc03bc96d1a966dc863eb1c0a607383f6bf4a416ff0a96170ca85", size = 1910964, upload-time = "2026-01-13T18:10:51.345Z" },
+    { url = "https://files.pythonhosted.org/packages/7d/f5/a2e5487cdad575fe6cf34f8a23f8c49e08ce5808fa75dc19d98bcebc20ec/apache_tvm_ffi-0.1.8.post2-cp312-abi3-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:caa48509f0c7d9b896823b492a9ee42afac2548065c1ec7ef07f9a0dc30d2796", size = 2025814, upload-time = "2026-01-13T18:10:52.804Z" },
+    { url = "https://files.pythonhosted.org/packages/8f/0d/8922c142281187ae6b989579876d00d20b84ccd3878aad487b91d951d254/apache_tvm_ffi-0.1.8.post2-cp312-abi3-win_amd64.whl", hash = "sha256:985831722d1dd562d13e8e34102fd99f42f964c53fc7cf9d80fc4f7602f89196", size = 1790204, upload-time = "2026-01-13T18:10:54.558Z" },
+    { url = "https://files.pythonhosted.org/packages/2c/6e/2c21e754adf5c08fff154ee0a75b01568a4ed5da2d8f4a4a95d8451736e0/apache_tvm_ffi-0.1.8.post2-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:4a3f6cb1173cfe19a1b66fd8577a6f3ce644bdc22691961c07c64304a7c3f17a", size = 1842240, upload-time = "2026-01-13T18:10:56.652Z" },
+    { url = "https://files.pythonhosted.org/packages/f6/0a/342dd451d714b683143bd0d7dbd26279772dedf1d827a7efd357f05ff0aa/apache_tvm_ffi-0.1.8.post2-cp314-cp314t-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:ac6c2d4e117ca63974bcd20fdf5715d01f3b4d0ed78921f493461050daf7c1a3", size = 1980660, upload-time = "2026-01-13T18:10:58.892Z" },
+    { url = "https://files.pythonhosted.org/packages/c6/63/59f00116530cf7513866467de9044dbdd1954a536009e56c44f167743b35/apache_tvm_ffi-0.1.8.post2-cp314-cp314t-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:0bc5456f971097dcd973daba32cb6f321893873c53235159ab6426b0c7bef7e2", size = 2052810, upload-time = "2026-01-13T18:11:01.698Z" },
+    { url = "https://files.pythonhosted.org/packages/46/dc/e22c784937fdc907785a764d773ef57a925c443d8ec01ad8bff43dd8d8d6/apache_tvm_ffi-0.1.8.post2-cp314-cp314t-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:7f2016b4b31e7f75d71c638bbd1ae43d6e239cf8e20b539fb9de6917b3fb25bc", size = 1923716, upload-time = "2026-01-13T18:11:03.225Z" },
+    { url = "https://files.pythonhosted.org/packages/ab/39/695f5642979d1d2d4cd3fca92e7b3b324ebba734b8aab9bdbacc26d4a05c/apache_tvm_ffi-0.1.8.post2-cp314-cp314t-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:4c0ca7be630d0888eae163a4298ddfb3f7bd837112c7e6ffcd7157e34e78215b", size = 2035440, upload-time = "2026-01-13T18:11:04.841Z" },
+    { url = "https://files.pythonhosted.org/packages/ed/e0/ed152425e51b7c8a4ce81d33683b43d87e770a76a65922dc7524a0106ae8/apache_tvm_ffi-0.1.8.post2-cp314-cp314t-win_amd64.whl", hash = "sha256:ecb0d9f7f410ba3b4d92547c2477f73f8406455448f4ea8c146515671fd20210", size = 1849938, upload-time = "2026-01-13T18:11:06.312Z" },
 ]
 
 [[package]]
@@ -1611,18 +1618,6 @@ wheels = [
 ]
 
 [[package]]
-name = "deprecated"
-version = "1.3.1"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "wrapt" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/49/85/12f0a49a7c4ffb70572b6c2ef13c90c88fd190debda93b23f026b25f9634/deprecated-1.3.1.tar.gz", hash = "sha256:b1b50e0ff0c1fddaa5708a2c6b0a6588bb09b892825ab2b214ac9ea9d92a5223", size = 2932523, upload-time = "2025-10-30T08:19:02.757Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/84/d0/205d54408c08b13550c733c4b85429e7ead111c7f0014309637425520a9a/deprecated-1.3.1-py2.py3-none-any.whl", hash = "sha256:597bfef186b6f60181535a29fbe44865ce137a5079f295b479886c82729d5f3f", size = 11298, upload-time = "2025-10-30T08:19:00.758Z" },
-]
-
-[[package]]
 name = "depyf"
 version = "0.20.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1973,7 +1968,7 @@ wheels = [
 
 [[package]]
 name = "flashinfer-python"
-version = "0.5.3"
+version = "0.6.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "apache-tvm-ffi" },
@@ -1982,8 +1977,7 @@ dependencies = [
     { name = "ninja" },
     { name = "numpy" },
     { name = "nvidia-cudnn-frontend" },
-    { name = "nvidia-cutlass-dsl", version = "4.2.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-sglang'" },
-    { name = "nvidia-cutlass-dsl", version = "4.3.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-fsdp' or extra == 'extra-7-nemo-rl-mcore' or extra != 'extra-7-nemo-rl-sglang' or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "nvidia-cutlass-dsl" },
     { name = "nvidia-ml-py" },
     { name = "packaging" },
     { name = "requests" },
@@ -1992,9 +1986,9 @@ dependencies = [
     { name = "torch", version = "2.9.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "sys_platform != 'darwin' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "tqdm" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/b4/91/cca69baeff24bb3efd12c7479a026432c8717ee47193694010494c528b22/flashinfer_python-0.5.3.tar.gz", hash = "sha256:100d59b0ede47878d2808cd3a1b9039d7a952d66338bc9f68dac192ae1b2e3f1", size = 4682367, upload-time = "2025-11-20T21:22:46.976Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/77/45/15645d2a4ee81d08206f3e132a77323e48312f510462415d7cd1122eba43/flashinfer_python-0.6.4.tar.gz", hash = "sha256:e6ab798bd1030e5ff7a3bc6952f36386c406928f60b79cf964a6db7aa7ccde75", size = 5337134, upload-time = "2026-02-19T07:33:36.647Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/76/78/6dc7e7da8cb87c9965644ea0d2439457a1bc9256c45ceda0044595be4143/flashinfer_python-0.5.3-py3-none-any.whl", hash = "sha256:b601293b72f9138bad173edc28df84b9f239a013be974e2e79d4ba98aeb38cf5", size = 6998069, upload-time = "2025-11-20T21:22:45.104Z" },
+    { url = "https://files.pythonhosted.org/packages/17/9a/d2bab76d2bb15062c6a2329614653e4f8bec9c78eec9069856ef0c7c0a79/flashinfer_python-0.6.4-py3-none-any.whl", hash = "sha256:105596b505892ae330af84e250ee0eb6fc2c3a22e8dc42bd46de1b90d36004c8", size = 7819999, upload-time = "2026-02-19T07:33:34.82Z" },
 ]
 
 [[package]]
@@ -5134,204 +5128,29 @@ wheels = [
 
 [[package]]
 name = "nvidia-cutlass-dsl"
-version = "4.2.1"
+version = "4.4.0"
 source = { registry = "https://pypi.org/simple" }
-resolution-markers = [
-    "python_full_version >= '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux'",
-    "python_full_version < '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux'",
-    "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux'",
-    "python_full_version < '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux'",
-    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux'",
-    "python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'linux'",
-    "python_full_version >= '3.13' and sys_platform == 'darwin'",
-    "python_full_version < '3.13' and sys_platform == 'darwin'",
-]
 dependencies = [
-    { name = "cuda-python", marker = "extra == 'extra-7-nemo-rl-sglang'" },
-    { name = "numpy", marker = "extra == 'extra-7-nemo-rl-sglang'" },
-    { name = "typing-extensions", marker = "extra == 'extra-7-nemo-rl-sglang'" },
+    { name = "nvidia-cutlass-dsl-libs-base" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/1e/1d/f168a3dbd8570e5dbbe0deca217d7b374c977b4a4970ebadf3b6d0f1174f/nvidia_cutlass_dsl-4.2.1-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:10ace6e2005cb0bc04d158c7660f8ec104ab29aeffb26f1ed3bb0b5a577ccc34", size = 58535504, upload-time = "2025-09-23T14:38:29.028Z" },
-    { url = "https://files.pythonhosted.org/packages/02/ab/5bcc0c8c620af5d4acbc71abce10e3eb3023e50342e6bc29b6461f72530e/nvidia_cutlass_dsl-4.2.1-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:d7ddc9c1f5bb803718d736c907fac857fc606f1fce630c0b1d741935a72723b9", size = 62230361, upload-time = "2025-09-23T14:40:18.156Z" },
-    { url = "https://files.pythonhosted.org/packages/cf/d5/9b79faaec3fa12c52b7de1e727af94c54184b00f280c79b667ab045550db/nvidia_cutlass_dsl-4.2.1-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:c0985124a74ba435e1f756aa78e89f64c6d01e4f54de1d5a5d218ebbc1c92eff", size = 58535424, upload-time = "2025-09-23T14:37:33.064Z" },
-    { url = "https://files.pythonhosted.org/packages/43/86/78c8cd3fa1a684f3976535d7ac69e54f4ede165b5abca7979fd0820f74f2/nvidia_cutlass_dsl-4.2.1-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:9356604afc8f62aac46634b3a12baf8cb3f3a6f2e44e398dcfe6ec98ff1a8d1b", size = 62230122, upload-time = "2025-09-23T14:40:46.621Z" },
+    { url = "https://files.pythonhosted.org/packages/55/09/42fca58af350265131b6f8665ad5b62526c95e6692788460bd5306d3efe2/nvidia_cutlass_dsl-4.4.0-py3-none-any.whl", hash = "sha256:2d1f34333e4d774002d44b53262d71aaf738700fcf3858290629f9a7b374c61c", size = 10168, upload-time = "2026-02-14T03:38:54.267Z" },
 ]
 
 [[package]]
-name = "nvidia-cutlass-dsl"
-version = "4.3.1"
+name = "nvidia-cutlass-dsl-libs-base"
+version = "4.4.0"
 source = { registry = "https://pypi.org/simple" }
-resolution-markers = [
-    "(python_full_version >= '3.13' and platform_machine == 'aarch64' and platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (python_full_version >= '3.15' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')",
-    "python_full_version < '3.13' and platform_machine == 'aarch64' and platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and python_full_version < '3.15' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "(python_full_version >= '3.13' and platform_machine == 'aarch64' and platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm') or (python_full_version >= '3.15' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm')",
-    "python_full_version < '3.13' and platform_machine == 'aarch64' and platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and python_full_version < '3.15' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "(python_full_version >= '3.13' and platform_machine == 'aarch64' and platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (python_full_version >= '3.15' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')",
-    "python_full_version < '3.13' and platform_machine == 'aarch64' and platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and python_full_version < '3.15' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "(python_full_version >= '3.13' and platform_machine == 'aarch64' and platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm') or (python_full_version >= '3.15' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm')",
-    "python_full_version < '3.13' and platform_machine == 'aarch64' and platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and python_full_version < '3.15' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "(python_full_version >= '3.13' and platform_machine == 'aarch64' and platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (python_full_version >= '3.15' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')",
-    "python_full_version < '3.13' and platform_machine == 'aarch64' and platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and python_full_version < '3.15' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "(python_full_version >= '3.13' and platform_machine == 'aarch64' and platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm') or (python_full_version >= '3.15' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm')",
-    "python_full_version < '3.13' and platform_machine == 'aarch64' and platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and python_full_version < '3.15' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "(python_full_version >= '3.13' and platform_machine == 'aarch64' and platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (python_full_version >= '3.15' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')",
-    "python_full_version < '3.13' and platform_machine == 'aarch64' and platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and python_full_version < '3.15' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "(python_full_version >= '3.13' and platform_machine == 'aarch64' and platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm') or (python_full_version >= '3.15' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm')",
-    "python_full_version < '3.13' and platform_machine == 'aarch64' and platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and python_full_version < '3.15' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "(python_full_version >= '3.13' and platform_machine == 'aarch64' and platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (python_full_version >= '3.15' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')",
-    "python_full_version < '3.13' and platform_machine == 'aarch64' and platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and python_full_version < '3.15' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "(python_full_version >= '3.13' and platform_machine == 'aarch64' and platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm') or (python_full_version >= '3.15' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm')",
-    "python_full_version < '3.13' and platform_machine == 'aarch64' and platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and python_full_version < '3.15' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "(python_full_version >= '3.13' and platform_machine == 'aarch64' and platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (python_full_version >= '3.15' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')",
-    "python_full_version < '3.13' and platform_machine == 'aarch64' and platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and python_full_version < '3.15' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "(python_full_version >= '3.13' and platform_machine == 'aarch64' and platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm') or (python_full_version >= '3.15' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm')",
-    "python_full_version < '3.13' and platform_machine == 'aarch64' and platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and python_full_version < '3.15' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "(python_full_version >= '3.13' and platform_machine == 'aarch64' and platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (python_full_version >= '3.15' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')",
-    "python_full_version < '3.13' and platform_machine == 'aarch64' and platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and python_full_version < '3.15' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "(python_full_version >= '3.13' and platform_machine == 'aarch64' and platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm') or (python_full_version >= '3.15' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm')",
-    "python_full_version < '3.13' and platform_machine == 'aarch64' and platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and python_full_version < '3.15' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "(python_full_version >= '3.13' and platform_machine == 'aarch64' and platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (python_full_version >= '3.15' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')",
-    "python_full_version < '3.13' and platform_machine == 'aarch64' and platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and python_full_version < '3.15' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-    "python_full_version < '3.13' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-vllm'",
-]
 dependencies = [
-    { name = "cuda-python", marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-fsdp' or extra == 'extra-7-nemo-rl-mcore' or extra != 'extra-7-nemo-rl-sglang' or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
-    { name = "numpy", marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-fsdp' or extra == 'extra-7-nemo-rl-mcore' or extra != 'extra-7-nemo-rl-sglang' or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
-    { name = "typing-extensions", marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-fsdp' or extra == 'extra-7-nemo-rl-mcore' or extra != 'extra-7-nemo-rl-sglang' or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "cuda-python" },
+    { name = "numpy" },
+    { name = "typing-extensions" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/b2/c5/f1586c64fcf569b890da776d08a32836a3ef2450cbe9e3ac2971dbecbcce/nvidia_cutlass_dsl-4.3.1-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:025a8c7a0fb80626e2a893954ea19b2e1ece8d131078c7da12b7fabc2634d04d", size = 58726236, upload-time = "2025-11-28T00:59:29.376Z" },
-    { url = "https://files.pythonhosted.org/packages/dc/5b/fe6a2db1688a690a94f8ad03706fa6db2055d82fab0c4fab764e8c89640f/nvidia_cutlass_dsl-4.3.1-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:b95ce5633e09f12c8d1fcd30c5db06b8325d41b3da0875d3e8a4c110ed5b5cdf", size = 58591826, upload-time = "2025-11-28T01:00:19.559Z" },
-    { url = "https://files.pythonhosted.org/packages/40/fe/5e48c63ff5a510c0edbac5167921a819c70f71daf3b6ead0e0e5346b2a42/nvidia_cutlass_dsl-4.3.1-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:c8e816cc061b34e016906fa87948f2b0fa836a95f27732c14097f3ddda8286e2", size = 58725695, upload-time = "2025-11-28T01:01:32.1Z" },
-    { url = "https://files.pythonhosted.org/packages/9c/ef/34b1bdd375226b818cd810145e207cceb50fd12eaa87e88a6e67820574d4/nvidia_cutlass_dsl-4.3.1-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:f71adcfb56607fc86ea621edcf9503eaa31f66f70efd7ab719c33683db082183", size = 58592065, upload-time = "2025-11-28T01:02:35.83Z" },
+    { url = "https://files.pythonhosted.org/packages/33/34/63a1dce4d65cd6fd29b9d50286abbfcdd965c3ca2156cf423eda2ab1fc5d/nvidia_cutlass_dsl_libs_base-4.4.0-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:9cde72efb065d9bea29a92ca85835eaedec20bf89af22798d2d2a551ccd51731", size = 75458501, upload-time = "2026-02-14T03:45:15.866Z" },
+    { url = "https://files.pythonhosted.org/packages/cf/ae/5bbd3c9d7909d64a7f139b480c70ff3220554f64775e941c95438265ef1f/nvidia_cutlass_dsl_libs_base-4.4.0-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:e31a2fcc9854417242ee072c9b8fd1257d5ee422166dfd85eb3f8784fee34dd8", size = 74345995, upload-time = "2026-02-14T03:45:42.9Z" },
+    { url = "https://files.pythonhosted.org/packages/48/5c/c76ec134e0fbd4ee2f31b32e1fbcb727e7f6323d136a3fc7a8ea3aa3e75d/nvidia_cutlass_dsl_libs_base-4.4.0-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:ad63fe382b36f69f2a9b51d35e95cbcb240565d06a990e5a19a8eacae49c8b94", size = 75456473, upload-time = "2026-02-14T03:43:51.005Z" },
+    { url = "https://files.pythonhosted.org/packages/32/22/65c0abbc8518d3f80b5d8adbd8cec640f16f8c0620b01cfbecbfd14d6899/nvidia_cutlass_dsl_libs_base-4.4.0-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:b0eb94678159f750db6bf214d79e0b815e9b5a53fad3925fda53e1591cbdeb0d", size = 74345762, upload-time = "2026-02-14T03:46:09.745Z" },
 ]
 
 [[package]]
@@ -5631,15 +5450,15 @@ wheels = [
 
 [[package]]
 name = "opentelemetry-api"
-version = "1.33.1"
+version = "1.39.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "deprecated" },
     { name = "importlib-metadata" },
+    { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/9a/8d/1f5a45fbcb9a7d87809d460f09dc3399e3fbd31d7f3e14888345e9d29951/opentelemetry_api-1.33.1.tar.gz", hash = "sha256:1c6055fc0a2d3f23a50c7e17e16ef75ad489345fd3df1f8b8af7c0bbf8a109e8", size = 65002, upload-time = "2025-05-16T18:52:41.146Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/97/b9/3161be15bb8e3ad01be8be5a968a9237c3027c5be504362ff800fca3e442/opentelemetry_api-1.39.1.tar.gz", hash = "sha256:fbde8c80e1b937a2c61f20347e91c0c18a1940cecf012d62e65a7caf08967c9c", size = 65767, upload-time = "2025-12-11T13:32:39.182Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/05/44/4c45a34def3506122ae61ad684139f0bbc4e00c39555d4f7e20e0e001c8a/opentelemetry_api-1.33.1-py3-none-any.whl", hash = "sha256:4db83ebcf7ea93e64637ec6ee6fabee45c5cbe4abd9cf3da95c43828ddb50b83", size = 65771, upload-time = "2025-05-16T18:52:17.419Z" },
+    { url = "https://files.pythonhosted.org/packages/cf/df/d3f1ddf4bb4cb50ed9b1139cc7b1c54c34a1e7ce8fd1b9a37c0d1551a6bd/opentelemetry_api-1.39.1-py3-none-any.whl", hash = "sha256:2edd8463432a7f8443edce90972169b195e7d6a05500cd29e6d13898187c9950", size = 66356, upload-time = "2025-12-11T13:32:17.304Z" },
 ]
 
 [[package]]
@@ -5658,41 +5477,41 @@ wheels = [
 
 [[package]]
 name = "opentelemetry-proto"
-version = "1.38.0"
+version = "1.39.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "protobuf" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/51/14/f0c4f0f6371b9cb7f9fa9ee8918bfd59ac7040c7791f1e6da32a1839780d/opentelemetry_proto-1.38.0.tar.gz", hash = "sha256:88b161e89d9d372ce723da289b7da74c3a8354a8e5359992be813942969ed468", size = 46152, upload-time = "2025-10-16T08:36:01.612Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/49/1d/f25d76d8260c156c40c97c9ed4511ec0f9ce353f8108ca6e7561f82a06b2/opentelemetry_proto-1.39.1.tar.gz", hash = "sha256:6c8e05144fc0d3ed4d22c2289c6b126e03bcd0e6a7da0f16cedd2e1c2772e2c8", size = 46152, upload-time = "2025-12-11T13:32:48.681Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/b6/6a/82b68b14efca5150b2632f3692d627afa76b77378c4999f2648979409528/opentelemetry_proto-1.38.0-py3-none-any.whl", hash = "sha256:b6ebe54d3217c42e45462e2a1ae28c3e2bf2ec5a5645236a490f55f45f1a0a18", size = 72535, upload-time = "2025-10-16T08:35:45.749Z" },
+    { url = "https://files.pythonhosted.org/packages/51/95/b40c96a7b5203005a0b03d8ce8cd212ff23f1793d5ba289c87a097571b18/opentelemetry_proto-1.39.1-py3-none-any.whl", hash = "sha256:22cdc78efd3b3765d09e68bfbd010d4fc254c9818afd0b6b423387d9dee46007", size = 72535, upload-time = "2025-12-11T13:32:33.866Z" },
 ]
 
 [[package]]
 name = "opentelemetry-sdk"
-version = "1.33.1"
+version = "1.39.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "opentelemetry-api" },
     { name = "opentelemetry-semantic-conventions" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/67/12/909b98a7d9b110cce4b28d49b2e311797cffdce180371f35eba13a72dd00/opentelemetry_sdk-1.33.1.tar.gz", hash = "sha256:85b9fcf7c3d23506fbc9692fd210b8b025a1920535feec50bd54ce203d57a531", size = 161885, upload-time = "2025-05-16T18:52:52.832Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/eb/fb/c76080c9ba07e1e8235d24cdcc4d125ef7aa3edf23eb4e497c2e50889adc/opentelemetry_sdk-1.39.1.tar.gz", hash = "sha256:cf4d4563caf7bff906c9f7967e2be22d0d6b349b908be0d90fb21c8e9c995cc6", size = 171460, upload-time = "2025-12-11T13:32:49.369Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/df/8e/ae2d0742041e0bd7fe0d2dcc5e7cce51dcf7d3961a26072d5b43cc8fa2a7/opentelemetry_sdk-1.33.1-py3-none-any.whl", hash = "sha256:19ea73d9a01be29cacaa5d6c8ce0adc0b7f7b4d58cc52f923e4413609f670112", size = 118950, upload-time = "2025-05-16T18:52:37.297Z" },
+    { url = "https://files.pythonhosted.org/packages/7c/98/e91cf858f203d86f4eccdf763dcf01cf03f1dae80c3750f7e635bfa206b6/opentelemetry_sdk-1.39.1-py3-none-any.whl", hash = "sha256:4d5482c478513ecb0a5d938dcc61394e647066e0cc2676bee9f3af3f3f45f01c", size = 132565, upload-time = "2025-12-11T13:32:35.069Z" },
 ]
 
 [[package]]
 name = "opentelemetry-semantic-conventions"
-version = "0.54b1"
+version = "0.60b1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "deprecated" },
     { name = "opentelemetry-api" },
+    { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/5b/2c/d7990fc1ffc82889d466e7cd680788ace44a26789809924813b164344393/opentelemetry_semantic_conventions-0.54b1.tar.gz", hash = "sha256:d1cecedae15d19bdaafca1e56b29a66aa286f50b5d08f036a145c7f3e9ef9cee", size = 118642, upload-time = "2025-05-16T18:52:53.962Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/91/df/553f93ed38bf22f4b999d9be9c185adb558982214f33eae539d3b5cd0858/opentelemetry_semantic_conventions-0.60b1.tar.gz", hash = "sha256:87c228b5a0669b748c76d76df6c364c369c28f1c465e50f661e39737e84bc953", size = 137935, upload-time = "2025-12-11T13:32:50.487Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/0a/80/08b1698c52ff76d96ba440bf15edc2f4bc0a279868778928e947c1004bdd/opentelemetry_semantic_conventions-0.54b1-py3-none-any.whl", hash = "sha256:29dab644a7e435b58d3a3918b58c333c92686236b30f7891d5e51f02933ca60d", size = 194938, upload-time = "2025-05-16T18:52:38.796Z" },
+    { url = "https://files.pythonhosted.org/packages/7a/5e/5958555e09635d09b75de3c4f8b9cae7335ca545d77392ffe7331534c402/opentelemetry_semantic_conventions-0.60b1-py3-none-any.whl", hash = "sha256:9fa8c8b0c110da289809292b0591220d3a7b53c1526a23021e977d68597893fb", size = 219982, upload-time = "2025-12-11T13:32:36.955Z" },
 ]
 
 [[package]]
@@ -7681,7 +7500,7 @@ dependencies = [
     { name = "msgspec" },
     { name = "ninja" },
     { name = "numpy" },
-    { name = "nvidia-cutlass-dsl", version = "4.2.1", source = { registry = "https://pypi.org/simple" } },
+    { name = "nvidia-cutlass-dsl" },
     { name = "nvidia-ml-py" },
     { name = "openai" },
     { name = "openai-harmony" },
