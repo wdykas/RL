@@ -153,12 +153,15 @@ fi
 
 # ---------- Persistent cache directories ----------
 # Shared project-level cache so all team members reuse compiled artifacts
-# (vLLM, FlashInfer cubins, Deep Gemm JIT, Triton, Inductor, uv).
+# (vLLM, FlashInfer cubins/workspace, Deep Gemm JIT, Triton, Inductor, uv).
 #
-# Permissions strategy:
-#   - setgid (g+s) on directories → new entries inherit the project group
-#   - Default POSIX ACLs (setfacl -d) → new files/dirs get group rwx regardless of the creating process's umask
-#   - umask 002 for mkdir -p → top-level dirs are group-writable immediately
+# Permission strategy:
+#   1. setgid (g+s)         → new files/dirs inherit the project group
+#   2. setfacl default ACLs → new files/dirs get group rwx regardless of
+#                              the creating process's umask. This propagates
+#                              to arbitrarily nested subdirectories (e.g.
+#                              FlashInfer's .cache/flashinfer/0.6.5/…) because
+#                              new directories inherit the parent's default ACL.
 PERSISTENT_CACHE="${PERSISTENT_CACHE:-/lustre/fsw/portfolios/llmservice/projects/llmservice_nemotron_ultra/nemo_rl/persistent_cache}"
 VLLM_CACHE_DIR="${PERSISTENT_CACHE}/vllm_compile_cache"
 FLASHINFER_CUBIN_CACHE="${PERSISTENT_CACHE}/flashinfer_cubins"
@@ -178,14 +181,11 @@ if ! touch "${PERSISTENT_CACHE}/.cache_write_test" 2>/dev/null; then
 fi
 rm -f "${PERSISTENT_CACHE}/.cache_write_test"
 
-(umask 002 && mkdir -p "${VLLM_CACHE_DIR}" "${FLASHINFER_CUBIN_CACHE}" "${FLASHINFER_WS_BASE}" \
+_CACHE_DIRS=("${PERSISTENT_CACHE}" "${VLLM_CACHE_DIR}" "${FLASHINFER_CUBIN_CACHE}" "${FLASHINFER_WS_BASE}" \
   "${LUSTRE_INDUCTOR_CACHE}" "${LUSTRE_TRITON_CACHE}")
-chmod g+rwxs "${PERSISTENT_CACHE}" "${VLLM_CACHE_DIR}" "${FLASHINFER_CUBIN_CACHE}" "${FLASHINFER_WS_BASE}" \
-  "${LUSTRE_INDUCTOR_CACHE}" "${LUSTRE_TRITON_CACHE}" 2>/dev/null || true
-# Default ACLs ensure any new file/dir created by any process (even with umask 022) inherits group rwx. 
-# This fixes the vLLM per-rank cache dirs (vllm_compile_cache_XXXX) that were being created without group write.
-for _d in "${PERSISTENT_CACHE}" "${VLLM_CACHE_DIR}" "${FLASHINFER_CUBIN_CACHE}" \
-          "${FLASHINFER_WS_BASE}" "${LUSTRE_INDUCTOR_CACHE}" "${LUSTRE_TRITON_CACHE}"; do
+mkdir -p "${_CACHE_DIRS[@]}"
+chmod g+rwxs "${_CACHE_DIRS[@]}" 2>/dev/null || true
+for _d in "${_CACHE_DIRS[@]}"; do
   setfacl -d -m g::rwx "${_d}" 2>/dev/null || true
 done
 
@@ -299,7 +299,7 @@ echo "Persistent cache root: ${PERSISTENT_CACHE}"
 # All static config (parallelism, vLLM kwargs, judge server_args, sequence
 # packing, etc.) lives in grpo_ultra_v3.yaml. Only per-run variables are
 # overridden here.
-TRAIN_CMD="cd ${CODE_ROOT} && umask 002 && date ; \
+TRAIN_CMD="cd ${CODE_ROOT} && date ; \
 ${VLLM_ENV_SOURCE}\
 OMP_NUM_THREADS=16 \
 RAY_DEDUP_LOGS=1 \
@@ -348,25 +348,32 @@ ${*}"
 # Overlay mounts
 # =============================================================================
 # Local source directories are bind-mounted into the container so edits on
-# Lustre take effect without rebuilding the container. Each mount can be
-# overridden via an env var or disabled by setting it to empty string.
+# Lustre take effect without rebuilding the container.
 #
+# MOUNTED BY DEFAULT:
 #   NRL_NEMO_RL_DIR      → /opt/nemo-rl/nemo_rl          (Python package)
 #   NRL_CONFIGS_DIR      → /opt/nemo-rl/examples/configs  (YAML configs)
-#   NRL_MEGATRON_LM_DIR  → /opt/nemo-rl/3rdparty/Megatron-LM-workspace/Megatron-LM
+#
+# OPT-IN ONLY (set the env var to enable — overlaying these shadows prebuilt
+# venvs and compiled artifacts inside the container, forcing expensive
+# re-creation at startup):
+#   NRL_MEGATRON_LM_DIR     → /opt/nemo-rl/3rdparty/Megatron-LM-workspace/Megatron-LM
 #   NRL_MEGATRON_BRIDGE_DIR → /opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge
-#   NRL_GYM_DIR          → /opt/nemo-rl/3rdparty/Gym-workspace/Gym
-#   NRL_VLLM_DIR         → /opt/nemo-rl/3rdparty/vllm
+#   NRL_GYM_DIR             → /opt/nemo-rl/3rdparty/Gym-workspace/Gym
+#   NRL_VLLM_DIR            → /opt/nemo-rl/3rdparty/vllm
+#
+# To enable a 3rdparty mount, set the var to the host path. Example:
+#   NRL_GYM_DIR=/path/to/Gym ./launch_ultra_pipeclean.sh
 #
 # Paths that don't exist on disk are silently skipped (container built-ins
-# are used instead). Set any var to "" to explicitly skip that mount.
+# are used instead). Set any var to "" to explicitly skip a default mount.
 # =============================================================================
 NRL_NEMO_RL_DIR="${NRL_NEMO_RL_DIR:-${OVERLAY_SOURCE}/nemo_rl}"
 NRL_CONFIGS_DIR="${NRL_CONFIGS_DIR:-${OVERLAY_SOURCE}/examples/configs}"
-NRL_MEGATRON_LM_DIR="${NRL_MEGATRON_LM_DIR:-${OVERLAY_SOURCE}/3rdparty/Megatron-LM-workspace/Megatron-LM}"
-NRL_MEGATRON_BRIDGE_DIR="${NRL_MEGATRON_BRIDGE_DIR:-${OVERLAY_SOURCE}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge}"
-NRL_GYM_DIR="${NRL_GYM_DIR:-${OVERLAY_SOURCE}/3rdparty/Gym-workspace/Gym}"
-NRL_VLLM_DIR="${NRL_VLLM_DIR:-${OVERLAY_SOURCE}/3rdparty/vllm}"
+NRL_MEGATRON_LM_DIR="${NRL_MEGATRON_LM_DIR:-}"
+NRL_MEGATRON_BRIDGE_DIR="${NRL_MEGATRON_BRIDGE_DIR:-}"
+NRL_GYM_DIR="${NRL_GYM_DIR:-}"
+NRL_VLLM_DIR="${NRL_VLLM_DIR:-}"
 
 _maybe_mount() {
   local src="$1" dst="$2" label="$3"
