@@ -141,7 +141,7 @@ if [[ -n "$TEARDOWN_COMMAND" ]]; then
 fi
 
 # Number of GPUs per worker node
-GPUS_PER_NODE=${GPUS_PER_NODE:-8}
+GPUS_PER_NODE=${GPUS_PER_NODE:-4}
 
 # Detect GRES support and set GRES_ARG
 GRES_ARG=$(maybe_gres_arg)
@@ -161,7 +161,7 @@ COMMON_SRUN_ARGS+=" --container-workdir=$SLURM_SUBMIT_DIR"
 COMMON_SRUN_ARGS+=" -p $SLURM_JOB_PARTITION"
 COMMON_SRUN_ARGS+=" -A $SLURM_JOB_ACCOUNT"
 # Number of CPUs per worker node
-CPUS_PER_WORKER=${CPUS_PER_WORKER:-112}
+CPUS_PER_WORKER=${CPUS_PER_WORKER:-144}
 
 num_retries=3
 
