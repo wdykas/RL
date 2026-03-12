@@ -20,16 +20,16 @@ REPO_ROOT="$(realpath "$SCRIPT_DIR/..")"
 
 
 # Parse command line arguments
-GIT_URL=${1:-https://github.com/vllm-project/vllm.git}
-GIT_REF=${2:-cc99baf14dacc2497d0c5ed84e076ef2c37f6a4d}
+GIT_URL=${1:-https://github.com/TomerBN-Nvidia/vllm.git}
+GIT_REF=${2:-ultra-rl-v0.17}
 # NOTE: VLLM_USE_PRECOMPILED=1 didn't always seem to work since the wheels were sometimes built against an incompatible torch/cuda combo.
-# This commit was chosen as one close to the v0.10 release: git merge-base --fork-point origin/main tags/v0.10.0
+# You need to export VLLM_PRECOMPILED_WHEEL_LOCATION to the full path of the wheel file.
 if [[ -n "${3:-}" ]]; then
   VLLM_PRECOMPILED_WHEEL_LOCATION="$3"
 elif [[ "$(uname -m)" == "aarch64" ]]; then
-  VLLM_PRECOMPILED_WHEEL_LOCATION="https://github.com/vllm-project/vllm/releases/download/v0.13.0/vllm-0.13.0-cp38-abi3-manylinux_2_31_aarch64.whl"
+  VLLM_PRECOMPILED_WHEEL_LOCATION="https://github.com/vllm-project/vllm/releases/download/v0.17.0/vllm-0.17.0-cp38-abi3-manylinux_2_31_aarch64.whl"
 else
-  VLLM_PRECOMPILED_WHEEL_LOCATION="https://github.com/vllm-project/vllm/releases/download/v0.13.0/vllm-0.13.0-cp38-abi3-manylinux_2_31_x86_64.whl"
+  VLLM_PRECOMPILED_WHEEL_LOCATION="https://github.com/vllm-project/vllm/releases/download/v0.17.0/vllm-0.17.0-cp38-abi3-manylinux_2_31_x86_64.whl"
 fi
 export VLLM_PRECOMPILED_WHEEL_LOCATION
 
@@ -46,9 +46,7 @@ echo "  Vllm Wheel location: $VLLM_PRECOMPILED_WHEEL_LOCATION"
 
 # Clone the repository
 echo "Cloning repository..."
-# When running inside Docker with --mount=type=ssh, the known_hosts file is empty.
-# Skip host key verification for internal builds (only applies to SSH URLs).
-GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" git clone "$GIT_URL" "$BUILD_DIR"
+git clone "$GIT_URL" "$BUILD_DIR"
 cd "$BUILD_DIR"
 git checkout "$GIT_REF"
 
@@ -63,9 +61,6 @@ uv venv
 echo "Removing comments from requirements files..."
 find requirements/ -name "*.txt" -type f -exec sed -i 's/#.*$//' {} \; 2>/dev/null || true
 find requirements/ -name "*.txt" -type f -exec sed -i '/^[[:space:]]*$/d' {} \; 2>/dev/null || true
-# Replace xformers==.* (but preserve any platform markers at the end)
-# NOTE: that xformers is bumped from 0.0.30 to 0.0.31 to work with torch==2.7.1. This version may need to change to change when we upgrade torch.
-find requirements/ -name "*.txt" -type f -exec sed -i -E 's/^(xformers)==[^;[:space:]]*/\1==0.0.32.post1/' {} \; 2>/dev/null || true
 
 uv run --no-project use_existing_torch.py
 
@@ -73,7 +68,7 @@ uv run --no-project use_existing_torch.py
 echo "Installing dependencies..."
 uv pip install --upgrade pip
 uv pip install numpy setuptools setuptools_scm
-uv pip install torch==2.9.0 --torch-backend=cu129
+uv pip install torch==2.10.0 --torch-backend=cu129
 
 # Install vLLM using precompiled wheel
 echo "Installing vLLM with precompiled wheel..."

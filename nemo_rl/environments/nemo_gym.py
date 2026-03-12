@@ -11,22 +11,69 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
+import subprocess
 from pathlib import Path
-from typing import Any, Dict, List, TypedDict
+from typing import Any, Dict, List, Optional, TypedDict
 
 import ray
 import torch
 from transformers import PreTrainedTokenizerBase
 
-from nemo_rl.distributed.virtual_cluster import _get_free_port_local, _get_node_ip_local
+from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_PORT_RANGE_HIGH,
+    DEFAULT_PORT_RANGE_LOW,
+    _get_free_port_local,
+    _get_node_ip_local,
+)
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.utils.timer import Timer
+
+
+def get_nemo_gym_uv_cache_dir() -> Optional[str]:
+    """Return the uv cache directory inside a container, or None outside one.
+
+    Inside a container (NRL_CONTAINER=1), returns the uv cache location so Gym
+    stores its caches in the expected shared path. Returns None outside a
+    container, meaning the caller should omit this arg and let Gym create the
+    cache locally (the default when you may not be able to write to /opt).
+    """
+    if not os.environ.get("NRL_CONTAINER"):
+        return None
+    return subprocess.check_output(["uv", "cache", "dir"]).decode().strip()
+
+
+def get_nemo_gym_venv_dir() -> Optional[str]:
+    """Return the NeMo Gym venv directory from NEMO_GYM_VENV_DIR, or None.
+
+    Returns the value of NEMO_GYM_VENV_DIR if set, otherwise None. When None
+    the caller should omit this arg and let Gym create venvs locally (the
+    default when a container is not used since you may not be able to write
+    to /opt).
+    """
+    return os.environ.get("NEMO_GYM_VENV_DIR")
 
 
 class NemoGymConfig(TypedDict):
     model_name: str
     base_urls: List[str]
+    ray_gpu_nodes: List[str]
+    ray_gpu_pgs: List
+    ray_num_gpus_per_node: Optional[int]
+    ray_namespace: Optional[str]
     initial_global_config_dict: Dict[str, Any]
+    invalid_tool_call_patterns: Optional[List[str]]  # Substrings in assistant text content that indicate an invalid tool call (default: ["<tool_call>", "</tool_call>", "<function_call>", "</function_call>"])
+    thinking_tags: Optional[List[str]]  # Thinking tags to check for malformed usage (default: ["<think>", "</think>"])
+
+
+class GenRMCompareConfig(TypedDict, total=False):
+    """Configuration for GenRM batch comparison."""
+
+    enabled: bool
+    agent_names: List[str]
+    server_name: str
+    num_generations_per_prompt: int
+    policy_model_server_name: str
 
 
 @ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
@@ -36,8 +83,11 @@ class NemoGym(EnvironmentInterface):
     def __init__(self, cfg: NemoGymConfig):
         self.cfg = cfg
 
+    def _spinup(self) -> None:
         self.node_ip = _get_node_ip_local()
-        self.head_server_port = _get_free_port_local()
+        port_range_low = self.cfg.get("port_range_low", DEFAULT_PORT_RANGE_LOW)
+        port_range_high = self.cfg.get("port_range_high", DEFAULT_PORT_RANGE_HIGH)
+        self.head_server_port = _get_free_port_local(port_range_low, port_range_high)
 
         from nemo_gym.cli import GlobalConfigDictParserConfig, RunHelper
         from nemo_gym.rollout_collection import RolloutCollectionHelper
@@ -57,6 +107,18 @@ class NemoGym(EnvironmentInterface):
         )
         initial_global_config_dict["policy_base_url"] = self.cfg["base_urls"]
 
+        # Gym servers default to 15001-20000 so they don't collide with NeMo RL
+        # master-address ports (11001-15000) or vLLM engine ports (20001+).
+        _gym_port_low = self.cfg.get("port_range_low", 15001)
+        _gym_port_high = self.cfg.get("port_range_high", 20000)
+        if _gym_port_low < 15001 or _gym_port_high > 20000:
+            print(
+                f"WARNING: Gym port range [{_gym_port_low}, {_gym_port_high}) overlaps "
+                f"with NeMo RL (11001-15000) or vLLM (20001+). Consider adjusting."
+            )
+        initial_global_config_dict["port_range_low"] = _gym_port_low
+        initial_global_config_dict["port_range_high"] = _gym_port_high
+
         initial_global_config_dict.setdefault(
             "global_aiohttp_connector_limit_per_host", 16_384
         )
@@ -75,6 +137,24 @@ Depending on your data shape, you may want to change these values."""
 
         initial_global_config_dict["ray_head_node_address"] = ray_context.gcs_address
         print(f"Ray head node address: {ray_context.gcs_address}")
+
+        ray_namespace = self.cfg.get("ray_namespace", None)
+        if ray_namespace is not None:
+            initial_global_config_dict["ray_namespace"] = ray_namespace
+            print(f"Ray namespace: {ray_namespace}")
+
+        initial_global_config_dict["ray_gpu_nodes"] = self.cfg["ray_gpu_nodes"]
+        # ray_gpu_pgs are Ray PlacementGroup objects — can't go through OmegaConf.
+        # They are passed separately to the scheduling helper via set_gpu_pgs().
+        initial_global_config_dict["ray_num_gpus_per_node"] = self.cfg[
+            "ray_num_gpus_per_node"
+        ]
+        print(
+            f"Ray reserved GPU nodes: {len(initial_global_config_dict['ray_gpu_nodes'])}"
+        )
+        print(
+            f"Ray num GPUs per node: {initial_global_config_dict['ray_num_gpus_per_node']}"
+        )
 
         # Head server
         initial_global_config_dict[HEAD_SERVER_KEY_NAME] = {
@@ -97,7 +177,9 @@ Depending on your data shape, you may want to change these values."""
                 / "nemo_gym_env.yaml",
                 initial_global_config_dict=DictConfig(initial_global_config_dict),
                 skip_load_from_cli=True,
-            )
+            ),
+            ray_gpu_pgs=self.cfg["ray_gpu_pgs"],
+            ray_gpu_nodes=self.cfg["ray_gpu_nodes"],
         )
 
         # Setup for rollout collection
@@ -107,23 +189,44 @@ Depending on your data shape, you may want to change these values."""
         )
         self.rch = RolloutCollectionHelper()
 
-    def health_check(self) -> bool:
-        return True
-
     async def run_rollouts(
         self,
         nemo_gym_examples: list[dict],
         tokenizer: PreTrainedTokenizerBase,
         timer_prefix: str,
+        genrm_config: Optional[GenRMCompareConfig] = None,
     ) -> list[dict]:
-        timer = Timer()
+        timer = Timer(context={"worker": "nemo_gym"})
+
+        # Build comparison strategy if GenRM is enabled
+        comparison_strategy = None
+        if genrm_config and genrm_config.get("enabled", False):
+            from nemo_gym.comparison_strategies import (
+                GenRMStrategy,
+                GenRMStrategyConfig,
+            )
+
+            comparison_strategy = GenRMStrategy(
+                GenRMStrategyConfig(
+                    agent_names=genrm_config.get("agent_names", ["genrm_simple_agent"]),
+                    genrm_compare_server_name=genrm_config.get(
+                        "server_name", "genrm_compare"
+                    ),
+                    policy_model_server_name=genrm_config.get("policy_model_server_name", "policy_model"),
+                    num_generations_per_prompt=genrm_config.get(
+                        "num_generations_per_prompt", 16
+                    ),
+                )
+            )
 
         timer.start("_run_rollouts_total")
         max_attempts, trial = self.rollout_max_attempts_to_avoid_lp_nan, 0
         while trial < max_attempts:
             nemo_gym_num_rows = len(nemo_gym_examples)
             nemo_gym_result_iterator = self.rch.run_examples(
-                examples=nemo_gym_examples, head_server_config=self.head_server_config
+                examples=nemo_gym_examples,
+                head_server_config=self.head_server_config,
+                comparison_strategy=comparison_strategy,
             )
 
             nemo_rl_rowidxs = []
@@ -182,7 +285,9 @@ Depending on your data shape, you may want to change these values."""
         )
 
         nemo_rl_message_log = []
-        seen_token_ids: List[int] = []
+        seen_token_ids = torch.tensor([])
+
+        batch_decode_items = []  # Collect (output_item_dict, prompt_token_ids, generation_token_ids) for batch decode
         for output_item_dict in nemo_gym_result["response"]["output"]:
             # Nemo RL really only has two types of messages: assistant and not assistant since that is all that it is concerned with (i.e. to train or not to train)
             # Here we map all the trainable messages to assistant and all the non-trainable messages to user.
@@ -192,45 +297,123 @@ Depending on your data shape, you may want to change these values."""
             if "generation_token_ids" not in output_item_dict:
                 continue
 
-            assert (
-                seen_token_ids
-                == output_item_dict["prompt_token_ids"][: len(seen_token_ids)]
-            ), f"""Non-contiguous messages found! This may be a tokenization issue where certain tokens are combined when messages are concatenated, or it may be due to part of the chat history being truncated (like if super long history is truncated or if reasoning is stripped out).
-Seen token IDs: {seen_token_ids}
+            prompt_token_ids_tensor = torch.tensor(output_item_dict["prompt_token_ids"])
+            n_seen = len(seen_token_ids)
+            if n_seen > 0:
+                assert torch.equal(
+                    seen_token_ids, prompt_token_ids_tensor[:n_seen]
+                ), f"""Non-contiguous messages found! This may be a tokenization issue where certain tokens are combined when messages are concatenated, or it may be due to part of the chat history being truncated (like if super long history is truncated or if reasoning is stripped out).
+Seen token IDs: {seen_token_ids.tolist()}
 Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
 """
+
+            n_seen = len(seen_token_ids)
+
+            # Create tensors for new tokens
+            new_prompt_token_ids = torch.tensor(
+                output_item_dict["prompt_token_ids"][n_seen:]
+            )
+            generation_token_ids = torch.tensor(
+                output_item_dict["generation_token_ids"]
+            )
+            generation_logprobs = torch.tensor(output_item_dict["generation_log_probs"])
+
 
             nemo_rl_message_log.append(
                 {
                     "role": "user",
                     "content": "",
-                    "token_ids": torch.tensor(
-                        output_item_dict["prompt_token_ids"][len(seen_token_ids) :]
-                    ),
+                    "token_ids": new_prompt_token_ids,
                 }
             )
+            # Valid tool calls go through the structured API (tool_calls field) and get
+            # executed by NeMo-Gym. If tool call patterns appear in the text content instead,
+            # the call was invalid and never executed — flag it so training can penalize it.
+            invalid_tool_call_patterns = self.cfg.get("invalid_tool_call_patterns") or ["<tool_call>", "</tool_call>", "<function_call>", "</function_call>"]
+            thinking_tags = self.cfg.get("thinking_tags") or ["<think>", "</think>"]
+            is_invalid_tool_call = False
+
+            # NeMo-Gym only attaches generation_token_ids to the last output item of a
+            # model call (see vllm_model/app.py postprocess_chat_response). So this item
+            # is guaranteed to be the final thing the model produced for this turn.
+            # If it's a reasoning item, the model output only reasoning (no content/tool calls).
+            is_output_message = "content" in output_item_dict and len(output_item_dict["content"]) > 0 and "text" in output_item_dict["content"][0]
+            is_reasoning_message = output_item_dict.get("type") == "reasoning" and len(output_item_dict["summary"]) > 0 and "text" in output_item_dict["summary"][0]
+
+            # Penalize malformed thinking tags: more than one of any thinking tag in
+            # reasoning, or any thinking tag leaking into the final answer content.
+            has_malformed_thinking = False
+
+            if is_output_message:
+                assistant_message_content = output_item_dict["content"][0]["text"]
+                if any(pattern in assistant_message_content for pattern in invalid_tool_call_patterns):
+                    is_invalid_tool_call = True
+                if any(tag in assistant_message_content for tag in thinking_tags):
+                    has_malformed_thinking = True
+            elif is_reasoning_message:
+                assistant_message_content = output_item_dict["summary"][0]["text"]
+                if any(pattern in assistant_message_content for pattern in invalid_tool_call_patterns):
+                    is_invalid_tool_call = True
+                if any(assistant_message_content.count(tag) > 1 for tag in thinking_tags):
+                    has_malformed_thinking = True
+
             nemo_rl_message_log.append(
                 {
                     "role": "assistant",
                     "content": "",
-                    "token_ids": torch.tensor(output_item_dict["generation_token_ids"]),
-                    "generation_logprobs": torch.tensor(
-                        output_item_dict["generation_log_probs"]
-                    ),
+                    "token_ids": generation_token_ids,
+                    "generation_logprobs": generation_logprobs,
+                    "is_invalid_tool_call": is_invalid_tool_call,
+                    "has_malformed_thinking": has_malformed_thinking,
                 }
             )
 
-            seen_token_ids.extend(nemo_rl_message_log[-2]["token_ids"])
-            seen_token_ids.extend(nemo_rl_message_log[-1]["token_ids"])
+            seen_token_ids = torch.cat(
+                [seen_token_ids, new_prompt_token_ids, generation_token_ids]
+            )
 
             # We pop to remove larger tensors from logging.
-            output_item_dict["prompt_str"] = tokenizer.decode(
-                output_item_dict.pop("prompt_token_ids")
+            prompt_token_ids_for_decode = output_item_dict.pop("prompt_token_ids")
+            generation_token_ids_for_decode = output_item_dict.pop(
+                "generation_token_ids"
             )
-            output_item_dict["generation_str"] = tokenizer.decode(
-                output_item_dict.pop("generation_token_ids")
-            )
+
             output_item_dict.pop("generation_log_probs")
+
+            batch_decode_items.append(
+                (
+                    output_item_dict,
+                    prompt_token_ids_for_decode,
+                    generation_token_ids_for_decode,
+                )
+            )
+
+        if batch_decode_items:
+            prompt_token_ids_batch = [item[1] for item in batch_decode_items]
+            generation_token_ids_batch = [item[2] for item in batch_decode_items]
+
+            prompt_strs = tokenizer.batch_decode(prompt_token_ids_batch)
+            generation_strs = tokenizer.batch_decode(generation_token_ids_batch)
+
+            for (output_item_dict, _, _), prompt_str, generation_str in zip(
+                batch_decode_items, prompt_strs, generation_strs
+            ):
+                output_item_dict["prompt_str"] = prompt_str
+                output_item_dict["generation_str"] = generation_str
+
+        if not nemo_rl_message_log:
+            input_messages = nemo_gym_result["responses_create_params"]["input"]
+            prompt_token_ids = tokenizer.apply_chat_template(
+                input_messages, tokenize=True
+            )
+            raise ValueError(
+                f"NeMo Gym returned a result with no generation data. "
+                f"This typically means the prompt for the first turn already exceeds the vLLM max_model_len, "
+                f"so vLLM rejected the request before any tokens could be generated.\n"
+                f"  Prompt length: {len(prompt_token_ids)} tokens.\n"
+                f"  → Fix: increase `policy.max_total_sequence_length` and `policy.generation.vllm_cfg.max_model_len` "
+                f"to a value larger than {len(prompt_token_ids)}."
+            )
 
         return {
             "message_log": nemo_rl_message_log,

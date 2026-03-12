@@ -21,7 +21,6 @@ import wandb.util
 
 wandb.util.VALUE_BYTES_LIMIT = 10_000_000
 
-import ray
 from omegaconf import OmegaConf
 from wandb import Table
 
@@ -42,10 +41,8 @@ from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.utils import setup_response_data
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.nemo_gym import (
-    NemoGymConfig,
     setup_nemo_gym_config,
 )
-from nemo_rl.environments.utils import create_env
 from nemo_rl.experience.rollouts import run_async_nemo_gym_rollout
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import (
@@ -191,9 +188,14 @@ The validation set you pass in will directly be used for validation with no addi
 
     init_ray()
 
+    is_trajectory_collection = (
+        config["env"]["nemo_gym"].pop("is_trajectory_collection", False) or False
+    )
+
     (
         policy,
         policy_generation,
+        nemo_gym_env,
         cluster,
         dataloader,
         val_dataloader,
@@ -204,22 +206,7 @@ The validation set you pass in will directly be used for validation with no addi
         master_config,
     ) = setup(config, tokenizer, train_dataset, val_dataset)
 
-    is_trajectory_collection = (
-        config["env"]["nemo_gym"].pop("is_trajectory_collection", False) or False
-    )
-    policy_generation.prepare_for_generation()
-    nemo_gym_config = NemoGymConfig(
-        model_name=policy_generation.cfg["model_name"],
-        base_urls=policy_generation.dp_openai_server_base_urls,
-        initial_global_config_dict=config["env"]["nemo_gym"],
-    )
-    nemo_gym = create_env(env_name="nemo_gym", env_config=nemo_gym_config)
-    # Blocking wait for NeMo-Gym to spin up
-    ray.get(nemo_gym.health_check.remote())
-
-    # Bind task_to_env and val_task_to_env for nemo_gym env
-    # Hardcode here to match `run_async_nemo_gym_rollout`
-    task_to_env = {"nemo_gym": nemo_gym}
+    task_to_env = {"nemo_gym": nemo_gym_env}
     val_task_to_env = task_to_env
 
     if is_trajectory_collection:
@@ -232,7 +219,55 @@ The validation set you pass in will directly be used for validation with no addi
             logger=logger,
             master_config=master_config,
         )
+    # Check if async mode is enabled
+    elif "async_grpo" in config["grpo"] and config["grpo"]["async_grpo"]["enabled"]:
+        # Async GRPO does not support dynamic sampling, reward scaling, or reward shaping (DAPO features)
+        unsupported_features = [
+            "use_dynamic_sampling",
+            "reward_scaling",
+            "reward_shaping",
+        ]
+
+        for feature in unsupported_features:
+            if feature not in config["grpo"]:
+                continue
+
+            if feature == "use_dynamic_sampling":
+                if config["grpo"][feature]:
+                    raise NotImplementedError(
+                        f"{feature} is not supported with async GRPO"
+                    )
+            else:
+                if config["grpo"][feature]["enabled"]:
+                    raise NotImplementedError(
+                        f"{feature} is not supported with async GRPO"
+                    )
+
+        from nemo_rl.algorithms.grpo import async_grpo_train
+
+        print("🚀 Running async GRPO training")
+
+        async_config = config["grpo"]["async_grpo"]
+        # Run async GRPO training
+        async_grpo_train(
+            policy=policy,
+            policy_generation=policy_generation,
+            dataloader=dataloader,
+            val_dataloader=val_dataloader,
+            tokenizer=tokenizer,
+            loss_fn=loss_fn,
+            task_to_env=task_to_env,
+            val_task_to_env=val_task_to_env,
+            logger=logger,
+            checkpointer=checkpointer,
+            grpo_save_state=grpo_state,
+            master_config=master_config,
+            max_trajectory_age_steps=async_config["max_trajectory_age_steps"],
+        )
     else:
+        print("🚀 Running synchronous GRPO training")
+
+        # Run standard GRPO training
         grpo_train(
             policy,
             policy_generation,

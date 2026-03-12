@@ -151,6 +151,10 @@ policy:
     cuda_graph_scope: null
     use_te_rng_tracker: true
     inference_rng_tracker: true
+    mtp_loss_scaling_factor: 0.0
+    mtp_use_repeated_layer: false
+    mtp_num_layers: 0
+    mtp_detach_heads: false
 
     optimizer:
       optimizer: "adam"

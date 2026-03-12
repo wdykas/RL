@@ -43,13 +43,12 @@ CACHED_DEPENDENCIES = [
     "qwen-vl-utils",
     "transformer-engine[pytorch,core_cu13]>=2.10.0a0,<2.13.0",
     "mamba-ssm",
-    "nvidia-resiliency-ext",
+    "nvidia-resiliency-ext~=0.4.1",
     "causal-conv1d",
     "flash-linear-attention",
     "timm",
     "open-clip-torch>=3.2.0",
     "mlflow>=3.5.0",
-    "torch>=2.6.0",
 ]
 
 # If the bridge source exists, compare cached dependencies with the submodule's pyproject
