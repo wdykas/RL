@@ -771,6 +771,8 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             enable_chunked_prefill=enable_chunked_prefill,
             pg_collection=pg_collection,
             mamba_inference_state_config=mamba_inference_state_config,
+            mamba_memory_ratio=0.25,
+            logging_step_interval=100
          )
 
         # Create inference context
@@ -818,14 +820,14 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         The engine's start_listening_to_data_parallel_coordinator returns the
         actual coordinator address (dp_addr) which is used to create the client.
         """
-        dp_addr = await self.dynamic_inference_engine.start_listening_to_data_parallel_coordinator(
+        self.coordinator_addr = await self.dynamic_inference_engine.start_listening_to_data_parallel_coordinator(
             inference_coordinator_port=coordinator_port,
             launch_inference_coordinator=True,
         )
         rank = torch.distributed.get_rank()
         if rank == 0:
             from megatron.core.inference.inference_client import InferenceClient
-            self.inference_client = InferenceClient(inference_coordinator_address=dp_addr)
+            self.inference_client = InferenceClient(inference_coordinator_address=self.coordinator_addr)
             result = self.inference_client.start()
             if result is not None:
                 await result
@@ -1182,20 +1184,19 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         return self.base_url
 
     def _setup_openai_api_server(self) -> str:
-        from megatron.core.inference.text_generation_server.dynamic_text_gen_server.flask_server import run_flask_server_on_client
+        from megatron.core.inference.text_generation_server.dynamic_text_gen_server.text_generation_server import start_text_gen_server
 
         from nemo_rl.distributed.virtual_cluster import _get_node_ip_local, _get_free_port_local
         ip = _get_node_ip_local()
         free_port = _get_free_port_local()
 
-        server_task = asyncio.create_task(
-            run_flask_server_on_client(
-                client=self.inference_client,
-                tokenizer=self.megatron_tokenizer,
-                parsers=self.cfg["generation"]["mcore_generation_config"].get("parsers", []),
-                flask_port=free_port,
-                verbose=True,
-            )
+        start_text_gen_server(
+            coordinator_addr=self.coordinator_addr,
+            tokenizer=self.megatron_tokenizer,
+            rank=torch.distributed.get_rank(),
+            server_port=free_port,
+            parsers=self.cfg["generation"]["mcore_generation_config"].get("parsers", []),
+            verbose=True,
         )
 
         time.sleep(10)

@@ -275,8 +275,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         self.cfg = config
         # Non-colocated Megatron uses swap_model_weights for refit
-        megatron_enabled = bool(config.get("megatron_cfg", {}).get("enabled", False))
-        generation_cfg = config.get("generation", {}) or {}
+        generation_cfg = config.get("generation")
+        megatron_enabled = generation_cfg.get("backend") == "megatron"
         colocated = generation_cfg.get("colocated", {}).get("enabled", True)
         self._uses_megatron_refit = megatron_enabled and not colocated
         self._refit_dst_rank_offset = 0

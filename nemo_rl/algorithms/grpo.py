@@ -1043,15 +1043,21 @@ def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
 
     # Validate the setup for training with NeMo-Gym
     assert _should_use_async_rollouts(master_config), (
-        "❌ Error: In order to use NeMo-Gym, you must use vllm generation backend with `async_engine: true`!"
+        "❌ Error: In order to use NeMo-Gym, you must use generation backend with `async_engine: true`!"
     )
 
     generation_config = master_config["policy"]["generation"]
 
     # We piggyback off of `_should_use_async_rollouts` to guarantee the existence of these configs.
-    should_expose_http_server = generation_config["vllm_cfg"].get("expose_http_server")
+    if generation_config["backend"] == "vllm":
+        should_expose_http_server = generation_config["vllm_cfg"].get("expose_http_server")
+    elif generation_config["backend"] == "megatron":
+        should_expose_http_server = generation_config["mcore_generation_config"].get("expose_http_server")
+    else:
+        should_expose_http_server = False
+
     assert should_expose_http_server, (
-        "In order to use NeMo-Gym, you must expose the vllm server via `expose_http_server: true`!"
+        "In order to use NeMo-Gym, you must expose the generation server via `expose_http_server: true`!"
     )
 
     return should_use_nemo_gym
