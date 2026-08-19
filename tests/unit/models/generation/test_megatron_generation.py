@@ -22,7 +22,10 @@ import torch
 from nemo_rl.algorithms.grpo import refit_policy_generation
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
+from nemo_rl.distributed.ray_actor_environment_registry import (
+    ACTOR_ENVIRONMENT_REGISTRY,
+)
+from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES, RayVirtualCluster
 from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
@@ -554,13 +557,13 @@ def test_megatron_generation_non_colocated_refit(
 # a deterministic, loud stand-in for RL drift.
 #
 # Expected outcomes on the current (pre-fix) code:
-#   N1 graphed non-colocated : FAIL at generation 1 (init-A baked at engine
-#                              construction, before the first refit) — the
-#                              field report's case.
+#   N1 graphed non-colocated : PASS on this revision because the initial lazy
+#                              refresh is captured and replayed with live A_log.
 #   N2 eager non-colocated   : diagnostic — measures whether construction
 #                              decodes without graphs; FAIL at generation 2.
-#   D1/D2 dual-mode          : PASS (training model, armed every cycle; hybrid
-#                              dual-mode decode runs eagerly, so refills land).
+#   D1 graphed dual-mode     : FAIL the direct cache check at generation 2;
+#                              tiny-model logprob parity can mask the stale A.
+#   D2 eager dual-mode       : PASS because the Python lazy refresh runs.
 #   R1 graphed reshard       : PASS gen 1 (swap precedes capture), FAIL gen 2.
 #   R2 eager reshard         : diagnostic — FAIL at generation 2.
 # Dense models are the control: the existing tests in this file cover them.
@@ -571,6 +574,21 @@ _MAMBA_DEBUG_WORKER_FQN = (
     "tests.unit.models.generation.mamba_cache_debug_worker."
     "MambaCacheDebugMegatronWorker"
 )
+
+
+@pytest.fixture
+def register_mamba_debug_worker():
+    """Register the debug worker in the MCore actor environment for this test."""
+    original = ACTOR_ENVIRONMENT_REGISTRY.get(_MAMBA_DEBUG_WORKER_FQN)
+    ACTOR_ENVIRONMENT_REGISTRY[_MAMBA_DEBUG_WORKER_FQN] = PY_EXECUTABLES.SYSTEM
+
+    yield
+
+    if original is None:
+        del ACTOR_ENVIRONMENT_REGISTRY[_MAMBA_DEBUG_WORKER_FQN]
+    else:
+        ACTOR_ENVIRONMENT_REGISTRY[_MAMBA_DEBUG_WORKER_FQN] = original
+
 
 _A_LOG_PERTURBATION = 1.0
 _PARITY_GATE = 1.05
@@ -625,6 +643,7 @@ def _tiny_hybrid_config(model_path, *, colocated, reshard, cuda_graph_impl):
         # A differing layout + impl forces the dedicated inference model (#3490).
         gen_cfg["tensor_model_parallel_size"] = 1
         gen_cfg["transformer_impl"] = "inference_optimized"
+        gen_cfg["moe_router_dtype"] = "fp32"
     return config
 
 
@@ -675,7 +694,12 @@ def _generation_parity(policy, outputs, input_data):
     _CACHE_MATRIX_CELLS,
 )
 def test_mamba_decode_cache_freshness(
-    tiny_nemotronh_model_path, cell, colocated, reshard, cuda_graph_impl
+    tiny_nemotronh_model_path,
+    register_mamba_debug_worker,
+    cell,
+    colocated,
+    reshard,
+    cuda_graph_impl,
 ):
     """Refit-delivered A_log updates must reach hybrid decode (matrix above)."""
     config = _tiny_hybrid_config(
@@ -693,15 +717,16 @@ def test_mamba_decode_cache_freshness(
     gen_cluster = None
     try:
         if colocated:
+            num_gpus = 2 if reshard else 1
             train_cluster = RayVirtualCluster(
-                bundle_ct_per_node_list=[2],
+                bundle_ct_per_node_list=[num_gpus],
                 use_gpus=True,
                 max_colocated_worker_groups=2,
-                num_gpus_per_node=2,
+                num_gpus_per_node=num_gpus,
                 name=f"mamba-cache-{cell}-cluster",
             )
-            if train_cluster.num_gpus_per_node < 2:
-                pytest.skip("Need 2 GPUs for the colocated cells")
+            if reshard and train_cluster.num_gpus_per_node < 2:
+                pytest.skip("Need 2 GPUs for the colocated reshard cell")
             policy = Policy(
                 cluster=train_cluster,
                 config=config,
@@ -712,6 +737,7 @@ def test_mamba_decode_cache_freshness(
             mg = MegatronGeneration(
                 config=config, tokenizer=hybrid_tokenizer, policy=policy
             )
+            mg.prepare_for_generation()
         else:
             train_cluster = RayVirtualCluster(
                 bundle_ct_per_node_list=[1],
@@ -757,10 +783,16 @@ def test_mamba_decode_cache_freshness(
         # Cycle 1: generate with the initial (refit-delivered or shared) weights.
         outputs1 = mg.generate(input_data, greedy=False)
         _assert_valid_generation_output(outputs1, input_data)
+        cache1 = (
+            _run_debug(policy, "debug_mamba_cache_report")
+            if colocated and not reshard
+            else None
+        )
         if colocated:
             mg.finish_generation()
         parity1 = _generation_parity(policy, outputs1, input_data)
-        cache1 = _run_debug(policy, "debug_mamba_cache_report") if colocated else None
+        if reshard:
+            cache1 = _run_debug(policy, "debug_mamba_cache_report")
         print(f"[{cell}] generation 1: parity={parity1:.4f} cache={cache1}")
 
         # The deterministic RL-drift stand-in, plus the arming the training
@@ -782,10 +814,16 @@ def test_mamba_decode_cache_freshness(
             refit_policy_generation(policy, mg, False)
         outputs2 = mg.generate(input_data, greedy=False)
         _assert_valid_generation_output(outputs2, input_data)
+        cache2 = (
+            _run_debug(policy, "debug_mamba_cache_report")
+            if colocated and not reshard
+            else None
+        )
         if colocated:
             mg.finish_generation()
         parity2 = _generation_parity(policy, outputs2, input_data)
-        cache2 = _run_debug(policy, "debug_mamba_cache_report") if colocated else None
+        if reshard:
+            cache2 = _run_debug(policy, "debug_mamba_cache_report")
         print(f"[{cell}] generation 2: parity={parity2:.4f} cache={cache2}")
 
         assert parity1 <= _PARITY_GATE, (

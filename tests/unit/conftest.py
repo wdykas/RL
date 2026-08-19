@@ -646,11 +646,11 @@ def tiny_nemotronh_model_path():
     pytest.importorskip("transformers.models.nemotron_h")
     from transformers import AutoTokenizer, NemotronHConfig, NemotronHForCausalLM
 
-    model_path = os.path.join(TEST_ASSETS_DIR, "tiny_nemotronh_with_llama3.2_tokenizer")
+    model_path = os.path.join(TEST_ASSETS_DIR, "tiny_nemotronh_with_qwen3_tokenizer")
     # Dims chosen TP2-safe (every sharded dim divisible by 2) and Mamba2-consistent:
     # d_inner = mamba_num_heads * mamba_head_dim = 256 = 2 * hidden_size.
     # Pattern "M*M-" = mamba, attention, mamba, MLP (no MoE: isolates the A cache).
-    # vocab_size=128256 so we can re-use the llama3.2 1b tokenizer.
+    # vocab_size=151936 so we can re-use the public Qwen3 tokenizer.
     config = NemotronHConfig(
         num_hidden_layers=4,
         hybrid_override_pattern="M*M-",
@@ -663,12 +663,12 @@ def tiny_nemotronh_model_path():
         ssm_state_size=64,
         n_groups=2,
         chunk_size=128,
-        vocab_size=128256,
+        vocab_size=151936,
         tie_word_embeddings=False,
         use_bias=False,
     )
     model = NemotronHForCausalLM(config=config)
-    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
     shutil.rmtree(model_path, ignore_errors=True)
     model.save_pretrained(model_path)
     tokenizer.save_pretrained(model_path)

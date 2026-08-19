@@ -21,11 +21,13 @@ it). See ``test_megatron_generation.py::test_mamba_decode_cache_freshness``.
 
 from typing import Any
 
+import ray
 import torch
 from megatron.core.ssm.mamba_mixer import MambaMixer
 
+from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.megatron_policy_worker import (
-    MegatronPolicyWorker,
+    MegatronPolicyWorkerImpl,
 )
 
 
@@ -48,7 +50,8 @@ def _iter_mixers(model: Any):
             yield name, module
 
 
-class MambaCacheDebugMegatronWorker(MegatronPolicyWorker):
+@ray.remote(runtime_env=get_runtime_env_for_policy_worker("megatron_policy_worker"))
+class MambaCacheDebugMegatronWorker(MegatronPolicyWorkerImpl):
     """MegatronPolicyWorker plus white-box probes for the A-cache repro test."""
 
     def debug_mamba_cache_report(self) -> list[dict[str, Any]]:
