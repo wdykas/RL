@@ -104,6 +104,7 @@ uv run coverage run -a \
     logger.wandb_enabled=false \
     logger.monitor_gpus=true \
     checkpointing.enabled=false \
+    policy.megatron_cfg.checkpoint.async_save=false \
     "$@" \
     2>&1 | tee "$RUN_LOG"
 
@@ -118,5 +119,5 @@ else
 fi
 
 uv run tests/json_dump_tb_logs.py "$LOG_DIR" --output_path "$JSON_METRICS"
-uv run tests/check_metrics.py "$JSON_METRICS" \
+uv run python tests/check_metrics.py "$JSON_METRICS" \
     "max(data[\"train/token_mult_prob_error\"]) < $max_token_mult_prob_error"

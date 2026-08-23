@@ -19,8 +19,8 @@ import threading
 import time
 import warnings
 from collections import Counter
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Literal, Optional
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional
 
 import requests
 import torch
@@ -31,6 +31,7 @@ from megatron.core.inference.config import (
 )
 from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+from megatron.core.inference.quantization.utils import resolve_mxfp8_backend
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.resharding.copy_services.gloo_copy_service import GlooCopyService
 from megatron.core.resharding.copy_services.nccl_copy_service import NCCLCopyService
@@ -95,81 +96,32 @@ def _configure_inference_optimized_layer_spec(model_provider: Any) -> bool:
 
 def _resolve_mxfp8_refit_backend(model_config: Any) -> str:
     """Resolve the MXFP8 storage required by the grouped-GEMM backend."""
-    try:
-        from megatron.core.inference.quantization.utils import (
-            resolve_mxfp8_backend,
-        )
-    except ImportError:
-        grouped_gemm_backend = getattr(
-            model_config.inference_grouped_gemm_backend,
-            "value",
-            model_config.inference_grouped_gemm_backend,
-        )
-        if grouped_gemm_backend == "torch":
-            return "triton"
-        if grouped_gemm_backend == "flashinfer":
-            return "flashinfer"
-        raise ValueError(
-            "MXFP8 inference does not support "
-            f"inference_grouped_gemm_backend={grouped_gemm_backend!r}."
-        )
     return resolve_mxfp8_backend(model_config.inference_grouped_gemm_backend)
-
-
-def _refresh_generation_caches(model_chunks: list[torch.nn.Module]) -> None:
-    """Refresh parameter-derived MCore caches after an in-place Bridge refit."""
-    for model_chunk in model_chunks:
-        for module in unwrap_model(model_chunk).modules():
-            if not isinstance(module, MegatronModule):
-                continue
-            refresh_cache = getattr(module, "refresh_cache", None)
-            if callable(refresh_cache):
-                refresh_cache()
-    torch.cuda.synchronize()
-
-
-class _RefittableMXFP8Tensor(MXFP8Tensor):
-    """MXFP8 storage with the logical tensor metadata Bridge needs for import."""
-
-    def __init__(
-        self,
-        tensor: MXFP8Tensor,
-        *,
-        shape: torch.Size,
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> None:
-        super().__init__(data=tensor.data, scale=tensor.scale, backend=tensor.backend)
-        self._logical_shape = shape
-        self._logical_dtype = dtype
-        self._logical_device = device
-
-    @property
-    def shape(self) -> torch.Size:
-        return self._logical_shape
-
-    @property
-    def dtype(self) -> torch.dtype:
-        return self._logical_dtype
-
-    @property
-    def device(self) -> torch.device:
-        return self._logical_device
 
 
 @dataclass
 class _MegatronRefitTask:
-    """A local Bridge import task and its persistent inference destination."""
+    """A Bridge import task and its mutable inference destination."""
 
-    param_name: str
-    mapping: Any
-    megatron_module: torch.nn.Module
+    conversion_task: Any
     destination: Any
-    dependencies: tuple[str, ...]
-    expected_shape: torch.Size
     target_id: int
-    global_param_name: str | None = None
-    is_mxfp8: bool = False
+
+    @property
+    def param_name(self) -> str:
+        return self.conversion_task.param_name
+
+    @property
+    def dependencies(self) -> tuple[str, ...]:
+        return self.conversion_task.hf_param_names
+
+    @property
+    def expected_shape(self) -> torch.Size:
+        return torch.Size(self.destination.shape)
+
+    @property
+    def is_mxfp8(self) -> bool:
+        return isinstance(self.destination, MXFP8Tensor)
 
 
 @dataclass
@@ -177,7 +129,7 @@ class _MegatronBulkRefitPiece:
     """One HF-local shard and the Megatron destination region it populates."""
 
     task: _MegatronRefitTask
-    component: Literal["full", "gate", "up"]
+    spec: Any
     shape: torch.Size
     dtype: torch.dtype
     device: torch.device
@@ -995,12 +947,6 @@ class MegatronGenerationRefitMixin:
 
         return True
 
-    @staticmethod
-    def _hf_dependencies(mapping: Any) -> tuple[str, ...]:
-        hf_param = mapping.hf_param
-        names = (hf_param,) if isinstance(hf_param, str) else tuple(hf_param.values())
-        return tuple(dict.fromkeys(names))
-
     def init_nccl_reshard_comm_groups_generation(
         self,
         *,
@@ -1029,10 +975,10 @@ class MegatronGenerationRefitMixin:
     def _commit_megatron_bulk_refit_piece(
         self, piece: _MegatronBulkRefitPiece, tensor: torch.Tensor
     ) -> None:
-        """Commit one received HF-local piece to BF16 or persistent MXFP8 storage."""
+        """Commit one received HF-local weight to its inference destination."""
         if tensor.shape != piece.shape:
             raise ValueError(
-                f"Shape mismatch for Megatron bulk refit component {piece.component!r} "
+                f"Shape mismatch for Megatron bulk refit weight {piece.spec.name!r} "
                 f"of {piece.task.param_name!r}: expected {tuple(piece.shape)}, "
                 f"got {tuple(tensor.shape)}."
             )
@@ -1041,15 +987,16 @@ class MegatronGenerationRefitMixin:
             piece.destination.copy_(tensor)
             return
 
-        if piece.component == "full":
-            self._write_generation_refit_weight(piece.task, tensor)
-            return
-
         pending = self._generation_m2n_pending.setdefault(piece.task.target_id, {})
-        pending[piece.component] = tensor
-        if "gate" in pending and "up" in pending:
-            fused = torch.cat([pending["gate"], pending["up"]], dim=0)
-            self._write_generation_refit_weight(piece.task, fused)
+        pending[piece.spec.name] = tensor
+        required = {
+            spec.name for spec in piece.task.conversion_task.local_hf_param_specs()
+        }
+        if required.issubset(pending):
+            logical_weight = piece.task.conversion_task.combine_local_hf_weights(
+                pending
+            )
+            self._write_generation_refit_weight(piece.task, logical_weight)
             del self._generation_m2n_pending[piece.task.target_id]
 
     def _build_megatron_bulk_refit_map(
@@ -1058,14 +1005,6 @@ class MegatronGenerationRefitMixin:
         tasks: list[_MegatronRefitTask],
     ) -> tuple["HFToLocalParamMap", set[int]]:
         """Map M-to-N's canonical HF FFN shards onto local Megatron storage."""
-        from megatron.bridge.models.conversion.param_mapping import (
-            FusedExpertMapping,
-            FusedGatedExpertMapping,
-            GatedMLPMapping,
-        )
-        from megatron.bridge.utils.common_utils import (
-            extract_expert_number_from_param,
-        )
         from nemo_rl.weight_sync.nccl_reshard_utils import (
             HFToLocalParamMap,
             LocalParamSpec,
@@ -1076,83 +1015,25 @@ class MegatronGenerationRefitMixin:
 
         pieces: dict[str, _MegatronBulkRefitPiece] = {}
 
-        def add_piece(
-            name: str,
-            task: _MegatronRefitTask,
-            component: Literal["full", "gate", "up"],
-            shape: torch.Size,
-            destination: torch.Tensor | None,
-        ) -> None:
-            if name in pieces:
-                raise RuntimeError(f"Duplicate Megatron M-to-N target for {name!r}.")
-            pieces[name] = _MegatronBulkRefitPiece(
+        def add_piece(task: _MegatronRefitTask, spec: Any) -> None:
+            if spec.name in pieces:
+                raise RuntimeError(
+                    f"Duplicate Megatron M-to-N target for {spec.name!r}."
+                )
+            destination = None if task.is_mxfp8 else spec.select(task.destination)
+            pieces[spec.name] = _MegatronBulkRefitPiece(
                 task=task,
-                component=component,
-                shape=shape,
+                spec=spec,
+                shape=spec.selected_shape(task.expected_shape),
                 dtype=task.destination.dtype,
                 device=task.destination.device,
                 destination=destination,
             )
 
         for task in tasks:
-            mapping = task.mapping
-            destination = None if task.is_mxfp8 else task.destination
-
-            if isinstance(mapping, GatedMLPMapping):
-                if task.expected_shape[0] % 2:
-                    raise ValueError(
-                        f"Expected an even gated-MLP dimension for {task.param_name!r}."
-                    )
-                component_shape = torch.Size(
-                    (task.expected_shape[0] // 2, *task.expected_shape[1:])
-                )
-                destination_parts = (
-                    (None, None)
-                    if destination is None
-                    else tuple(torch.chunk(destination, 2, dim=0))
-                )
-                for component, target in zip(
-                    ("gate", "up"), destination_parts, strict=True
-                ):
-                    name = mapping.hf_param[component]
-                    if is_nccl_reshard_param(name):
-                        add_piece(name, task, component, component_shape, target)
-                continue
-
-            if isinstance(mapping, FusedGatedExpertMapping):
-                global_name = task.global_param_name or task.param_name
-                expert_index = extract_expert_number_from_param(global_name)
-                if task.expected_shape[0] % 2:
-                    raise ValueError(
-                        f"Expected an even fused-expert dimension for {task.param_name!r}."
-                    )
-                prefix = str(mapping.hf_param)[: -len(".gate_up_proj")]
-                component_shape = torch.Size(
-                    (task.expected_shape[0] // 2, *task.expected_shape[1:])
-                )
-                destination_parts = (
-                    (None, None)
-                    if destination is None
-                    else tuple(torch.chunk(destination, 2, dim=0))
-                )
-                for component, target in zip(
-                    ("gate", "up"), destination_parts, strict=True
-                ):
-                    name = f"{prefix}.{expert_index}.{component}_proj.weight"
-                    add_piece(name, task, component, component_shape, target)
-                continue
-
-            if isinstance(mapping, FusedExpertMapping):
-                global_name = task.global_param_name or task.param_name
-                expert_index = extract_expert_number_from_param(global_name)
-                prefix = str(mapping.hf_param)[: -len(".down_proj")]
-                name = f"{prefix}.{expert_index}.down_proj.weight"
-                add_piece(name, task, "full", task.expected_shape, destination)
-                continue
-
-            hf_param = mapping.hf_param
-            if isinstance(hf_param, str) and is_nccl_reshard_param(hf_param):
-                add_piece(hf_param, task, "full", task.expected_shape, destination)
+            for spec in task.conversion_task.local_hf_param_specs():
+                if is_nccl_reshard_param(spec.name):
+                    add_piece(task, spec)
 
         expert_pieces: dict[
             tuple[str, str], list[tuple[int, _MegatronBulkRefitPiece]]
@@ -1232,75 +1113,49 @@ class MegatronGenerationRefitMixin:
         return HFToLocalParamMap(specs=specs), bulk_target_ids
 
     def _prepare_mxfp8_refit(self, tasks: list[_MegatronRefitTask]) -> None:
-        """Replace inference FP8 parameters with persistent MCore MXFP8 storage."""
+        """Install persistent MCore MXFP8 destinations before engine initialization."""
         model_chunks = (
             self.model if isinstance(self.model, (list, tuple)) else [self.model]
         )
         cores = [unwrap_model(model) for model in model_chunks]
-        needs_mxfp8 = any(
-            getattr(core.config, "transformer_impl", None) == "inference_optimized"
-            and getattr(core.config, "fp8_recipe", None) == "mxfp8"
+        mxfp8_cores = [
+            core
             for core in cores
-        )
-        if not needs_mxfp8:
+            if getattr(core.config, "transformer_impl", None) == "inference_optimized"
+            and getattr(core.config, "fp8_recipe", None) == "mxfp8"
+        ]
+        if not mxfp8_cores:
             return
-        if len(cores) != 1:
-            raise NotImplementedError(
-                "Packed Megatron MXFP8 refit does not yet support virtual pipeline stages."
-            )
-        core = cores[0]
-        if (
-            getattr(core.config, "share_embeddings_and_output_weights", False)
-            and getattr(core.config, "pipeline_model_parallel_size", 1) > 1
-        ):
-            raise NotImplementedError(
-                "Packed Megatron MXFP8 refit does not yet support tied embeddings "
-                "across pipeline stages."
-            )
         if self._inference_engine_initialized:
             raise RuntimeError(
                 "MXFP8 refit buffers must be prepared before inference-engine "
                 "initialization; construct MegatronGeneration with skip_weight_load=True."
             )
 
-        from megatron.bridge.models.conversion.utils import (
-            get_module_and_param_from_name,
-        )
         from megatron.core.inference.quantization.utils import (
-            collect_mxfp8_param_metadata,
             quantize_params_to_mxfp8,
         )
 
-        decoder = core.decoder if hasattr(core, "decoder") else core
-        param_name_by_id = {
-            id(param): name for name, param in decoder.named_parameters()
-        }
-        logical_metadata = collect_mxfp8_param_metadata(decoder)
-        backend = _resolve_mxfp8_refit_backend(core.config)
-        persistent_buffers = quantize_params_to_mxfp8(decoder, backend=backend)
-
-        # Bridge mappings query the destination's logical shape/dtype/device.
-        # MCore's MXFP8 wrapper intentionally exposes only physical data/scale,
-        # so use a thin subclass that shares those exact persistent allocations.
-        for name, tensor in tuple(persistent_buffers.items()):
-            shape, dtype, device = logical_metadata[name]
-            refittable = _RefittableMXFP8Tensor(
-                tensor, shape=shape, dtype=dtype, device=device
+        destination_by_id: dict[int, MXFP8Tensor] = {}
+        for core in mxfp8_cores:
+            decoder = core.decoder if hasattr(core, "decoder") else core
+            param_name_by_id = {
+                id(param): name for name, param in decoder.named_parameters()
+            }
+            persistent_buffers = quantize_params_to_mxfp8(
+                decoder, backend=_resolve_mxfp8_refit_backend(core.config)
             )
-            module, current = get_module_and_param_from_name(decoder, name)
-            if current is not tensor:
-                raise RuntimeError(
-                    f"MXFP8 destination changed while preparing {name!r}."
-                )
-            setattr(module, name.rsplit(".", 1)[-1], refittable)
-            persistent_buffers[name] = refittable
+            destination_by_id.update(
+                {
+                    param_id: persistent_buffers[name]
+                    for param_id, name in param_name_by_id.items()
+                    if name in persistent_buffers
+                }
+            )
 
         for task in tasks:
-            decoder_name = param_name_by_id.get(task.target_id)
-            if decoder_name not in persistent_buffers:
-                continue
-            task.is_mxfp8 = True
-            task.destination = persistent_buffers[decoder_name]
+            if task.target_id in destination_by_id:
+                task.destination = destination_by_id[task.target_id]
 
     def _build_generation_refit_tasks(
         self,
@@ -1321,14 +1176,9 @@ class MegatronGenerationRefitMixin:
                 )
             tasks.append(
                 _MegatronRefitTask(
-                    param_name=conversion_task.param_name,
-                    mapping=conversion_task.mapping,
-                    megatron_module=conversion_task.megatron_module,
+                    conversion_task=replace(conversion_task, param_weight=None),
                     destination=destination,
-                    dependencies=self._hf_dependencies(conversion_task.mapping),
-                    expected_shape=torch.Size(destination.shape),
                     target_id=id(destination),
-                    global_param_name=conversion_task.global_param_name,
                 )
             )
 
@@ -1488,17 +1338,7 @@ class MegatronGenerationRefitMixin:
                 f"expected {tuple(task.expected_shape)}, got {tuple(converted_weight.shape)}."
             )
 
-        if task.is_mxfp8:
-            converted_weight = converted_weight.to(torch.bfloat16).contiguous()
-            quantized_weight = MXFP8Tensor.from_bf16(
-                converted_weight, backend=task.destination.backend
-            )
-            task.destination.data.copy_(quantized_weight.data)
-            task.destination.scale.view(torch.uint8).copy_(
-                quantized_weight.scale.view(torch.uint8)
-            )
-        else:
-            task.destination.copy_(converted_weight)
+        task.destination.copy_(converted_weight)
 
     def _load_generation_refit_batch(
         self, weights: list[tuple[str, torch.Tensor]]
@@ -1532,13 +1372,8 @@ class MegatronGenerationRefitMixin:
                 if current_stream is not None and source_stream is not None:
                     current_stream.wait_stream(source_stream)
 
-            hf_weights = (
-                self.megatron_bridge._model_bridge.maybe_modify_loaded_hf_weight(
-                    task.mapping.hf_param, self._generation_refit_pending_weights
-                )
-            )
-            converted_weight = task.mapping.hf_to_megatron(
-                hf_weights, task.megatron_module
+            converted_weight = self.megatron_bridge.convert_hf_weight(
+                task.conversion_task, self._generation_refit_pending_weights
             )
             if converted_weight is None:
                 raise RuntimeError(
@@ -1586,10 +1421,8 @@ class MegatronGenerationRefitMixin:
                     f"missing inputs: {missing}."
                 )
 
-            self.megatron_bridge._model_bridge._broadcast_shared_embeddings(
-                self._generation_refit_model_chunks
-            )
-            _refresh_generation_caches(self._generation_refit_model_chunks)
+            self.megatron_bridge.finalize_hf_import(self._generation_refit_model_chunks)
+            torch.cuda.synchronize()
             return True
         finally:
             self._generation_refit_pending_weights.clear()

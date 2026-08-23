@@ -218,16 +218,16 @@ generation side maps those HF names onto whatever its own storage layout is.
   their persistent MCore storage. Misc weights continue through Megatron Bridge's
   packed-broadcast import path.
 
-**To extend to a new backend**, the only piece with genuinely new logic is
-`build_hf_to_local_param_map`. Everything else is boilerplate that follows a fixed
-contract and can be copied from the existing backend almost verbatim.
+**To extend to a new backend**, provide a destination map from canonical HF weights
+to that backend's local storage. vLLM implements this as
+`build_hf_to_local_param_map`; Megatron derives it from Bridge conversion tasks.
+Everything else follows the fixed transport contract.
 
-**The one backend-specific implementation — `build_hf_to_local_param_map`:** resolve
-each bulk HF name to your local storage as a `LocalParamSpec` — `base` for tensors
-sent/received as-is, and `pre`/`post` hooks wherever your layout requires staging
-(fused/merged tensors, layout conversions, grouped-expert stacking). This is the *only*
-place your backend's parameter layout is encoded; all cross-mesh byte movement is
-already handled by the shared metadata and `xferdtensor`.
+**The backend-specific destination map:** resolve each bulk HF name to local storage
+as a `LocalParamSpec` — `base` for tensors sent/received as-is, and `pre`/`post` hooks
+wherever the layout requires staging (fused/merged tensors, layout conversions,
+grouped-expert stacking). This is the only place the backend's parameter layout is
+encoded; shared metadata and `xferdtensor` handle the cross-mesh byte movement.
 
 (A new *training* backend additionally has to produce the HF-named metadata — names,
 global shapes, dtypes, and the parallelism description the agnostic builder consumes —

@@ -624,9 +624,8 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
             "layerwise-reload weight loaders that ModelOpt real quant requires)."
         )
 
-    # This initial version supports only the Megatron train + vLLM gen
-    # combination; the DTensor train backend refit path is intentionally
-    # dropped (Megatron is the path validated end-to-end).
+    # Only Megatron training currently provides the local Bridge source views;
+    # DTensor training is not supported by this transport yet.
     megatron_enabled = megatron_cfg.get("enabled", False)
     dtensor_enabled = dtensor_cfg.get("enabled", False)
     if not megatron_enabled:

@@ -62,7 +62,7 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
 
     Args:
         policy: Policy object implementing ColocatablePolicyInterface (Megatron).
-        generation: Generation object implementing GenerationInterface (vLLM).
+        generation: Generation object implementing GenerationInterface.
         train_cluster: RayVirtualCluster for the training workers.  Only used by
             ``init_communicator()``; may be ``None`` for sync-only instances.
         inference_cluster: RayVirtualCluster for the inference workers.  Only

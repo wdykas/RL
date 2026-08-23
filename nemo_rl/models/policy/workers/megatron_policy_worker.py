@@ -21,7 +21,7 @@ import warnings
 from collections import OrderedDict, defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, replace
-from typing import Any, Iterable, Iterator, Literal, Optional, TypeVar, cast
+from typing import Any, Iterable, Iterator, Optional, TypeVar, cast
 
 log = logging.getLogger(__name__)
 
@@ -227,30 +227,33 @@ def _estimate_refit_tensor_size_in_bytes(
     return param.numel() * tp_size * ep_size * element_size
 
 
-def _is_mxfp8_refit_source(tensor: torch.Tensor) -> bool:
-    """Whether a training parameter uses TE MXFP8 physical storage."""
+def _is_quantized_refit_source(tensor: torch.Tensor) -> bool:
+    """Whether a training parameter uses TE quantized physical storage."""
     # Defer optional TE FP8 helpers until a refit source is inspected.
-    from megatron.core.fp8_utils import is_grouped_mxfp8tensor, is_mxfp8tensor
+    from megatron.core.fp8_utils import (
+        is_float8tensor,
+        is_grouped_tensor_with_quantized_storage,
+    )
 
-    return is_mxfp8tensor(tensor) or is_grouped_mxfp8tensor(tensor)
+    return is_float8tensor(tensor) or is_grouped_tensor_with_quantized_storage(tensor)
 
 
-def _dequantize_mxfp8_refit_source(tensor: torch.Tensor) -> torch.Tensor:
-    """Materialize a logical BF16 weight from TE MXFP8 parameter storage."""
-    # Defer optional TE FP8 helpers until an MXFP8 source is materialized.
+def _dequantize_refit_source(tensor: torch.Tensor) -> torch.Tensor:
+    """Materialize a logical BF16 weight from TE quantized parameter storage."""
+    # Defer optional TE FP8 helpers until a quantized source is materialized.
     from megatron.core.fp8_utils import (
         dequantize_fp8_tensor,
         get_grouped_quantized_members,
-        is_grouped_mxfp8tensor,
-        is_mxfp8tensor,
+        is_float8tensor,
+        is_grouped_tensor_with_quantized_storage,
     )
 
-    if is_grouped_mxfp8tensor(tensor):
+    if is_grouped_tensor_with_quantized_storage(tensor):
         members = get_grouped_quantized_members(tensor, create_if_missing=True)
         return torch.stack(
             [dequantize_fp8_tensor(member).to(torch.bfloat16) for member in members]
         )
-    if is_mxfp8tensor(tensor):
+    if is_float8tensor(tensor):
         return dequantize_fp8_tensor(tensor).to(torch.bfloat16)
     return tensor
 
@@ -264,17 +267,17 @@ def _get_refit_task_source(task: Any) -> Optional[torch.Tensor]:
         return source
 
     original = getattr(module, param_name.rsplit(".", 1)[-1], None)
-    if original is not None and _is_mxfp8_refit_source(original):
+    if original is not None and _is_quantized_refit_source(original):
         return original
     return source
 
 
 @dataclass(frozen=True)
-class _MXFP8RefitSource:
-    """A live MXFP8 parameter plus the logical HF component to transfer."""
+class _QuantizedRefitSource:
+    """A live quantized parameter plus the Bridge view to transfer."""
 
     tensor: torch.Tensor
-    component: Literal["full", "gate", "up"] = "full"
+    spec: Any
 
 
 @dataclass(frozen=True)
@@ -2322,15 +2325,15 @@ class MegatronPolicyWorkerImpl(
     def _build_refit_conversion_tasks(self) -> list:
         """Build the conversion-task list driving refit (BF16 or FP8 export).
 
-        For BF16 / FP8-but-fp8_param=False training: standard ``get_conversion_tasks``.
-        For FP8-with-fp8_param=True: Bridge's ``build_export_fp8_tasks``, which
-        emits a *pair* of tasks per FP8 weight (the FP8 data and a ``*_scale_inv``
-        scale tensor).
+        Megatron generation consumes logical weights through standard Bridge
+        tasks. Other backends keep Bridge physical FP8 data and scale tasks.
         """
-        if self._is_fp8_export():
-            return self.megatron_bridge._model_bridge.build_export_fp8_tasks(
-                self.megatron_bridge.hf_pretrained, [self.model]
-            )
+        generation_cfg = self.cfg.get("generation")
+        uses_megatron_generation = (
+            generation_cfg is not None and generation_cfg["backend"] == "megatron"
+        )
+        if self._is_fp8_export() and not uses_megatron_generation:
+            return self.megatron_bridge.get_export_fp8_tasks(self.model)
         return [
             task
             for task in self.megatron_bridge.get_conversion_tasks([self.model])
@@ -2386,14 +2389,14 @@ class MegatronPolicyWorkerImpl(
     def _iter_logical_refit_conversion_tasks(
         conversion_tasks: Iterable[Any],
     ) -> Iterator[Any]:
-        """Yield Bridge tasks whose MXFP8 sources are materialized as BF16."""
+        """Yield Bridge tasks whose quantized sources are materialized as BF16."""
         for task in conversion_tasks:
             if task is None or task.param_weight is None:
                 yield task
                 continue
             source = _get_refit_task_source(task)
             assert source is not None
-            logical_weight = _dequantize_mxfp8_refit_source(source)
+            logical_weight = _dequantize_refit_source(source)
             yield (
                 replace(task, param_weight=logical_weight)
                 if logical_weight is not task.param_weight
@@ -2477,48 +2480,29 @@ class MegatronPolicyWorkerImpl(
             ).reshape(1)
             yield param_name, scale_tensor
 
-    @staticmethod
-    def _select_local_refit_component(
-        tensor: torch.Tensor, component: Literal["full", "gate", "up"]
-    ) -> torch.Tensor:
-        if component == "full":
-            return tensor
-        # The output dimension is dim 0 for an ordinary matrix and dim 1 for
-        # stacked/grouped expert matrices, i.e. always the penultimate dim.
-        gate, up = torch.chunk(tensor, 2, dim=-2)
-        return gate if component == "gate" else up
-
     def _local_refit_source_spec(
-        self,
-        tensor: torch.Tensor,
-        component: Literal["full", "gate", "up"] = "full",
+        self, tensor: torch.Tensor, spec: Any
     ) -> LocalParamSpec:
-        """Build a live BF16 source spec for a BF16 or TE MXFP8 parameter."""
-        if not _is_mxfp8_refit_source(tensor):
-            return LocalParamSpec(
-                base=self._select_local_refit_component(tensor, component)
-            )
+        """Build a live source spec for a BF16 or TE-quantized parameter."""
+        if not _is_quantized_refit_source(tensor):
+            return LocalParamSpec(base=spec.select(tensor))
 
-        return LocalParamSpec(base=_MXFP8RefitSource(tensor, component))
+        return LocalParamSpec(base=_QuantizedRefitSource(tensor, spec))
 
     def _materialize_local_refit_spec(
         self,
         spec: LocalParamSpec,
         logical_source_cache: dict[int, torch.Tensor],
     ) -> RefitCtx:
-        """Materialize one local source, reusing MXFP8 dequantization within a layer."""
+        """Materialize one local source, reusing quantized-source dequantization within a layer."""
         base = spec.base
-        if isinstance(base, _MXFP8RefitSource):
+        if isinstance(base, _QuantizedRefitSource):
             source_id = id(base.tensor)
             logical = logical_source_cache.get(source_id)
             if logical is None:
-                logical = _dequantize_mxfp8_refit_source(base.tensor)
+                logical = _dequantize_refit_source(base.tensor)
                 logical_source_cache[source_id] = logical
-            return RefitCtx(
-                buf=self._select_local_refit_component(
-                    logical, base.component
-                ).contiguous()
-            )
+            return RefitCtx(buf=base.spec.select(logical).contiguous())
         if isinstance(base, _GroupedRefitSource):
             return RefitCtx(
                 buf=torch.stack(
@@ -2545,78 +2529,25 @@ class MegatronPolicyWorkerImpl(
         Unlike ``_iter_params_with_optional_kv_scales`` (PP broadcast + TP gather
         via ``export_hf_weights``), this yields TP-local source specs directly
         from the Megatron params — no collectives. BF16 specs retain live tensor
-        views; MXFP8 specs materialize logical BF16 during each refit. EP:
+        views; quantized specs materialize logical BF16 during each refit. EP:
         ``refit_conversion_tasks`` already holds only this rank's local experts;
         PP non-local params have ``param_weight is None``.
         """
-        from megatron.bridge.models.conversion.param_mapping import (
-            FusedExpertMapping,
-            FusedGatedExpertMapping,
-            GatedMLPMapping,
-        )
-
         from nemo_rl.weight_sync.nccl_reshard_utils import is_nccl_reshard_param
-
-        def _expert_idx(megatron_name: str) -> str:
-            # Grouped-GEMM experts are numbered by the megatron param name
-            m = re.search(r"\d+$", megatron_name)
-            assert m, f"expected trailing expert index in {megatron_name!r}"
-            return m.group()
 
         for task in self.refit_conversion_tasks:
             local_tensor = _get_refit_task_source(task)
             if local_tensor is None:
-                continue  # non-local PP rank
-            # FP8 scale siblings take the misc path.
+                continue
             if task.global_param_name.endswith("_scale_inv"):
                 continue
 
-            if isinstance(task.mapping, GatedMLPMapping):
-                # FFN gate/up fused in linear_fc1 as [gate_shard; up_shard] (dim 0).
-                yield (
-                    task.mapping.hf_param["gate"],
-                    self._local_refit_source_spec(local_tensor, "gate"),
-                )
-                yield (
-                    task.mapping.hf_param["up"],
-                    self._local_refit_source_spec(local_tensor, "up"),
-                )
-                continue
-
-            if isinstance(task.mapping, FusedGatedExpertMapping):
-                # Grouped-GEMM MoE (e.g. Qwen3.5-VL): linear_fc1 fuses gate+up per
-                # expert [gate; up] (dim 0) — same layout as the dense branch
-                # above, but the hf_param is a single, index-less string.  Un-fuse
-                # into gate/up AND re-attach the per-expert index.
-                idx = _expert_idx(task.global_param_name)
-                prefix = str(task.mapping.hf_param)[: -len(".gate_up_proj")]
-                yield (
-                    f"{prefix}.{idx}.gate_proj.weight",
-                    self._local_refit_source_spec(local_tensor, "gate"),
-                )
-                yield (
-                    f"{prefix}.{idx}.up_proj.weight",
-                    self._local_refit_source_spec(local_tensor, "up"),
-                )
-                continue
-
-            if isinstance(task.mapping, FusedExpertMapping):
-                # Grouped-GEMM down (linear_fc2): re-attach the per-expert index +
-                # ``.weight`` so it matches standard per-expert down_proj.
-                idx = _expert_idx(task.global_param_name)
-                prefix = str(task.mapping.hf_param)[: -len(".down_proj")]
-                yield (
-                    f"{prefix}.{idx}.down_proj.weight",
-                    self._local_refit_source_spec(local_tensor),
-                )
-                continue
-
-            # Simple 1:1 mappings: only the FFN down_proj (and any non-gated
-            # simple gate/up) hits this branch. QKV (a compound mapping) and
-            # every non-FFN param fall through to misc, so they are skipped.
-            hf_param = task.mapping.hf_param
-            if not isinstance(hf_param, dict) and is_nccl_reshard_param(str(hf_param)):
-                yield str(hf_param), self._local_refit_source_spec(local_tensor)
+            for spec in task.local_hf_param_specs():
+                if is_nccl_reshard_param(spec.name):
+                    yield (
+                        spec.name,
+                        self._local_refit_source_spec(local_tensor, spec),
+                    )
 
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/stream_weights_via_ipc_zmq")
@@ -2946,7 +2877,7 @@ class MegatronPolicyWorkerImpl(
 
         Wraps this rank's local Megatron shards into ``LocalParamSpec``s:
         - direct: ``base`` is sharded local tensor view, sent as-is.
-        - MXFP8: ``base`` describes the quantized source and logical component.
+        - quantized: ``base`` defers logical view materialization until refit.
         - grouped MoE expert: ``base`` holds the ordered per-expert specs, which
           are materialized and stacked into ``[E_local, ...]`` each refit.
         """
