@@ -514,6 +514,10 @@ conflicts = [
 ]
 
 
+# Set package-specific environment variables required by source builds.
+[tool.uv.extra-build-variables]
+torch-memory-saver = { TMS_CUDA_MAJOR = "13" }
+
 # Augment build dependencies for packages that need torch at build time
 [tool.uv.extra-build-dependencies]
 flash-attn = [{ requirement = "torch", match-runtime = true }]

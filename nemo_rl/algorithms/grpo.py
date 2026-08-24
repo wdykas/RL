@@ -144,6 +144,7 @@ from nemo_rl.weight_sync.checkpoint_engine_config import (
     checkpoint_engine_refit_config,
 )
 from nemo_rl.weight_sync.factory import create_weight_synchronizer
+from nemo_rl.weight_sync.nccl_reshard_utils import check_nccl_reshard_refit_support
 
 # ===============================================================================
 # Configuration
@@ -1515,10 +1516,6 @@ def setup(
         generation_config.get("refit_transport") == "nccl_reshard"
     )
     if nccl_reshard_refit_enabled:
-        from nemo_rl.weight_sync.nccl_reshard_utils import (
-            check_nccl_reshard_refit_support,
-        )
-
         check_nccl_reshard_refit_support(master_config)
 
     refit_transport = generation_config.get("refit_transport")

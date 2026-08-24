@@ -671,7 +671,7 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
 
         # Precision compatibility (train ↔ gen). vLLM supports byte-compatible
         # BF16/BF16 and blockwise-FP8/FP8, plus receiver-side BF16-to-MXFP8.
-        # Megatron generation sends logical BF16 weights from BF16 or MXFP8
+        # Megatron generation sends logical BF16 weights from BF16 or TE-quantized
         # training storage, then writes BF16 or performs on-receive MXFP8
         # quantization at the destination.
         #   BF16 train  ↔ BF16 gen   (default, tested)
@@ -753,19 +753,15 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
                     "policy.megatron_cfg.fp8_cfg.fp8_param=True requires "
                     "policy.megatron_cfg.fp8_cfg.enabled=True."
                 )
-            if fp8_param and fp8_recipe != "mxfp8":
-                violations.append(
-                    "Megatron-generation nccl_reshard refit supports fp8_param=True "
-                    "only with policy.megatron_cfg.fp8_cfg.fp8_recipe='mxfp8' "
-                    f"(got {fp8_recipe!r})."
-                )
-
+            gen_ep = mcore_generation_cfg.get("expert_model_parallel_size", 1)
             gen_etp = mcore_generation_cfg.get("expert_tensor_parallel_size", 1)
-            if gen_etp not in (1, None):
+            if gen_ep not in (1, None) and gen_etp not in (1, None):
                 violations.append(
-                    "policy.generation.mcore_generation_config."
-                    "expert_tensor_parallel_size must be 1 for nccl_reshard refit "
-                    f"(got {gen_etp})."
+                    "Megatron-generation nccl_reshard refit supports expert "
+                    "parallelism or expert tensor parallelism, but not both at "
+                    "once (got policy.generation.mcore_generation_config."
+                    f"expert_model_parallel_size={gen_ep} and "
+                    f"expert_tensor_parallel_size={gen_etp})."
                 )
             gen_pp = mcore_generation_cfg.get("pipeline_model_parallel_size", 1)
             if gen_pp != 1:
@@ -783,10 +779,10 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
                     "fp8_cfg.fp8_recipe must be 'mxfp8' when FP8 is enabled."
                 )
 
-    # Gen-backend restrictions.  The reshard supports gen-side TP, DP, and EP;
-    # the vLLM backend shards experts by index across its TP ranks, so its EP
-    # is either 1 (TP-sharded experts) or equal to TP (EP-sharded).  PP is not
-    # yet supported gen-side.
+    # Gen-backend restrictions. The reshard supports gen-side TP, DP, EP, and
+    # Megatron ETP when EP=1. The vLLM backend shards experts by index across
+    # its TP ranks, so its EP is either 1 (TP-sharded experts) or equal to TP
+    # (EP-sharded). PP is not yet supported gen-side.
     if generation.get("backend") == "vllm":
         gen_tp = vllm_cfg.get("tensor_parallel_size", 1)
         gen_ep = vllm_cfg.get("expert_parallel_size", 1)
@@ -850,9 +846,8 @@ def build_nccl_reshard_refit_info(
             "layer_to_pp_stage must be provided when pp_size > 1"
         )
 
-    # Currently we don't support ETP>1 for the nccl_reshard_refit.
-    # Non-expert params, ranks are partitioned (tp, dp);
-    # Expert params, ranks are partitioned (ep, edp).
+    # Training-side ETP>1 is not supported yet. Non-expert params partition
+    # ranks by (tp, dp); expert params partition them by (ep, edp).
     def _build_train_src_meshes(num_gpus: int, rank_offset: int, stage_pp: int):
         non_expert_mesh, non_expert_dim_map = build_mesh_info(
             num_gpus,
@@ -878,6 +873,11 @@ def build_nccl_reshard_refit_info(
     gen_ep = gen_parallelism.get("ep_size", 1)
     gen_etp = gen_parallelism.get("etp_size", gen_tp if gen_ep == 1 else 1)
     gen_pp = gen_parallelism.get("pp_size", 1)
+    if gen_ep > 1 and gen_etp > 1:
+        raise ValueError(
+            "nccl_reshard cannot represent generation expert parallelism and "
+            f"expert tensor parallelism together (got ep={gen_ep}, etp={gen_etp})."
+        )
 
     def _build_dst_meshes(num_gpus: int, rank_offset: int):
         non_expert = build_mesh_info(

@@ -30,22 +30,25 @@ single `ValueError` listing every violation. The current requirements are:
   training backend is not supported yet.).
 * **vLLM or Megatron generation backend** — `policy.generation.backend` must be
   `vllm` or `megatron` (SGLang and TRTLLM are not supported yet).
-* Megatron `expert_tensor_parallel_size` (i.e., ETP) must be 1; custom PP layouts
-  (`pipeline_model_parallel_layout`, virtual PP > 1, embedding/loss pipeline-split
-  accounting) are not supported yet.
+* Training-side Megatron `expert_tensor_parallel_size` (i.e., ETP) must be 1;
+  custom PP layouts (`pipeline_model_parallel_layout`, virtual PP > 1,
+  embedding/loss pipeline-split accounting) are not supported yet.
 * **Precision** for vLLM supports BF16 train ↔ BF16 gen, blockwise-FP8 train
   (`fp8_param=true` + blockwise recipe) ↔ FP8 gen, and BF16 train → MXFP8 gen
   (`vllm_cfg.precision=fp8`, `vllm_cfg.is_mx=true`). Blockwise-FP8 train →
   MXFP8 gen is not supported.
-* Megatron generation accepts BF16 or MXFP8 training parameters
-  (`fp8_param=true` + MXFP8 recipe). MXFP8 sources are materialized as logical
-  BF16 for transport; the destination either stores BF16 or quantizes each
-  complete local weight into MXFP8. When MXFP8 parameter all-gather reuses the
-  gradient buffer, that aliased allocation stays GPU-resident across refit so
+* Megatron generation accepts BF16 or supported Transformer Engine FP8 training
+  parameter storage, including blockwise FP8 and MXFP8 with `fp8_param=true`.
+  Quantized sources are materialized as logical BF16 for transport; the
+  destination either stores BF16 or quantizes each complete local weight into
+  MXFP8. When MXFP8 parameter all-gather reuses the gradient buffer, that
+  aliased allocation stays GPU-resident across refit so
   persistent DDP/autograd views remain valid; ordinary gradient buffers and
   optimizer state are still offloaded.
 * vLLM expert parallelism is supported with the NeMo RL convention
   `expert_parallel_size == tensor_parallel_size`.
+* Megatron generation supports either expert parallelism or expert tensor
+  parallelism. Combining generation EP > 1 and ETP > 1 is not supported yet.
 * For Megatron generation, `refit_transport=nccl_reshard` selects M-to-N
   regardless of `mcore_generation_config.refit_impl`. Set `refit_transport=null`
   with `refit_impl=bridge` for packed Bridge refit or `refit_impl=mcore` for

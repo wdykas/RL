@@ -430,7 +430,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         world_size: int,
         *,
         rank_offset: int,
-        refit_backend: str = "gloo",
+        refit_backend: str = "nccl",
     ) -> list[ray.ObjectRef]:
         """Initialize the megatron refit collective on this policy's workers."""
         return self.worker_group.run_all_workers_single_data(

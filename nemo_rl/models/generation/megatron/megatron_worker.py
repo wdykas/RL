@@ -18,9 +18,9 @@ import os
 import threading
 import time
 import warnings
-from collections import Counter
+from collections import Counter, OrderedDict
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional
+from typing import Any, AsyncGenerator, Optional
 
 import requests
 import torch
@@ -31,8 +31,14 @@ from megatron.core.inference.config import (
 )
 from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
-from megatron.core.inference.quantization.utils import resolve_mxfp8_backend
+from megatron.core.inference.quantization.utils import (
+    quantize_params_to_mxfp8,
+    resolve_mxfp8_backend,
+)
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_inference_spec,
+)
 from megatron.core.resharding.copy_services.gloo_copy_service import GlooCopyService
 from megatron.core.resharding.copy_services.nccl_copy_service import NCCLCopyService
 from megatron.core.resharding.refit import (
@@ -43,6 +49,12 @@ from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.utils import toggle_cuda_graphs
 from megatron.core.utils import unwrap_model
+from torch.distributed.distributed_c10d import (
+    PrefixStore,
+    ProcessGroup,
+    ProcessGroupGloo,
+    _world,
+)
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.interfaces import (
@@ -61,17 +73,19 @@ from nemo_rl.models.megatron.memory_saver import (
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_consumer
-
-if TYPE_CHECKING:
-    from nemo_rl.weight_sync.nccl_reshard_utils import HFToLocalParamMap
+from nemo_rl.weight_sync.nccl_reshard_utils import (
+    HFToLocalParamMap,
+    LocalParamSpec,
+    RefitCtx,
+    _INDIVIDUAL_EXPERT_RE,
+    _STR_TO_DTYPE,
+    is_nccl_reshard_param,
+    restore_refit_info_placements,
+)
 
 
 def _inference_optimized_transformer_layer_spec(config: Any) -> Any:
     """Build the generic GPT layer spec backed by MCore inference linears."""
-    from megatron.core.models.gpt.gpt_layer_specs import (
-        get_gpt_layer_with_inference_spec,
-    )
-
     return get_gpt_layer_with_inference_spec(
         qk_layernorm=config.qk_layernorm,
         multi_latent_attention=config.multi_latent_attention,
@@ -86,6 +100,8 @@ def _inference_optimized_transformer_layer_spec(config: Any) -> Any:
 
 def _configure_inference_optimized_layer_spec(model_provider: Any) -> bool:
     """Select MCore inference linears for a Bridge generic-GPT provider."""
+    # Bridge imports ModelOpt plugins that can re-enter MCore while this module
+    # is still initializing, so keep this cycle-sensitive provider import local.
     from megatron.bridge.models.gpt_provider import GPTModelProvider
 
     if not isinstance(model_provider, GPTModelProvider):
@@ -822,7 +838,7 @@ class MegatronGenerationRefitMixin:
         port: int,
         world_size: int,
         rank_offset: int,
-        refit_backend: str = "gloo",
+        refit_backend: str = "nccl",
     ) -> None:
         """Initialize the refit collective for non-colocated weight transfer.
 
@@ -840,13 +856,6 @@ class MegatronGenerationRefitMixin:
                 '"gloo". See https://github.com/NVIDIA-NeMo/RL/issues/3646',
                 stacklevel=2,
             )
-
-        from torch.distributed.distributed_c10d import (
-            PrefixStore,
-            ProcessGroup,
-            ProcessGroupGloo,
-            _world,
-        )
 
         local_rank = torch.distributed.get_rank()
         global_rank = local_rank + rank_offset
@@ -1030,16 +1039,8 @@ class MegatronGenerationRefitMixin:
         self,
         refit_info: dict[str, Any],
         tasks: list[_MegatronRefitTask],
-    ) -> tuple["HFToLocalParamMap", set[int]]:
+    ) -> tuple[HFToLocalParamMap, set[int]]:
         """Map M-to-N's canonical HF FFN shards onto local Megatron storage."""
-        from nemo_rl.weight_sync.nccl_reshard_utils import (
-            HFToLocalParamMap,
-            LocalParamSpec,
-            RefitCtx,
-            _INDIVIDUAL_EXPERT_RE,
-            is_nccl_reshard_param,
-        )
-
         pieces: dict[str, _MegatronBulkRefitPiece] = {}
 
         def add_piece(task: _MegatronRefitTask, spec: Any) -> None:
@@ -1159,10 +1160,6 @@ class MegatronGenerationRefitMixin:
                 "initialization; construct MegatronGeneration with skip_weight_load=True."
             )
 
-        from megatron.core.inference.quantization.utils import (
-            quantize_params_to_mxfp8,
-        )
-
         destination_by_id: dict[int, MXFP8Tensor] = {}
         for core in mxfp8_cores:
             decoder = core.decoder if hasattr(core, "decoder") else core
@@ -1258,11 +1255,6 @@ class MegatronGenerationRefitMixin:
         self, refit_info: dict[str, Any]
     ) -> None:
         """Prepare Megatron as the destination of NCCL M-to-N reshard refit."""
-        from nemo_rl.weight_sync.nccl_reshard_utils import (
-            _STR_TO_DTYPE,
-            restore_refit_info_placements,
-        )
-
         refit_info = restore_refit_info_placements(refit_info)
         model_chunks, tasks = self._build_generation_refit_tasks()
         self._prepare_mxfp8_refit(tasks)
@@ -1287,9 +1279,8 @@ class MegatronGenerationRefitMixin:
     @torch.no_grad()
     def nccl_reshard_generation_refit(self) -> bool:
         """Receive bulk FFN shards via M-to-N, then import packed misc weights."""
-        from collections import OrderedDict
-
-        from nemo_rl.weight_sync.nccl_reshard_utils import RefitCtx
+        # Keep this transport import local: xferdtensor probes the optional
+        # nccl.m2n extension at import time.
         from nemo_rl.weight_sync.xferdtensor import DTensorRef, xferdtensor
 
         self._generation_m2n_pending: dict[int, dict[str, torch.Tensor]] = {}

@@ -179,7 +179,7 @@ def test_check_nccl_reshard_refit_support_accepts_megatron_bf16_and_mxfp8(
         "colocated": {"enabled": False},
         "mcore_generation_config": {
             "refit_impl": "bridge",
-            "expert_tensor_parallel_size": 1,
+            "expert_tensor_parallel_size": 2,
             "pipeline_model_parallel_size": 1,
             "fp8_cfg": generation_fp8_cfg,
         },
@@ -188,9 +188,7 @@ def test_check_nccl_reshard_refit_support_accepts_megatron_bf16_and_mxfp8(
     check_nccl_reshard_refit_support(config)
 
 
-def test_check_nccl_reshard_refit_support_rejects_blockwise_fp8_megatron_source() -> (
-    None
-):
+def test_check_nccl_reshard_accepts_blockwise_megatron_source() -> None:
     config = _valid_nccl_reshard_config()
     config.policy["precision"] = "bfloat16"
     config.policy["megatron_cfg"]["fp8_cfg"] = {
@@ -209,8 +207,7 @@ def test_check_nccl_reshard_refit_support_rejects_blockwise_fp8_megatron_source(
         },
     }
 
-    with pytest.raises(ValueError, match="fp8_recipe='mxfp8'"):
-        check_nccl_reshard_refit_support(config)
+    check_nccl_reshard_refit_support(config)
 
 
 def test_check_nccl_reshard_refit_support_rejects_disabled_mxfp8_params() -> None:
@@ -662,6 +659,32 @@ def test_build_refit_info_replicates_megatron_experts_when_etp_is_one():
 
     gate = _find(info, "model.layers.0.mlp.experts.gate_proj.weight")
     assert all(isinstance(placement, Replicate) for placement in gate["dst_placements"])
+
+
+def test_build_refit_info_shards_megatron_experts_across_etp():
+    info = build_nccl_reshard_refit_info(
+        _moe_metadata(num_experts=2),
+        train_parallelism={"tp_size": 1, "ep_size": 2, "pp_size": 1},
+        gen_parallelism={
+            "tp_size": 2,
+            "ep_size": 1,
+            "etp_size": 2,
+            "pp_size": 1,
+        },
+        train_world_size=2,
+        gen_world_size=2,
+    )
+
+    gate = _find(info, "model.layers.0.mlp.experts.gate_proj.weight")
+    down = _find(info, "model.layers.0.mlp.experts.down_proj.weight")
+    assert any(
+        isinstance(placement, Shard) and placement.dim == 1
+        for placement in gate["dst_placements"]
+    )
+    assert any(
+        isinstance(placement, Shard) and placement.dim == 2
+        for placement in down["dst_placements"]
+    )
 
 
 # --------------------------------------------------------------------------

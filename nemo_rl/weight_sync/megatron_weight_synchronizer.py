@@ -18,7 +18,13 @@ from typing import Any, Optional
 import ray
 
 from nemo_rl.utils.timer import Timer
+from nemo_rl.weight_sync.collective_weight_synchronizer import (
+    CollectiveWeightSynchronizer,
+)
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
+from nemo_rl.weight_sync.nccl_reshard_weight_synchronizer import (
+    NcclReshardWeightSynchronizer,
+)
 
 
 class MegatronWeightSynchronizer(WeightSynchronizer):
@@ -58,10 +64,6 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
         self._transport: Optional[WeightSynchronizer] = None
         if not colocated and not generation.uses_native_refit:
             if generation.cfg.get("refit_transport") == "nccl_reshard":
-                from nemo_rl.weight_sync.nccl_reshard_weight_synchronizer import (
-                    NcclReshardWeightSynchronizer,
-                )
-
                 self._transport = NcclReshardWeightSynchronizer(
                     policy=policy,
                     generation=generation,
@@ -69,10 +71,6 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
                     inference_cluster=inference_cluster,
                 )
             else:
-                from nemo_rl.weight_sync.collective_weight_synchronizer import (
-                    CollectiveWeightSynchronizer,
-                )
-
                 self._transport = CollectiveWeightSynchronizer(
                     policy=policy,
                     generation=generation,

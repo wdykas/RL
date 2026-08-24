@@ -121,6 +121,11 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
     HFToLocalParamMap,
     LocalParamSpec,
     RefitCtx,
+    _INDIVIDUAL_EXPERT_RE,
+    _extract_layer_name,
+    _extract_layer_prefix,
+    build_nccl_reshard_refit_info,
+    is_nccl_reshard_param,
 )
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
@@ -302,8 +307,6 @@ def _collect_mtp_hf_layer_names(conversion_tasks: Optional[list]) -> set[str]:
     Returns:
         Set of HF layer names, e.g. ``{"model.layers.61", "mtp.layers.0"}``.
     """
-    from nemo_rl.weight_sync.nccl_reshard_utils import _extract_layer_name
-
     mtp_layers: set[str] = set()
     for task in conversion_tasks or []:
         if task is None:
@@ -2542,8 +2545,6 @@ class MegatronPolicyWorkerImpl(
         ``refit_conversion_tasks`` already holds only this rank's local experts;
         PP non-local params have ``param_weight is None``.
         """
-        from nemo_rl.weight_sync.nccl_reshard_utils import is_nccl_reshard_param
-
         for task in self.refit_conversion_tasks:
             local_tensor = _get_refit_task_source(task)
             if local_tensor is None:
@@ -2703,11 +2704,6 @@ class MegatronPolicyWorkerImpl(
         its own fused layout (e.g., vLLM w13/w2) gen-side, so this train worker
         stays agnostic to any gen backend's MoE-fusion layout.
         """
-        from nemo_rl.weight_sync.nccl_reshard_utils import (
-            build_nccl_reshard_refit_info,
-            is_nccl_reshard_param,
-        )
-
         self.refit_param_info_mcore = self._calculate_refit_param_info()
 
         # Single pass over Bridge's stream: classify each param as major
@@ -2726,11 +2722,6 @@ class MegatronPolicyWorkerImpl(
         # state_dict_metadata[hf_name] -> [shape, dtype]
         # At the same time, filter the params to the misc subset (packed_broadcast path).
         # misc_meta[hf_name] -> [shape, dtype]
-        from nemo_rl.weight_sync.nccl_reshard_utils import (
-            _extract_layer_name,
-            _extract_layer_prefix,
-        )
-
         # HF layers whose weights come from Megatron's MTP module. The prefix
         # gate inside is_nccl_reshard_param only catches families whose HF
         # names keep the bare ``mtp.`` prefix (NemotronH, Qwen3.5); DeepSeek
@@ -2853,8 +2844,6 @@ class MegatronPolicyWorkerImpl(
         must precede expert 1 to match the EP ``Shard(0)`` layout the gen side
         expects.
         """
-        from nemo_rl.weight_sync.nccl_reshard_utils import _INDIVIDUAL_EXPERT_RE
-
         index_groups: dict[tuple[str, str], list[tuple[int, str]]] = {}
         for name in param_map:
             # find all the expert params
@@ -2903,6 +2892,8 @@ class MegatronPolicyWorkerImpl(
         mapping = {}
         for layer_name in refit_info["layer_names"]:
             for p in refit_info["per_layer_params"][layer_name]:
+                if p.get("pp_stage", 0) != self.my_pp_stage:
+                    continue
                 name = p["name"]
                 if p.get("grouped_expert_proj"):
                     mapping[name] = _expert_spec(p["grouped_expert_proj"], name)
@@ -2985,8 +2976,6 @@ class MegatronPolicyWorkerImpl(
         torch.cuda.synchronize()
 
         torch.cuda.empty_cache()
-
-        import time
 
         misc_t0 = time.perf_counter()
         self._broadcast_misc_params_packed(kv_scales=kv_scales)
