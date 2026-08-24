@@ -181,6 +181,10 @@ def test_check_nccl_reshard_refit_support_accepts_megatron_bf16_and_mxfp8(
             "expert_model_parallel_size": 2,
             "expert_tensor_parallel_size": 2,
             "pipeline_model_parallel_size": 1,
+            # MXFP8 destinations quantize through resolve_mxfp8_backend, so the
+            # grouped-GEMM backend must be one it accepts. MCore's default
+            # ("vllm") is not, and NeMo-RL supplies no default of its own.
+            "inference_grouped_gemm_backend": "torch",
             "fp8_cfg": generation_fp8_cfg,
         },
     }
@@ -226,10 +230,7 @@ def test_check_nccl_reshard_refit_support_allows_transport_to_override_refit_imp
         },
     }
 
-    # The override is legal, but refit_backend is silently stranded by it, so
-    # the user gets told rather than left to wonder which transport ran.
-    with pytest.warns(UserWarning, match="overrides"):
-        check_nccl_reshard_refit_support(config)
+    check_nccl_reshard_refit_support(config)
 
 
 def test_check_nccl_reshard_rejects_mxfp8_with_unsupported_grouped_gemm_backend() -> (
@@ -258,26 +259,46 @@ def test_check_nccl_reshard_rejects_mxfp8_with_unsupported_grouped_gemm_backend(
         check_nccl_reshard_refit_support(config)
 
 
-@pytest.mark.parametrize("gemm_backend", ["torch", "flashinfer", None])
+@pytest.mark.parametrize("gemm_backend", ["torch", "flashinfer"])
 def test_check_nccl_reshard_accepts_supported_grouped_gemm_backends(
-    gemm_backend: object,
+    gemm_backend: str,
 ) -> None:
     config = _valid_nccl_reshard_config()
     config.policy["precision"] = "bfloat16"
-    mcore_cfg = {
-        "refit_impl": "mcore",
-        "pipeline_model_parallel_size": 1,
-        "fp8_cfg": {"enabled": True, "fp8_recipe": "mxfp8"},
-    }
-    if gemm_backend is not None:
-        mcore_cfg["inference_grouped_gemm_backend"] = gemm_backend
     config.policy["generation"] = {
         "backend": "megatron",
         "colocated": {"enabled": False},
-        "mcore_generation_config": mcore_cfg,
+        "mcore_generation_config": {
+            "refit_impl": "mcore",
+            "pipeline_model_parallel_size": 1,
+            "inference_grouped_gemm_backend": gemm_backend,
+            "fp8_cfg": {"enabled": True, "fp8_recipe": "mxfp8"},
+        },
     }
 
     check_nccl_reshard_refit_support(config)
+
+
+def test_check_nccl_reshard_rejects_mxfp8_with_omitted_grouped_gemm_backend() -> None:
+    """An omitted key resolves to MCore's default 'vllm', which MXFP8 rejects.
+
+    Treating the omitted case as valid would let exactly the configuration the
+    guard exists for reach the first refit before failing.
+    """
+    config = _valid_nccl_reshard_config()
+    config.policy["precision"] = "bfloat16"
+    config.policy["generation"] = {
+        "backend": "megatron",
+        "colocated": {"enabled": False},
+        "mcore_generation_config": {
+            "refit_impl": "mcore",
+            "pipeline_model_parallel_size": 1,
+            "fp8_cfg": {"enabled": True, "fp8_recipe": "mxfp8"},
+        },
+    }
+
+    with pytest.raises(ValueError, match="inference_grouped_gemm_backend"):
+        check_nccl_reshard_refit_support(config)
 
 
 # --------------------------------------------------------------------------

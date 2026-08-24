@@ -29,7 +29,6 @@ live in ``nemo_rl/weight_sync/xferdtensor.py`` — import both from there.
 """
 
 import re
-import warnings
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Protocol, runtime_checkable
@@ -759,34 +758,27 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
                     "fp8_cfg.fp8_recipe must be 'mxfp8' when FP8 is enabled."
                 )
 
-            # refit_transport wins over refit_impl (see MegatronGeneration.
-            # uses_native_refit), which silently strands both knobs. Warn rather
-            # than reject: the override is deliberate and documented.
-            if mcore_generation_cfg.get("refit_impl") == "mcore":
-                warnings.warn(
-                    "policy.generation.refit_transport='nccl_reshard' overrides "
-                    "mcore_generation_config.refit_impl='mcore'; the M-to-N "
-                    "transport is used and refit_backend="
-                    f"{mcore_generation_cfg.get('refit_backend')!r} is ignored. "
-                    "Set refit_transport=null to use native MCore refit.",
-                    stacklevel=2,
-                )
-
             # MXFP8 inference quantizes through resolve_mxfp8_backend, which
             # only accepts the 'torch' and 'flashinfer' grouped-GEMM backends.
             # MCore's own guards for this compare config.fp8 (an e4m3/hybrid
             # format) against "mxfp8" (a recipe) and so never fire, and the
             # failure otherwise surfaces deep inside the first refit.
-            gemm_backend = mcore_generation_cfg.get("inference_grouped_gemm_backend")
+            #
+            # An omitted key is NOT safe: MCore's TransformerConfig default is
+            # "vllm", which resolve_mxfp8_backend rejects. Resolve the default
+            # here so the omitted case fails at config time like the explicit one.
+            gemm_backend = mcore_generation_cfg.get(
+                "inference_grouped_gemm_backend", "vllm"
+            )
             if gen_fp8_cfg.get("enabled") and gemm_backend not in (
-                None,
                 "torch",
                 "flashinfer",
             ):
                 violations.append(
                     "MXFP8 Megatron generation requires policy.generation."
                     "mcore_generation_config.inference_grouped_gemm_backend to be "
-                    f"'torch' or 'flashinfer' (got {gemm_backend!r})."
+                    f"'torch' or 'flashinfer' (got {gemm_backend!r}; MCore's "
+                    "default is 'vllm', so this key must be set explicitly)."
                 )
 
     # Gen-backend restrictions. The reshard supports gen-side TP, DP, EP, and

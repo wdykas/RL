@@ -108,25 +108,22 @@ def _configure_inference_optimized_layer_spec(model_provider: Any) -> bool:
     Overwriting those would rebuild a ``moe_layer_freq`` model's dense layers
     as MoE layers, so leave any non-default spec alone.
 
+    Non-GPT providers are left alone too. Hybrid/Mamba stacks (Nemotron-H via
+    ``HybridModelProvider``) are not ``GPTModelProvider`` subclasses and resolve
+    ``inference_optimized`` through their own stack spec, so this is a no-op for
+    them rather than an error.
+
     Returns:
         True if the provider's layer spec was replaced, False if the provider
-        already carries a model-specific spec that handles inference itself.
-
-    Raises:
-        ValueError: If the provider is not a Bridge ``GPTModelProvider``, which
-            means ``transformer_impl='inference_optimized'`` would be silently
-            ignored and the training linears used for generation instead.
+        carries a model-specific spec (or is not a GPT provider) and handles
+        inference selection itself.
     """
     # Bridge imports ModelOpt plugins that can re-enter MCore while this module
     # is still initializing, so keep this cycle-sensitive provider import local.
     from megatron.bridge.models.gpt_provider import GPTModelProvider, default_layer_spec
 
     if not isinstance(model_provider, GPTModelProvider):
-        raise ValueError(
-            "mcore_generation_config.transformer_impl='inference_optimized' "
-            "requires a Bridge GPTModelProvider, got "
-            f"{type(model_provider).__name__}."
-        )
+        return False
     if model_provider.transformer_layer_spec is not default_layer_spec:
         return False
     model_provider.transformer_layer_spec = _inference_optimized_transformer_layer_spec

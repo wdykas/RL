@@ -773,19 +773,17 @@ class MegatronPolicyWorkerImpl(
         model_config.param_sync_func = None
         self._first_train_step_forward_pre_hook_disabled = True
 
-    def _copy_main_params_to_param_buffer(
-        self, zero_grad_buffer: bool = False, *, force: bool = False
-    ) -> None:
+    def _copy_main_params_to_param_buffer(self, zero_grad_buffer: bool = False) -> None:
         """Stage FP32 optimizer masters into the shared MXFP8 param buffer.
+
+        Only valid while the forward pre-hooks are still installed: this stages
+        the buffer but does not all-gather it, and callers rely on the
+        hook-driven (or explicit) param sync to publish the result. Staging with
+        hooks already off would zero the aliased param/grad buffer and leave
+        every other DP rank's slice at zero.
 
         Args:
             zero_grad_buffer: Also zero the aliased gradient buffer first.
-            force: Stage even when the forward pre-hooks are already disabled.
-                The normal callers run while hooks are still installed (the
-                hook-driven all-gather is what would otherwise restage the
-                buffer). A refit can arrive with hooks already off, in which
-                case nothing has restaged the buffer since the optimizer step
-                and generation would read pre-step weights.
         """
         if not isinstance(self.model, DistributedDataParallel):
             return
@@ -793,7 +791,7 @@ class MegatronPolicyWorkerImpl(
         if not self._uses_mxfp8_overlap_shared_param_buffer():
             return
 
-        if not force and not self._forward_pre_hook_enabled():
+        if not self._forward_pre_hook_enabled():
             return
 
         if zero_grad_buffer:
@@ -3207,17 +3205,21 @@ class MegatronPolicyWorkerImpl(
         # latest weights and leaves hooks disabled while the shared param/grad
         # buffer is held across refit. The normal train-step transition
         # re-enables them.
-        if self._uses_mxfp8_overlap_shared_param_buffer():
-            if self._forward_pre_hook_enabled():
-                self._disable_forward_pre_hook_until_next_train_step(param_sync=True)
-            else:
-                # Hooks were already disabled (e.g. a logprob pass disabled them
-                # with param_sync=False and they stay off through the following
-                # train step). Nothing has restaged the shared buffer since the
-                # optimizer step, so generation would refit pre-step weights.
-                self._copy_main_params_to_param_buffer(
-                    zero_grad_buffer=True, force=True
-                )
+        # TODO(#3739): when the hooks are already disabled, nothing has restaged
+        # the shared buffer since the optimizer step, so generation may refit
+        # pre-step weights. Staging alone is NOT a fix: with
+        # reuse_grad_buf_for_mxfp8_param_ag, param_data aliases grad_data, so
+        # zero_grad_buffer() wipes the parameters and _copy_main_params_to_param_buffer
+        # restores only this rank's shard - every other DP rank's slice stays
+        # zero until an all-gather runs. Upstream pairs exactly this staging with
+        # a subsequent start_param_sync() (see DistributedOptimizer.
+        # prepare_model_params_for_param_sync). Any fix must add that sync and be
+        # validated on a multi-DP MXFP8 run.
+        if (
+            self._uses_mxfp8_overlap_shared_param_buffer()
+            and self._forward_pre_hook_enabled()
+        ):
+            self._disable_forward_pre_hook_until_next_train_step(param_sync=True)
 
         no_grad = torch.no_grad()
         no_grad.__enter__()
