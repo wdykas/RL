@@ -877,9 +877,9 @@ def build_nccl_reshard_refit_info(
     # experts across its ordinary TP ranks.
     gen_tp = gen_parallelism.get("tp_size", 1) or 1
     gen_ep = gen_parallelism.get("ep_size", 1) or 1
-    gen_etp = gen_parallelism.get("etp_size")
-    if gen_etp is None:
-        gen_etp = gen_tp if gen_ep == 1 else 1
+    # Bind to a definite int: _build_dst_meshes closes over this, and a
+    # narrowed-in-place Optional would still read as int | None inside it.
+    gen_etp: int = gen_parallelism.get("etp_size") or (gen_tp if gen_ep == 1 else 1)
     gen_pp = gen_parallelism.get("pp_size", 1) or 1
 
     def _build_dst_meshes(num_gpus: int, rank_offset: int):

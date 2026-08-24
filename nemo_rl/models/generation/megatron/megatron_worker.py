@@ -874,6 +874,8 @@ class MegatronGenerationRefitMixin:
         self._generation_nccl_reshard_refit_info = None
         self._generation_hf_to_local_param_map = None
         self._generation_m2n_pending = None
+        # Native MCore copy service, built by init_collective_mcore_generation.
+        self.refit_copy_service = None
 
     def init_collective_mcore_generation(
         self,
@@ -997,7 +999,7 @@ class MegatronGenerationRefitMixin:
         after `prepare_for_generation()` has completed and the CG has been recorded.
         The `NVSHMEMCopyService` lazy init can corrupt CUDA graph state.
         """
-        if not hasattr(self, "refit_copy_service"):
+        if self.refit_copy_service is None:
             return
         if not hasattr(self.refit_copy_service, "_ensure_initialized"):
             return
