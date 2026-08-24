@@ -45,6 +45,23 @@ single `ValueError` listing every violation. The current requirements are:
   aliased allocation stays GPU-resident across refit so
   persistent DDP/autograd views remain valid; ordinary gradient buffers and
   optimizer state are still offloaded.
+* **The wire format is always BF16, even for MXFP8 train → MXFP8 gen.** This is
+  forced by the upstream API, not a shortcut, and is worth stating because it
+  means an MXFP8 trainer does *not* get a smaller refit (expect ~2x the
+  theoretical MXFP8 wire size, plus a dequantize on the source and a re-quantize
+  on the destination). Three reasons it cannot currently be otherwise:
+  * TE MXFP8 and MCore MXFP8 are not byte-compatible. MCore itself dequantizes
+    and re-quantizes when converting between them, deliberately, "to avoid any
+    numerical differences between TE and mcore MXFP8 formats"
+    (`megatron/core/inference/quantization/utils.py`).
+  * `MXFP8Tensor`'s only data constructor is `from_bf16`; `copy_` delegates to
+    `quantize_`, which calls `from_bf16`. There is no relayout entry point.
+  * MCore stores *swizzled* scales, padded to multiples of 128 rows and 4
+    columns, so a shard of the swizzled scales is not a shard of the logical
+    scales. An alignment-aware MXFP8 transport would have to unswizzle,
+    re-slice, and re-swizzle — most of the cost of a requantize anyway.
+  The benefit of this path is capability (M-to-N reshard into a Megatron
+  engine), not bandwidth.
 * vLLM expert parallelism is supported with the NeMo RL convention
   `expert_parallel_size == tensor_parallel_size`.
 * Megatron generation supports expert parallelism and expert tensor
@@ -52,7 +69,13 @@ single `ValueError` listing every violation. The current requirements are:
 * For Megatron generation, `refit_transport=nccl_reshard` selects M-to-N
   regardless of `mcore_generation_config.refit_impl`. Set `refit_transport=null`
   with `refit_impl=bridge` for packed Bridge refit or `refit_impl=mcore` for
-  Megatron Core's native refit.
+  Megatron Core's native refit. `refit_impl` defaults to `mcore`, so existing
+  recipes keep native refit unless they opt in; `refit_backend` is only
+  consulted when `refit_impl=mcore`, and combining `refit_impl=mcore` with
+  `refit_transport=nccl_reshard` warns that `refit_backend` is unused.
+  `refit_impl` applies to non-colocated generation only — colocated refit always
+  uses the in-place wake-reshard, and `refit_impl=bridge` is rejected there
+  rather than silently ignored.
 * **Generation-side PP > 1 is not supported by this refit transport yet.**
   Megatron-Core and vLLM can run generation with PP, and training-side Megatron
   PP is supported here; the missing piece is generation-stage-aware destination

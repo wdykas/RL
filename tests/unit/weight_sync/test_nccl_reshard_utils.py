@@ -221,8 +221,60 @@ def test_check_nccl_reshard_refit_support_allows_transport_to_override_refit_imp
         "colocated": {"enabled": False},
         "mcore_generation_config": {
             "refit_impl": "mcore",
+            "refit_backend": "nvshmem",
             "pipeline_model_parallel_size": 1,
         },
+    }
+
+    # The override is legal, but refit_backend is silently stranded by it, so
+    # the user gets told rather than left to wonder which transport ran.
+    with pytest.warns(UserWarning, match="overrides"):
+        check_nccl_reshard_refit_support(config)
+
+
+def test_check_nccl_reshard_rejects_mxfp8_with_unsupported_grouped_gemm_backend() -> (
+    None
+):
+    """MXFP8 inference quantizes only through the torch/flashinfer backends.
+
+    MCore's own guard for this compares ``config.fp8`` (an e4m3/hybrid *format*)
+    against ``"mxfp8"`` (a *recipe*) and so never fires, and the failure would
+    otherwise surface deep inside the first refit.
+    """
+    config = _valid_nccl_reshard_config()
+    config.policy["precision"] = "bfloat16"
+    config.policy["generation"] = {
+        "backend": "megatron",
+        "colocated": {"enabled": False},
+        "mcore_generation_config": {
+            "refit_impl": "mcore",
+            "pipeline_model_parallel_size": 1,
+            "inference_grouped_gemm_backend": "vllm",
+            "fp8_cfg": {"enabled": True, "fp8_recipe": "mxfp8"},
+        },
+    }
+
+    with pytest.raises(ValueError, match="inference_grouped_gemm_backend"):
+        check_nccl_reshard_refit_support(config)
+
+
+@pytest.mark.parametrize("gemm_backend", ["torch", "flashinfer", None])
+def test_check_nccl_reshard_accepts_supported_grouped_gemm_backends(
+    gemm_backend: object,
+) -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["precision"] = "bfloat16"
+    mcore_cfg = {
+        "refit_impl": "mcore",
+        "pipeline_model_parallel_size": 1,
+        "fp8_cfg": {"enabled": True, "fp8_recipe": "mxfp8"},
+    }
+    if gemm_backend is not None:
+        mcore_cfg["inference_grouped_gemm_backend"] = gemm_backend
+    config.policy["generation"] = {
+        "backend": "megatron",
+        "colocated": {"enabled": False},
+        "mcore_generation_config": mcore_cfg,
     }
 
     check_nccl_reshard_refit_support(config)

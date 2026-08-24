@@ -77,7 +77,8 @@ policy:
       kv_cache_management_mode: "persist"
       materialize_only_last_token_logits: true
       num_speculative_tokens: 0
-      refit_backend: "nccl"
+      refit_impl: "mcore"  # Non-colocated only; colocated always uses the in-place wake-reshard. Options: "mcore" (native reshard/refit) or "bridge" (shared packed broadcast).
+      refit_backend: "nccl"  # Native MCore copy-service backend, used only when refit_impl="mcore". Options: "gloo" or "nccl" ("nvshmem" is currently broken, see https://github.com/NVIDIA-NeMo/RL/issues/3646).
       parsers: []
       expose_http_server: false
 

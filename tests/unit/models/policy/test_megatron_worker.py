@@ -120,8 +120,62 @@ def test_megatron_fp8_refit_tasks_match_generation_backend() -> None:
     worker.megatron_bridge.get_export_fp8_tasks.assert_called_once_with(worker.model)
 
 
+def test_fp8_export_payload_survives_for_non_megatron_backends() -> None:
+    """Bridge's FP8 export tasks must reach vLLM as fp8, not dequantized BF16.
+
+    ``_iter_logical_refit_conversion_tasks`` exists so a Megatron inference
+    engine (BF16 or MXFP8 only) can consume quantized training storage. Applying
+    it to the vLLM path would replace the physical fp8 ``...weight`` with BF16
+    while its ``..._scale_inv`` sibling passed through untouched, so vLLM would
+    rescale BF16 values with a blockwise scale - wrong weights, no error.
+    """
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    fp8_payload = torch.zeros(4, 2, dtype=torch.float8_e4m3fn)
+
+    class _QuantizedParam(torch.Tensor):
+        """Stands in for a live TE Float8BlockwiseQTensor on the module."""
+
+    module = SimpleNamespace(
+        weight=_QuantizedParam(torch.zeros(4, 2, dtype=torch.bfloat16))
+    )
+    task = SimpleNamespace(
+        param_weight=fp8_payload,
+        megatron_module=module,
+        param_name="linear_fc1.weight",
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.model = object()
+    worker.draft_model = None
+    worker.refit_conversion_tasks = [task]
+    worker.megatron_bridge = SimpleNamespace(
+        export_hf_weights=MagicMock(return_value=iter(()))
+    )
+
+    worker.cfg = {"generation": {"backend": "vllm"}}
+    list(worker._iter_params_with_optional_kv_scales())
+    forwarded = worker.megatron_bridge.export_hf_weights.call_args.kwargs[
+        "conversion_tasks"
+    ]
+    # The vLLM path forwards Bridge's task list verbatim - not a rewriting generator.
+    assert list(forwarded) == [task]
+    assert forwarded[0].param_weight.dtype == torch.float8_e4m3fn
+
+    worker.cfg = {"generation": {"backend": "megatron"}}
+    list(worker._iter_params_with_optional_kv_scales())
+    megatron_forwarded = worker.megatron_bridge.export_hf_weights.call_args.kwargs[
+        "conversion_tasks"
+    ]
+    # Megatron generation gets the materializing generator instead.
+    assert not isinstance(megatron_forwarded, list)
+
+
 def test_local_hf_shards_follow_bridge_specs() -> None:
     from megatron.bridge.models.conversion.param_mapping import LocalHFParamSpec
+
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
     )
@@ -149,11 +203,11 @@ def test_local_hf_shards_follow_bridge_specs() -> None:
 
 
 def test_megatron_m2n_stages_fused_mxfp8_weight_until_complete() -> None:
+    from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+
     from nemo_rl.models.generation.megatron.megatron_worker import (
         MegatronGenerationRefitMixin,
     )
-
-    from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 
     gate_name = "model.layers.0.mlp.gate_proj.weight"
     up_name = "model.layers.0.mlp.up_proj.weight"
@@ -256,7 +310,7 @@ def test_megatron_m2n_unstacks_grouped_experts_into_local_weights() -> None:
 def test_prepare_mxfp8_refit_replaces_only_quantized_parameters(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from megatron.core.inference.quantization import utils as quantization_utils
+    from nemo_rl.models.generation.megatron import megatron_worker as worker_module
     from nemo_rl.models.generation.megatron.megatron_worker import (
         MegatronGenerationRefitMixin,
     )
@@ -272,7 +326,9 @@ def test_prepare_mxfp8_refit_replaces_only_quantized_parameters(
     core.decoder.norm = torch.nn.Parameter(torch.zeros(2))
     quantized_destination = object()
     quantize = MagicMock(return_value={"weight": quantized_destination})
-    monkeypatch.setattr(quantization_utils, "quantize_params_to_mxfp8", quantize)
+    # megatron_worker binds this name at import time, so the patch must target
+    # the consuming module rather than megatron.core...quantization.utils.
+    monkeypatch.setattr(worker_module, "quantize_params_to_mxfp8", quantize)
 
     weight_task = _make_refit_task(
         param_name="weight",
@@ -525,8 +581,9 @@ def test_megatron_refit_bridge_tasks_export_logical_quantized_weights(
 def test_megatron_refit_quantized_source_dequantizes_once_per_layer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
     from megatron.bridge.models.conversion.param_mapping import LocalHFParamSpec
+
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
 
     worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
     quantized_source = torch.zeros((2, 4, 2), dtype=torch.uint8)

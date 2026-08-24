@@ -132,7 +132,7 @@ class MegatronGeneration(GenerationInterface):
         # `self._policy_config` keeps a reference to the full PolicyConfig.
         self._policy_config = config
         self.cfg: MCoreGenerationConfig = config["generation"]
-        self.refit_impl = self.cfg["mcore_generation_config"].get("refit_impl", "mcore")
+        self.refit_impl = self.cfg["mcore_generation_config"]["refit_impl"]
         if self.refit_impl not in ("bridge", "mcore"):
             raise ValueError(
                 "policy.generation.mcore_generation_config.refit_impl must be "
@@ -214,7 +214,10 @@ class MegatronGeneration(GenerationInterface):
             world_size: Total world size (train + inference workers).
             train_world_size: Number of training workers (used to offset ranks).
             refit_backend: Optional override for the native MCore copy-service
-                backend. Ignored by Bridge packed refit.
+                backend ("gloo" or "nccl"; "nvshmem" is currently broken and
+                warns at setup, see
+                https://github.com/NVIDIA-NeMo/RL/issues/3646). Ignored by
+                Bridge packed refit.
 
         Returns:
             List of Ray ObjectRefs for the collective init futures.

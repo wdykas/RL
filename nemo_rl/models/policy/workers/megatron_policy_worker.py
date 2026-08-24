@@ -118,10 +118,10 @@ from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 from nemo_rl.utils.r3_trace import maybe_r3_trace_stage
 from nemo_rl.utils.timer import Timer
 from nemo_rl.weight_sync.nccl_reshard_utils import (
+    _INDIVIDUAL_EXPERT_RE,
     HFToLocalParamMap,
     LocalParamSpec,
     RefitCtx,
-    _INDIVIDUAL_EXPERT_RE,
     _extract_layer_name,
     _extract_layer_prefix,
     build_nccl_reshard_refit_info,
@@ -580,6 +580,7 @@ class MegatronPolicyWorkerImpl(
         ):
             # Bridge's generic GPT provider defaults to its training layer spec.
             # Dedicated inference workers need MCore inference linears instead.
+            # A model-specific provider already handles this and returns False.
             _configure_inference_optimized_layer_spec(self.megatron_cfg.model)
         self.dtype = runtime_config.dtype
         self.optimizer_cpu_offload = runtime_config.optimizer_cpu_offload
@@ -737,6 +738,7 @@ class MegatronPolicyWorkerImpl(
         self._held_gather_buffer = None
 
         self._init_inference_engine_state()
+        self._init_generation_refit_state()
 
         log_gpu_memory_diagnostics(
             label="init_complete", worker_type="MegatronPolicyWorker"
@@ -771,14 +773,27 @@ class MegatronPolicyWorkerImpl(
         model_config.param_sync_func = None
         self._first_train_step_forward_pre_hook_disabled = True
 
-    def _copy_main_params_to_param_buffer(self, zero_grad_buffer: bool = False) -> None:
+    def _copy_main_params_to_param_buffer(
+        self, zero_grad_buffer: bool = False, *, force: bool = False
+    ) -> None:
+        """Stage FP32 optimizer masters into the shared MXFP8 param buffer.
+
+        Args:
+            zero_grad_buffer: Also zero the aliased gradient buffer first.
+            force: Stage even when the forward pre-hooks are already disabled.
+                The normal callers run while hooks are still installed (the
+                hook-driven all-gather is what would otherwise restage the
+                buffer). A refit can arrive with hooks already off, in which
+                case nothing has restaged the buffer since the optimizer step
+                and generation would read pre-step weights.
+        """
         if not isinstance(self.model, DistributedDataParallel):
             return
 
         if not self._uses_mxfp8_overlap_shared_param_buffer():
             return
 
-        if not self._forward_pre_hook_enabled():
+        if not force and not self._forward_pre_hook_enabled():
             return
 
         if zero_grad_buffer:
@@ -2334,17 +2349,23 @@ class MegatronPolicyWorkerImpl(
             and self.fp8_cfg.get("fp8_recipe") == "blockwise"
         )
 
+    def _uses_megatron_generation(self) -> bool:
+        """Return True if the refit destination is a Megatron inference engine.
+
+        Megatron generation stores BF16 or MXFP8 weights, so quantized training
+        storage must be materialized as logical BF16 for transport. Every other
+        destination consumes Bridge's physical export tasks unchanged.
+        """
+        generation_cfg = self.cfg.get("generation")
+        return generation_cfg is not None and generation_cfg["backend"] == "megatron"
+
     def _build_refit_conversion_tasks(self) -> list:
         """Build the conversion-task list driving refit (BF16 or FP8 export).
 
         Megatron generation consumes logical weights through standard Bridge
         tasks. Other backends keep Bridge physical FP8 data and scale tasks.
         """
-        generation_cfg = self.cfg.get("generation")
-        uses_megatron_generation = (
-            generation_cfg is not None and generation_cfg["backend"] == "megatron"
-        )
-        if self._is_fp8_export() and not uses_megatron_generation:
+        if self._is_fp8_export() and not self._uses_megatron_generation():
             return self.megatron_bridge.get_export_fp8_tasks(self.model)
         return [
             task
@@ -2437,12 +2458,19 @@ class MegatronPolicyWorkerImpl(
             # Default to the full conversion tasks
             conversion_tasks = self.refit_conversion_tasks
 
+        # Only Megatron generation needs quantized sources materialized as
+        # logical BF16. Bridge's FP8 export tasks already carry the physical
+        # fp8 payload plus its scale_inv sibling, and rewriting them would ship
+        # a BF16 weight next to a live blockwise scale.
+        if self._uses_megatron_generation():
+            conversion_tasks = self._iter_logical_refit_conversion_tasks(
+                conversion_tasks
+            )
+
         base_iter = self.megatron_bridge.export_hf_weights(
             [self.model],
             show_progress=False,
-            conversion_tasks=self._iter_logical_refit_conversion_tasks(
-                conversion_tasks
-            ),  # used for metadata caching
+            conversion_tasks=conversion_tasks,
         )
 
         # Yield the original parameters first.
@@ -3179,11 +3207,17 @@ class MegatronPolicyWorkerImpl(
         # latest weights and leaves hooks disabled while the shared param/grad
         # buffer is held across refit. The normal train-step transition
         # re-enables them.
-        if (
-            self._uses_mxfp8_overlap_shared_param_buffer()
-            and self._forward_pre_hook_enabled()
-        ):
-            self._disable_forward_pre_hook_until_next_train_step(param_sync=True)
+        if self._uses_mxfp8_overlap_shared_param_buffer():
+            if self._forward_pre_hook_enabled():
+                self._disable_forward_pre_hook_until_next_train_step(param_sync=True)
+            else:
+                # Hooks were already disabled (e.g. a logprob pass disabled them
+                # with param_sync=False and they stay off through the following
+                # train step). Nothing has restaged the shared buffer since the
+                # optimizer step, so generation would refit pre-step weights.
+                self._copy_main_params_to_param_buffer(
+                    zero_grad_buffer=True, force=True
+                )
 
         no_grad = torch.no_grad()
         no_grad.__enter__()

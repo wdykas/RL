@@ -35,6 +35,11 @@ run_test() {
 }
 
 run_test uv run --no-sync bash ./tests/functional/grpo_vllm_mxfp8_rollout_gb200.sh
+# L1_Functional_Tests_Megatron_4.sh guards Megatron-generation tests behind
+# megatron_generation_supported(), which skips on compute_cap >= 100. That guard
+# is deliberately NOT applied here: MXFP8 inference is Blackwell-only, so this
+# runner is the one place the path can be exercised at all. Do not copy the
+# guard over.
 run_test env REFIT_PRECISION=mxfp8 uv run --no-sync bash ./tests/functional/grpo_megatron_nccl_reshard_refit.sh
 
 cd ${PROJECT_ROOT}/tests

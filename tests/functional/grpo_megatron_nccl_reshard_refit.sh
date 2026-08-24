@@ -109,7 +109,11 @@ uv run coverage run -a \
     2>&1 | tee "$RUN_LOG"
 
 grep -q "nccl_reshard bulk comm group" "$RUN_LOG"
-grep -q "cuda graph warmup" "$RUN_LOG"
+# NeMo-RL-owned marker: the engine is initialized lazily after the first refit
+# so CUDA graphs capture the final (possibly MXFP8) buffers. Do not assert on
+# Megatron-LM's "cuda graph warmup" tqdm label - it is upstream-owned and only
+# appears when tqdm is not disabled.
+grep -q "Initialized persistent inference engine" "$RUN_LOG"
 if [[ "${REQUIRE_REAL_NCCL_M2N:-0}" == "1" ]]; then
     grep -q "reshard path: real nccl.m2n.reshard" "$RUN_LOG"
 else

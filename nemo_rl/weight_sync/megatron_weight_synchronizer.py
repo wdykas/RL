@@ -62,6 +62,20 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
         self._inference_cluster = inference_cluster
         self._refit_backend: Optional[str] = None
         self._transport: Optional[WeightSynchronizer] = None
+        if colocated:
+            # Colocated refit always uses the in-place wake-reshard, so
+            # refit_impl is inert. Reject rather than silently ignoring it:
+            # a user asking for the Bridge transport would otherwise get the
+            # native one with no indication their setting did nothing.
+            mcore_cfg = generation.cfg.get("mcore_generation_config", {}) or {}
+            if mcore_cfg.get("refit_impl") == "bridge":
+                raise ValueError(
+                    "policy.generation.mcore_generation_config.refit_impl="
+                    "'bridge' is not supported with colocated generation, which "
+                    "always uses the in-place wake-reshard. Set refit_impl="
+                    "'mcore', or set colocated.enabled=false to use the Bridge "
+                    "packed-broadcast transport."
+                )
         if not colocated and not generation.uses_native_refit:
             if generation.cfg.get("refit_transport") == "nccl_reshard":
                 self._transport = NcclReshardWeightSynchronizer(

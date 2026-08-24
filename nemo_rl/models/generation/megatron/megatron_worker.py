@@ -74,11 +74,11 @@ from nemo_rl.models.megatron.memory_saver import (
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_consumer
 from nemo_rl.weight_sync.nccl_reshard_utils import (
+    _INDIVIDUAL_EXPERT_RE,
+    _STR_TO_DTYPE,
     HFToLocalParamMap,
     LocalParamSpec,
     RefitCtx,
-    _INDIVIDUAL_EXPERT_RE,
-    _STR_TO_DTYPE,
     is_nccl_reshard_param,
     restore_refit_info_placements,
 )
@@ -99,12 +99,35 @@ def _inference_optimized_transformer_layer_spec(config: Any) -> Any:
 
 
 def _configure_inference_optimized_layer_spec(model_provider: Any) -> bool:
-    """Select MCore inference linears for a Bridge generic-GPT provider."""
+    """Select MCore inference linears for a Bridge generic-GPT provider.
+
+    Only the generic path needs this. Model-specific providers (DeepSeek,
+    MiniMax, GLM, ...) install ``get_gpt_decoder_block_spec``, which already
+    dispatches ``transformer_impl='inference_optimized'`` itself and — unlike
+    the uniform spec built here — gives dense and MoE layers *different* specs.
+    Overwriting those would rebuild a ``moe_layer_freq`` model's dense layers
+    as MoE layers, so leave any non-default spec alone.
+
+    Returns:
+        True if the provider's layer spec was replaced, False if the provider
+        already carries a model-specific spec that handles inference itself.
+
+    Raises:
+        ValueError: If the provider is not a Bridge ``GPTModelProvider``, which
+            means ``transformer_impl='inference_optimized'`` would be silently
+            ignored and the training linears used for generation instead.
+    """
     # Bridge imports ModelOpt plugins that can re-enter MCore while this module
     # is still initializing, so keep this cycle-sensitive provider import local.
-    from megatron.bridge.models.gpt_provider import GPTModelProvider
+    from megatron.bridge.models.gpt_provider import GPTModelProvider, default_layer_spec
 
     if not isinstance(model_provider, GPTModelProvider):
+        raise ValueError(
+            "mcore_generation_config.transformer_impl='inference_optimized' "
+            "requires a Bridge GPTModelProvider, got "
+            f"{type(model_provider).__name__}."
+        )
+    if model_provider.transformer_layer_spec is not default_layer_spec:
         return False
     model_provider.transformer_layer_spec = _inference_optimized_transformer_layer_spec
     return True
@@ -832,6 +855,29 @@ class MegatronGenerationMixin:
 class MegatronGenerationRefitMixin:
     """Refit collective, weight transfer, and engine suspend/resume around refits."""
 
+    def _init_generation_refit_state(self) -> None:
+        """Reset every refit attribute to its unprepared state.
+
+        Declaring these up front keeps ``prepare_refit_info`` readiness a value
+        check rather than an ``hasattr`` probe, and makes the full set visible
+        to anyone adding a ``__getstate__``.
+        """
+        # Bridge import plan, populated by prepare_refit_info.
+        self._generation_refit_state_dict_info = None
+        self._generation_refit_tasks = None
+        self._generation_refit_model_chunks = None
+        self._generation_refit_dependency_counts = None
+        # Per-refit progress, reset at the start of each transfer.
+        self._generation_refit_task_index = 0
+        self._generation_refit_remaining_dependencies = {}
+        self._generation_refit_pending_weights = {}
+        self._generation_refit_pending_streams = {}
+        # nccl_reshard (M-to-N) transport state.
+        self._generation_nccl_reshard_groups = None
+        self._generation_nccl_reshard_refit_info = None
+        self._generation_hf_to_local_param_map = None
+        self._generation_m2n_pending = None
+
     def init_collective_mcore_generation(
         self,
         ip: str,
@@ -1350,6 +1396,20 @@ class MegatronGenerationRefitMixin:
     def _write_generation_refit_weight(
         self, task: _MegatronRefitTask, converted_weight: torch.Tensor
     ) -> None:
+        """Copy one converted weight into its persistent inference destination.
+
+        ``copy_`` rather than rebinding: an MXFP8 destination quantizes in place
+        and keeps its storage address, which is what already-captured CUDA
+        graphs point at.
+
+        Args:
+            task: The Bridge import task owning the destination tensor.
+            converted_weight: The assembled weight in the destination's layout.
+
+        Raises:
+            ValueError: If the converted weight does not match the destination
+                shape, which means the refit plan and the model disagree.
+        """
         if converted_weight.shape != task.expected_shape:
             raise ValueError(
                 f"Shape mismatch for Megatron parameter {task.param_name!r}: "
@@ -1361,6 +1421,18 @@ class MegatronGenerationRefitMixin:
     def _load_generation_refit_batch(
         self, weights: list[tuple[str, torch.Tensor]]
     ) -> None:
+        """Import every Bridge task whose HF inputs have now all arrived.
+
+        Called once per ``packed_broadcast_consumer`` batch. Weights arrive in
+        HF order, but a task may fuse several of them (gate/up, stacked
+        experts), so each tensor is buffered until its task's dependency count
+        reaches zero, then the task is converted and written in task order.
+        Buffered tensors record their producing stream so the conversion can
+        wait on it before reading across streams.
+
+        Args:
+            weights: ``(hf_name, tensor)`` pairs unpacked from this batch.
+        """
         batch_stream = (
             torch.cuda.current_stream() if weights and weights[0][1].is_cuda else None
         )
@@ -1409,7 +1481,7 @@ class MegatronGenerationRefitMixin:
     @torch.no_grad()
     def update_generation_weights_from_collective(self) -> bool:
         """Receive packed HF tensors and import them into the Megatron model."""
-        if not hasattr(self, "_generation_refit_state_dict_info"):
+        if self._generation_refit_state_dict_info is None:
             raise RuntimeError(
                 "Megatron refit metadata is not prepared. Call prepare_refit_info first."
             )

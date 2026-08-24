@@ -37,6 +37,7 @@ from tests.unit.test_utils import SimpleLossFn
 model_name = "Qwen/Qwen3-0.6B"
 
 
+@pytest.mark.mcore
 @pytest.mark.parametrize("refit_impl", ["bridge", "mcore"])
 def test_megatron_generation_dispatches_refit_implementation(refit_impl):
     generation = object.__new__(MegatronGeneration)
@@ -79,6 +80,7 @@ def test_megatron_generation_dispatches_refit_implementation(refit_impl):
         generation._policy.init_collective_mcore_generation.assert_not_called()
 
 
+@pytest.mark.mcore
 def test_megatron_generation_m2n_transport_overrides_native_refit() -> None:
     generation = object.__new__(MegatronGeneration)
     generation.refit_impl = "mcore"
@@ -105,6 +107,7 @@ def test_megatron_generation_m2n_transport_overrides_native_refit() -> None:
     generation._policy.init_collective_mcore_generation.assert_not_called()
 
 
+@pytest.mark.mcore
 def test_bridge_refit_finalizes_import_before_return(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
