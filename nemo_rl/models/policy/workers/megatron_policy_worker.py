@@ -3212,16 +3212,19 @@ class MegatronPolicyWorkerImpl(
         # latest weights and leaves hooks disabled while the shared param/grad
         # buffer is held across refit. The normal train-step transition
         # re-enables them.
-        # TODO(#3739): when the hooks are already disabled, nothing has restaged
-        # the shared buffer since the optimizer step, so generation may refit
-        # pre-step weights. Staging alone is NOT a fix: with
-        # reuse_grad_buf_for_mxfp8_param_ag, param_data aliases grad_data, so
-        # zero_grad_buffer() wipes the parameters and _copy_main_params_to_param_buffer
-        # restores only this rank's shard - every other DP rank's slice stays
-        # zero until an all-gather runs. Upstream pairs exactly this staging with
-        # a subsequent start_param_sync() (see DistributedOptimizer.
-        # prepare_model_params_for_param_sync). Any fix must add that sync and be
-        # validated on a multi-DP MXFP8 run.
+        # Deliberately conditional on the hooks being enabled. Every state in
+        # which they are already off is one where the weights are current
+        # anyway: before the first train step the buffer holds the checkpoint;
+        # eval entry already forced a sync via disable_forward_pre_hook(
+        # param_sync=True) and runs no optimizer step; a skipped step leaves the
+        # masters unchanged; and a successful step re-enables the hooks before
+        # returning. If a stale case is ever found, note that staging alone does
+        # NOT fix it - with reuse_grad_buf_for_mxfp8_param_ag param_data aliases
+        # grad_data, so zero_grad_buffer() wipes the parameters and
+        # _copy_main_params_to_param_buffer restores only this rank's shard,
+        # leaving every other DP rank at zero. Upstream pairs that staging with a
+        # following start_param_sync (DistributedOptimizer.
+        # prepare_model_params_for_param_sync); any fix needs the sync too.
         if (
             self._uses_mxfp8_overlap_shared_param_buffer()
             and self._forward_pre_hook_enabled()
