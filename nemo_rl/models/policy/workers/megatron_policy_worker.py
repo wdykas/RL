@@ -2570,12 +2570,19 @@ class MegatronPolicyWorkerImpl(
         views; quantized specs materialize logical BF16 during each refit. EP:
         ``refit_conversion_tasks`` already holds only this rank's local experts;
         PP non-local params have ``param_weight is None``.
+
+        Only a Megatron destination gets the logical-BF16 materialization. Every
+        other backend keeps Bridge's payload verbatim, which for an FP8 export
+        task is the physical fp8 view its ``_scale_inv`` sibling describes;
+        dequantizing it here would ship BF16 bytes under an fp8 scale.
         """
+        uses_megatron_generation = self._uses_megatron_generation()
         for task in self.refit_conversion_tasks:
-            local_tensor = _get_refit_task_source(task)
+            if uses_megatron_generation:
+                local_tensor = _get_refit_task_source(task)
+            else:
+                local_tensor = task.param_weight
             if local_tensor is None:
-                continue
-            if task.global_param_name.endswith("_scale_inv"):
                 continue
 
             for spec in task.local_hf_param_specs():
