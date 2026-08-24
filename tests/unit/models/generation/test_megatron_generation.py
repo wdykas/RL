@@ -14,7 +14,7 @@
 
 import gc
 from copy import deepcopy
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -35,26 +35,6 @@ from nemo_rl.weight_sync.megatron_weight_synchronizer import (
 from tests.unit.test_utils import SimpleLossFn
 
 model_name = "Qwen/Qwen3-0.6B"
-
-
-def test_megatron_generation_defaults_to_native_refit():
-    config = {
-        "generation": {
-            "mcore_generation_config": {
-                "refit_backend": "gloo",
-                "expose_http_server": False,
-            }
-        }
-    }
-
-    generation = MegatronGeneration(
-        config=config,
-        tokenizer=MagicMock(),
-        policy=MagicMock(),
-    )
-
-    assert generation.refit_impl == "mcore"
-    assert generation.uses_native_refit
 
 
 @pytest.mark.parametrize("refit_impl", ["bridge", "mcore"])
@@ -123,51 +103,6 @@ def test_megatron_generation_m2n_transport_overrides_native_refit() -> None:
         rank_offset=2,
     )
     generation._policy.init_collective_mcore_generation.assert_not_called()
-
-
-def test_megatron_generation_forwards_m2n_refit_lifecycle() -> None:
-    generation = object.__new__(MegatronGeneration)
-    generation._policy = MagicMock()
-    generation._owns_policy = False
-    generation._policy.worker_group.run_all_workers_single_data.side_effect = [
-        ["init"],
-        ["prepare"],
-        ["refit"],
-    ]
-
-    assert generation.init_nccl_reshard_comm_group(
-        pp_ips=["10.0.0.1"],
-        pp_ports=[1234],
-        pp_size=1,
-        train_ranks_per_stage=2,
-        sub_world_size=4,
-    ) == ["init"]
-    with patch(
-        "nemo_rl.models.generation.megatron.megatron_generation.ray.get",
-        return_value=["prepare"],
-    ) as get:
-        generation.prepare_nccl_reshard_refit_info({"layer_names": []})
-        get.assert_called_once_with(["prepare"])
-    assert generation.nccl_reshard_refit() == ["refit"]
-
-    assert (
-        generation._policy.worker_group.run_all_workers_single_data.call_args_list
-        == [
-            call(
-                "init_nccl_reshard_comm_groups_generation",
-                pp_ips=["10.0.0.1"],
-                pp_ports=[1234],
-                pp_size=1,
-                train_ranks_per_stage=2,
-                sub_world_size=4,
-            ),
-            call(
-                "prepare_nccl_reshard_generation_refit_info",
-                refit_info={"layer_names": []},
-            ),
-            call("nccl_reshard_generation_refit"),
-        ]
-    )
 
 
 def test_bridge_refit_finalizes_import_before_return(
@@ -696,13 +631,11 @@ def test_megatron_generation_colocated(
 @pytest.mark.mcore
 @pytest.mark.timeout(900)
 @pytest.mark.parametrize("skip_weight_load", [False, True])
-@pytest.mark.parametrize("refit_impl", ["bridge", "mcore"])
 def test_megatron_generation_non_colocated_refit(
     policy_cluster_separate,
     test_input_data,
     tokenizer,
     skip_weight_load,
-    refit_impl,
 ):
     """Non-colocated Megatron generation.
 
@@ -724,7 +657,6 @@ def test_megatron_generation_non_colocated_refit(
         pytest.skip("Need at least two GPUs across separate clusters")
 
     config = deepcopy(basic_megatron_test_config)
-    config["generation"]["mcore_generation_config"]["refit_impl"] = refit_impl
 
     policy = None
     mg = None

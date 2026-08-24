@@ -345,18 +345,16 @@ def build_mesh_info(
     **innermost** (rightmost, fastest-varying) axis — consecutive global ranks
     differ in it.
 
-    Callers never activate EP and TP in the same mesh:
-    ``_build_train_src_meshes`` builds a separate non-expert mesh
-    (``ep_size=1``) and expert mesh (``tp_size=1``).  So the innermost active
-    dim — and the coord a modulo recovers — is:
+    Callers build separate non-expert (TP) and expert (EP/ETP) meshes. An
+    expert mesh may activate both EP and expert TP. The active axes use
+    Megatron's rank order, with TP innermost and EP immediately outside it:
 
       * **TP** in the non-expert mesh (EP dropped): ``global_rank % tp_size``
         recovers the TP coord, the standard Megatron non-expert layout.
-      * **EP** in the expert mesh (TP dropped): ``global_rank % ep_size``
-        recovers the EP coord, Megatron-Core's MoE rank layout.
-
-    (Were EP and TP ever active together, the emit order would make TP — not
-    EP — innermost; that case does not arise today.)
+      * **EP** in an EP-only expert mesh: ``global_rank % ep_size`` recovers
+        the EP coord.
+      * **ETP + EP** in a generation expert mesh: ETP is the innermost axis,
+        matching Megatron-Core's expert rank generator.
 
     Returns:
         ``(MeshInfo, dim_map)`` where *dim_map* maps ``"tp"``/``"ep"``/``"dp"``/``"pp"``
@@ -387,7 +385,7 @@ def get_placements(param_name: str, dim_map: dict, ndim: int) -> list:
     """Determine DTensor placements for a parameter given a *dim_map*.
 
     1-D params (layernorm, bias) are always fully replicated.
-    Expert params shard dim 0 on EP; their TP shard dims are shifted by +1.
+    Expert params shard dim 0 on EP; their ETP shard dims are shifted by +1.
     """
     num_mesh_dims = len(dim_map) or 1
     placements = [Replicate() for _ in range(num_mesh_dims)]
@@ -399,12 +397,12 @@ def get_placements(param_name: str, dim_map: dict, ndim: int) -> list:
     if is_expert_param(param_name):
         if "ep" in dim_map:
             placements[dim_map["ep"]] = Shard(0)
-        else:
-            # We currently never shards both EP and TP for the expert params
-            # so far. If MCore etp is enabled, the logic should be changed
-            tp_dim = _get_expert_tp_shard_dim(param_name)
-            if tp_dim is not None and "tp" in dim_map:
-                placements[dim_map["tp"]] = Shard(tp_dim + 1)
+        # The grouped HF tensor has a leading expert dimension, so the usual
+        # projection shard dimension is shifted by one for ETP. This remains
+        # independent of EP's Shard(0) when both axes are active.
+        tp_dim = _get_expert_tp_shard_dim(param_name)
+        if tp_dim is not None and "tp" in dim_map:
+            placements[dim_map["tp"]] = Shard(tp_dim + 1)
     else:
         # for non-expert params
         tp_dim = get_tp_shard_dim(param_name)
@@ -640,15 +638,6 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
         )
 
     if megatron_enabled:
-        etp = megatron_cfg.get("expert_tensor_parallel_size", 1)
-
-        # ETP is not supported yet.
-        if etp not in (1, None):
-            violations.append(
-                f"Megatron expert_tensor_parallel_size is not supported yet "
-                f"(got etp={etp})."
-            )
-
         # PP-layout knobs that _build_layer_to_pp_stage doesn't yet handle.
         if megatron_cfg.get("pipeline_model_parallel_layout") is not None:
             violations.append(
@@ -753,16 +742,6 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
                     "policy.megatron_cfg.fp8_cfg.fp8_param=True requires "
                     "policy.megatron_cfg.fp8_cfg.enabled=True."
                 )
-            gen_ep = mcore_generation_cfg.get("expert_model_parallel_size", 1)
-            gen_etp = mcore_generation_cfg.get("expert_tensor_parallel_size", 1)
-            if gen_ep not in (1, None) and gen_etp not in (1, None):
-                violations.append(
-                    "Megatron-generation nccl_reshard refit supports expert "
-                    "parallelism or expert tensor parallelism, but not both at "
-                    "once (got policy.generation.mcore_generation_config."
-                    f"expert_model_parallel_size={gen_ep} and "
-                    f"expert_tensor_parallel_size={gen_etp})."
-                )
             gen_pp = mcore_generation_cfg.get("pipeline_model_parallel_size", 1)
             if gen_pp != 1:
                 violations.append(
@@ -780,7 +759,7 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
                 )
 
     # Gen-backend restrictions. The reshard supports gen-side TP, DP, EP, and
-    # Megatron ETP when EP=1. The vLLM backend shards experts by index across
+    # Megatron ETP. The vLLM backend shards experts by index across
     # its TP ranks, so its EP is either 1 (TP-sharded experts) or equal to TP
     # (EP-sharded). PP is not yet supported gen-side.
     if generation.get("backend") == "vllm":
@@ -817,7 +796,8 @@ def build_nccl_reshard_refit_info(
     Args:
         state_dict_metadata: ``{hf_param_name: {"shape": list, "dtype": str}}``
             The input ``state_dict_metadata`` has a global view of the parameters
-        train_parallelism / gen_parallelism: ``{"tp_size", "ep_size", "pp_size"}``
+        train_parallelism / gen_parallelism:
+            ``{"tp_size", "ep_size", "etp_size", "pp_size"}``
         train_world_size / gen_world_size: number of GPUs per side
         layer_to_pp_stage: optional mapping from layer name to PP stage index.
             When provided (PP>1), per-stage meshes are built so each PP stage's
@@ -840,14 +820,17 @@ def build_nccl_reshard_refit_info(
     pp_size = train_parallelism.get("pp_size", 1)
     tp_size = train_parallelism.get("tp_size", 1)
     ep_size = train_parallelism.get("ep_size", 1)
+    etp_size = train_parallelism.get("etp_size", 1)
+    if etp_size is None:
+        etp_size = tp_size
     use_per_stage = pp_size > 1
     if use_per_stage:
         assert layer_to_pp_stage is not None, (
             "layer_to_pp_stage must be provided when pp_size > 1"
         )
 
-    # Training-side ETP>1 is not supported yet. Non-expert params partition
-    # ranks by (tp, dp); expert params partition them by (ep, edp).
+    # Non-expert params partition ranks by (tp, dp); expert params partition
+    # them by (etp, ep, edp), matching MCore's separate expert rank grid.
     def _build_train_src_meshes(num_gpus: int, rank_offset: int, stage_pp: int):
         non_expert_mesh, non_expert_dim_map = build_mesh_info(
             num_gpus,
@@ -859,7 +842,7 @@ def build_nccl_reshard_refit_info(
         expert_mesh, expert_dim_map = build_mesh_info(
             num_gpus,
             rank_offset=rank_offset,
-            tp_size=1,
+            tp_size=etp_size,
             ep_size=ep_size,
             pp_size=stage_pp,
         )
@@ -869,15 +852,12 @@ def build_nccl_reshard_refit_info(
     # Expert params follow the generation backend's EP/ETP layout. vLLM uses
     # TP for experts when EP=1, whereas Megatron can keep ETP=1 and replicate
     # experts across its ordinary TP ranks.
-    gen_tp = gen_parallelism.get("tp_size", 1)
-    gen_ep = gen_parallelism.get("ep_size", 1)
-    gen_etp = gen_parallelism.get("etp_size", gen_tp if gen_ep == 1 else 1)
-    gen_pp = gen_parallelism.get("pp_size", 1)
-    if gen_ep > 1 and gen_etp > 1:
-        raise ValueError(
-            "nccl_reshard cannot represent generation expert parallelism and "
-            f"expert tensor parallelism together (got ep={gen_ep}, etp={gen_etp})."
-        )
+    gen_tp = gen_parallelism.get("tp_size", 1) or 1
+    gen_ep = gen_parallelism.get("ep_size", 1) or 1
+    gen_etp = gen_parallelism.get("etp_size")
+    if gen_etp is None:
+        gen_etp = gen_tp if gen_ep == 1 else 1
+    gen_pp = gen_parallelism.get("pp_size", 1) or 1
 
     def _build_dst_meshes(num_gpus: int, rank_offset: int):
         non_expert = build_mesh_info(
@@ -887,30 +867,13 @@ def build_nccl_reshard_refit_info(
             ep_size=1,
             pp_size=gen_pp,
         )
-        if gen_ep > 1:
-            expert = build_mesh_info(
-                num_gpus,
-                rank_offset=rank_offset,
-                tp_size=1,
-                ep_size=gen_ep,
-                pp_size=gen_pp,
-            )
-        elif gen_etp > 1:
-            expert = build_mesh_info(
-                num_gpus,
-                rank_offset=rank_offset,
-                tp_size=gen_etp,
-                ep_size=1,
-                pp_size=gen_pp,
-            )
-        else:
-            expert = build_mesh_info(
-                num_gpus,
-                rank_offset=rank_offset,
-                tp_size=1,
-                ep_size=1,
-                pp_size=gen_pp,
-            )
+        expert = build_mesh_info(
+            num_gpus,
+            rank_offset=rank_offset,
+            tp_size=gen_etp,
+            ep_size=gen_ep,
+            pp_size=gen_pp,
+        )
         return non_expert, expert
 
     if use_per_stage:

@@ -85,9 +85,12 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
 
     def _train_parallelism(self) -> dict[str, int]:
         megatron_cfg = self._policy.cfg["megatron_cfg"]
+        tp_size = megatron_cfg.get("tensor_model_parallel_size", 1)
+        etp_size = megatron_cfg.get("expert_tensor_parallel_size")
         return {
-            "tp_size": megatron_cfg.get("tensor_model_parallel_size", 1),
+            "tp_size": tp_size,
             "ep_size": megatron_cfg.get("expert_model_parallel_size", 1),
+            "etp_size": tp_size if etp_size is None else etp_size,
             "pp_size": megatron_cfg.get("pipeline_model_parallel_size", 1),
         }
 
@@ -108,10 +111,13 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
                 **self._policy.cfg["megatron_cfg"],
                 **generation_cfg["mcore_generation_config"],
             }
+            tp_size = megatron_cfg["tensor_model_parallel_size"]
+            etp_size = megatron_cfg.get("expert_tensor_parallel_size")
             return {
-                "tp_size": megatron_cfg["tensor_model_parallel_size"],
+                "tp_size": tp_size,
                 "ep_size": megatron_cfg["expert_model_parallel_size"],
-                "etp_size": megatron_cfg.get("expert_tensor_parallel_size", 1),
+                # Match MCore's effective default: an omitted/None ETP uses TP.
+                "etp_size": tp_size if etp_size is None else etp_size,
                 "pp_size": megatron_cfg["pipeline_model_parallel_size"],
             }
         raise ValueError(

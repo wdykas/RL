@@ -30,8 +30,8 @@ single `ValueError` listing every violation. The current requirements are:
   training backend is not supported yet.).
 * **vLLM or Megatron generation backend** — `policy.generation.backend` must be
   `vllm` or `megatron` (SGLang and TRTLLM are not supported yet).
-* Training-side Megatron `expert_tensor_parallel_size` (i.e., ETP) must be 1;
-  custom PP layouts (`pipeline_model_parallel_layout`, virtual PP > 1,
+* Training-side Megatron supports expert tensor parallelism. Custom PP layouts
+  (`pipeline_model_parallel_layout`, virtual PP > 1,
   embedding/loss pipeline-split accounting) are not supported yet.
 * **Precision** for vLLM supports BF16 train ↔ BF16 gen, blockwise-FP8 train
   (`fp8_param=true` + blockwise recipe) ↔ FP8 gen, and BF16 train → MXFP8 gen
@@ -47,13 +47,16 @@ single `ValueError` listing every violation. The current requirements are:
   optimizer state are still offloaded.
 * vLLM expert parallelism is supported with the NeMo RL convention
   `expert_parallel_size == tensor_parallel_size`.
-* Megatron generation supports either expert parallelism or expert tensor
-  parallelism. Combining generation EP > 1 and ETP > 1 is not supported yet.
+* Megatron generation supports expert parallelism and expert tensor
+  parallelism, including using both together.
 * For Megatron generation, `refit_transport=nccl_reshard` selects M-to-N
   regardless of `mcore_generation_config.refit_impl`. Set `refit_transport=null`
   with `refit_impl=bridge` for packed Bridge refit or `refit_impl=mcore` for
   Megatron Core's native refit.
-* Generation-side PP > 1 is not supported.
+* **Generation-side PP > 1 is not supported by this refit transport yet.**
+  Megatron-Core and vLLM can run generation with PP, and training-side Megatron
+  PP is supported here; the missing piece is generation-stage-aware destination
+  routing in `nccl_reshard`.
 * **No ModelOpt real quantization** — `policy.generation.real_quant=false`. Real-quant
   rollouts refit through vLLM's layerwise-reload weight loaders, which the bulk
   `xferdtensor` writes bypass.

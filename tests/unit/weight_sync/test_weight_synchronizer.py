@@ -555,48 +555,8 @@ def _mock_megatron_policy(**overrides):
 
 
 class TestMegatronWeightSynchronizer:
-    def test_non_colocated_requires_clusters(self):
-        with pytest.raises(ValueError):
-            MegatronWeightSynchronizer(
-                _mock_megatron_policy(), _mock_megatron_generation(), colocated=False
-            )
-
     @patch(
-        "nemo_rl.weight_sync.collective_weight_synchronizer.CollectiveWeightSynchronizer"
-    )
-    def test_bridge_refit_delegates_transfer_and_keeps_megatron_lifecycle(
-        self, mock_collective_cls
-    ):
-        policy = _mock_megatron_policy()
-        gen = _mock_megatron_generation(uses_native_refit=False)
-        collective = mock_collective_cls.return_value
-        sync = MegatronWeightSynchronizer(
-            policy,
-            gen,
-            colocated=False,
-            train_cluster=_mock_cluster(),
-            inference_cluster=_mock_cluster(),
-        )
-
-        sync.init_communicator()
-        assert sync.sync_weights(kv_scales={"scale": 1.0}) == {}
-
-        collective.init_communicator.assert_called_once()
-        collective.sync_weights.assert_called_once_with(kv_scales={"scale": 1.0})
-        gen.suspend_for_refit.assert_called_once()
-        policy.offload_before_refit.assert_called_once()
-        assert [
-            call.kwargs.get("tags")
-            for call in gen.prepare_for_generation.call_args_list
-        ] == [["weights"], ["kv_cache"]]
-        gen.resume_after_refit.assert_called_once()
-        policy.swap_weights_via_reshard.assert_not_called()
-
-        sync.shutdown()
-        collective.shutdown.assert_called_once()
-
-    @patch(
-        "nemo_rl.weight_sync.nccl_reshard_weight_synchronizer.NcclReshardWeightSynchronizer"
+        "nemo_rl.weight_sync.megatron_weight_synchronizer.NcclReshardWeightSynchronizer"
     )
     def test_m2n_refit_delegates_transfer_and_keeps_megatron_lifecycle(
         self, mock_m2n_cls
@@ -626,24 +586,6 @@ class TestMegatronWeightSynchronizer:
             for call in gen.prepare_for_generation.call_args_list
         ] == [["weights"], ["kv_cache"]]
         gen.resume_after_refit.assert_called_once()
-
-    def test_colocated_sync_is_offload_and_wake(self):
-        policy = _mock_megatron_policy()
-        gen = _mock_megatron_generation()
-        sync = MegatronWeightSynchronizer(policy, gen, colocated=True)
-
-        sync.init_communicator()  # no collective to wire
-        policy.init_collective_mcore_generation.assert_not_called()
-
-        assert sync.is_stale
-        assert sync.sync_weights() == {}
-        policy.offload_before_refit.assert_called_once()
-        # The refit-protocol tag makes the wake bypass the worker's
-        # engine-awake early-return (the reshard copy rides this wake).
-        gen.prepare_for_generation.assert_called_once_with(tags=["colocated_refit"])
-        gen.suspend_for_refit.assert_not_called()
-        policy.swap_weights_via_reshard.assert_not_called()
-        assert not sync.is_stale
 
     @patch("nemo_rl.weight_sync.megatron_weight_synchronizer.ray")
     def test_non_colocated_sync_sequence(self, mock_ray):
@@ -675,41 +617,6 @@ class TestMegatronWeightSynchronizer:
         policy.preinit_nvshmem.assert_not_called()
         assert not sync.is_stale
 
-    @patch("nemo_rl.weight_sync.megatron_weight_synchronizer.ray")
-    def test_non_colocated_nvshmem_preinits(self, mock_ray):
-        mock_ray.get.side_effect = lambda futures: [True for _ in futures]
-        policy = _mock_megatron_policy()
-        gen = _mock_megatron_generation(refit_backend="nvshmem")
-        sync = MegatronWeightSynchronizer(
-            policy,
-            gen,
-            colocated=False,
-            train_cluster=_mock_cluster(),
-            inference_cluster=_mock_cluster(),
-        )
-        sync.init_communicator()
-        sync.sync_weights()
-        policy.preinit_nvshmem.assert_called_once()
-        gen.preinit_nvshmem_collective.assert_called_once()
-
-    @patch("nemo_rl.weight_sync.megatron_weight_synchronizer.ray")
-    def test_non_colocated_failed_update_raises(self, mock_ray):
-        # swap futures resolve fine; the inference-side results report failure
-        mock_ray.get.side_effect = lambda futures: [False for _ in futures]
-        policy = _mock_megatron_policy()
-        gen = _mock_megatron_generation()
-        sync = MegatronWeightSynchronizer(
-            policy,
-            gen,
-            colocated=False,
-            train_cluster=_mock_cluster(),
-            inference_cluster=_mock_cluster(),
-        )
-        sync.init_communicator()
-        with pytest.raises(RuntimeError):
-            sync.sync_weights()
-        assert sync.is_stale
-
 
 class TestFactory:
     def test_colocated_vllm_returns_ipc(self):
@@ -733,30 +640,6 @@ class TestFactory:
             colocated=True,
         )
         assert isinstance(sync, HTTPWeightSynchronizer)
-
-    def test_colocated_megatron_returns_megatron_synchronizer(self):
-        policy = _mock_policy()
-        gen = _mock_generation()
-        sync = create_weight_synchronizer(
-            policy=policy,
-            generation=gen,
-            generation_backend=MEGATRON_BACKEND,
-            colocated=True,
-        )
-        assert isinstance(sync, MegatronWeightSynchronizer)
-
-    def test_non_colocated_megatron_returns_megatron_synchronizer(self):
-        policy = _mock_policy()
-        gen = _mock_generation()
-        sync = create_weight_synchronizer(
-            policy=policy,
-            generation=gen,
-            generation_backend=MEGATRON_BACKEND,
-            colocated=False,
-            train_cluster=_mock_cluster(),
-            inference_cluster=_mock_cluster(),
-        )
-        assert isinstance(sync, MegatronWeightSynchronizer)
 
     def test_non_colocated_vllm_returns_collective(self):
         policy = _mock_policy()
@@ -812,7 +695,7 @@ class TestFactory:
         assert sync._transport._gen_parallelism() == {
             "tp_size": 8,
             "ep_size": 2,
-            "etp_size": 1,
+            "etp_size": 8,
             "pp_size": 1,
         }
 

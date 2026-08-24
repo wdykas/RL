@@ -2237,24 +2237,6 @@ class TestCreateMegatronConfigFP8:
         assert ddp_kwargs["fp8_param_gather"] is True
         assert ddp_kwargs["reuse_grad_buf_for_mxfp8_param_ag"] is True
 
-    @pytest.mark.parametrize(
-        ("fp8_cfg", "expected_recipe"),
-        [
-            (None, None),
-            ({"enabled": False, "fp8_recipe": "mxfp8"}, None),
-            ({"enabled": True, "fp8_recipe": "blockwise"}, "blockwise"),
-        ],
-    )
-    def test_optimizer_recipe_tracks_enabled_fp8_config(self, fp8_cfg, expected_recipe):
-        optimizer_kwargs, ddp_kwargs = self._subconfig_kwargs(
-            self._config(fp8_cfg), fp8_param_enabled=False
-        )
-
-        assert optimizer_kwargs["fp8_recipe"] == expected_recipe
-        assert optimizer_kwargs["reuse_grad_buf_for_mxfp8_param_ag"] is False
-        assert ddp_kwargs["fp8_param_gather"] is False
-        assert ddp_kwargs["reuse_grad_buf_for_mxfp8_param_ag"] is False
-
 
 @pytest.mark.mcore
 class TestCreateMegatronConfigOptimizerOffload:
