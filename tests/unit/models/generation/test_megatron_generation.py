@@ -67,6 +67,7 @@ def test_skip_weight_load_defers_http_server_until_refit(
 
     prepare_for_generation.assert_not_called()
     assert generation.dp_openai_server_base_urls == []
+    assert lm_policy.Policy.call_args.kwargs["refit_role"] == "destination"
 
 
 @pytest.mark.mcore
@@ -107,7 +108,7 @@ def test_megatron_generation_dispatches_refit_implementation(refit_impl):
             rank_offset=2,
         )
         generation._policy.worker_group.run_all_workers_single_data.assert_called_once_with(
-            "update_generation_weights_from_collective"
+            "update_weights_from_collective"
         )
         generation._policy.init_collective_mcore_generation.assert_not_called()
 
@@ -137,6 +138,22 @@ def test_megatron_generation_m2n_transport_overrides_native_refit() -> None:
         rank_offset=2,
     )
     generation._policy.init_collective_mcore_generation.assert_not_called()
+
+
+@pytest.mark.mcore
+def test_megatron_generation_uses_common_refit_worker_api() -> None:
+    generation = object.__new__(MegatronGeneration)
+    generation._policy = MagicMock()
+    generation._policy.worker_group.run_all_workers_single_data.return_value = []
+    refit_info = {"layer_names": [], "per_layer_params": {}}
+
+    generation.prepare_nccl_reshard_refit_info(refit_info)
+    generation.nccl_reshard_refit()
+
+    calls = generation._policy.worker_group.run_all_workers_single_data.call_args_list
+    assert calls[0].args == ("prepare_nccl_reshard_refit_info",)
+    assert calls[0].kwargs == {"refit_info": refit_info}
+    assert calls[1].args == ("nccl_reshard_refit",)
 
 
 @pytest.mark.mcore

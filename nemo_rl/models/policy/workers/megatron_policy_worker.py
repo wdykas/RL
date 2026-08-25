@@ -59,7 +59,7 @@ from nemo_rl.data.multimodal_utils import (
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
-from nemo_rl.models.generation.interfaces import GenerationDatumSpec
+from nemo_rl.models.generation.interfaces import GenerationDatumSpec, RefitPayloadMode
 from nemo_rl.models.generation.megatron.megatron_worker import (
     MegatronGenerationMixin,
     MegatronGenerationRefitMixin,
@@ -102,6 +102,7 @@ from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
     ReferenceLogprobOutputSpec,
+    RefitRole,
 )
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
@@ -388,6 +389,10 @@ class MegatronPolicyWorkerImpl(
     AbstractPolicyWorker,
     ColocatablePolicyInterface,
 ):
+    # Tests and extension classes that bypass __init__ retain the historical
+    # training/source behavior unless they explicitly select destination.
+    refit_role: RefitRole = "source"
+    refit_payload_mode: RefitPayloadMode = "bridge_export"
     # Holds the split-API train-step state between begin/finish or
     # begin/abort; None when no step is open. Declared at class level so
     # ``self._train_step_state = None`` after finish/abort type-checks.
@@ -506,9 +511,17 @@ class MegatronPolicyWorkerImpl(
         *,
         worker_sharding_annotations: NamedSharding,
         skip_weight_load: bool = False,
+        refit_role: RefitRole = "source",
         **kwargs: Any,
     ):
         """Initialize the MegatronPolicyWorker."""
+        if refit_role not in ("source", "destination"):
+            raise ValueError(
+                "refit_role must be 'source' or 'destination', "
+                f"got {refit_role!r}."
+            )
+        self.refit_role = refit_role
+        self.refit_payload_mode: RefitPayloadMode = "bridge_export"
         # NVML-based and guarded on torch.cuda.is_initialized(), so this does
         # not initialize a CUDA context ahead of the set_device below.
         log_gpu_memory_diagnostics(
@@ -2235,8 +2248,12 @@ class MegatronPolicyWorkerImpl(
 
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/prepare_refit_info")
-    def prepare_refit_info(self) -> None:
+    def _prepare_source_refit_info(
+        self,
+        refit_payload_mode: RefitPayloadMode,
+    ) -> dict[str, tuple[torch.Size, torch.dtype]]:
         """Prepare state dict metadata for weight refitting and IPC streaming."""
+        self.refit_payload_mode = refit_payload_mode
         self.refit_param_info_mcore = self._calculate_refit_param_info()
 
         # Collect tensor metadata for refit / hf side info.
@@ -2245,6 +2262,30 @@ class MegatronPolicyWorkerImpl(
             refit_param_info_hf[name] = (tensor.shape, tensor.dtype)
 
         return refit_param_info_hf
+
+    def prepare_refit_info(
+        self,
+        state_dict_info: Optional[dict[str, Any]] = None,
+        *,
+        refit_payload_mode: RefitPayloadMode = "bridge_export",
+    ) -> Optional[dict[str, tuple[torch.Size, torch.dtype]]]:
+        """Prepare refit state for this worker's explicit source/destination role."""
+        if self.refit_role == "destination":
+            if state_dict_info is None:
+                raise ValueError("Destination refit requires state_dict_info.")
+            self._prepare_destination_refit_info(state_dict_info)
+            return None
+        if state_dict_info is not None:
+            raise ValueError("Source refit does not accept state_dict_info.")
+        return self._prepare_source_refit_info(refit_payload_mode)
+
+    def update_weights_from_collective(self) -> bool:
+        """Receive a collective refit on a destination-role worker."""
+        if self.refit_role != "destination":
+            raise RuntimeError(
+                "update_weights_from_collective is only valid for destination-role workers."
+            )
+        return self._update_destination_weights_from_collective()
 
     def _collect_mtp_metrics(
         self,
@@ -2364,23 +2405,17 @@ class MegatronPolicyWorkerImpl(
             and self.fp8_cfg.get("fp8_recipe") == "blockwise"
         )
 
-    def _uses_megatron_generation(self) -> bool:
-        """Return True if the refit destination is a Megatron inference engine.
-
-        Megatron generation stores BF16 or MXFP8 weights, so quantized training
-        storage must be materialized as logical BF16 for transport. Every other
-        destination consumes Bridge's physical export tasks unchanged.
-        """
-        generation_cfg = self.cfg.get("generation")
-        return generation_cfg is not None and generation_cfg["backend"] == "megatron"
+    def _uses_logical_refit_payload(self) -> bool:
+        """Return whether the destination requested logical floating-point weights."""
+        return self.refit_payload_mode == "logical_weights"
 
     def _build_refit_conversion_tasks(self) -> list:
         """Build the conversion-task list driving refit (BF16 or FP8 export).
 
-        Megatron generation consumes logical weights through standard Bridge
-        tasks. Other backends keep Bridge physical FP8 data and scale tasks.
+        A destination that requests logical weights consumes standard Bridge
+        tasks. Otherwise, keep Bridge's physical FP8 data and scale tasks.
         """
-        if self._is_fp8_export() and not self._uses_megatron_generation():
+        if self._is_fp8_export() and not self._uses_logical_refit_payload():
             return self.megatron_bridge.get_export_fp8_tasks(self.model)
         return [
             task
@@ -2477,7 +2512,7 @@ class MegatronPolicyWorkerImpl(
         # logical BF16. Bridge's FP8 export tasks already carry the physical
         # fp8 payload plus its scale_inv sibling, and rewriting them would ship
         # a BF16 weight next to a live blockwise scale.
-        if self._uses_megatron_generation():
+        if self._uses_logical_refit_payload():
             conversion_tasks = self._iter_logical_refit_conversion_tasks(
                 conversion_tasks
             )
@@ -2593,9 +2628,9 @@ class MegatronPolicyWorkerImpl(
         task is the physical fp8 view its ``_scale_inv`` sibling describes;
         dequantizing it here would ship BF16 bytes under an fp8 scale.
         """
-        uses_megatron_generation = self._uses_megatron_generation()
+        uses_logical_payload = self._uses_logical_refit_payload()
         for task in self.refit_conversion_tasks:
-            if uses_megatron_generation:
+            if uses_logical_payload:
                 local_tensor = _get_refit_task_source(task)
             else:
                 local_tensor = task.param_weight
@@ -2748,12 +2783,13 @@ class MegatronPolicyWorkerImpl(
         return layer_to_pp_stage
 
     @torch.no_grad()
-    def prepare_nccl_reshard_refit_info(
+    def _prepare_source_nccl_reshard_refit_info(
         self,
         train_parallelism,
         gen_parallelism,
         train_world_size,
         gen_world_size,
+        refit_payload_mode: RefitPayloadMode,
     ):
         """Prepare per-layer parameter metadata for nccl_reshard-based refit.
 
@@ -2762,6 +2798,7 @@ class MegatronPolicyWorkerImpl(
         its own fused layout (e.g., vLLM w13/w2) gen-side, so this train worker
         stays agnostic to any gen backend's MoE-fusion layout.
         """
+        self.refit_payload_mode = refit_payload_mode
         self.refit_param_info_mcore = self._calculate_refit_param_info()
 
         # Single pass over Bridge's stream: classify each param as major
@@ -2878,6 +2915,54 @@ class MegatronPolicyWorkerImpl(
 
         return self.nccl_reshard_refit_info
 
+    def prepare_nccl_reshard_refit_info(
+        self,
+        train_parallelism: Optional[dict[str, Any]] = None,
+        gen_parallelism: Optional[dict[str, Any]] = None,
+        train_world_size: Optional[int] = None,
+        gen_world_size: Optional[int] = None,
+        *,
+        refit_info: Optional[dict[str, Any]] = None,
+        refit_payload_mode: RefitPayloadMode = "bridge_export",
+    ) -> Optional[dict[str, Any]]:
+        """Prepare NCCL-reshard state for the worker's explicit refit role."""
+        if self.refit_role == "destination":
+            if refit_info is None:
+                raise ValueError("Destination NCCL refit requires refit_info.")
+            if any(
+                value is not None
+                for value in (
+                    train_parallelism,
+                    gen_parallelism,
+                    train_world_size,
+                    gen_world_size,
+                )
+            ):
+                raise ValueError(
+                    "Destination NCCL refit does not accept source parallelism arguments."
+                )
+            self._prepare_destination_nccl_reshard_refit_info(refit_info)
+            return None
+
+        if refit_info is not None:
+            raise ValueError("Source NCCL refit does not accept refit_info.")
+        if (
+            train_parallelism is None
+            or gen_parallelism is None
+            or train_world_size is None
+            or gen_world_size is None
+        ):
+            raise ValueError(
+                "Source NCCL refit requires train/gen parallelism and world sizes."
+            )
+        return self._prepare_source_nccl_reshard_refit_info(
+            train_parallelism,
+            gen_parallelism,
+            train_world_size,
+            gen_world_size,
+            refit_payload_mode,
+        )
+
     def _build_expert_groups(self, param_map):
         """Group this rank's local expert params into stack-ready source specs.
 
@@ -2935,7 +3020,9 @@ class MegatronPolicyWorkerImpl(
         )
         return _GroupedRefitSource(tuple(expert_specs))
 
-    def build_hf_to_local_param_map(self, refit_info: dict) -> HFToLocalParamMap:
+    def _build_source_hf_to_local_param_map(
+        self, refit_info: dict[str, Any]
+    ) -> HFToLocalParamMap:
         """Build the Megatron-backend ``hf_to_local_param_map`` (HFToLocalParamMap).
 
         Wraps this rank's local Megatron shards into ``LocalParamSpec``s:
@@ -2971,8 +3058,25 @@ class MegatronPolicyWorkerImpl(
                     mapping[name] = spec
         return HFToLocalParamMap(specs=mapping)
 
+    def build_hf_to_local_param_map(
+        self,
+        refit_info: dict[str, Any],
+        *,
+        destination_tasks: Optional[list[Any]] = None,
+    ) -> HFToLocalParamMap:
+        """Build the local map for this worker's source or destination role."""
+        if self.refit_role == "destination":
+            if destination_tasks is None:
+                _, destination_tasks = self._build_generation_refit_tasks()
+            return self._build_destination_hf_to_local_param_map(
+                refit_info, destination_tasks
+            )
+        if destination_tasks is not None:
+            raise ValueError("Source refit does not accept destination_tasks.")
+        return self._build_source_hf_to_local_param_map(refit_info)
+
     @torch.no_grad()
-    def nccl_reshard_refit(self, kv_scales=None):
+    def _source_nccl_reshard_refit(self, kv_scales=None):
         """Transfer weights to generation workers via xferdtensor.
 
         Uses TP-local shards directly from Megatron parameters, bypassing
@@ -3051,6 +3155,17 @@ class MegatronPolicyWorkerImpl(
                 f"{time.perf_counter() - misc_t0:.2f}s",
                 flush=True,
             )
+
+    def nccl_reshard_refit(
+        self, kv_scales: Optional[dict[str, float]] = None
+    ) -> Optional[bool]:
+        """Run NCCL reshard as the worker's configured source/destination role."""
+        if self.refit_role == "destination":
+            if kv_scales is not None:
+                raise ValueError("Destination NCCL refit does not accept kv_scales.")
+            return self._destination_nccl_reshard_refit()
+        self._source_nccl_reshard_refit(kv_scales=kv_scales)
+        return None
 
     def _broadcast_misc_params_packed(self, kv_scales=None) -> None:
         """Broadcast misc params via the existing packed_broadcast machinery."""

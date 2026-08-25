@@ -24,6 +24,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
     GenerationOutputSpec,
+    RefitPayloadMode,
 )
 from nemo_rl.models.generation.megatron.config import (
     MCoreGenerationConfig,
@@ -178,6 +179,7 @@ class MegatronGeneration(GenerationInterface):
             init_reference_model=False,
             weights_path=weights_path,
             skip_weight_load=skip_weight_load,
+            refit_role="destination",
         )
 
         # A skip-load model does not have its final weight objects yet. In particular,
@@ -197,6 +199,10 @@ class MegatronGeneration(GenerationInterface):
             self.refit_impl == "mcore"
             and self.cfg.get("refit_transport") != "nccl_reshard"
         )
+
+    def get_refit_payload_mode(self) -> RefitPayloadMode:
+        """Request logical weights for Bridge conversion into Megatron storage."""
+        return "logical_weights"
 
     def init_collective(
         self,
@@ -247,7 +253,7 @@ class MegatronGeneration(GenerationInterface):
         if self.uses_native_refit:
             return self._policy.swap_weights_via_reshard(is_source=False)
         return self._policy.worker_group.run_all_workers_single_data(
-            "update_generation_weights_from_collective"
+            "update_weights_from_collective"
         )
 
     def init_nccl_reshard_comm_group(
@@ -272,14 +278,14 @@ class MegatronGeneration(GenerationInterface):
     def prepare_nccl_reshard_refit_info(self, refit_info: dict[str, Any]) -> None:
         """Build each inference worker's HF-to-Megatron M-to-N receive map."""
         futures = self._policy.worker_group.run_all_workers_single_data(
-            "prepare_nccl_reshard_generation_refit_info", refit_info=refit_info
+            "prepare_nccl_reshard_refit_info", refit_info=refit_info
         )
         ray.get(futures)
 
     def nccl_reshard_refit(self) -> list[ray.ObjectRef]:
         """Receive one NCCL M-to-N refit on every Megatron inference worker."""
         return self._policy.worker_group.run_all_workers_single_data(
-            "nccl_reshard_generation_refit"
+            "nccl_reshard_refit"
         )
 
     def generate(
@@ -408,7 +414,7 @@ class MegatronGeneration(GenerationInterface):
         if state_dict_info is None:
             raise ValueError("Megatron collective refit requires state_dict_info.")
         futures = self._policy.worker_group.run_all_workers_single_data(
-            "prepare_generation_refit_info", state_dict_info=state_dict_info
+            "prepare_refit_info", state_dict_info=state_dict_info
         )
         ray.get(futures)
 

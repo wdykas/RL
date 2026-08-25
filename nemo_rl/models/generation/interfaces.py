@@ -13,12 +13,14 @@
 # limitations under the License.
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, NotRequired, Optional, TypedDict, Union
+from typing import Any, Literal, NotRequired, Optional, TypedDict, Union
 
 import ray
 import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+RefitPayloadMode = Literal["bridge_export", "logical_weights"]
 
 # Routed-expert index tensors ([seq, layers, topk]) are carried in the narrowest
 # signed dtype that fits ids 0..num_experts-1 plus the -1 missing-route sentinel:
@@ -456,6 +458,10 @@ class GenerationInterface(ABC):
     def get_inference_world_size(self) -> int | None:
         """Return a backend-specific collective world size when required."""
         return None
+
+    def get_refit_payload_mode(self) -> RefitPayloadMode:
+        """Return the backend's required representation for transferred weights."""
+        return "bridge_export"
 
     def prepare_nccl_reshard_refit_info(self, refit_info: dict) -> None:
         """Prepare per-layer param metadata for nccl_reshard-based refit."""

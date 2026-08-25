@@ -76,6 +76,7 @@ def _mock_generation(**overrides):
     gen.init_collective.return_value = [MagicMock()]
     gen.get_collective_sender_spec.return_value = CollectiveSenderSpec()
     gen.get_inference_world_size.return_value = None
+    gen.get_refit_payload_mode.return_value = "bridge_export"
     for k, v in overrides.items():
         setattr(gen, k, v)
     return gen
@@ -401,7 +402,9 @@ class TestCollectiveWeightSynchronizer:
         )
         sync.init_communicator()
 
-        policy.prepare_refit_info.assert_called_once()
+        policy.prepare_refit_info.assert_called_once_with(
+            refit_payload_mode="bridge_export"
+        )
         gen.prepare_refit_info.assert_called_once()
         policy.init_collective.assert_called_once_with(
             "10.0.0.1", 29500, 6, train_world_size=4, nccl_peer="nemo"
@@ -498,7 +501,13 @@ class TestNcclReshardWeightSynchronizer:
         )
         sync.init_communicator()
 
-        policy.prepare_nccl_reshard_refit_info.assert_called_once()
+        policy.prepare_nccl_reshard_refit_info.assert_called_once_with(
+            {"tp_size": 2, "ep_size": 1, "etp_size": 2, "pp_size": 1},
+            {"tp_size": 4, "ep_size": 1, "etp_size": 4, "pp_size": 1},
+            2,
+            4,
+            refit_payload_mode="bridge_export",
+        )
         gen.prepare_nccl_reshard_refit_info.assert_called_once()
         (shipped,), _ = gen.prepare_nccl_reshard_refit_info.call_args
         for params in shipped["per_layer_params"].values():

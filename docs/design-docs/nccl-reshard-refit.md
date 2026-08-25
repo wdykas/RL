@@ -130,6 +130,15 @@ the inference-engine lifecycle and delegates only the transfer to an
 `NcclReshardWeightSynchronizer.init_communicator()` runs three steps once, before
 training starts:
 
+The generation backend declares whether it needs Bridge's physical export or logical
+weights. The synchronizer passes that payload requirement to the source worker; the
+source worker does not inspect or branch on the destination backend's name. Megatron workers
+are assigned an explicit `source` or `destination` refit role and expose the same
+`prepare_refit_info`, `build_hf_to_local_param_map`,
+`prepare_nccl_reshard_refit_info`, and `nccl_reshard_refit` entry points in either
+role. The older generation-specific method names remain compatibility aliases for
+external callers.
+
 1. **`init_collective()`** — creates the `model_update_group`, a NCCL group spanning all
    training and generation ranks. The bulk path does not use it; it carries the misc
    packed-broadcast (and FP8 KV-cache scales), identical to the conventional collective

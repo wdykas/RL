@@ -96,7 +96,7 @@ def _make_refit_task(
     )
 
 
-def test_megatron_fp8_refit_tasks_match_generation_backend() -> None:
+def test_megatron_fp8_refit_tasks_match_payload_mode() -> None:
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
     )
@@ -111,11 +111,11 @@ def test_megatron_fp8_refit_tasks_match_generation_backend() -> None:
         get_conversion_tasks=MagicMock(return_value=logical_tasks),
     )
 
-    worker.cfg = {"generation": {"backend": "megatron"}}
+    worker.refit_payload_mode = "logical_weights"
     assert worker._build_refit_conversion_tasks() == logical_tasks[1:]
     worker.megatron_bridge.get_export_fp8_tasks.assert_not_called()
 
-    worker.cfg = {"generation": {"backend": "vllm"}}
+    worker.refit_payload_mode = "bridge_export"
     assert worker._build_refit_conversion_tasks() == physical_tasks
     worker.megatron_bridge.get_export_fp8_tasks.assert_called_once_with(worker.model)
 
@@ -265,6 +265,86 @@ def test_nccl_reshard_all_misc_refit_supports_empty_bulk(pp_size: int) -> None:
     worker._build_layer_to_pp_stage.assert_not_called()
 
 
+def test_destination_refit_role_uses_common_worker_interface() -> None:
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+    from nemo_rl.weight_sync.nccl_reshard_utils import HFToLocalParamMap
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.refit_role = "destination"
+    tasks = [object()]
+    expected_map = HFToLocalParamMap()
+    refit_info = {"layer_names": [], "per_layer_params": {}}
+    state_dict_info = {"weight": ((2, 2), torch.bfloat16)}
+    worker._build_generation_refit_tasks = MagicMock(
+        return_value=([torch.nn.Module()], tasks)
+    )
+    worker._build_destination_hf_to_local_param_map = MagicMock(
+        return_value=expected_map
+    )
+    worker._prepare_destination_refit_info = MagicMock()
+    worker._prepare_destination_nccl_reshard_refit_info = MagicMock()
+    worker._destination_nccl_reshard_refit = MagicMock(return_value=True)
+    worker._update_destination_weights_from_collective = MagicMock(return_value=True)
+
+    assert worker.build_hf_to_local_param_map(refit_info) is expected_map
+    worker.prepare_refit_info(state_dict_info)
+    worker.prepare_nccl_reshard_refit_info(refit_info=refit_info)
+    assert worker.nccl_reshard_refit()
+    assert worker.update_weights_from_collective()
+
+    worker._build_destination_hf_to_local_param_map.assert_called_once_with(
+        refit_info, tasks
+    )
+    worker._prepare_destination_refit_info.assert_called_once_with(state_dict_info)
+    worker._prepare_destination_nccl_reshard_refit_info.assert_called_once_with(
+        refit_info
+    )
+
+
+def test_megatron_destination_misc_plan_uses_shipped_misc_metadata() -> None:
+    from nemo_rl.models.generation.megatron.megatron_worker import (
+        MegatronGenerationRefitMixin,
+    )
+    from nemo_rl.weight_sync.nccl_reshard_utils import HFToLocalParamMap
+
+    bulk_task = SimpleNamespace(
+        dependencies=("model.layers.0.mlp.experts.0.gate_proj.weight",)
+    )
+    misc_task = SimpleNamespace(dependencies=("model.layers.0.input_layernorm.weight",))
+    model_chunks = [torch.nn.Module()]
+    worker = object.__new__(MegatronGenerationRefitMixin)
+    worker._build_generation_refit_tasks = MagicMock(
+        return_value=(model_chunks, [bulk_task, misc_task])
+    )
+    worker._prepare_mxfp8_refit = MagicMock()
+    worker.build_hf_to_local_param_map = MagicMock(
+        return_value=HFToLocalParamMap()
+    )
+    worker._install_generation_refit_plan = MagicMock()
+    refit_info = {
+        "layer_names": [],
+        "per_layer_params": {},
+        "misc_meta": {
+            "model.layers.0.input_layernorm.weight": {
+                "shape": [2],
+                "dtype": "torch.bfloat16",
+            }
+        },
+    }
+
+    worker._prepare_destination_nccl_reshard_refit_info(refit_info)
+
+    worker._install_generation_refit_plan.assert_called_once_with(
+        model_chunks=model_chunks,
+        tasks=[misc_task],
+        state_dict_info={
+            "model.layers.0.input_layernorm.weight": ((2,), torch.bfloat16)
+        },
+    )
+
+
 def test_megatron_m2n_stages_fused_mxfp8_weight_until_complete() -> None:
     from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 
@@ -298,7 +378,7 @@ def test_megatron_m2n_stages_fused_mxfp8_weight_until_complete() -> None:
     worker = object.__new__(MegatronGenerationRefitMixin)
     worker._generation_m2n_pending = {}
     worker._write_generation_refit_weight = MagicMock()
-    param_map, _ = worker._build_megatron_bulk_refit_map(refit_info, [task])
+    param_map = worker._build_destination_hf_to_local_param_map(refit_info, [task])
 
     gate_spec = param_map.get(gate_name)
     gate_ctx = gate_spec.pre(None)
@@ -352,7 +432,7 @@ def test_megatron_m2n_unstacks_grouped_experts_into_local_weights() -> None:
         },
     }
     worker = object.__new__(MegatronGenerationRefitMixin)
-    param_map, _ = worker._build_megatron_bulk_refit_map(refit_info, tasks)
+    param_map = worker._build_destination_hf_to_local_param_map(refit_info, tasks)
 
     gate_spec = param_map.get(grouped_gate)
     gate_ctx = gate_spec.pre(None)

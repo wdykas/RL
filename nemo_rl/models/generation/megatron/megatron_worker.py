@@ -869,10 +869,11 @@ class MegatronGenerationRefitMixin:
         self._generation_refit_remaining_dependencies = {}
         self._generation_refit_pending_weights = {}
         self._generation_refit_pending_streams = {}
-        # nccl_reshard (M-to-N) transport state.
+        # nccl_reshard (M-to-N) transport state. The source and destination
+        # roles use the same public state names and RefitBuilderInterface.
         self._generation_nccl_reshard_groups = None
-        self._generation_nccl_reshard_refit_info = None
-        self._generation_hf_to_local_param_map = None
+        self.nccl_reshard_refit_info = None
+        self.hf_to_local_param_map = None
         self._generation_m2n_pending = None
         # Native MCore copy service, built by init_collective_mcore_generation.
         self.refit_copy_service = None
@@ -1080,12 +1081,12 @@ class MegatronGenerationRefitMixin:
             self._write_generation_refit_weight(piece.task, logical_weight)
             del self._generation_m2n_pending[piece.task.target_id]
 
-    def _build_megatron_bulk_refit_map(
+    def _build_destination_hf_to_local_param_map(
         self,
         refit_info: dict[str, Any],
         tasks: list[_MegatronRefitTask],
-    ) -> tuple[HFToLocalParamMap, set[int]]:
-        """Map M-to-N's canonical HF FFN shards onto local Megatron storage."""
+    ) -> HFToLocalParamMap:
+        """Map canonical HF FFN shards onto local Megatron destinations."""
         pieces: dict[str, _MegatronBulkRefitPiece] = {}
 
         def add_piece(task: _MegatronRefitTask, spec: Any) -> None:
@@ -1150,7 +1151,6 @@ class MegatronGenerationRefitMixin:
             return LocalParamSpec(base=None, pre=pre, post=post)
 
         specs = {}
-        bulk_target_ids: set[int] = set()
         for layer_name in refit_info["layer_names"]:
             for param_info in refit_info["per_layer_params"][layer_name]:
                 name = param_info["name"]
@@ -1168,7 +1168,6 @@ class MegatronGenerationRefitMixin:
                             f"No local Megatron experts map to M-to-N weight {name!r}."
                         )
                     specs[name] = grouped_spec(grouped)
-                    bulk_target_ids.update(piece.task.target_id for piece in grouped)
                     continue
 
                 piece = pieces.get(name)
@@ -1181,9 +1180,8 @@ class MegatronGenerationRefitMixin:
                     if piece.task.is_mxfp8
                     else LocalParamSpec(base=piece.destination)
                 )
-                bulk_target_ids.add(piece.task.target_id)
 
-        return HFToLocalParamMap(specs=specs), bulk_target_ids
+        return HFToLocalParamMap(specs=specs)
 
     def _prepare_mxfp8_refit(self, tasks: list[_MegatronRefitTask]) -> None:
         """Install persistent MCore MXFP8 destinations before engine initialization."""
@@ -1286,6 +1284,13 @@ class MegatronGenerationRefitMixin:
 
     @torch.no_grad()
     def prepare_generation_refit_info(self, state_dict_info: dict[str, Any]) -> None:
+        """Compatibility alias for destination-role ``prepare_refit_info``."""
+        self._prepare_destination_refit_info(state_dict_info)
+
+    @torch.no_grad()
+    def _prepare_destination_refit_info(
+        self, state_dict_info: dict[str, Any]
+    ) -> None:
         """Build the local HF-to-Megatron receive plan before the first refit."""
         model_chunks, tasks = self._build_generation_refit_tasks()
         self._prepare_mxfp8_refit(tasks)
@@ -1299,12 +1304,19 @@ class MegatronGenerationRefitMixin:
     def prepare_nccl_reshard_generation_refit_info(
         self, refit_info: dict[str, Any]
     ) -> None:
+        """Compatibility alias for destination-role NCCL refit preparation."""
+        self._prepare_destination_nccl_reshard_refit_info(refit_info)
+
+    @torch.no_grad()
+    def _prepare_destination_nccl_reshard_refit_info(
+        self, refit_info: dict[str, Any]
+    ) -> None:
         """Prepare Megatron as the destination of NCCL M-to-N reshard refit."""
         refit_info = restore_refit_info_placements(refit_info)
         model_chunks, tasks = self._build_generation_refit_tasks()
         self._prepare_mxfp8_refit(tasks)
-        bulk_map, bulk_target_ids = self._build_megatron_bulk_refit_map(
-            refit_info, tasks
+        bulk_map = self.build_hf_to_local_param_map(
+            refit_info, destination_tasks=tasks
         )
 
         misc_meta = refit_info.get("misc_meta", {})
@@ -1312,17 +1324,26 @@ class MegatronGenerationRefitMixin:
             name: (tuple(meta["shape"]), _STR_TO_DTYPE[meta["dtype"]])
             for name, meta in misc_meta.items()
         }
-        misc_tasks = [task for task in tasks if task.target_id not in bulk_target_ids]
+        misc_tasks = [
+            task
+            for task in tasks
+            if set(task.dependencies).issubset(misc_state_dict_info)
+        ]
         self._install_generation_refit_plan(
             model_chunks=model_chunks,
             tasks=misc_tasks,
             state_dict_info=misc_state_dict_info,
         )
-        self._generation_nccl_reshard_refit_info = refit_info
-        self._generation_hf_to_local_param_map = bulk_map
+        self.nccl_reshard_refit_info = refit_info
+        self.hf_to_local_param_map = bulk_map
 
     @torch.no_grad()
     def nccl_reshard_generation_refit(self) -> bool:
+        """Compatibility alias for destination-role ``nccl_reshard_refit``."""
+        return self._destination_nccl_reshard_refit()
+
+    @torch.no_grad()
+    def _destination_nccl_reshard_refit(self) -> bool:
         """Receive bulk FFN shards via M-to-N, then import packed misc weights."""
         # Keep this transport import local: xferdtensor probes the optional
         # nccl.m2n extension at import time.
@@ -1331,7 +1352,7 @@ class MegatronGenerationRefitMixin:
         self._generation_m2n_pending: dict[int, dict[str, torch.Tensor]] = {}
 
         def receive_one(param_info: dict[str, Any], group: Any, stream: Any) -> None:
-            spec = self._generation_hf_to_local_param_map.get(param_info["name"])
+            spec = self.hf_to_local_param_map.get(param_info["name"])
             if spec is None:
                 raise RuntimeError(
                     f"Megatron M-to-N refit has no destination for {param_info['name']!r}."
@@ -1354,7 +1375,7 @@ class MegatronGenerationRefitMixin:
                 spec.post(ctx)
 
         stage_params: OrderedDict[int, list[dict[str, Any]]] = OrderedDict()
-        refit_info = self._generation_nccl_reshard_refit_info
+        refit_info = self.nccl_reshard_refit_info
         for layer_name in refit_info["layer_names"]:
             for param_info in refit_info["per_layer_params"][layer_name]:
                 stage_params.setdefault(param_info.get("pp_stage", 0), []).append(
@@ -1388,7 +1409,7 @@ class MegatronGenerationRefitMixin:
                     f"{sorted(self._generation_m2n_pending)}"
                 )
             torch.cuda.empty_cache()
-            return self.update_generation_weights_from_collective()
+            return self._update_destination_weights_from_collective()
         finally:
             self._generation_m2n_pending.clear()
 
@@ -1486,6 +1507,11 @@ class MegatronGenerationRefitMixin:
 
     @torch.no_grad()
     def update_generation_weights_from_collective(self) -> bool:
+        """Compatibility alias for destination-role collective refit."""
+        return self._update_destination_weights_from_collective()
+
+    @torch.no_grad()
+    def _update_destination_weights_from_collective(self) -> bool:
         """Receive packed HF tensors and import them into the Megatron model."""
         if self._generation_refit_state_dict_info is None:
             raise RuntimeError(
