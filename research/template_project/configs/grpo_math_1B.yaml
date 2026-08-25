@@ -301,6 +301,8 @@ policy:
       use_cuda_graphs_for_non_decode_steps: true  # Enable CUDA graphs for prefill/context processing
       enable_chunked_prefill: true  # Split long prefills into chunks for better memory management
       max_tokens: 16384 # Maximum number of tokens to use in a single step. Analogous to vllm's max_num_batched_tokens
+      refit_impl: "mcore"  # Non-colocated only; colocated always uses the in-place wake-reshard. Options: "mcore" (native reshard/refit) or "bridge" (shared packed broadcast).
+      refit_backend: "nccl"  # Native MCore copy-service backend, used only when refit_impl="mcore". Options: "gloo" or "nccl" ("nvshmem" is currently broken, see https://github.com/NVIDIA-NeMo/RL/issues/3646).
     vllm_cfg:
       async_engine: false
       precision: ${policy.precision}

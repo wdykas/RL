@@ -781,6 +781,21 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
                     "default is 'vllm', so this key must be set explicitly)."
                 )
 
+            # _prepare_mxfp8_refit only installs persistent MXFP8 destinations
+            # for cores whose transformer_impl is 'inference_optimized'. Without
+            # it the refit silently falls back to copying BF16 into TE FP8
+            # params instead of quantizing, so reject the pairing up front.
+            if (
+                gen_fp8_cfg.get("enabled")
+                and mcore_generation_cfg.get("transformer_impl")
+                != "inference_optimized"
+            ):
+                violations.append(
+                    "MXFP8 Megatron generation requires policy.generation."
+                    "mcore_generation_config.transformer_impl='inference_optimized' "
+                    f"(got {mcore_generation_cfg.get('transformer_impl')!r})."
+                )
+
     # Gen-backend restrictions. The reshard supports gen-side TP, DP, EP, and
     # Megatron ETP. The vLLM backend shards experts by index across
     # its TP ranks, so its EP is either 1 (TP-sharded experts) or equal to TP

@@ -69,7 +69,8 @@ single `ValueError` listing every violation. The current requirements are:
 * For Megatron generation, `refit_transport=nccl_reshard` selects M-to-N
   regardless of `mcore_generation_config.refit_impl`. Set `refit_transport=null`
   with `refit_impl=bridge` for packed Bridge refit or `refit_impl=mcore` for
-  Megatron Core's native refit. `refit_impl` defaults to `mcore`, so existing
+  Megatron Core's native refit. `refit_impl` is a required key that the shipped
+  exemplars set to `mcore`, so existing
   recipes keep native refit unless they opt in; `refit_backend` is only
   consulted when `refit_impl=mcore`, and combining `refit_impl=mcore` with
   `refit_transport=nccl_reshard` warns that `refit_backend` is unused.

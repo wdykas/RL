@@ -185,6 +185,9 @@ def test_check_nccl_reshard_refit_support_accepts_megatron_bf16_and_mxfp8(
             # grouped-GEMM backend must be one it accepts. MCore's default
             # ("vllm") is not, and NeMo-RL supplies no default of its own.
             "inference_grouped_gemm_backend": "torch",
+            # _prepare_mxfp8_refit only installs MXFP8 destinations for
+            # inference_optimized cores; this mirrors the functional test.
+            "transformer_impl": "inference_optimized",
             "fp8_cfg": generation_fp8_cfg,
         },
     }
@@ -272,6 +275,7 @@ def test_check_nccl_reshard_accepts_supported_grouped_gemm_backends(
             "refit_impl": "mcore",
             "pipeline_model_parallel_size": 1,
             "inference_grouped_gemm_backend": gemm_backend,
+            "transformer_impl": "inference_optimized",
             "fp8_cfg": {"enabled": True, "fp8_recipe": "mxfp8"},
         },
     }

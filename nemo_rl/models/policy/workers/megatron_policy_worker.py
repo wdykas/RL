@@ -2584,6 +2584,14 @@ class MegatronPolicyWorkerImpl(
                 local_tensor = task.param_weight
             if local_tensor is None:
                 continue
+            # An FP8 export task's scale sibling must not enter the bulk map.
+            # Bridge wraps it in _HFNameSuffixMapping, which overrides only
+            # resolve/hf_to_megatron/megatron_to_hf; local_hf_param_specs falls
+            # through __getattr__ to the base mapping and returns the UNSUFFIXED
+            # weight name. Without this skip the scale is emitted under the
+            # weight's key and overwrites it in the param map.
+            if task.global_param_name.endswith("_scale_inv"):
+                continue
 
             for spec in task.local_hf_param_specs():
                 if is_nccl_reshard_param(spec.name):
