@@ -14,6 +14,7 @@
 
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -2855,6 +2856,95 @@ def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
         routed_experts_dtype="int16",
         use_fastokens=False,
     )
+
+
+def test_setup_refits_megatron_before_starting_nemo_gym(
+    monkeypatch, mock_grpo_components
+):
+    """A skip-load Megatron server must start only after its initial refit."""
+    from nemo_rl.algorithms import grpo as grpo_mod
+
+    events = []
+    checkpointer = MagicMock()
+    checkpointer.get_latest_checkpoint_path.return_value = None
+    checkpointer.load_training_info.return_value = None
+    checkpointer.get_resume_paths.return_value = (None, None)
+    generation = SimpleNamespace(
+        weight_synchronizer=None,
+        dp_openai_server_base_urls=[],
+    )
+    generation_init = MagicMock(return_value=generation)
+    synchronizer = MagicMock()
+    synchronizer.init_communicator.side_effect = lambda: events.append("init")
+
+    def sync_weights():
+        events.append("sync")
+        generation.dp_openai_server_base_urls = ["http://megatron.example/v1"]
+
+    synchronizer.sync_weights.side_effect = sync_weights
+
+    nemo_gym_actor = object()
+
+    def spinup_nemo_gym_actor(**kwargs):
+        assert kwargs["base_urls"] == ["http://megatron.example/v1"]
+        events.append("gym")
+        return nemo_gym_actor
+
+    monkeypatch.setattr(grpo_mod, "Logger", lambda *_args, **_kwargs: MagicMock())
+    monkeypatch.setattr(
+        grpo_mod, "CheckpointManager", lambda *_args, **_kwargs: checkpointer
+    )
+    monkeypatch.setattr(
+        grpo_mod, "ClippedPGLossFn", lambda *_args, **_kwargs: MagicMock()
+    )
+    monkeypatch.setattr(
+        grpo_mod, "StatefulDataLoader", lambda *_args, **_kwargs: [None]
+    )
+    monkeypatch.setattr(grpo_mod, "RayVirtualCluster", MagicMock)
+    monkeypatch.setattr(grpo_mod, "Policy", lambda *_args, **_kwargs: MagicMock())
+    monkeypatch.setattr(grpo_mod, "MegatronGeneration", generation_init)
+    monkeypatch.setattr(
+        grpo_mod, "create_weight_synchronizer", lambda **_kwargs: synchronizer
+    )
+    monkeypatch.setattr(grpo_mod, "spinup_nemo_gym_actor", spinup_nemo_gym_actor)
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.policy["model_name"] = "test-model"
+    master_config.policy["tokenizer"] = {"use_fastokens": False}
+    master_config.policy["dtensor_cfg"] = {"enabled": False}
+    master_config.policy["megatron_cfg"] = {
+        "enabled": False,
+        "pipeline_model_parallel_size": 1,
+    }
+    master_config.policy["generation"] = {
+        "backend": "megatron",
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "top_k": None,
+        "val_temperature": 1.0,
+        "val_top_p": 1.0,
+        "val_top_k": None,
+        "colocated": {
+            "enabled": False,
+            "resources": {"gpus_per_node": 1, "num_nodes": 1},
+        },
+        "mcore_generation_config": {"expose_http_server": True},
+    }
+    master_config.env = {"should_use_nemo_gym": True}
+    master_config.loss_fn = ClippedPGLossConfig(reference_policy_kl_penalty=0.0)
+    master_config.grpo.val_period = 0
+    master_config.grpo.batch_multiplier = 1
+    master_config.cluster["gpus_per_node"] = 2
+    master_config.data["shuffle"] = False
+    master_config.data["num_workers"] = 0
+
+    dataset = MagicMock()
+    dataset.__len__ = MagicMock(return_value=1)
+    result = grpo_mod.setup(master_config, MagicMock(), dataset, None)
+
+    assert generation_init.call_args.kwargs["skip_weight_load"] is True
+    assert events == ["init", "sync", "gym"]
+    assert result[2] is nemo_gym_actor
 
 
 def test_grpo_train_collects_generation_logger_and_seq_metrics(

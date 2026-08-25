@@ -187,13 +187,7 @@ class MegatronGeneration(GenerationInterface):
         # prepare_for_generation(tags=["kv_cache"]) after the first weight transfer,
         # which initializes the engine and captures against the final buffers.
         #
-        # The HTTP server is the exception: its URLs only exist once the engine is
-        # up, and grpo.setup spins NeMo-Gym up on those URLs immediately after
-        # construction — long before the first refit. Deferring there would hand
-        # the gym an empty backend list, so keep the eager start for that case.
-        if not skip_weight_load or self.cfg["mcore_generation_config"].get(
-            "expose_http_server", False
-        ):
+        if not skip_weight_load:
             self.prepare_for_generation()
 
     @property

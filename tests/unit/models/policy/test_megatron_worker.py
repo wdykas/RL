@@ -202,6 +202,69 @@ def test_local_hf_shards_follow_bridge_specs() -> None:
     assert shards["model.layers.0.mlp.gate_proj.weight"].base[0, 0] == 99
 
 
+def test_local_refit_names_require_safe_views_from_every_grouped_task() -> None:
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _collect_local_refit_hf_names,
+    )
+
+    grouped_name = "model.layers.0.mlp.experts.down_proj"
+    safe_name = "model.layers.0.mlp.down_proj.weight"
+    tasks = [
+        SimpleNamespace(
+            hf_param_names=(grouped_name,),
+            local_hf_param_specs=lambda: (object(),),
+        ),
+        SimpleNamespace(
+            hf_param_names=(grouped_name,),
+            local_hf_param_specs=lambda: (),
+        ),
+        SimpleNamespace(
+            hf_param_names=(safe_name,),
+            local_hf_param_specs=lambda: (object(),),
+        ),
+    ]
+
+    assert _collect_local_refit_hf_names(tasks) == {safe_name}
+
+
+@pytest.mark.parametrize("pp_size", [1, 2])
+def test_nccl_reshard_all_misc_refit_supports_empty_bulk(pp_size: int) -> None:
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+    from nemo_rl.weight_sync.nccl_reshard_utils import HFToLocalParamMap
+
+    misc_name = "model.layers.0.mlp.experts.down_proj"
+    task = SimpleNamespace(
+        global_param_name="decoder.layers.0.mlp.experts.linear_fc2.weight",
+        hf_param_names=(misc_name,),
+        mapping=SimpleNamespace(hf_param=misc_name),
+        local_hf_param_specs=lambda: (),
+    )
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.refit_conversion_tasks = [task]
+    worker._calculate_refit_param_info = MagicMock(return_value={})
+    worker._iter_params_with_optional_kv_scales = MagicMock(
+        return_value=iter([(misc_name, torch.empty(2, 2))])
+    )
+    worker._build_layer_to_pp_stage = MagicMock()
+    worker.build_hf_to_local_param_map = MagicMock(return_value=HFToLocalParamMap())
+
+    info = worker.prepare_nccl_reshard_refit_info(
+        train_parallelism={"tp_size": 1, "ep_size": 1, "pp_size": pp_size},
+        gen_parallelism={"tp_size": 1, "ep_size": 1, "pp_size": 1},
+        train_world_size=pp_size,
+        gen_world_size=1,
+    )
+
+    assert info["layer_names"] == []
+    assert info["per_layer_params"] == {}
+    assert list(info["misc_meta"]) == [misc_name]
+    assert worker.hf_to_local_param_map.specs == {}
+    assert worker._misc_conversion_tasks == [task]
+    worker._build_layer_to_pp_stage.assert_not_called()
+
+
 def test_megatron_m2n_stages_fused_mxfp8_weight_until_complete() -> None:
     from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 
@@ -214,6 +277,7 @@ def test_megatron_m2n_stages_fused_mxfp8_weight_until_complete() -> None:
     destination = MXFP8Tensor(
         data=torch.empty((8, 2)),
         scale=torch.empty(1),
+        dtype=torch.bfloat16,
         backend="triton",
     )
     task = _make_refit_task(

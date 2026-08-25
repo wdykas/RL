@@ -73,7 +73,7 @@ single `ValueError` listing every violation. The current requirements are:
   exemplars set to `mcore`, so existing
   recipes keep native refit unless they opt in; `refit_backend` is only
   consulted when `refit_impl=mcore`, and combining `refit_impl=mcore` with
-  `refit_transport=nccl_reshard` warns that `refit_backend` is unused.
+  `refit_transport=nccl_reshard` leaves `refit_backend` unused.
   `refit_impl` applies to non-colocated generation only — colocated refit always
   uses the in-place wake-reshard, and `refit_impl=bridge` is rejected there
   rather than silently ignored.

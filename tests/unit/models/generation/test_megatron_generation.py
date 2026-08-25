@@ -38,6 +38,37 @@ model_name = "Qwen/Qwen3-0.6B"
 
 
 @pytest.mark.mcore
+def test_skip_weight_load_defers_http_server_until_refit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """HTTP URLs must not force engine init before MXFP8 refit buffers exist."""
+    import nemo_rl.models.policy.lm_policy as lm_policy
+
+    config = deepcopy(basic_megatron_test_config)
+    config["generation"]["colocated"]["enabled"] = False
+    config["generation"]["mcore_generation_config"]["expose_http_server"] = True
+
+    prepare_for_generation = MagicMock()
+    monkeypatch.setattr(lm_policy, "Policy", MagicMock())
+    monkeypatch.setattr(
+        MegatronGeneration, "init_cluster_placement_groups", MagicMock()
+    )
+    monkeypatch.setattr(
+        MegatronGeneration, "prepare_for_generation", prepare_for_generation
+    )
+
+    generation = MegatronGeneration(
+        config=config,
+        tokenizer=MagicMock(),
+        cluster=MagicMock(),
+        skip_weight_load=True,
+    )
+
+    prepare_for_generation.assert_not_called()
+    assert generation.dp_openai_server_base_urls == []
+
+
+@pytest.mark.mcore
 @pytest.mark.parametrize("refit_impl", ["bridge", "mcore"])
 def test_megatron_generation_dispatches_refit_implementation(refit_impl):
     generation = object.__new__(MegatronGeneration)

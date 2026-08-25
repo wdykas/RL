@@ -1282,14 +1282,6 @@ def setup(
         policy_generation, megatron_gen_time = init_megatron_generation(policy)
         setup_timing_metrics.megatron_generation_init_time_s = megatron_gen_time
 
-        if enable_nemo_gym:
-            # The Megatron inference engine must be up before its server URLs exist.
-            nemo_gym_actor, nemo_gym_time = _spinup_nemo_gym(
-                policy_generation.dp_openai_server_base_urls,
-                generation_config["model_name"],
-            )
-            setup_timing_metrics.nemo_gym_init_time_s = nemo_gym_time
-
         print(
             f"  ✓ Using {backend} backend for generation with {policy_config['model_name']}",
             flush=True,
@@ -1547,6 +1539,15 @@ def setup(
             t0 = time.perf_counter()
             policy_generation.weight_synchronizer.sync_weights()
             setup_timing_metrics.generation_init_load_time_s = time.perf_counter() - t0
+        if enable_nemo_gym:
+            # A non-colocated skip-load engine only has valid weights and server
+            # URLs after the initial refit above. Colocated generation starts its
+            # engine eagerly, but uses the same post-synchronizer ordering here.
+            nemo_gym_actor, nemo_gym_time = _spinup_nemo_gym(
+                policy_generation.dp_openai_server_base_urls,
+                generation_config["model_name"],
+            )
+            setup_timing_metrics.nemo_gym_init_time_s = nemo_gym_time
     # if it is not colocated inference, initialize collective communication for update weights
     elif (
         not colocated_inference

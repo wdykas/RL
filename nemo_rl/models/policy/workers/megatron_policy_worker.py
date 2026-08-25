@@ -320,6 +320,23 @@ def _collect_mtp_hf_layer_names(conversion_tasks: Optional[list]) -> set[str]:
     return mtp_layers
 
 
+def _collect_local_refit_hf_names(conversion_tasks: Iterable[Any]) -> set[str]:
+    """Return HF names whose Bridge tasks expose safe direct local views.
+
+    Every task contributing to a grouped HF tensor must provide local specs.
+    Mappings that need transpose, interleave, or other grouped-export transforms
+    return no specs and therefore stay on the normal Bridge conversion path.
+    """
+    support_by_name: dict[str, bool] = {}
+    for task in conversion_tasks:
+        if task is None:
+            continue
+        has_local_views = bool(task.local_hf_param_specs())
+        for name in task.hf_param_names:
+            support_by_name[name] = support_by_name.get(name, True) and has_local_views
+    return {name for name, supported in support_by_name.items() if supported}
+
+
 @contextmanager
 def _meta_tensor_alloc_context():
     """Skip real GPU work during metadata enumeration.
@@ -2770,6 +2787,9 @@ class MegatronPolicyWorkerImpl(
         # the only reliable signal. vLLM keeps the MTP drafter separate from
         # the main model and updates it through load_weights -> misc path.
         mtp_hf_layers_names = _collect_mtp_hf_layer_names(self.refit_conversion_tasks)
+        local_refit_hf_names = _collect_local_refit_hf_names(
+            self.refit_conversion_tasks
+        )
 
         layer_prefix = None
         with _meta_tensor_alloc_context():
@@ -2783,6 +2803,7 @@ class MegatronPolicyWorkerImpl(
                 # nccl-reshard path; everything else -> misc (packed_broadcast).
                 if (
                     is_nccl_reshard_param(name)
+                    and name in local_refit_hf_names
                     and _extract_layer_name(name) not in mtp_hf_layers_names
                 ):
                     state_dict_metadata[name] = meta
@@ -2811,9 +2832,12 @@ class MegatronPolicyWorkerImpl(
         pp_size = train_parallelism.get("pp_size", 1)
         # Construct a dict[layer_name:str] -> pp_stage:int.
         layer_to_pp_stage = None
-        assert layer_prefix is not None, "layer_prefix is not set"
         if pp_size > 1:
-            layer_to_pp_stage = self._build_layer_to_pp_stage(pp_size, layer_prefix)
+            layer_to_pp_stage = (
+                self._build_layer_to_pp_stage(pp_size, layer_prefix)
+                if layer_prefix is not None
+                else {}
+            )
 
         # The key metadata, which should shared with generation workers
         self.nccl_reshard_refit_info = build_nccl_reshard_refit_info(
