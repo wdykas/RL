@@ -1461,14 +1461,21 @@ class MegatronGenerationRefitMixin:
                 if current_stream is not None and source_stream is not None:
                     current_stream.wait_stream(source_stream)
 
-            converted_weight = self.megatron_bridge.convert_hf_weight(
-                task.conversion_task, self._generation_refit_pending_weights
+            converted = next(
+                iter(
+                    self.megatron_bridge.stream_weights_hf_to_megatron(
+                        self._generation_refit_model_chunks,
+                        conversion_tasks=[task.conversion_task],
+                        hf_state_dict=self._generation_refit_pending_weights,
+                    )
+                ),
+                None,
             )
-            if converted_weight is None:
+            if converted is None:
                 raise RuntimeError(
                     f"Bridge produced no local value for {task.param_name!r}."
                 )
-            self._write_generation_refit_weight(task, converted_weight)
+            self._write_generation_refit_weight(task, converted.weight)
 
             for name in task.dependencies:
                 self._generation_refit_remaining_dependencies[name] -= 1

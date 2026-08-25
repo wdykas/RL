@@ -14,6 +14,7 @@
 
 import gc
 from copy import deepcopy
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -168,6 +169,49 @@ def test_bridge_refit_finalizes_import_before_return(
     worker.megatron_bridge.finalize_hf_import.assert_called_once_with(
         worker._generation_refit_model_chunks
     )
+
+
+@pytest.mark.mcore
+def test_bridge_refit_converts_external_state_through_streaming_api() -> None:
+    import nemo_rl.models.generation.megatron.megatron_worker as worker_module
+
+    worker = object.__new__(worker_module.MegatronGenerationRefitMixin)
+    conversion_task = SimpleNamespace(
+        param_name="megatron.weight", hf_param_names=("hf.weight",)
+    )
+    task = worker_module._MegatronRefitTask(
+        conversion_task=conversion_task,
+        destination=torch.empty(2),
+        target_id=1,
+    )
+    converted_weight = torch.ones(2)
+    worker._generation_refit_pending_weights = {}
+    worker._generation_refit_pending_streams = {}
+    worker._generation_refit_remaining_dependencies = {"hf.weight": 1}
+    worker._generation_refit_tasks = [task]
+    worker._generation_refit_task_index = 0
+    worker._generation_refit_model_chunks = [torch.nn.Module()]
+    worker.megatron_bridge = MagicMock()
+    streamed_states = []
+
+    def stream_weights(*_args, hf_state_dict, **_kwargs):
+        streamed_states.append(dict(hf_state_dict))
+        return iter([SimpleNamespace(weight=converted_weight)])
+
+    worker.megatron_bridge.stream_weights_hf_to_megatron.side_effect = stream_weights
+    worker._write_generation_refit_weight = MagicMock()
+    source_weight = torch.zeros(2)
+
+    worker._load_generation_refit_batch([("hf.weight", source_weight)])
+
+    stream_call = worker.megatron_bridge.stream_weights_hf_to_megatron.call_args
+    assert stream_call.args == (worker._generation_refit_model_chunks,)
+    assert stream_call.kwargs["conversion_tasks"] == [conversion_task]
+    assert streamed_states[0]["hf.weight"] is source_weight
+    worker._write_generation_refit_weight.assert_called_once_with(
+        task, converted_weight
+    )
+    assert worker._generation_refit_pending_weights == {}
 
 
 basic_megatron_test_config: PolicyConfig = {
