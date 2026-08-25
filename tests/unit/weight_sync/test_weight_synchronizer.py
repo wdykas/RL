@@ -773,10 +773,6 @@ class TestFactory:
         assert isinstance(sync, MegatronWeightSynchronizer)
 
     def test_non_colocated_megatron_m2n_uses_effective_parallelism(self):
-        from nemo_rl.weight_sync.nccl_reshard_weight_synchronizer import (
-            NcclReshardWeightSynchronizer,
-        )
-
         policy = _mock_policy()
         policy.cfg = {
             "megatron_cfg": {

@@ -2202,6 +2202,7 @@ class TestCreateMegatronConfigFP8:
 
     @staticmethod
     def _subconfig_kwargs(config, *, fp8_param_enabled):
+        # Keep the optional MCore/Transformer Engine setup import test-local.
         from nemo_rl.models.megatron.setup import _create_megatron_config
 
         with (

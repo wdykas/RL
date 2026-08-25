@@ -2520,10 +2520,10 @@ class MegatronPolicyWorkerImpl(
             # Default to the full conversion tasks
             conversion_tasks = self.refit_conversion_tasks
 
-        # Only Megatron generation needs quantized sources materialized as
-        # logical BF16. Bridge's FP8 export tasks already carry the physical
-        # fp8 payload plus its scale_inv sibling, and rewriting them would ship
-        # a BF16 weight next to a live blockwise scale.
+        # Megatron generation consumes transient logical BF16, matching MCore's
+        # native refit wire format; Bridge's training FP8 is not inference MXFP8.
+        # Other backends keep Bridge's physical FP8 payload and scale_inv sibling;
+        # mixing that scale with BF16 would corrupt the imported weight.
         if self._uses_logical_refit_payload():
             conversion_tasks = self._iter_logical_refit_conversion_tasks(
                 conversion_tasks
@@ -3103,6 +3103,7 @@ class MegatronPolicyWorkerImpl(
         # hf_to_local_param_map is built once in prepare_nccl_reshard_refit_info;
         # weight values change but the name → spec mapping is stable across
         # refits.
+        # Keep this local because xferdtensor probes optional NCCL M-to-N bindings.
         from nemo_rl.weight_sync.xferdtensor import DTensorRef, xferdtensor
 
         # MXFP8 source dequantization, grouped-MoE stacking, and spec.post enqueue

@@ -21,6 +21,7 @@ import pytest
 import ray
 import torch
 
+import nemo_rl.models.policy.lm_policy as lm_policy
 from nemo_rl.algorithms.grpo import refit_policy_generation
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -44,8 +45,6 @@ def test_skip_weight_load_defers_http_server_until_refit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """HTTP URLs must not force engine init before MXFP8 refit buffers exist."""
-    import nemo_rl.models.policy.lm_policy as lm_policy
-
     config = deepcopy(basic_megatron_test_config)
     config["generation"]["colocated"]["enabled"] = False
     config["generation"]["mcore_generation_config"]["expose_http_server"] = True
@@ -161,6 +160,7 @@ def test_megatron_generation_uses_common_refit_worker_api() -> None:
 def test_bridge_refit_finalizes_import_before_return(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Keep the optional MCore/Transformer Engine worker import test-local.
     import nemo_rl.models.generation.megatron.megatron_worker as worker_module
 
     events = []
@@ -191,6 +191,7 @@ def test_bridge_refit_finalizes_import_before_return(
 
 @pytest.mark.mcore
 def test_bridge_refit_converts_external_state_through_streaming_api() -> None:
+    # Keep the optional MCore/Transformer Engine worker import test-local.
     import nemo_rl.models.generation.megatron.megatron_worker as worker_module
 
     worker = object.__new__(worker_module.MegatronGenerationRefitMixin)

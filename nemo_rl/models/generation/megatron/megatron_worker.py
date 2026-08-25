@@ -1141,6 +1141,7 @@ class MegatronGenerationRefitMixin:
         sub_world_size: int,
     ) -> None:
         """Join every training PP stage's M-to-N communicator as a gen rank."""
+        # Keep this local because the module imports optional NCCL4Py bindings.
         from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
 
         rank_in_group = train_ranks_per_stage + self.rank

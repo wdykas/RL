@@ -25,6 +25,7 @@ import torch
 from omegaconf import OmegaConf
 from torchdata.stateful_dataloader import StatefulDataLoader
 
+from nemo_rl.algorithms import grpo as grpo_mod
 from nemo_rl.algorithms.advantage_estimator import (
     GDPOAdvantageEstimator,
     GRPOAdvantageEstimator,
@@ -3192,8 +3193,6 @@ def test_setup_refits_megatron_before_starting_nemo_gym(
     monkeypatch, mock_grpo_components
 ):
     """A skip-load Megatron server must start only after its initial refit."""
-    from nemo_rl.algorithms import grpo as grpo_mod
-
     events = []
     checkpointer = MagicMock()
     checkpointer.get_latest_checkpoint_path.return_value = None

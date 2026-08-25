@@ -42,9 +42,13 @@ from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.checkpoint import CheckpointManager
+from nemo_rl.weight_sync.nccl_reshard_utils import HFToLocalParamMap
 from tests.unit.test_utils import SimpleLossFn
 
 pytestmark = pytest.mark.mcore
+
+# Megatron Core/Bridge and worker-module imports stay test-local so pytest can
+# collect this module without the optional MCore/Transformer Engine stack.
 
 
 def _make_refit_task(
@@ -232,7 +236,6 @@ def test_nccl_reshard_all_misc_refit_supports_empty_bulk(pp_size: int) -> None:
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
     )
-    from nemo_rl.weight_sync.nccl_reshard_utils import HFToLocalParamMap
 
     misc_name = "model.layers.0.mlp.experts.down_proj"
     task = SimpleNamespace(
@@ -269,7 +272,6 @@ def test_destination_refit_role_uses_common_worker_interface() -> None:
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
     )
-    from nemo_rl.weight_sync.nccl_reshard_utils import HFToLocalParamMap
 
     worker = object.__new__(MegatronPolicyWorkerImpl)
     worker.refit_role = "destination"
@@ -307,7 +309,6 @@ def test_megatron_destination_misc_plan_uses_shipped_misc_metadata() -> None:
     from nemo_rl.models.generation.megatron.megatron_worker import (
         MegatronGenerationRefitMixin,
     )
-    from nemo_rl.weight_sync.nccl_reshard_utils import HFToLocalParamMap
 
     bulk_task = SimpleNamespace(
         dependencies=("model.layers.0.mlp.experts.0.gate_proj.weight",)
