@@ -16,6 +16,7 @@ import gc
 import logging
 import os
 import re
+import socket
 import time
 import warnings
 from collections import OrderedDict, defaultdict
@@ -58,6 +59,7 @@ from nemo_rl.data.multimodal_utils import (
 )
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.held_port import receive_held_socket
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec, RefitPayloadMode
 from nemo_rl.models.generation.megatron.megatron_worker import (
@@ -512,13 +514,13 @@ class MegatronPolicyWorkerImpl(
         worker_sharding_annotations: NamedSharding,
         skip_weight_load: bool = False,
         refit_role: RefitRole = "source",
+        reserved_http_server_port: Optional[int] = None,
         **kwargs: Any,
     ):
         """Initialize the MegatronPolicyWorker."""
         if refit_role not in ("source", "destination"):
             raise ValueError(
-                "refit_role must be 'source' or 'destination', "
-                f"got {refit_role!r}."
+                f"refit_role must be 'source' or 'destination', got {refit_role!r}."
             )
         self.refit_role = refit_role
         self.refit_payload_mode: RefitPayloadMode = "bridge_export"
@@ -553,6 +555,15 @@ class MegatronPolicyWorkerImpl(
         # Set rank for non-collocated to check which ranks to broadcast from
         self.rank = get_rank_safe()
         self.timer = Timer(context={"worker": "megatron_policy", "rank": self.rank})
+
+        # Adopt the driver-reserved OpenAI server socket before any heavy init.
+        # The port holder has kept it bound and listening since reservation, so
+        # there was no window in which the pre-published URL could be stolen.
+        self._reserved_http_server_socket: Optional[socket.socket] = None
+        if reserved_http_server_port is not None and self.rank == 0:
+            self._reserved_http_server_socket = receive_held_socket(
+                reserved_http_server_port
+            )
 
         # Step 1: Setup distributed
         setup_distributed()
@@ -769,6 +780,7 @@ class MegatronPolicyWorkerImpl(
 
         self._init_inference_engine_state()
         self._init_generation_refit_state()
+        self._setup_colocated_cuda_graph_managers()
 
         log_gpu_memory_diagnostics(
             label="init_complete", worker_type="MegatronPolicyWorker"
@@ -3486,10 +3498,19 @@ class MegatronPolicyWorkerImpl(
         no_grad = torch.no_grad()
         no_grad.__enter__()
         keep_shared_buffer = self._uses_mxfp8_overlap_shared_param_buffer()
+        # Non-reshard colocated serves both models from the same param buffers.
+        generation_cfg = self.cfg.get("generation")
+        keep_params_for_generation = (
+            generation_cfg is not None
+            and generation_cfg.get("backend") == "megatron"
+            and self.is_generation_colocated
+            and self.inference_model is None
+            and self._colocated_reshard_plan is None
+        )
         self.model = self.move_model(
             self.model,
             "cpu",
-            move_params=not keep_shared_buffer,
+            move_params=not (keep_shared_buffer or keep_params_for_generation),
             move_grads=not keep_shared_buffer,
         )
         self.model.eval()

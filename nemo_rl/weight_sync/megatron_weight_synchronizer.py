@@ -67,8 +67,7 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
             # refit_impl is inert. Reject rather than silently ignoring it:
             # a user asking for the Bridge transport would otherwise get the
             # native one with no indication their setting did nothing.
-            mcore_cfg = generation.cfg.get("mcore_generation_config", {}) or {}
-            if mcore_cfg.get("refit_impl") == "bridge":
+            if generation.cfg["mcore_generation_config"]["refit_impl"] == "bridge":
                 raise ValueError(
                     "policy.generation.mcore_generation_config.refit_impl="
                     "'bridge' is not supported with colocated generation, which "

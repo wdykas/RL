@@ -27,6 +27,7 @@ import torch
 from megatron.core.inference.config import (
     InferenceConfig,
     KVCacheManagementMode,
+    MambaInferenceStateConfig,
     PrefixCachingCoordinatorPolicy,
 )
 from megatron.core.inference.engines.dynamic_engine import EngineState
@@ -36,6 +37,7 @@ from megatron.core.inference.quantization.utils import (
     resolve_mxfp8_backend,
 )
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.utils import set_decode_expert_padding
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_inference_spec,
 )
@@ -46,8 +48,19 @@ from megatron.core.resharding.refit import (
     swap_model_weights,
 )
 from megatron.core.transformer import MegatronModule
+from megatron.core.transformer.cuda_graph_config import (
+    normalize_inference_cuda_graph_scope,
+)
+from megatron.core.transformer.cuda_graphs import (
+    CudaGraphManager,
+    _CudagraphGlobalRecord,
+)
 from megatron.core.transformer.enums import InferenceCudaGraphScope
-from megatron.core.transformer.utils import toggle_cuda_graphs
+from megatron.core.transformer.module import GraphableMegatronModule
+from megatron.core.transformer.utils import (
+    set_model_config_attribute,
+    toggle_cuda_graphs,
+)
 from megatron.core.utils import unwrap_model
 from torch.distributed.distributed_c10d import (
     PrefixStore,
@@ -183,6 +196,7 @@ class MegatronGenerationMixin:
      - tokenizer: HF tokenizer.
      - megatron_tokenizer: tokenizer for inference.
      - is_generation_colocated: Whether colocated or distributed.
+     - _reserved_http_server_socket: driver-reserved server socket, or None.
     """
 
     # Colocated-reshard hosts assign the dedicated inference-layout model here
@@ -212,13 +226,93 @@ class MegatronGenerationMixin:
         self._inference_loop = None
         self._inference_thread = None
 
+    def _setup_colocated_cuda_graph_managers(self) -> None:
+        """Create inference CUDA-graph managers for shared-model colocated generation.
+
+        Colocated policies build the shared training model without CUDA graphs.
+        But CUDA graphs configs MUST be in-place at initialization.
+
+        Must run at worker init: colocated reshard is detected via the pending reshard plan
+        (its dedicated inference model is built later, with graphs enabled);
+        the plan is consumed on the first generation cycle.
+        """
+        generation_cfg = self.cfg.get("generation")
+        if (
+            generation_cfg is None
+            or generation_cfg.get("backend") != "megatron"
+            or not self.is_generation_colocated
+            or self._colocated_reshard_plan is not None
+        ):
+            return
+        mcore_generation_config = generation_cfg["mcore_generation_config"]
+        cuda_graph_impl = mcore_generation_config["cuda_graph_impl"]
+        if cuda_graph_impl == "none":
+            return
+        if cuda_graph_impl != "local":
+            raise ValueError(
+                "Colocated Megatron generation supports only cuda_graph_impl "
+                f"'none' or 'local' for inference CUDA graphs, got '{cuda_graph_impl}'. "
+                "'transformer_engine' and 'full_iteration' are training-only capture modes."
+            )
+
+        lang_module = unwrap_model(self.model)
+        # A model built with graphs enabled already owns managers.
+        if not any(
+            hasattr(module, "cudagraph_manager") for module in lang_module.modules()
+        ):
+            scope = normalize_inference_cuda_graph_scope(
+                mcore_generation_config.get("inference_cuda_graph_scope"),
+                cuda_graph_impl,
+            )
+            # Need the correct configs.
+            set_model_config_attribute(lang_module, "cuda_graph_impl", cuda_graph_impl)
+            set_model_config_attribute(lang_module, "inference_cuda_graph_scope", scope)
+            set_model_config_attribute(lang_module, "cuda_graph_modules", [])
+
+            # Need to recurse the configs' effects down into modules.
+            # Megatron-LM has no API for attaching inference CUDA-graph managers to
+            # an already-built model (reported upstream), so this mirrors its
+            # construction-time setup.
+            # TODO: switch to the upstream API once it exists.
+            for module in lang_module.modules():
+                if not isinstance(module, GraphableMegatronModule):
+                    continue
+                if hasattr(module, "create_mcore_cudagraph_manager"):
+                    module.create_mcore_cudagraph_manager(module.config)
+                else:
+                    module.cudagraph_manager = CudaGraphManager(module.config)
+
+            # Handle MTP as well.
+            # TODO: this path only becomes testable once #3331 merges.
+            if getattr(lang_module, "mtp_process", False):
+                if hasattr(lang_module, "_setup_mtp_cuda_graphs") and not hasattr(
+                    lang_module, "_mtp_cudagraph_manager"
+                ):
+                    lang_module._setup_mtp_cuda_graphs()
+                assert hasattr(lang_module, "_mtp_cudagraph_manager"), (
+                    f"cuda_graph_impl='{cuda_graph_impl}', but no MTP graph manager was created."
+                )
+
+            assert any(
+                hasattr(module, "cudagraph_manager") for module in lang_module.modules()
+            ), (
+                f"cuda_graph_impl='{cuda_graph_impl}' is set for colocated Megatron "
+                "generation, but no CUDA-graph manager could be created for this model."
+            )
+
+        # Detach for training; this caches the managers built above.
+        toggle_cuda_graphs(lang_module, set_to="none")
+
+    def get_inference_cuda_graph_capture_count(self) -> int:
+        """Inference CUDA graphs captured in this worker process (0 = eager decode)."""
+        return len(_CudagraphGlobalRecord.cudagraph_inference_record)
+
     def _initialize_inference_engine(self, mcore_generation_config: dict) -> None:
         """Initialize the persistent inference engine and client."""
         # TODO: Switch to standardized Megatron API.
         if self._inference_engine_initialized:
             return
 
-        from megatron.core.inference.config import MambaInferenceStateConfig
         from megatron.core.inference.contexts.dynamic_context import (
             DynamicInferenceContext,
         )
@@ -428,18 +522,23 @@ class MegatronGenerationMixin:
         )
 
         ip = _get_node_ip_local()
-        free_port = _get_free_port_local()
+        reserved_socket = self._reserved_http_server_socket
+        if reserved_socket is not None:
+            server_port = reserved_socket.getsockname()[1]
+        else:
+            server_port = _get_free_port_local()
 
         start_text_gen_server(
             coordinator_addr=self.coordinator_addr,
             tokenizer=self.megatron_tokenizer,
             rank=torch.distributed.get_rank(),
-            server_port=free_port,
+            server_port=server_port,
             parsers=self.cfg["generation"]["mcore_generation_config"]["parsers"],
             verbose=False,
+            sock=reserved_socket,
         )
 
-        base_url = f"http://{ip}:{free_port}/v1"
+        base_url = f"http://{ip}:{server_port}/v1"
         max_wait_time = 300
         start_time = time.time()
         with requests.Session() as session:
@@ -510,6 +609,9 @@ class MegatronGenerationMixin:
             ]
             if cuda_graph_impl != "none":
                 toggle_cuda_graphs(lang_module, set_to="none")
+                # Need to turn off padding before training.
+                # Gains nightly MoE coverage once #2884 and #3570 merge.
+                set_decode_expert_padding(lang_module, set_to=False)
 
         rotary_module = getattr(lang_module, "rotary_pos_emb", None)
         if rotary_module is not None and hasattr(
@@ -1288,9 +1390,7 @@ class MegatronGenerationRefitMixin:
         self._prepare_destination_refit_info(state_dict_info)
 
     @torch.no_grad()
-    def _prepare_destination_refit_info(
-        self, state_dict_info: dict[str, Any]
-    ) -> None:
+    def _prepare_destination_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         """Build the local HF-to-Megatron receive plan before the first refit."""
         model_chunks, tasks = self._build_generation_refit_tasks()
         self._prepare_mxfp8_refit(tasks)
@@ -1315,9 +1415,7 @@ class MegatronGenerationRefitMixin:
         refit_info = restore_refit_info_placements(refit_info)
         model_chunks, tasks = self._build_generation_refit_tasks()
         self._prepare_mxfp8_refit(tasks)
-        bulk_map = self.build_hf_to_local_param_map(
-            refit_info, destination_tasks=tasks
-        )
+        bulk_map = self.build_hf_to_local_param_map(refit_info, destination_tasks=tasks)
 
         misc_meta = refit_info.get("misc_meta", {})
         misc_state_dict_info = {

@@ -546,7 +546,10 @@ def _mock_megatron_generation(
     gen.cfg = {
         "backend": "megatron",
         "refit_transport": refit_transport,
-        "mcore_generation_config": {"refit_backend": refit_backend},
+        "mcore_generation_config": {
+            "refit_backend": refit_backend,
+            "refit_impl": "mcore",
+        },
     }
     gen.uses_native_refit = uses_native_refit
     gen.suspend_for_refit.return_value = None
@@ -752,7 +755,7 @@ class TestFactory:
     def test_colocated_megatron_returns_megatron_synchronizer(self):
         sync = create_weight_synchronizer(
             policy=_mock_policy(),
-            generation=_mock_generation(),
+            generation=_mock_megatron_generation(),
             generation_backend=MEGATRON_BACKEND,
             colocated=True,
         )

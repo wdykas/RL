@@ -105,6 +105,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         worker_extension_cls_fqn: Optional[str] = None,
         skip_weight_load: bool = False,
         refit_role: RefitRole = "source",
+        reserved_http_server_port: Optional[int] = None,
     ):
         self.debug_payload_metrics = False
         if weights_path:
@@ -125,6 +126,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             raise ValueError(
                 "Configure either Megatron (policy.megatron_cfg.enabled=true) or "
                 "DTensor (policy.dtensor_cfg.enabled=true), not both."
+            )
+        if reserved_http_server_port is not None and not megatron_enable:
+            raise ValueError(
+                "reserved_http_server_port is only supported by the Megatron "
+                "worker (policy.megatron_cfg.enabled=true)."
             )
         if draft_enabled and not megatron_enable:
             raise ValueError(
@@ -273,6 +279,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             raise ValueError("refit_role='destination' requires the Megatron backend.")
         if skip_weight_load:
             worker_kwargs["skip_weight_load"] = True
+        if reserved_http_server_port is not None:
+            worker_kwargs["reserved_http_server_port"] = reserved_http_server_port
 
         if use_v2:
             # DTensor v2 workers reconstruct tokenizer/processor locally to avoid

@@ -319,9 +319,7 @@ def test_megatron_destination_misc_plan_uses_shipped_misc_metadata() -> None:
         return_value=(model_chunks, [bulk_task, misc_task])
     )
     worker._prepare_mxfp8_refit = MagicMock()
-    worker.build_hf_to_local_param_map = MagicMock(
-        return_value=HFToLocalParamMap()
-    )
+    worker.build_hf_to_local_param_map = MagicMock(return_value=HFToLocalParamMap())
     worker._install_generation_refit_plan = MagicMock()
     refit_info = {
         "layer_names": [],
@@ -913,19 +911,53 @@ def test_megatron_offload_before_refit_honors_offload_optimizer_for_refit(
     assert moved == (["cpu"] if offload_optimizer else [])
 
 
-def test_megatron_offload_after_refit_keeps_shared_buffer(monkeypatch):
-    """Checkpoint CUDA IPC handles must be dropped before model storage is replaced."""
+@pytest.mark.parametrize(
+    "generation_backend, colocated, has_inference_model, shared_buffer, "
+    "expect_move_params, expect_move_grads",
+    [
+        # Plain training worker (no generation config): params always move.
+        (None, False, False, False, True, True),
+        # Shared-model colocated Megatron generation: params must stay resident —
+        # inference CUDA graphs replay with capture-time param pointers, and a
+        # CPU round-trip re-allocates their storage.
+        ("megatron", True, False, False, False, True),
+        # Colocated reshard (dedicated inference model): params still move; the
+        # graphs live on the dedicated, torch_memory_saver-managed model.
+        ("megatron", True, True, False, True, True),
+        # MXFP8 overlap aliases the parameter and gradient buffers, so neither
+        # storage can move independently.
+        (None, False, False, True, False, False),
+    ],
+)
+def test_megatron_offload_after_refit_finalizes_before_model_move(
+    monkeypatch,
+    generation_backend,
+    colocated,
+    has_inference_model,
+    shared_buffer,
+    expect_move_params,
+    expect_move_grads,
+):
+    """Checkpoint CUDA IPC handles must be dropped before model storage is replaced,
+    and graph/shared-buffer owners must keep their aliased storage resident."""
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
     )
 
     events = []
+    move_kwargs = []
     worker = object.__new__(MegatronPolicyWorkerImpl)
     worker.model = _FakeTrainableModel()
+    worker.cfg = (
+        {"generation": {"backend": generation_backend}} if generation_backend else {}
+    )
+    worker.is_generation_colocated = colocated
+    worker.inference_model = object() if has_inference_model else None
+    worker._colocated_reshard_plan = None
     worker.finalize_async_save = lambda: events.append("finalize_async_save")
-    worker._uses_mxfp8_overlap_shared_param_buffer = lambda: True
+    worker._uses_mxfp8_overlap_shared_param_buffer = lambda: shared_buffer
     worker.move_model = lambda model, device, **kwargs: (
-        events.append(("move_model", kwargs)) or model
+        events.append("move_model") or move_kwargs.append(kwargs) or model
     )
     worker.offload_before_refit = lambda: events.append("offload_before_refit")
 
@@ -948,15 +980,9 @@ def test_megatron_offload_after_refit_keeps_shared_buffer(monkeypatch):
     MegatronPolicyWorkerImpl.offload_after_refit(worker)
 
     assert events[0] == "finalize_async_save"
-    assert events.index("finalize_async_save") < events.index(
-        (
-            "move_model",
-            {
-                "move_params": False,
-                "move_grads": False,
-            },
-        )
-    )
+    assert events.index("finalize_async_save") < events.index("move_model")
+    assert move_kwargs[0]["move_params"] is expect_move_params
+    assert move_kwargs[0]["move_grads"] is expect_move_grads
 
 
 def test_megatron_save_checkpoint_onloads_model_before_save(monkeypatch):
