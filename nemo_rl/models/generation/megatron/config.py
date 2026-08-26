@@ -16,6 +16,19 @@ from typing import Any, Literal, NotRequired, Optional, TypedDict, cast
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.utils.packed_tensor import get_target_packed_tensor_size
+
+
+def resolve_refit_execution_batch_bytes(configured_bytes: int | None) -> int:
+    """Resolve native MCore staging bytes using NeMo-RL's collective default."""
+    if configured_bytes is None:
+        return get_target_packed_tensor_size()
+    if configured_bytes <= 0:
+        raise ValueError(
+            "policy.generation.mcore_generation_config."
+            "refit_execution_batch_bytes must be positive or null."
+        )
+    return configured_bytes
 
 
 class MCoreGenerationSpecificArgs(TypedDict):
@@ -52,6 +65,9 @@ class MCoreGenerationSpecificArgs(TypedDict):
     refit_impl: Literal["bridge", "mcore"]
     # Copy-service backend used only when refit_impl="mcore".
     refit_backend: Literal["gloo", "nccl", "nvshmem"]
+    # Soft per-rank staging limit for native MCore refit. None uses the same
+    # dynamic packed-buffer target as NeMo-RL's existing collective refit.
+    refit_execution_batch_bytes: int | None
     num_speculative_tokens: int
 
     mamba_inference_ssm_states_dtype: NotRequired[str]

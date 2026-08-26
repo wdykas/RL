@@ -445,6 +445,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         world_size: int,
         *,
         rank_offset: int,
+        refit_execution_batch_bytes: int | None,
         refit_backend: str = "nccl",
     ) -> list[ray.ObjectRef]:
         """Initialize the megatron refit collective on this policy's workers."""
@@ -454,6 +455,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             port=port,
             world_size=world_size,
             rank_offset=rank_offset,
+            refit_execution_batch_bytes=refit_execution_batch_bytes,
             refit_backend=refit_backend,
         )
 

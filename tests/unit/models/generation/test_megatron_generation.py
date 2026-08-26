@@ -29,6 +29,7 @@ from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation.megatron import MegatronGeneration, megatron_generation
 from nemo_rl.models.generation.megatron.config import (
     dedicated_inference_megatron_cfg,
+    resolve_refit_execution_batch_bytes,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
@@ -79,6 +80,7 @@ def test_megatron_generation_dispatches_refit_implementation(refit_impl):
         "mcore_generation_config": {
             "refit_impl": refit_impl,
             "refit_backend": "gloo",
+            "refit_execution_batch_bytes": 123,
         }
     }
     generation._policy = MagicMock()
@@ -93,6 +95,7 @@ def test_megatron_generation_dispatches_refit_implementation(refit_impl):
             1234,
             4,
             rank_offset=2,
+            refit_execution_batch_bytes=123,
             refit_backend="gloo",
         )
         generation._policy.swap_weights_via_reshard.assert_called_once_with(
@@ -122,6 +125,7 @@ def test_megatron_generation_m2n_transport_overrides_native_refit() -> None:
         "mcore_generation_config": {
             "refit_impl": "mcore",
             "refit_backend": "nccl",
+            "refit_execution_batch_bytes": 123,
         },
     }
     generation._policy = MagicMock()
@@ -154,6 +158,19 @@ def test_megatron_generation_uses_common_refit_worker_api() -> None:
     assert calls[0].args == ("prepare_nccl_reshard_refit_info",)
     assert calls[0].kwargs == {"refit_info": refit_info}
     assert calls[1].args == ("nccl_reshard_refit",)
+
+
+@pytest.mark.mcore
+def test_native_refit_batch_bytes_use_collective_default(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.megatron.config.get_target_packed_tensor_size",
+        lambda: 456,
+    )
+
+    assert resolve_refit_execution_batch_bytes(None) == 456
+    assert resolve_refit_execution_batch_bytes(123) == 123
+    with pytest.raises(ValueError, match="must be positive or null"):
+        resolve_refit_execution_batch_bytes(0)
 
 
 @pytest.mark.mcore
@@ -342,6 +359,7 @@ basic_megatron_test_config: PolicyConfig = {
             "num_speculative_tokens": 0,
             "refit_impl": "bridge",
             "refit_backend": "gloo",  # not nvshmem: its NVLS multicast init is unavailable in CI
+            "refit_execution_batch_bytes": None,
             "parsers": [],
             "expose_http_server": False,
         },

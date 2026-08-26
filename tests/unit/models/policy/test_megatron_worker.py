@@ -1434,6 +1434,7 @@ def create_megatron_test_config(
                 "num_speculative_tokens": 0,
                 "refit_impl": "bridge",
                 "refit_backend": "gloo",  # not nvshmem: its NVLS multicast init is unavailable in CI
+                "refit_execution_batch_bytes": None,
                 "parsers": [],
                 "expose_http_server": False,
             },

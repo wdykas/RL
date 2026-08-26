@@ -294,6 +294,9 @@ class MegatronGeneration(GenerationInterface):
                 port,
                 world_size,
                 rank_offset=train_world_size,
+                refit_execution_batch_bytes=self.cfg["mcore_generation_config"][
+                    "refit_execution_batch_bytes"
+                ],
                 refit_backend=backend,
             )
         return self._policy.init_collective(

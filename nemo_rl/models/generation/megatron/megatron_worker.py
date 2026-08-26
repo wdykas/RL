@@ -75,6 +75,9 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
     verify_right_padding,
 )
+from nemo_rl.models.generation.megatron.config import (
+    resolve_refit_execution_batch_bytes,
+)
 from nemo_rl.models.generation.megatron.utils import (
     log_gpu_memory,
     resolve_torch_dtype,
@@ -979,6 +982,7 @@ class MegatronGenerationRefitMixin:
         self._generation_m2n_pending = None
         # Native MCore copy service, built by init_collective_mcore_generation.
         self.refit_copy_service = None
+        self.refit_execution_batch_bytes: int | None = None
 
     def init_collective_mcore_generation(
         self,
@@ -986,6 +990,7 @@ class MegatronGenerationRefitMixin:
         port: int,
         world_size: int,
         rank_offset: int,
+        refit_execution_batch_bytes: int | None,
         refit_backend: str = "nccl",
     ) -> None:
         """Initialize the refit collective for non-colocated weight transfer.
@@ -995,6 +1000,8 @@ class MegatronGenerationRefitMixin:
             port: Port for the process group rendezvous.
             world_size: Total world size (train + inference workers).
             rank_offset: Offset for this side's ranks (`train_world_size` for inference).
+            refit_execution_batch_bytes: Configured native MCore staging limit.
+                None uses NeMo-RL's dynamic collective-refit default.
             refit_backend: Copy-service backend ("gloo" or "nccl";
                 "nvshmem" is currently broken, see the issue below).
         """
@@ -1004,6 +1011,9 @@ class MegatronGenerationRefitMixin:
                 '"gloo". See https://github.com/NVIDIA-NeMo/RL/issues/3646',
                 stacklevel=2,
             )
+        execution_batch_bytes = resolve_refit_execution_batch_bytes(
+            refit_execution_batch_bytes
+        )
 
         local_rank = torch.distributed.get_rank()
         global_rank = local_rank + rank_offset
@@ -1060,6 +1070,7 @@ class MegatronGenerationRefitMixin:
         pg._set_group_name(group_name)
 
         self.refit_pg = pg
+        self.refit_execution_batch_bytes = execution_batch_bytes
 
         # Register in torch.distributed's global state so that high-level ops
         # (all_gather_object, broadcast_object_list) work with this PG.
@@ -1093,6 +1104,7 @@ class MegatronGenerationRefitMixin:
             group=self.refit_pg,
             src_rank_offset=0,
             dst_rank_offset=self.refit_dst_rank_offset,
+            execution_batch_bytes=self.refit_execution_batch_bytes,
         )
 
     def preinit_nvshmem_collective(self) -> None:
@@ -1119,6 +1131,8 @@ class MegatronGenerationRefitMixin:
         """
         src_model = self.model if is_source else None
         dst_model = None if is_source else self.model
+        if self.refit_execution_batch_bytes is None:
+            raise RuntimeError("Native MCore refit was not initialized.")
 
         swap_model_weights(
             src_model,
@@ -1127,6 +1141,7 @@ class MegatronGenerationRefitMixin:
             group=self.refit_pg,
             src_rank_offset=0,
             dst_rank_offset=self.refit_dst_rank_offset,
+            execution_batch_bytes=self.refit_execution_batch_bytes,
         )
 
         return True
@@ -1672,6 +1687,11 @@ class MegatronGenerationRefitMixin:
         inference_model = self.inference_model
         if inference_model is None:
             return
+        execution_batch_bytes = resolve_refit_execution_batch_bytes(
+            self.cfg["generation"]["mcore_generation_config"][
+                "refit_execution_batch_bytes"
+            ]
+        )
 
         # Bring the inference weights back to GPU.
         self._onload_inference_model()
@@ -1694,6 +1714,7 @@ class MegatronGenerationRefitMixin:
                 group=None,
                 src_rank_offset=0,
                 dst_rank_offset=0,
+                execution_batch_bytes=execution_batch_bytes,
             )
             self._swap_weights_plan_prepared = True
 
@@ -1706,6 +1727,7 @@ class MegatronGenerationRefitMixin:
             group=None,
             src_rank_offset=0,
             dst_rank_offset=0,
+            execution_batch_bytes=execution_batch_bytes,
         )
         # Offload training model.
         self.model = self.move_model(

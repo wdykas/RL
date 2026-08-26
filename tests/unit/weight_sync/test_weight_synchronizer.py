@@ -538,6 +538,7 @@ class TestNcclReshardWeightSynchronizer:
 def _mock_megatron_generation(
     refit_backend="nccl",
     *,
+    refit_execution_batch_bytes=123,
     refit_transport=None,
     uses_native_refit=True,
     **overrides,
@@ -549,6 +550,7 @@ def _mock_megatron_generation(
         "mcore_generation_config": {
             "refit_backend": refit_backend,
             "refit_impl": "mcore",
+            "refit_execution_batch_bytes": refit_execution_batch_bytes,
         },
     }
     gen.uses_native_refit = uses_native_refit
@@ -614,6 +616,12 @@ class TestMegatronWeightSynchronizer:
 
         sync.init_communicator()
         policy.init_collective_mcore_generation.assert_called_once()
+        assert (
+            policy.init_collective_mcore_generation.call_args.kwargs[
+                "refit_execution_batch_bytes"
+            ]
+            == 123
+        )
         gen.init_collective.assert_called_once()
 
         assert sync.sync_weights() == {}

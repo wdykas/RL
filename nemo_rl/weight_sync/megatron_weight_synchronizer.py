@@ -110,11 +110,15 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
         self._refit_backend = self._generation.cfg["mcore_generation_config"][
             "refit_backend"
         ]
+        refit_execution_batch_bytes = self._generation.cfg["mcore_generation_config"][
+            "refit_execution_batch_bytes"
+        ]
         futures_train = self._policy.init_collective_mcore_generation(
             ip,
             port,
             world_size,
             rank_offset=0,
+            refit_execution_batch_bytes=refit_execution_batch_bytes,
             refit_backend=self._refit_backend,
         )
         futures_inference = self._generation.init_collective(
