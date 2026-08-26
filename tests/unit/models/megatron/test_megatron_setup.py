@@ -615,28 +615,6 @@ class TestApplyModelOverrides:
 class TestApplyParallelismConfig:
     """Tests for _apply_parallelism_config function."""
 
-    def test_inference_weight_sharding_removes_training_gtp_axes(self):
-        from nemo_rl.models.megatron.setup import (
-            _configure_non_gtp_inference_weight_sharding,
-        )
-
-        model_provider = SimpleNamespace(
-            tensor_model_parallel_size=4,
-            tensor_parallel_num_weight_shards=8,
-            gtp_weight_remat_size=2,
-            expert_tensor_parallel_size=2,
-            expert_tensor_parallel_num_weight_shards=8,
-            expert_gtp_weight_remat_size=4,
-        )
-
-        result = _configure_non_gtp_inference_weight_sharding(model_provider)
-
-        assert result is model_provider
-        assert model_provider.tensor_parallel_num_weight_shards == 4
-        assert model_provider.gtp_weight_remat_size == 1
-        assert model_provider.expert_tensor_parallel_num_weight_shards == 2
-        assert model_provider.expert_gtp_weight_remat_size == 1
-
     def test_basic_parallelism_config(self):
         """Test applying basic parallelism configuration."""
         from nemo_rl.models.megatron.setup import _apply_parallelism_config

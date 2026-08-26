@@ -1608,7 +1608,6 @@ def build_inference_model(
     inference_provider.recompute_num_layers = None
     if inference_provider.transformer_impl == "inference_optimized":
         inference_provider.moe_pad_experts_for_cuda_graph_inference = False
-    _configure_non_gtp_inference_weight_sharding(inference_provider)
     # Re-run the deferred MCore post-init (virtual, idempotent).
     inference_provider.finalize()
 
@@ -1646,33 +1645,6 @@ def build_inference_model(
     inference_model = inference_model[0]
     inference_model.eval()
     return inference_model
-
-
-def _configure_non_gtp_inference_weight_sharding(model_provider: Any) -> Any:
-    """Match an inference provider to the TP/EP-only process-group grid.
-
-    Colocated inference process groups currently have no GTP axes. A provider copied from a GTP
-    training model must therefore use ordinary TP sharding after the inference TP sizes are
-    applied. MCore refit materializes the source GTP shards into this destination layout.
-
-    The ``hasattr`` guards preserve compatibility with MCore versions predating GTP.
-    """
-    field_values = (
-        (
-            "tensor_parallel_num_weight_shards",
-            model_provider.tensor_model_parallel_size,
-        ),
-        ("gtp_weight_remat_size", 1),
-        (
-            "expert_tensor_parallel_num_weight_shards",
-            model_provider.expert_tensor_parallel_size,
-        ),
-        ("expert_gtp_weight_remat_size", 1),
-    )
-    for field_name, value in field_values:
-        if hasattr(model_provider, field_name):
-            setattr(model_provider, field_name, value)
-    return model_provider
 
 
 def setup_model_and_optimizer(

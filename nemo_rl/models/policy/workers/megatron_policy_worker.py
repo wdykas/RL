@@ -3207,49 +3207,6 @@ class MegatronPolicyWorkerImpl(
         self.inference_model = build_inference_model(
             inference_config, self.megatron_cfg, plan.initial_model_provider
         )
-        training_model_config = get_model_config(self.model)
-        inference_model_config = get_model_config(self.inference_model)
-        training_gtp = getattr(training_model_config, "gtp_weight_remat_size", 1)
-        training_expert_gtp = getattr(
-            training_model_config, "expert_gtp_weight_remat_size", 1
-        )
-        inference_gtp = getattr(inference_model_config, "gtp_weight_remat_size", 1)
-        inference_expert_gtp = getattr(
-            inference_model_config, "expert_gtp_weight_remat_size", 1
-        )
-        if inference_gtp != 1 or inference_expert_gtp != 1:
-            raise RuntimeError(
-                "The dedicated inference model unexpectedly retained the training GTP axis"
-            )
-
-        if training_gtp > 1 or training_expert_gtp > 1:
-            training_chunks = (
-                self.model if isinstance(self.model, (list, tuple)) else (self.model,)
-            )
-            training_has_gtp_params = any(
-                getattr(param, "is_gtp_weight_remat", False)
-                for chunk in training_chunks
-                for param in chunk.parameters()
-            )
-            inference_has_gtp_params = any(
-                getattr(param, "is_gtp_weight_remat", False)
-                for param in self.inference_model.parameters()
-            )
-            if not training_has_gtp_params:
-                raise RuntimeError(
-                    "GTP is configured for the training model but no GTP-sharded parameters exist"
-                )
-            if inference_has_gtp_params:
-                raise RuntimeError(
-                    "The dedicated inference model unexpectedly contains GTP-sharded parameters"
-                )
-            print(
-                "[colocated-reshard] weight sharding "
-                f"training GTP={training_gtp} -> inference GTP={inference_gtp}; "
-                "training expert-GTP="
-                f"{training_expert_gtp} -> inference expert-GTP={inference_expert_gtp}",
-                flush=True,
-            )
         # The plan is consumed (provider mutated to the inference layout); release it.
         self._colocated_reshard_plan = None
 

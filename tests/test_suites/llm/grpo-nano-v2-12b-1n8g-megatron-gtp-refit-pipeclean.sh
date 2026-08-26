@@ -30,8 +30,3 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 uv run tests/check_metrics.py $JSON_METRICS \
     'max(data["train/token_mult_prob_error"]) < 1.05'
-
-if ! grep -q "\[colocated-reshard\] weight sharding training GTP=2 -> inference GTP=1" $RUN_LOG; then
-    echo "FAIL: Nemotron Nano did not exercise active GTP-to-TP refit"
-    exit 1
-fi
