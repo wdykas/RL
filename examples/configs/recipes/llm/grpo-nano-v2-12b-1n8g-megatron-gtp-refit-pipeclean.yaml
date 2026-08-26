@@ -1,0 +1,35 @@
+defaults: ./grpo-nano-v2-12b-1n8g-megatron.yaml
+grpo:
+  num_prompts_per_step: 2
+  num_generations_per_prompt: 2
+  max_num_steps: 2
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/grpo-nano-v2-12b-1n8g-megatron-gtp-refit-pipeclean
+policy:
+  train_global_batch_size: 4
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  megatron_cfg:
+    tensor_model_parallel_size: 4
+    sequence_parallel: true
+    model_overrides:
+      tensor_parallel_num_weight_shards: 8
+  generation:
+    backend: megatron
+    max_new_tokens: 128
+    mcore_generation_config:
+      transformer_impl: inference_optimized
+      tensor_model_parallel_size: 8
+      sequence_parallel: true
+      cuda_graph_impl: none
+      inference_cuda_graph_scope: none
+      mamba_inference_ssm_states_dtype: float32
+      mamba_inference_conv_states_dtype: float32
+data:
+  max_input_seq_length: 384
+logger:
+  log_dir: logs/grpo-nano-v2-12b-1n8g-megatron-gtp-refit-pipeclean
+  wandb_enabled: false
+  wandb:
+    name: grpo-nano-v2-12b-1n8g-megatron-gtp-refit-pipeclean
