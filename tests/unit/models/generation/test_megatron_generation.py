@@ -25,6 +25,8 @@ from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.models.generation.megatron.config import (
     dedicated_inference_megatron_cfg,
+    is_disaggregated_generation,
+    validate_disaggregated_generation,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
@@ -138,6 +140,8 @@ basic_megatron_test_config: PolicyConfig = {
             "use_cuda_graphs_for_non_decode_steps": True,
             "enable_chunked_prefill": True,
             "enable_prefix_caching": False,
+            "disaggregation_shards": None,
+            "kv_transport_backend": "nccl",
             "max_tokens": 16384,
             "kv_cache_management_mode": "persist",
             "materialize_only_last_token_logits": True,
@@ -148,6 +152,30 @@ basic_megatron_test_config: PolicyConfig = {
         },
     },
 }
+
+
+def test_validate_disaggregated_generation_config():
+    """Disaggregation validates topology and fails early on unsupported modes."""
+    config = deepcopy(basic_megatron_test_config)
+    mcore_config = config["generation"]["mcore_generation_config"]
+    mcore_config["disaggregation_shards"] = (
+        "tp=1,dp=1,role=prefill+tp=1,dp=1,role=decode"
+    )
+    mcore_config["enable_prefix_caching"] = True
+    config["generation"]["colocated"]["enabled"] = True
+
+    assert is_disaggregated_generation(config)
+    validate_disaggregated_generation(config, world_size=2)
+    assert dedicated_inference_megatron_cfg(config) is not None
+
+    config["generation"]["colocated"]["enabled"] = False
+    with pytest.raises(NotImplementedError, match="colocated.enabled=true"):
+        validate_disaggregated_generation(config, world_size=2)
+
+    config["generation"]["colocated"]["enabled"] = True
+    mcore_config["enable_prefix_caching"] = False
+    with pytest.raises(ValueError, match="enable_prefix_caching=true"):
+        validate_disaggregated_generation(config, world_size=2)
 
 
 @pytest.fixture(scope="function")
@@ -519,6 +547,45 @@ def test_megatron_generation_colocated(
         assert mg.shutdown() is True
         after_shutdown = mg.generate(test_input_data, greedy=True)
         _assert_valid_generation_output(after_shutdown, test_input_data)
+    finally:
+        if policy is not None:
+            policy.shutdown()
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+@pytest.mark.mcore
+@pytest.mark.timeout(900)
+def test_megatron_generation_colocated_disaggregated(
+    cluster, test_input_data, tokenizer
+):
+    """Colocated generation hands KV state from a prefill to a decode shard."""
+    if cluster.num_gpus_per_node < 2:
+        pytest.skip("Need two GPUs for one prefill and one decode shard")
+
+    config = deepcopy(basic_megatron_test_config)
+    config["generation"]["colocated"]["enabled"] = True
+    mcore_config = config["generation"]["mcore_generation_config"]
+    mcore_config.update(
+        {
+            "cuda_graph_impl": "none",
+            "num_cuda_graphs": 0,
+            "enable_chunked_prefill": False,
+            "enable_prefix_caching": True,
+            "disaggregation_shards": ("tp=1,dp=1,role=prefill+tp=1,dp=1,role=decode"),
+            "kv_transport_backend": "nccl",
+        }
+    )
+
+    policy = None
+    try:
+        policy = Policy(cluster=cluster, config=config, tokenizer=tokenizer)
+        generation = MegatronGeneration(
+            policy=policy, config=config, tokenizer=tokenizer
+        )
+        generation.prepare_for_generation()
+        outputs = generation.generate(test_input_data, greedy=True)
+        _assert_valid_generation_output(outputs, test_input_data)
     finally:
         if policy is not None:
             policy.shutdown()

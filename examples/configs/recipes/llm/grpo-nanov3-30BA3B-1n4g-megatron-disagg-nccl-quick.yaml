@@ -1,0 +1,51 @@
+defaults: ../../grpo_math_1B.yaml
+grpo:
+  num_prompts_per_step: 1
+  num_generations_per_prompt: 4
+  max_num_steps: 1
+  val_period: 1000000
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/grpo-nanov3-30BA3B-1n4g-megatron-disagg-nccl-quick
+policy:
+  model_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16
+  tokenizer:
+    name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+  train_global_batch_size: 4
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  dtensor_cfg:
+    enabled: false
+  megatron_cfg:
+    enabled: true
+    bias_activation_fusion: false
+    expert_model_parallel_size: 4
+    moe_router_dtype: fp32
+  sequence_packing:
+    enabled: false
+  generation:
+    backend: megatron
+    max_new_tokens: 64
+    mcore_generation_config:
+      transformer_impl: inference_optimized
+      inference_grouped_gemm_backend: vllm
+      moe_router_num_groups: null
+      moe_router_group_topk: null
+      tensor_model_parallel_size: 1
+      expert_tensor_parallel_size: 1
+      expert_model_parallel_size: 2
+      sequence_parallel: false
+      activation_checkpointing: false
+      cuda_graph_impl: none
+      num_cuda_graphs: 0
+      enable_chunked_prefill: false
+      enable_prefix_caching: true
+      disaggregation_shards: tp=1,dp=2,ep=2,expt_tp=1,role=prefill+tp=1,dp=2,ep=2,expt_tp=1,role=decode
+      max_tokens: 1024
+      buffer_size_gb: 20
+logger:
+  log_dir: logs/grpo-nanov3-30BA3B-1n4g-megatron-disagg-nccl-quick
+  tensorboard_enabled: true
+cluster:
+  gpus_per_node: 4
+  segment_size: 1

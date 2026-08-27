@@ -61,7 +61,10 @@ from megatron.bridge.training.utils.pg_utils import get_pg_collection
 from megatron.bridge.utils.cuda_graph import set_cuda_graph_modules
 from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
 from megatron.core import parallel_state
-from megatron.core.inference.shards import build_inference_pg_collection
+from megatron.core.inference.shards import (
+    build_inference_pg_collection,
+    build_inference_pg_collections_for_shards,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.enums import AttnBackend, InferenceCudaGraphScope
@@ -227,6 +230,8 @@ from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.generation.megatron.config import (
     dedicated_inference_megatron_cfg,
+    is_disaggregated_generation,
+    validate_disaggregated_generation,
 )
 from nemo_rl.models.megatron.community_import import (
     import_model_from_hf_name,
@@ -355,6 +360,10 @@ def validate_and_set_config(
             top_p=generation_cfg["top_p"],
             temperature=generation_cfg["temperature"],
         )
+        if generation_cfg["backend"] == "megatron":
+            validate_disaggregated_generation(
+                config, world_size=torch.distributed.get_world_size()
+            )
 
     # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error for PyNCCLCommunicator.
     # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
@@ -1557,12 +1566,45 @@ def build_inference_model(
     Returns:
         The inference model module (single element; not DDP-wrapped, no optimizer).
     """
+    resolved_policy_cfg = policy_cfg
+    inference_pg_collection = None
+    if is_disaggregated_generation(policy_cfg):
+        shard_spec = policy_cfg["generation"]["mcore_generation_config"][
+            "disaggregation_shards"
+        ]
+        inference_shards = build_inference_pg_collections_for_shards(
+            total_world_size=torch.distributed.get_world_size(),
+            shards=shard_spec,
+            use_tp_pp_dp_mapping=megatron_cfg.dist.use_tp_pp_dp_mapping,
+        )
+        local_shards = [
+            shard for shard in inference_shards if shard.pg_collection is not None
+        ]
+        if len(local_shards) != 1:
+            raise RuntimeError(
+                "Each rank must belong to exactly one Megatron inference shard; "
+                f"rank {torch.distributed.get_rank()} belongs to {len(local_shards)}."
+            )
+        local_shard = local_shards[0]
+        local_spec = local_shard.spec
+        resolved_policy_cfg = copy.deepcopy(policy_cfg)
+        resolved_policy_cfg["megatron_cfg"].update(
+            {
+                "tensor_model_parallel_size": local_spec.tp,
+                "pipeline_model_parallel_size": local_spec.pp,
+                "context_parallel_size": 1,
+                "expert_model_parallel_size": local_spec.ep,
+                "expert_tensor_parallel_size": local_spec.expt_tp,
+            }
+        )
+        inference_pg_collection = local_shard.pg_collection
+
     inference_provider = initial_model_provider
     train_pipeline_model_parallel_size = inference_provider.pipeline_model_parallel_size
-    _apply_parallelism_config(inference_provider, policy_cfg)
-    _apply_moe_config(inference_provider, policy_cfg)
-    if "transformer_impl" in policy_cfg["megatron_cfg"]:
-        inference_provider.transformer_impl = policy_cfg["megatron_cfg"][
+    _apply_parallelism_config(inference_provider, resolved_policy_cfg)
+    _apply_moe_config(inference_provider, resolved_policy_cfg)
+    if "transformer_impl" in resolved_policy_cfg["megatron_cfg"]:
+        inference_provider.transformer_impl = resolved_policy_cfg["megatron_cfg"][
             "transformer_impl"
         ]
     # A custom (uneven) pipeline split is tuned for the training PP; reset to an even split
@@ -1587,23 +1629,24 @@ def build_inference_model(
     # Re-run the deferred MCore post-init (virtual, idempotent).
     inference_provider.finalize()
 
-    world_size = torch.distributed.get_world_size()
-    inference_pg_collection = build_inference_pg_collection(
-        world_size,
-        tp_size=inference_provider.tensor_model_parallel_size,
-        pp_size=inference_provider.pipeline_model_parallel_size,
-        cp_size=inference_provider.context_parallel_size,
-        ep_size=inference_provider.expert_model_parallel_size,
-        expt_tp_size=inference_provider.expert_tensor_parallel_size,
-        use_tp_pp_dp_mapping=megatron_cfg.dist.use_tp_pp_dp_mapping,
-        rank_offset=0,  # colocated: the same ranks hold both the training and inference models
-    )
+    if inference_pg_collection is None:
+        world_size = torch.distributed.get_world_size()
+        inference_pg_collection = build_inference_pg_collection(
+            world_size,
+            tp_size=inference_provider.tensor_model_parallel_size,
+            pp_size=inference_provider.pipeline_model_parallel_size,
+            cp_size=inference_provider.context_parallel_size,
+            ep_size=inference_provider.expert_model_parallel_size,
+            expt_tp_size=inference_provider.expert_tensor_parallel_size,
+            use_tp_pp_dp_mapping=megatron_cfg.dist.use_tp_pp_dp_mapping,
+            rank_offset=0,
+        )
     setattr(inference_provider, "_pg_collection", inference_pg_collection)
 
     # Match the training mixed-precision wrapper.
     mixed_precision_wrapper = (
         MoEFloat16Module
-        if policy_cfg["megatron_cfg"]["freeze_moe_router"]
+        if resolved_policy_cfg["megatron_cfg"]["freeze_moe_router"]
         else Float16Module
     )
 

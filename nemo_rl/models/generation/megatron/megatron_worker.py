@@ -27,8 +27,10 @@ from megatron.core.inference.config import (
     KVCacheManagementMode,
     PrefixCachingCoordinatorPolicy,
 )
+from megatron.core.inference.engine_factory import build_dynamic_inference_engine
 from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.shards_spec import resolve_inference_shard
 from megatron.core.resharding.copy_services.gloo_copy_service import GlooCopyService
 from megatron.core.resharding.copy_services.nccl_copy_service import NCCLCopyService
 from megatron.core.resharding.refit import (
@@ -100,27 +102,16 @@ class MegatronGenerationMixin:
 
     def _initialize_inference_engine(self, mcore_generation_config: dict) -> None:
         """Initialize the persistent inference engine and client."""
-        # TODO: Switch to standardized Megatron API.
         if self._inference_engine_initialized:
             return
 
         from megatron.core.inference.config import MambaInferenceStateConfig
-        from megatron.core.inference.contexts.dynamic_context import (
-            DynamicInferenceContext,
-        )
-        from megatron.core.inference.engines.dynamic_engine import (
-            DynamicInferenceEngine,
-        )
-        from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
-            GPTInferenceWrapper,
-        )
-        from megatron.core.inference.text_generation_controllers.text_generation_controller import (
-            TextGenerationController,
-        )
         from megatron.core.utils import get_attr_wrapped_model
 
         gen_model = self._gen_model()
         pg_collection = get_attr_wrapped_model(gen_model, "pg_collection")
+
+        disaggregation_shards = mcore_generation_config.get("disaggregation_shards")
 
         buffer_size_gb = mcore_generation_config["buffer_size_gb"]
         num_cuda_graphs = mcore_generation_config["num_cuda_graphs"]
@@ -199,6 +190,10 @@ class MegatronGenerationMixin:
             num_speculative_tokens=num_speculative_tokens,
             logprobs_mode="processed_logprobs",
             max_requests=max_requests,
+            disaggregation_shards=disaggregation_shards,
+            kv_transport_backend=mcore_generation_config.get(
+                "kv_transport_backend", "nixl"
+            ),
         )
 
         if "inference_cuda_graph_scope" in mcore_generation_config:
@@ -206,18 +201,14 @@ class MegatronGenerationMixin:
                 mcore_generation_config["inference_cuda_graph_scope"]
             ]
 
-        self.inference_context = DynamicInferenceContext(
-            gen_model.config, inference_config
-        )
-        self.inference_wrapped_model = GPTInferenceWrapper(
-            gen_model, self.inference_context
-        )
-        text_generation_controller = TextGenerationController(
-            inference_wrapped_model=self.inference_wrapped_model,
+        self.dynamic_inference_engine = build_dynamic_inference_engine(
+            model=gen_model,
             tokenizer=self.megatron_tokenizer,
+            inference_config=inference_config,
         )
-        self.dynamic_inference_engine = DynamicInferenceEngine(
-            text_generation_controller, self.inference_context
+        self.inference_context = self.dynamic_inference_engine.context
+        self.inference_wrapped_model = (
+            self.dynamic_inference_engine.controller.inference_wrapped_model
         )
 
         self._inference_engine_initialized = True
@@ -914,6 +905,21 @@ class MegatronGenerationRefitMixin:
         pause_inference_weights()
         self._inference_model_offloaded = True
 
+    def _disaggregation_refit_pool(self) -> tuple[int, int]:
+        """Return the destination-pool count and this rank's shard index."""
+        shard_spec = self.cfg["generation"]["mcore_generation_config"].get(
+            "disaggregation_shards"
+        )
+        if shard_spec is None:
+            return 1, 0
+
+        assignment = resolve_inference_shard(
+            shard_spec,
+            torch.distributed.get_world_size(),
+            torch.distributed.get_rank(),
+        )
+        return assignment.shard_count, assignment.index
+
     def _reshard_into_inference_model(self) -> None:
         """Reshard current training weights into the colocated inference-layout model."""
         inference_model = self.inference_model
@@ -933,7 +939,11 @@ class MegatronGenerationRefitMixin:
         if self.should_disable_forward_pre_hook and self._forward_pre_hook_enabled():
             self._disable_forward_pre_hook_until_next_train_step(param_sync=True)
 
-        # Build + cache the same-rank reshard plan once, before the first CUDA-graph capture.
+        num_dst_pools, dst_pool_index = self._disaggregation_refit_pool()
+
+        # Build and cache every destination pool's plan before the first CUDA
+        # graph capture. Megatron also prepares any required MXFP8 transform
+        # for this rank's inference shard.
         if not self._swap_weights_plan_prepared:
             prepare_swap_model_weights(
                 src_model=self.model,
@@ -941,6 +951,8 @@ class MegatronGenerationRefitMixin:
                 group=None,
                 src_rank_offset=0,
                 dst_rank_offset=0,
+                num_dst_pools=num_dst_pools,
+                dst_pool_index=dst_pool_index,
             )
             self._swap_weights_plan_prepared = True
 
@@ -953,6 +965,8 @@ class MegatronGenerationRefitMixin:
             group=None,
             src_rank_offset=0,
             dst_rank_offset=0,
+            num_dst_pools=num_dst_pools,
+            dst_pool_index=dst_pool_index,
         )
         # Offload training model.
         self.model = self.move_model(

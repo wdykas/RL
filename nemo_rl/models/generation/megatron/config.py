@@ -48,6 +48,12 @@ class MCoreGenerationSpecificArgs(TypedDict):
     enable_chunked_prefill: bool
     enable_prefix_caching: bool
 
+    # Native Megatron prefill/decode disaggregation. The shard string uses
+    # Megatron's ``tp=...,dp=...,role=prefill+...role=decode`` syntax and must
+    # partition the colocated worker group's full world size.
+    disaggregation_shards: NotRequired[Optional[str]]
+    kv_transport_backend: NotRequired[Literal["nixl", "nccl"]]
+
     refit_backend: Literal["gloo", "nccl", "nvshmem"]
     num_speculative_tokens: int
 
@@ -70,6 +76,51 @@ class MCoreGenerationConfig(GenerationConfig):
     """Generation config for Megatron Inference."""
 
     mcore_generation_config: MCoreGenerationSpecificArgs
+
+
+def is_disaggregated_generation(policy_config: PolicyConfig) -> bool:
+    """Whether the Megatron generation config declares prefill/decode shards."""
+    generation_config = cast(MCoreGenerationConfig, policy_config["generation"])
+    return (
+        generation_config["mcore_generation_config"].get("disaggregation_shards")
+        is not None
+    )
+
+
+def validate_disaggregated_generation(
+    policy_config: PolicyConfig, *, world_size: int
+) -> None:
+    """Validate NeMo-RL's supported native disaggregation topology."""
+    if not is_disaggregated_generation(policy_config):
+        return
+
+    generation_config = cast(MCoreGenerationConfig, policy_config["generation"])
+    mcore_config = generation_config["mcore_generation_config"]
+    if not generation_config["colocated"]["enabled"]:
+        raise NotImplementedError(
+            "Megatron prefill/decode disaggregation currently requires "
+            "policy.generation.colocated.enabled=true."
+        )
+    if not mcore_config["enable_prefix_caching"]:
+        raise ValueError(
+            "Megatron prefill/decode disaggregation requires "
+            "policy.generation.mcore_generation_config.enable_prefix_caching=true."
+        )
+    if "kv_transport_backend" not in mcore_config:
+        raise ValueError(
+            "Megatron prefill/decode disaggregation requires an explicit "
+            "policy.generation.mcore_generation_config.kv_transport_backend."
+        )
+    # Deferred import keeps the generic config module importable without the
+    # optional MCore dependency.
+    from megatron.core.inference.disaggregation.coordinator_setup import (
+        validate_disaggregation_shards,
+    )
+
+    validate_disaggregation_shards(
+        mcore_config["disaggregation_shards"],
+        world_size,
+    )
 
 
 def merged_inference_megatron_cfg(policy_config: PolicyConfig) -> dict[str, Any]:
@@ -125,6 +176,11 @@ def dedicated_inference_megatron_cfg(
     impl_differs = inference_mcfg.get("transformer_impl") != train_mcfg.get(
         "transformer_impl"
     )
-    if not (layout_differs or impl_differs):
+    # Disaggregation always needs a second model: each rank owns only the
+    # prefill or decode shard selected by ``disaggregation_shards``, while the
+    # training model still spans the complete colocated worker group.
+    if not (
+        layout_differs or impl_differs or is_disaggregated_generation(policy_config)
+    ):
         return None
     return inference_mcfg
