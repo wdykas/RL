@@ -274,6 +274,7 @@ project-includes = [
   "tools/model_diagnostics/4.vllm_precision_compilation_test.py",
   "tools/model_diagnostics/5.prefix_caching_nan.py",
   "tools/model_diagnostics/6.vllm_routed_experts_completeness.py",
+  "tools/model_diagnostics/7.flashinfer_sampling_tail_bias.py",
   "tools/refit_bandwidth_calculator.py",
   "tools/x_token/__init__.py",
   "tools/x_token/reapply_exact_map.py",

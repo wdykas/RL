@@ -174,6 +174,36 @@ def test_native_refit_batch_bytes_use_collective_default(monkeypatch) -> None:
 
 
 @pytest.mark.mcore
+@pytest.mark.parametrize(
+    ("configured_top_p", "expected_mcore_top_p"),
+    [(None, 0.0), (1.0, 0.0), (0.95, 0.95)],
+)
+def test_megatron_sampling_params_normalize_disabled_top_p(
+    monkeypatch: pytest.MonkeyPatch,
+    configured_top_p: float | None,
+    expected_mcore_top_p: float,
+) -> None:
+    import nemo_rl.models.generation.megatron.megatron_worker as worker_module
+
+    worker = object.__new__(worker_module.MegatronGenerationMixin)
+    worker.cfg = {
+        "generation": {
+            "temperature": 1.0,
+            "top_k": None,
+            "top_p": configured_top_p,
+            "max_new_tokens": 8,
+        }
+    }
+    worker.megatron_tokenizer = SimpleNamespace(eod=0)
+    monkeypatch.setattr(worker_module, "SamplingParams", SimpleNamespace)
+
+    sampling_params = worker._build_sampling_params(greedy=False, stop_words=None)
+
+    assert sampling_params.top_k == 0
+    assert sampling_params.top_p == expected_mcore_top_p
+
+
+@pytest.mark.mcore
 def test_bridge_refit_finalizes_import_before_return(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

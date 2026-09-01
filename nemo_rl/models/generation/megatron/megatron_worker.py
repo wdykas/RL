@@ -99,7 +99,6 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
     restore_refit_info_placements,
 )
 
-
 def _inference_optimized_transformer_layer_spec(config: Any) -> Any:
     """Build the generic GPT layer spec backed by MCore inference linears."""
     return get_gpt_layer_with_inference_spec(
@@ -392,7 +391,10 @@ class MegatronGenerationMixin:
             static_kv_memory_pointers=needs_static_kv_pointers,
             use_cuda_graphs_for_non_decode_steps=use_cuda_graphs_for_non_decode_steps,
             use_flashinfer_fused_rope=use_flashinfer_fused_rope,
-            sampling_backend="flashinfer",
+            # FlashInfer's probability-CDF samplers can select the last
+            # positive vocabulary id when fp32 cumulative mass falls short of
+            # a random draw. Keep RL rollouts on the correctness-first backend.
+            sampling_backend="torch",
             use_synchronous_zmq_collectives=True,
             materialize_only_last_token_logits=materialize_only_last_token_logits,
             enable_chunked_prefill=enable_chunked_prefill,
@@ -723,6 +725,10 @@ class MegatronGenerationMixin:
         top_p_val = (
             0.0 if greedy else (float(top_p_cfg) if top_p_cfg is not None else 0.0)
         )
+        # MCore uses 0.0 as its no-top-p sentinel. Normalize the public 1.0
+        # spelling so the backend does not run a no-op nucleus filter.
+        if top_p_val == 1.0:
+            top_p_val = 0.0
 
         return SamplingParams(
             temperature=self.cfg["generation"]["temperature"] if not greedy else 0,
