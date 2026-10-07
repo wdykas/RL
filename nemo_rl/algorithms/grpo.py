@@ -3844,6 +3844,13 @@ def _grpo_train_impl(
                     metrics.update(
                         {f"mtp/{k}": v for k, v in train_results["mtp_metrics"].items()}
                     )
+                if "learning_metrics" in train_results:
+                    metrics.update(
+                        {
+                            f"learning/{k}": v
+                            for k, v in train_results["learning_metrics"].items()
+                        }
+                    )
                 if "draft_grad_norm" in train_results:
                     metrics["draft_grad_norm"] = train_results[
                         "draft_grad_norm"
@@ -5753,6 +5760,13 @@ def async_grpo_train(
                 if "mtp_metrics" in train_results:
                     metrics.update(
                         {f"mtp/{k}": v for k, v in train_results["mtp_metrics"].items()}
+                    )
+                if "learning_metrics" in train_results:
+                    metrics.update(
+                        {
+                            f"learning/{k}": v
+                            for k, v in train_results["learning_metrics"].items()
+                        }
                     )
                 if "draft_grad_norm" in train_results:
                     metrics["draft_grad_norm"] = train_results[

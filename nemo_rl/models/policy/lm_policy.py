@@ -941,6 +941,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             aggregated_results["moe_metrics"] = results[0]["moe_metrics"]
         if "mtp_metrics" in results[0]:
             aggregated_results["mtp_metrics"] = results[0]["mtp_metrics"]
+        if "learning_metrics" in results[0]:
+            aggregated_results["learning_metrics"] = results[0]["learning_metrics"]
         if "draft_grad_norm" in results[0]:
             aggregated_results["draft_grad_norm"] = results[0]["draft_grad_norm"]
 
