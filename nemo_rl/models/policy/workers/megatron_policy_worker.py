@@ -1125,6 +1125,7 @@ class MegatronPolicyWorkerImpl(
         torch.distributed.barrier()  # pragma: no cover
         torch.cuda.synchronize()  # pragma: no cover
         _train_t0 = time.perf_counter()  # pragma: no cover
+        self._learning_metrics_snapshot(data, eval_mode)
 
         with ctx:
             all_mb_metrics = []
@@ -1446,6 +1447,7 @@ class MegatronPolicyWorkerImpl(
                 metrics["num_ranks"] = torch.distributed.get_world_size()
             except Exception as e:
                 warnings.warn(f"Failed to compute FLOPs for MFU reporting: {e}")
+        self._collect_learning_metrics(metrics, eval_mode)
         self.timer.stop("train")
         return metrics
 
@@ -3003,6 +3005,78 @@ class MegatronPolicyWorkerImpl(
                 "aborted; a training rank most likely stopped participating"
             )
         return result
+
+    def _learning_metrics_cfg(self) -> Optional[dict[str, Any]]:
+        lm_cfg = self.cfg["megatron_cfg"].get("learning_metrics") or {}
+        return lm_cfg if lm_cfg.get("enabled", False) else None
+
+    def _learning_metrics_snapshot(self, data: BatchedDataDict, eval_mode: bool) -> None:
+        """On the first training call (rank 0), keep a CPU copy of the initial weights and a fixed probe set."""
+        lm_cfg = self._learning_metrics_cfg()
+        if lm_cfg is None or eval_mode or hasattr(self, "_learning_metrics_state"):
+            return
+        state: dict[str, Any] = {"calls": 0}
+        if torch.distributed.get_rank() == 0:
+            n = int(lm_cfg.get("num_probe_seqs", 8))
+            max_tokens = int(lm_cfg.get("max_probe_tokens", 1024))
+            ids, lens = data["input_ids"][:n].cpu(), data["input_lengths"][:n].cpu()
+            state["probe"] = [ids[i, : min(int(lens[i]), max_tokens)].clone() for i in range(len(lens))]
+            state["init_params"] = {
+                name: p.detach().to("cpu", copy=True) for name, p in self.model.named_parameters()
+            }
+        self._learning_metrics_state = state
+
+    @torch.no_grad()
+    def _probe_logits(self, probe: list[torch.Tensor]) -> torch.Tensor:
+        model = self.model[0] if isinstance(self.model, list) else self.model
+        outs = []
+        for seq in probe:
+            input_ids = seq.cuda().unsqueeze(0)
+            position_ids = torch.arange(input_ids.shape[1], device=input_ids.device).unsqueeze(0)
+            logits = model(input_ids=input_ids, position_ids=position_ids, attention_mask=None)
+            if logits.shape[0] == input_ids.shape[1] and logits.shape[1] == 1:
+                logits = logits.transpose(0, 1)
+            outs.append(logits[0, :-1].float().cpu())
+        return torch.cat(outs)
+
+    def _collect_learning_metrics(self, metrics: dict[str, Any], eval_mode: bool) -> None:
+        """Every N train() calls, compare the current policy with the initial weights on the probe set (rank 0).
+
+        Requires TP=1 and PP=1 (full-vocab logits on one rank); otherwise it is skipped with a warning.
+        """
+        lm_cfg = self._learning_metrics_cfg()
+        state = getattr(self, "_learning_metrics_state", None)
+        if lm_cfg is None or eval_mode or state is None:
+            return
+        state["calls"] += 1
+        if torch.distributed.get_rank() != 0 or state["calls"] % int(lm_cfg.get("every_n_steps", 10)) != 0:
+            return
+        if (
+            parallel_state.get_tensor_model_parallel_world_size() != 1
+            or parallel_state.get_pipeline_model_parallel_world_size() != 1
+        ):
+            warnings.warn("learning_metrics requires TP=1 and PP=1; skipping.")
+            return
+        from nemo_rl.algorithms.learning_metrics import learning_metrics
+
+        params = dict(self.model.named_parameters())
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            logits_now = self._probe_logits(state["probe"])
+            current = {name: p.detach().to("cpu", copy=True) for name, p in params.items()}
+            with torch.no_grad():
+                for name, p in params.items():
+                    p.copy_(state["init_params"][name].to(p.device, p.dtype))
+            logits_init = self._probe_logits(state["probe"])
+            with torch.no_grad():
+                for name, p in params.items():
+                    p.copy_(current[name].to(p.device, p.dtype))
+        finally:
+            self.model.train(was_training)
+        metrics["learning_metrics"] = learning_metrics(
+            logits_now, logits_init, p=float(lm_cfg.get("nucleus_p", 0.9))
+        )
 
     def _collect_mtp_metrics(
         self,

@@ -373,6 +373,20 @@ class MegatronCheckpointConfig(TypedDict, total=False):
     ckpt_fully_parallel_load_exchange_algo: str  # "broadcast" | "gather_rounds"
 
 
+class LearningMetricsConfig(TypedDict, total=False):
+    """Learning-vs-sharpening monitor (nemo_rl/algorithms/learning_metrics.py). Off unless enabled."""
+
+    enabled: bool
+    # compute every N train() calls
+    every_n_steps: int
+    # fixed probe set = first N sequences of the first training batch
+    num_probe_seqs: int
+    # tokens per probe sequence (bounds memory: probe logits are num_probe_seqs * max_probe_tokens * vocab)
+    max_probe_tokens: int
+    # nucleus mass defining the initial model's support for novel_mass
+    nucleus_p: float
+
+
 class MegatronConfig(TypedDict):
     enabled: Literal[True]
     env_vars: NotRequired[dict[str, str] | None]
@@ -433,6 +447,8 @@ class MegatronConfig(TypedDict):
     # If True, defer the casting of logits to float32 until the backward pass.
     # If you are using logprob_chunk_size, you must set this to True.
     defer_fp32_logits: NotRequired[bool]
+    # Optional learning-vs-sharpening monitor (logged as learning/* in GRPO).
+    learning_metrics: NotRequired[LearningMetricsConfig]
     # gives ~20% training perf speedup with sequence packing
     apply_rope_fusion: bool
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
