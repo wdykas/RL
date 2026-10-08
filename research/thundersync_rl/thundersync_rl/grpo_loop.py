@@ -36,9 +36,11 @@ from __future__ import annotations
 
 import asyncio
 import time
+from types import SimpleNamespace
 from typing import Any, Literal, Optional
 
 import numpy as np
+import ray
 import torch
 from pydantic import BaseModel
 
@@ -89,6 +91,10 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     max_open_groups: int = 4
     # Upper bound on trajectories per backward chunk (bounds activation memory).
     max_chunk_trajectories: int = 8
+    # Experiment: score each batch under theta_k and theta_{k+1} (two extra
+    # forward passes) and log how much of it cross-iteration speculative
+    # rollouts would keep (see policy_drift_metrics).
+    measure_policy_drift: bool = False
 
 
 class ThunderSyncMasterConfig(MasterConfig):
@@ -184,6 +190,66 @@ def build_chunk_data(
     return pad_batch_to_multiple(data, pad_to_multiple)
 
 
+def _run_workers(policy: Policy, method: str, **kwargs) -> list[Any]:
+    return ray.get(
+        policy.worker_group.run_all_workers_single_data(method, **kwargs)
+    )
+
+
+def policy_drift_metrics(
+    lp_old: torch.Tensor,
+    lp_new: torch.Tensor,
+    mask: torch.Tensor,
+    prefix: str,
+) -> dict[str, Any]:
+    """Acceptance statistics for drafts sampled from ``lp_old`` verified by ``lp_new``.
+
+    Exact speculative sampling accepts draft token x with probability
+    min(1, p_new(x) / p_old(x)). For each trajectory (row) this reports the
+    expected accepted prefix length sum_t prod_{s<=t} alpha_s under token-level
+    verification, and the probability of accepting the whole draft under token
+    (prod alpha) and block verification (b_t = min(1, b_{t-1} r_t), Sun et al.).
+    """
+    out: dict[str, list[float]] = {"reject": [], "frac": [], "full": [], "block": []}
+    lens = []
+    # One sampled verification per row: (generated tokens, tokens accepted before
+    # the first rejection), for offline schedule simulation.
+    samples: list[tuple[int, int]] = []
+    gen = torch.Generator().manual_seed(0)
+    for i in range(mask.shape[0]):
+        m = mask[i].bool()
+        if not m.any():
+            continue
+        log_r = (lp_new[i] - lp_old[i])[m].double()
+        alpha = torch.clamp(log_r, max=0.0)  # log min(1, r)
+        surv = torch.cumsum(alpha, 0).exp()  # P(prefix through t accepted)
+        log_b = torch.zeros(())
+        for lr in log_r.tolist():
+            log_b = min(0.0, float(log_b) + lr)
+        n = int(m.sum())
+        lens.append(n)
+        u = torch.rand(n, generator=gen, dtype=torch.float64)
+        rejected = torch.nonzero(u > alpha.exp()).flatten()
+        samples.append((n, int(rejected[0]) if rejected.numel() else n))
+        out["reject"].append(float((1 - alpha.exp()).mean()))
+        out["frac"].append(float(surv.sum()) / n)
+        out["full"].append(float(surv[-1]))
+        out["block"].append(float(np.exp(log_b)))
+    w = np.array(lens, dtype=np.float64)
+    long = w >= np.percentile(w, 75)
+    return {
+        f"{prefix}/token_reject_rate": float(np.mean(out["reject"])),
+        # Token-weighted: share of all generated tokens a draft would keep.
+        f"{prefix}/accepted_token_frac": float(np.sum(np.array(out["frac"]) * w) / w.sum()),
+        f"{prefix}/accepted_token_frac_longest25": float(
+            np.sum((np.array(out["frac"]) * w)[long]) / w[long].sum()
+        ),
+        f"{prefix}/full_accept_token_verif": float(np.mean(out["full"])),
+        f"{prefix}/full_accept_block_verif": float(np.mean(out["block"])),
+        f"{prefix}/samples": samples,
+    }
+
+
 def _initial_sample_state(batch: BatchedDataDict, i: int) -> dict[str, Any]:
     return {
         "message_log": batch["message_log"][i],
@@ -247,6 +313,7 @@ async def _run_one_step(
     arrivals: list[tuple[float, int, int, float]] = []
     dispatches: list[tuple[float, float, int, int, int]] = []
     last_rollout_t = None
+    all_trajectories: list[Trajectory] = []
 
     async def rollout(i: int):
         state, metrics = await run_sample_multi_turn_rollout(
@@ -322,18 +389,18 @@ async def _run_one_step(
                 loss_mult = 0.0
             ntok = sum(int(m["token_ids"].numel()) for m in state["message_log"])
             arrivals.append((last_rollout_t - t_start, i // G, ntok, reward))
-            planner.add(
-                Trajectory(
-                    group=(step, i // G),
-                    index=i,
-                    reward=reward,
-                    payload={
-                        "message_log": state["message_log"],
-                        "loss_multiplier": loss_mult,
-                    },
-                    num_tokens=ntok,
-                )
+            traj = Trajectory(
+                group=(step, i // G),
+                index=i,
+                reward=reward,
+                payload={
+                    "message_log": state["message_log"],
+                    "loss_multiplier": loss_mult,
+                },
+                num_tokens=ntok,
             )
+            all_trajectories.append(traj)
+            planner.add(traj)
             wake.set()
         rollouts_done = True
         wake.set()
@@ -344,9 +411,93 @@ async def _run_one_step(
         raise
     assert planner.all_done()
     t_rollout_end = last_rollout_t
+    drift_data = lp_old = None
+    if ts_cfg.measure_policy_drift:
+        # theta_k: every chunk is backpropagated, the optimizer has not stepped.
+        drift_data = build_chunk_data(
+            SimpleNamespace(
+                trajectories=all_trajectories,
+                group=None,
+                advantages=[0.0] * len(all_trajectories),
+            ),
+            tokenizer,
+            master_config,
+            learner.dp_size * master_config.policy["logprob_batch_size"],
+        )
+        lp_old = learner.policy.get_logprobs(drift_data)["logprobs"]
+        _run_workers(learner.policy, "save_master_weights", tag="k")
+        # Optimizer-state forecast of theta_{k+1} (zero new gradient). Scored
+        # now, then theta_k is restored bit-exactly before the real step.
+        lp_adam = None
+        if step > 0:
+            _run_workers(learner.policy, "save_adam_forecast", tag="adam")
+            _run_workers(learner.policy, "load_master_combination", coeffs={"adam": 1.0})
+            lp_adam = learner.policy.get_logprobs(drift_data)["logprobs"]
+            _run_workers(learner.policy, "load_master_combination", coeffs={"k": 1.0})
+            assert torch.equal(
+                learner.policy.get_logprobs(drift_data)["logprobs"], lp_old
+            ), "theta_k restore failed"
+        # Same weights, reversed row order (different batching): the training
+        # engine's own batch-variance floor.
+        rev = list(range(drift_data.size))[::-1]
+        lp_old_rev = learner.policy.get_logprobs(drift_data.select_indices(rev))[
+            "logprobs"
+        ][rev]
     t_finish = time.perf_counter()
     results = learner.finish()
     t_end = time.perf_counter()
+    drift: dict[str, float] = {}
+    if drift_data is not None:
+        lp_new = learner.policy.get_logprobs(drift_data)["logprobs"]
+        mask = drift_data["token_mask"] * drift_data["sample_mask"].unsqueeze(-1)
+        gen = drift_data["generation_logprobs"]
+        # Pure policy drift (same training engine on both sides).
+        drift.update(policy_drift_metrics(lp_old, lp_new, mask, "drift"))
+        # Drafts as actually sampled (inference engine q) verified by theta_{k+1}
+        # on the training engine: drift plus the engine mismatch.
+        drift.update(policy_drift_metrics(gen, lp_new, mask, "drift_vs_gen"))
+        drift.update(policy_drift_metrics(lp_old, lp_old_rev, mask, "batchvar"))
+        # Forecast drafter: extrapolate the fp32 master weights along the last
+        # update, theta_hat = theta_k + c (theta_k - theta_{k-1}), round to the
+        # model dtype, and score the same tokens. Drafts would be sampled from
+        # theta_hat; the importance weight q_hat/q_k re-targets the per-token
+        # rejection estimate from theta_k's samples.
+        _run_workers(learner.policy, "save_master_weights", tag="k1")
+        if lp_adam is not None:
+            # Parameter-space quality of the forecast (rank 0's shard).
+            dist = _run_workers(
+                learner.policy, "master_distances", ref="k1", others=["k", "adam"]
+            )[0]
+            for k_, v_ in dist.items():
+                drift[f"param/{k_}"] = v_
+            drift.update(policy_drift_metrics(lp_adam, lp_new, mask, "forecast_adam"))
+            w = (lp_adam - lp_old).exp()
+            rej = (1 - (lp_new - lp_adam).exp()).clamp(min=0)
+            drift["forecast_adam/token_reject_rate_is"] = float(
+                (w * rej * mask).sum() / mask.sum()
+            )
+        if step > 0:
+            for c in (1.0,):
+                _run_workers(
+                    learner.policy,
+                    "load_master_combination",
+                    coeffs={"k": 1.0 + c, "km1": -c},
+                )
+                lp_hat = learner.policy.get_logprobs(drift_data)["logprobs"]
+                tag = f"forecast_c{c}"
+                drift.update(policy_drift_metrics(lp_hat, lp_new, mask, tag))
+                w = (lp_hat - lp_old).exp()
+                rej = (1 - (lp_new - lp_hat).exp()).clamp(min=0)
+                drift[f"{tag}/token_reject_rate_is"] = float(
+                    (w * rej * mask).sum() / mask.sum()
+                )
+                drift.update(policy_drift_metrics(lp_old, lp_hat, mask, f"{tag}_vs_k"))
+            _run_workers(learner.policy, "load_master_combination", coeffs={"k1": 1.0})
+            lp_check = learner.policy.get_logprobs(drift_data)["logprobs"]
+            assert torch.equal(lp_check * mask, lp_new * mask), "restore failed"
+        _run_workers(learner.policy, "rename_master_weights", src="k", dst="km1")
+        # Mismatch floor: theta_k on both, different engines.
+        drift.update(policy_drift_metrics(gen, lp_old, mask, "mismatch"))
 
     # No "loss" metric: bucket chunks are backpropagated with advantage 1, so
     # the per-chunk loss values the worker sums are not the GRPO loss.
@@ -370,6 +521,7 @@ async def _run_one_step(
         "timeline/arrivals": arrivals,
         "timeline/dispatches": dispatches,
         "timeline/step_end": t_end - t_start,
+        **drift,
     }
     return out
 

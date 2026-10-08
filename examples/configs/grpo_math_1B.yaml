@@ -112,6 +112,10 @@ loss_fn:
   # VAPO positive-example NLL loss weight: L = L_PPO + mu * L_NLL(correct samples).
   # 0.0 disables it. VAPO paper recommends 0.1.
   positive_example_nll_weight: 0.0
+  # Skip forward/backward for rows whose advantages are all zero (e.g. groups with identical
+  # rewards). Exact for purely advantage-weighted losses (no KL/NLL); their tokens still count
+  # toward normalization. Megatron split train API (single controller) only.
+  skip_zero_advantage_rows: false
 
 checkpointing:
   enabled: true

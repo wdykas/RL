@@ -1569,16 +1569,39 @@ class MegatronPolicyWorkerImpl(
                 f"mtp_loss_scaling_factor={mtp_loss_scaling_factor}."
             )
 
+        skip_zero_advantage_rows = (
+            isinstance(loss_fn, ClippedPGLossFn) and loss_fn.skip_zero_advantage_rows
+        )
+        if skip_zero_advantage_rows:
+            self._require_advantage_weighted_gradients(
+                "loss_fn.skip_zero_advantage_rows"
+            )
+            # Packed / dynamic microbatches are laid out by the driver for the
+            # full row set; dropping rows on the worker would invalidate them.
+            if (
+                self.cfg["sequence_packing"]["enabled"]
+                or self.cfg["dynamic_batching"]["enabled"]
+            ):
+                raise ValueError(
+                    "loss_fn.skip_zero_advantage_rows requires fixed-size "
+                    "microbatches (sequence_packing and dynamic_batching disabled)"
+                )
+
         return {
             "loss_fn": loss_fn,
             "loss_type": loss_type,
             "metric_normalizations": metric_normalizations,
+            "skip_zero_advantage_rows": skip_zero_advantage_rows,
             "mtp_enabled": mtp_enabled,
             "mtp_detach_heads": mtp_detach_heads,
             "gbs": gbs or self.cfg["train_global_batch_size"],
             "mbs": mbs or self.cfg["train_micro_batch_size"],
             "local_valid_seqs": torch.zeros((), dtype=torch.float64, device="cuda"),
             "local_valid_toks": torch.zeros((), dtype=torch.float64, device="cuda"),
+            # Counts of the rows actually trained (differs from the above only
+            # when zero-advantage rows are skipped); denominators for metrics.
+            "trained_valid_seqs": torch.zeros((), dtype=torch.float64, device="cuda"),
+            "trained_valid_toks": torch.zeros((), dtype=torch.float64, device="cuda"),
             "all_mb_metrics": [],
             "mb_losses": [],
             "total_num_microbatches": 0,
@@ -1814,6 +1837,38 @@ class MegatronPolicyWorkerImpl(
                 )
             raise
 
+    def _drop_zero_advantage_rows(
+        self, data: BatchedDataDict[Any]
+    ) -> tuple[Optional[BatchedDataDict[Any]], torch.Tensor, torch.Tensor]:
+        """Keep only rows with a nonzero advantage on some valid token.
+
+        Returns the kept rows (``None`` if there are none) and their valid
+        sequence/token counts. The kept set is topped up with dropped rows to
+        a multiple of the microbatch size: fixed-size microbatching would
+        otherwise discard the remainder, and a zero-advantage row adds exactly
+        zero gradient.
+        """
+        sample_mask = data["sample_mask"]
+        token_mask = data["token_mask"][:, 1:] * sample_mask.unsqueeze(-1)
+        live = (data["advantages"][:, 1:] * token_mask).ne(0).any(dim=-1)
+        keep = torch.nonzero(live).flatten().tolist()
+        state = self._train_step_state
+        # Still run one microbatch per step when nothing is live yet, so every
+        # rank reports the same metric schema at finish.
+        if not keep and state["all_mb_metrics"]:
+            zero = torch.zeros((), dtype=torch.float64, device="cuda")
+            return None, zero, zero
+        mbs = state["mbs"]
+        pad = -len(keep) % mbs if keep else min(mbs, data.size)
+        if pad:
+            dropped = torch.nonzero(~live).flatten().tolist()
+            keep = sorted(keep + dropped[:pad])
+        kept_seqs = torch.sum(sample_mask[keep]).to(torch.float64)
+        kept_toks = torch.sum(token_mask[keep]).to(torch.float64)
+        if len(keep) < data.size:
+            data = data.select_indices(keep)
+        return data, kept_seqs, kept_toks
+
     def _train_microbatch_body(
         self,
         state: dict[str, Any],
@@ -1840,6 +1895,18 @@ class MegatronPolicyWorkerImpl(
 
         state["local_valid_seqs"] = state["local_valid_seqs"] + call_local_seqs
         state["local_valid_toks"] = state["local_valid_toks"] + call_local_toks
+
+        # Rows whose advantages are all zero contribute exactly zero gradient
+        # (the loss validated that every term is advantage-weighted) but keep
+        # their tokens in the normalization counted above.
+        if state["skip_zero_advantage_rows"]:
+            data, call_local_seqs, call_local_toks = self._drop_zero_advantage_rows(
+                data
+            )
+            if data is None:
+                return
+        state["trained_valid_seqs"] = state["trained_valid_seqs"] + call_local_seqs
+        state["trained_valid_toks"] = state["trained_valid_toks"] + call_local_toks
 
         # Match the synchronous Megatron path: derive the mask on the worker
         # immediately before microbatch processing so sequence packing applies
@@ -2027,9 +2094,19 @@ class MegatronPolicyWorkerImpl(
         policy_counts = torch.stack(
             [state["local_valid_seqs"], state["local_valid_toks"]]
         ).to(torch.float64)
+        # Trained-row counts (metric denominators) differ from the policy
+        # counts only when zero-advantage rows are skipped; reduce them in the
+        # same collective then.
+        skip_zero_adv = state["skip_zero_advantage_rows"]
+        trained_counts = (
+            torch.stack([state["trained_valid_seqs"], state["trained_valid_toks"]])
+            if skip_zero_adv
+            else policy_counts[:0]
+        ).to(torch.float64)
         to_reduce = torch.cat(
             [
                 policy_counts,
+                trained_counts,
                 draft_step_state.counts_for_reduction(policy_counts),
             ]
         )
@@ -2038,7 +2115,12 @@ class MegatronPolicyWorkerImpl(
         )
         global_valid_seqs = to_reduce[0]
         global_valid_toks = to_reduce[1]
-        draft_step_state.set_global_counts(to_reduce[2:])
+        trained_valid_seqs, trained_valid_toks = (
+            (to_reduce[2], to_reduce[3])
+            if skip_zero_adv
+            else (global_valid_seqs, global_valid_toks)
+        )
+        draft_step_state.set_global_counts(to_reduce[2 + trained_counts.numel() :])
 
         if state["loss_type"] == LossType.TOKEN_LEVEL:
             n_true = global_valid_toks
@@ -2203,14 +2285,18 @@ class MegatronPolicyWorkerImpl(
         # (see MetricNormalizer in the loss interfaces). masked_mean is
         # linear in 1/N so per-metric scalar multiplies recover the right
         # normalized values.
+        # Diagnostics are sums over the rows that ran forward, so they are
+        # averaged over those rows; this equals the full batch unless
+        # zero-advantage rows were skipped. The loss keeps the full-batch
+        # (gradient) normalization: skipped rows contribute zero loss.
         n_toks_safe = (
-            global_valid_toks
-            if global_valid_toks.item() > 0
+            trained_valid_toks
+            if trained_valid_toks.item() > 0
             else torch.tensor(1.0, device="cuda")
         )
         n_seqs_safe = (
-            global_valid_seqs
-            if global_valid_seqs.item() > 0
+            trained_valid_seqs
+            if trained_valid_seqs.item() > 0
             else torch.tensor(1.0, device="cuda")
         )
         inv_toks = float((1.0 / n_toks_safe).item())
@@ -2229,7 +2315,9 @@ class MegatronPolicyWorkerImpl(
             kind = metric_normalizations.get(name)
             if kind is MetricNormalizer.NONE:
                 return value
-            if kind is MetricNormalizer.TOKENS:
+            if name == "loss":
+                scale = inv_n
+            elif kind is MetricNormalizer.TOKENS:
                 scale = inv_toks
             elif kind is MetricNormalizer.SEQUENCES:
                 scale = inv_seqs
@@ -2245,6 +2333,7 @@ class MegatronPolicyWorkerImpl(
         # curr_lr/curr_wd captured pre-scheduler.step above.
         global_valid_seqs_f = float(global_valid_seqs.item())
         global_valid_toks_f = float(global_valid_toks.item())
+        trained_valid_toks_f = float(trained_valid_toks.item())
 
         for m in state["all_mb_metrics"]:
             out: dict[str, Any] = {}
@@ -2261,6 +2350,8 @@ class MegatronPolicyWorkerImpl(
             out["wd"] = curr_wd
             out["global_valid_seqs"] = global_valid_seqs_f
             out["global_valid_toks"] = global_valid_toks_f
+            if state["skip_zero_advantage_rows"]:
+                out["trained_valid_toks"] = trained_valid_toks_f
             rescaled_metrics.append(out)
 
         # Scale per-mb losses by 1/N and reduce per-call sums.
@@ -2314,22 +2405,28 @@ class MegatronPolicyWorkerImpl(
         self._train_step_state = None
         return metrics
 
+    def _require_advantage_weighted_gradients(self, feature: str) -> None:
+        """Reject model-side loss terms that are not advantage-weighted.
+
+        Gradient streaming rescales a chunk's gradient by its advantage and
+        zero-advantage skipping drops rows whose advantage is zero; both are
+        exact only if every gradient term is proportional to the advantage.
+        """
+        if self.mtp_enabled:
+            raise ValueError(f"{feature} does not support MTP losses")
+        if "draft" in self.cfg and self.cfg["draft"].enabled:
+            raise ValueError(f"{feature} does not support draft-model training")
+        if self.cfg["megatron_cfg"]["moe_router_load_balancing_type"] != "none":
+            raise ValueError(
+                f"{feature} requires moe_router_load_balancing_type='none': "
+                "MoE auxiliary losses are not advantage-weighted"
+            )
+
     def _make_grad_stream_accumulator(
         self, spec: GradStreamingSpec
     ) -> StreamingGroupAccumulator:
-        # Buckets are later scaled by the group's advantage, so every gradient
-        # term in a streamed chunk must be advantage-weighted. Loss terms that
-        # are not (or live outside the captured grad buffers) would be
-        # silently mis-scaled.
-        if self.mtp_enabled:
-            raise ValueError("gradient streaming does not support MTP losses")
-        if "draft" in self.cfg and self.cfg["draft"].enabled:
-            raise ValueError("gradient streaming does not support draft-model training")
-        if self.cfg["megatron_cfg"]["moe_router_load_balancing_type"] != "none":
-            raise ValueError(
-                "gradient streaming requires moe_router_load_balancing_type='none': "
-                "MoE auxiliary losses are not advantage-weighted"
-            )
+        # Buckets are later scaled by the group's advantage.
+        self._require_advantage_weighted_gradients("gradient streaming")
         ddp_cfg = self.cfg["megatron_cfg"]["distributed_data_parallel_config"]
         if not ddp_cfg["grad_reduce_in_fp32"]:
             raise ValueError(

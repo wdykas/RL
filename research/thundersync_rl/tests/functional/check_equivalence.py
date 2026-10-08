@@ -60,7 +60,7 @@ from nemo_rl.utils.config import (
 ACTOR_ENVIRONMENT_REGISTRY[WORKER_FQN] = PY_EXECUTABLES.MCORE
 
 
-def make_batch(num_groups, group_size, seq_len, vocab, seed):
+def make_batch(num_groups, group_size, seq_len, vocab, seed, uniform_groups=0):
     g = torch.Generator().manual_seed(seed)
     n = num_groups * group_size
     input_ids = torch.randint(0, vocab, (n, seq_len), generator=g)
@@ -71,6 +71,9 @@ def make_batch(num_groups, group_size, seq_len, vocab, seed):
         (pos >= prompt_len.unsqueeze(1)) & (pos < lengths.unsqueeze(1))
     ).float()
     rewards = (torch.rand(n, generator=g) < 0.4).float().tolist()
+    # The first ``uniform_groups`` groups get identical rewards (zero advantage).
+    for gi in range(uniform_groups):
+        rewards[gi * group_size : (gi + 1) * group_size] = [float(gi % 2)] * group_size
     zeros = torch.zeros(n, seq_len)
     data = BatchedDataDict(
         {
@@ -113,6 +116,12 @@ def main():
     p.add_argument("--group-size", type=int, default=8)
     p.add_argument("--seq-len", type=int, default=256)
     p.add_argument("--tol", type=float, default=1e-3)
+    p.add_argument(
+        "--uniform-groups",
+        type=int,
+        default=0,
+        help="groups per step with identical rewards (exercises zero-advantage skipping)",
+    )
     p.add_argument(
         "--mode",
         choices=["stream", "permuted_sync"],
@@ -254,7 +263,10 @@ def main():
     rng = random.Random(0)
     worst = {"grad": 0.0, "delta": 0.0}
     for step in range(args.steps):
-        data, rewards = make_batch(args.num_groups, G, args.seq_len, vocab, seed=step)
+        data, rewards = make_batch(
+            args.num_groups, G, args.seq_len, vocab, seed=step,
+            uniform_groups=args.uniform_groups,
+        )
         advs = []
         for gi in range(args.num_groups):
             advs += adv_fn(rewards[gi * G : (gi + 1) * G])
@@ -284,7 +296,8 @@ def main():
             f"grad_norm a={float(torch.as_tensor(res_a['grad_norm']).mean()):.6e} "
             f"b={float(torch.as_tensor(res_b['grad_norm']).mean()):.6e} "
             f"grad_rel_err={grad_err:.3e} Delta={delta:.3e} "
-            f"peak_open_buffers={res_b.get('stream_peak_open_buffers')}",
+            f"peak_open_buffers={res_b.get('stream_peak_open_buffers')} "
+            f"trained_toks={res_b.get('all_mb_metrics', {}).get('trained_valid_toks', ['all'])[0]}",
             flush=True,
         )
     passed = worst["grad"] <= args.tol if compare_grads else worst["delta"] <= args.tol

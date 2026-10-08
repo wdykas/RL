@@ -10,6 +10,8 @@ EXP_DIR=$SCRIPT_DIR/$EXP_NAME
 RUN_LOG=$EXP_DIR/run.log
 export PYTHONPATH=${PROJECT_ROOT}:${PYTHONPATH:-}
 # True fp32 GEMMs: TF32 rounding (~1e-3) would swamp the comparison.
+# mbs=4 keeps most streamed chunks at full micro-batch size: Megatron fp32 grads shift
+# ~1e-4 with micro-batch size (LM-head reduction), which would also swamp it.
 export NVIDIA_TF32_OVERRIDE=0
 
 rm -rf $EXP_DIR
@@ -26,6 +28,7 @@ uv run tests/functional/check_equivalence.py \
     policy.megatron_cfg.optimizer.bf16=false \
     policy.megatron_cfg.optimizer.fp16=false \
     policy.megatron_cfg.optimizer.use_precision_aware_optimizer=false \
+    policy.train_micro_batch_size=4 \
     $@ \
     2>&1 | tee $RUN_LOG
 

@@ -214,6 +214,11 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     # L = L_PPO + μ·L_NLL(correct)   (arXiv:2504.05118, Eq. 10)
     # Set to 0 to disable.
     positive_example_nll_weight: float = 0.0
+    # Skip forward/backward for rows whose advantages are all zero (e.g. GRPO groups with
+    # identical rewards). Exact: with no KL/NLL/distillation term their gradient is zero,
+    # and their tokens still count toward the loss normalization. Diagnostic metrics are
+    # averaged over the trained rows only. Supported by the Megatron split train API.
+    skip_zero_advantage_rows: bool = False
 
 
 class ClippedPGLossDataDict(TypedDict):
@@ -353,6 +358,22 @@ class ClippedPGLossFn(LossFunction):
         # Whether to compute importance weights per-sequence instead of per-token.
         self.sequence_level_importance_ratios = cfg.sequence_level_importance_ratios
         self.positive_example_nll_weight = cfg.positive_example_nll_weight
+        self.skip_zero_advantage_rows = cfg.skip_zero_advantage_rows
+        if self.skip_zero_advantage_rows:
+            # Every remaining loss term is advantage-weighted, so a zero-advantage
+            # row contributes exactly zero gradient.
+            nonzero_terms = {
+                "reference_policy_kl_penalty": self.reference_policy_kl_penalty != 0,
+                "positive_example_nll_weight": self.positive_example_nll_weight != 0,
+                "on_policy_distillation": self.opd_full is not None,
+                "seq_logprob_error_in_loss": self.seq_logprob_error_in_loss,
+            }
+            bad = [name for name, on in nonzero_terms.items() if on]
+            if bad:
+                raise ValueError(
+                    "loss_fn.skip_zero_advantage_rows requires a purely "
+                    f"advantage-weighted loss; disable: {bad}"
+                )
         self.loss_type = (
             LossType.TOKEN_LEVEL if cfg.token_level_loss else LossType.SEQUENCE_LEVEL
         )
