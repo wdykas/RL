@@ -59,6 +59,10 @@ policy:
       resources:
         gpus_per_node: 2
         num_nodes: 1
+    mcore_generation_config:
+      # Linear decode ladder step = cuda_graph_max_tokens / N; 4 pads the 1-8 request rollout
+      # tail to 128 tokens. 16 measured -30% decode time/token (auto/-1: same speed, 2x warmup).
+      num_cuda_graphs: 16
 
 cluster:
   gpus_per_node: 4

@@ -25,6 +25,11 @@ loss_fn:
   # Optional inference/training mismatch correction; compatible with trajectory streaming.
   use_importance_sampling_correction: false
 policy:
+  generation:
+    mcore_generation_config:
+      # Finer decode CUDA-graph ladder for the rollout tail (step 512/16 = 32 tokens vs 128):
+      # measured -30% decode time/token at 1.5B.
+      num_cuda_graphs: 16
   megatron_cfg:
     # Non-colocated learner never yields memory to inference: skip per-chunk empty_cache.
     empty_unused_memory_level: 0
