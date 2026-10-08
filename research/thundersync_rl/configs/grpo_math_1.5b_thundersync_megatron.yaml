@@ -1,0 +1,73 @@
+# ThunderSyncRL: zero-staleness GRPO with gradient streaming.
+# Megatron training backend + non-colocated Megatron inference backend.
+defaults: "../../../examples/configs/grpo_math_1B_megatron.yaml"
+
+thundersync:
+  granularity: trajectory  # trajectory (ThunderSyncRL) | group | batch (sync baseline)
+  storage_device: cuda  # per-group accumulators: cuda | cpu (pinned host memory)
+  max_buckets_per_group: 2  # distinct rewards per open group before collapsing to (G1, G2)
+  max_open_groups: 4  # cap on groups holding gradient buckets (bounds accumulator memory)
+  max_chunk_trajectories: 8
+
+grpo:
+  num_prompts_per_step: 16
+  num_generations_per_prompt: 8
+  max_num_steps: 20
+  val_period: -1
+  val_at_start: false
+  normalize_rewards: true
+  use_leave_one_out_baseline: true
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  force_on_policy_ratio: true
+  # Optional: correct the inference/training numerical mismatch (zero staleness removes
+  # policy lag, not kernel differences). Weights exp(log pi_train - log pi_infer) are
+  # detached per-token constants, so streaming stays exact.
+  use_importance_sampling_correction: false
+  truncated_importance_sampling_ratio: null  # e.g. 2.0
+  truncated_importance_sampling_type: null  # tis | icepop | seq-mask-tis
+  token_level_loss: true
+
+policy:
+  model_name: Qwen/Qwen2.5-Math-1.5B-Instruct
+  max_total_sequence_length: 1024
+  train_global_batch_size: ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}
+  # Megatron micro-batches are CPU-launch bound at this size (~85 ms each), so
+  # fewer, larger ones are much faster (16x1024 tokens: 426 ms at 4 vs 283 ms at 8).
+  train_micro_batch_size: 8
+  logprob_batch_size: 4
+  sequence_packing:
+    enabled: false
+  dynamic_batching:
+    enabled: false
+  megatron_cfg:
+    # The learner is non-colocated and never yields memory to inference, so skip
+    # the per-chunk torch.cuda.empty_cache() (costly with many small chunks).
+    empty_unused_memory_level: 0
+    optimizer:
+      lr: 1.0e-6
+      min_lr: 1.0e-6
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: true
+      overlap_param_gather: false
+  generation:
+    backend: megatron
+    refit_transport: null
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 2
+        num_nodes: 1
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 1
+
+logger:
+  log_dir: logs/thundersync
+  wandb_enabled: false
+  tensorboard_enabled: true
+
+checkpointing:
+  enabled: false
