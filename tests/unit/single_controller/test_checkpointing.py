@@ -746,6 +746,7 @@ def _actor_master_config(
         async_rl=AsyncRLConfig(
             sampler=sampler_cfg,
             min_groups_for_streaming_train=1,
+            trajectory_streaming=None,
             max_inflight_prompts=4,
             max_buffered_rollouts=4,
         ),
@@ -2589,6 +2590,7 @@ def _setup_master_config(checkpoint_dir: str) -> MasterConfig:
         env={},
         async_rl=AsyncRLConfig(
             min_groups_for_streaming_train=4,
+            trajectory_streaming=None,
             max_buffered_rollouts=8,
         ),
         checkpointing={

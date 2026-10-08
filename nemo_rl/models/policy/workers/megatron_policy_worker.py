@@ -21,7 +21,7 @@ import warnings
 from collections import OrderedDict, defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, replace
-from typing import Any, Iterable, Iterator, Optional, TypeVar, cast
+from typing import Any, Hashable, Iterable, Iterator, Optional, TypeVar, cast
 
 log = logging.getLogger(__name__)
 
@@ -51,6 +51,11 @@ from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import (
 )
 from transformers import PreTrainedTokenizerBase
 
+from nemo_rl.algorithms.grad_streaming import (
+    GradStreamingSpec,
+    StreamBucket,
+    StreamingGroupAccumulator,
+)
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.loss.loss_functions import ClippedPGLossFn
@@ -1582,6 +1587,12 @@ class MegatronPolicyWorkerImpl(
             # so far.
             "num_chunks": 0,
             "draft_step_state": DraftStepState(),
+            # Trajectory-level gradient streaming (see grad_streaming.py);
+            # None unless begin_train_step was given a GradStreamingSpec.
+            "grad_stream": None,
+            # group -> (local_valid_seqs, local_valid_toks) contributed by its
+            # bucketed chunks, so a discarded group can be un-counted.
+            "grad_stream_group_counts": {},
             # Saved across the step so we can restore at finish/abort.
             "saved_grad_sync_func": None,
             "saved_no_sync_func": None,
@@ -1655,6 +1666,7 @@ class MegatronPolicyWorkerImpl(
         loss_fn: LossFunction,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
+        grad_streaming: Optional[GradStreamingSpec] = None,
     ) -> None:
         existing = getattr(self, "_train_step_state", None)
         if existing is not None:
@@ -1728,12 +1740,16 @@ class MegatronPolicyWorkerImpl(
             state["saved_no_sync_func"] = None
             state["saved_finalize_model_grads_func"] = None
 
+        if grad_streaming is not None:
+            state["grad_stream"] = self._make_grad_stream_accumulator(grad_streaming)
+
         self._train_step_state = state
 
     @wrap_with_nvtx_name("megatron_policy_worker/train_microbatch")
     def train_microbatch(
         self,
         data: BatchedDataDict[Any],
+        stream_bucket: Optional[StreamBucket] = None,
     ) -> None:
         """One DP slice of data → one ``forward_backward_func`` invocation.
 
@@ -1744,12 +1760,38 @@ class MegatronPolicyWorkerImpl(
         land in ``param.main_grad`` and per-microbatch metrics accumulate
         in the open-step state until ``finish_train_step`` surfaces them.
 
+        With gradient streaming enabled for the step, the chunk's gradient
+        is moved out of the grad buffers right after backward: into the
+        ``stream_bucket`` accumulator when given (chunk trained with
+        advantage 1, group still open), else straight into the batch
+        accumulator (chunk trained with final advantages).
+
         Multimodal validity-mask and model-owned packing/CP behavior match the
         regular ``train`` path.
         """
         state = self._assert_step_open()
+        grad_stream: Optional[StreamingGroupAccumulator] = state["grad_stream"]
+        if stream_bucket is not None and grad_stream is None:
+            raise ValueError(
+                "train_microbatch got a stream_bucket but the step was opened "
+                "without grad_streaming"
+            )
         try:
+            seqs_before = state["local_valid_seqs"].clone()
+            toks_before = state["local_valid_toks"].clone()
             self._train_microbatch_body(state, data)
+            if stream_bucket is not None:
+                counts = state["grad_stream_group_counts"]
+                prev_seqs, prev_toks = counts.get(stream_bucket.group, (0.0, 0.0))
+                counts[stream_bucket.group] = (
+                    prev_seqs + (state["local_valid_seqs"] - seqs_before),
+                    prev_toks + (state["local_valid_toks"] - toks_before),
+                )
+            if grad_stream is not None:
+                if stream_bucket is None:
+                    grad_stream.capture(None, None)
+                else:
+                    grad_stream.capture(stream_bucket.group, stream_bucket.reward)
         except Exception:
             # The body left all three mcore hooks nulled when begin_train_step
             # opened the step. If we propagate without restoring, future steps
@@ -1965,6 +2007,13 @@ class MegatronPolicyWorkerImpl(
 
     def _finish_train_step_body(self, state: dict[str, Any]) -> dict[str, Any]:
         from nemo_rl.algorithms.loss.interfaces import LossType
+
+        # Gradient streaming: fold the batch accumulator back into the grad
+        # buffers so normalization, DP reduction, clipping and the optimizer
+        # step below run exactly as for a non-streamed step.
+        if state["grad_stream"] is not None:
+            state["grad_stream"].finalize()
+            state["grad_stream"] = None
 
         # Recover policy and draft counts with one existing DP collective.
         # The draft slice is length-1 while the step is active and empty
@@ -2265,6 +2314,124 @@ class MegatronPolicyWorkerImpl(
         return metrics
 
     @wrap_with_nvtx_name("megatron_policy_worker/abort_train_step")
+    def _make_grad_stream_accumulator(
+        self, spec: GradStreamingSpec
+    ) -> StreamingGroupAccumulator:
+        # Buckets are later scaled by the group's advantage, so every gradient
+        # term in a streamed chunk must be advantage-weighted. Loss terms that
+        # are not (or live outside the captured grad buffers) would be
+        # silently mis-scaled.
+        if self.mtp_enabled:
+            raise ValueError("gradient streaming does not support MTP losses")
+        if "draft" in self.cfg and self.cfg["draft"].enabled:
+            raise ValueError("gradient streaming does not support draft-model training")
+        if self.cfg["megatron_cfg"]["moe_router_load_balancing_type"] != "none":
+            raise ValueError(
+                "gradient streaming requires moe_router_load_balancing_type='none': "
+                "MoE auxiliary losses are not advantage-weighted"
+            )
+        ddp_cfg = self.cfg["megatron_cfg"]["distributed_data_parallel_config"]
+        if not ddp_cfg["grad_reduce_in_fp32"]:
+            raise ValueError(
+                "gradient streaming moves per-chunk gradients out of the grad "
+                "buffers; set distributed_data_parallel_config.grad_reduce_in_fp32"
+                "=true so they are fp32"
+            )
+        buffers = self.model.buffers + self.model.expert_parallel_buffers
+        if any(
+            getattr(buf.ddp_config, "reuse_grad_buf_for_mxfp8_param_ag", False)
+            for buf in buffers
+        ):
+            raise ValueError(
+                "gradient streaming uses the grad buffers as scratch space, which "
+                "is incompatible with reusing them for MXFP8 param all-gather"
+            )
+        grads = [buf.grad_data for buf in buffers]
+        if spec.storage_device == "cuda":
+            # Batch accumulator + up to max_buckets_per_group per open group,
+            # each an fp32 copy of this rank's gradient buffers.
+            grad_bytes = sum(g.numel() for g in grads) * 4
+            needed = grad_bytes * (
+                1 + spec.max_buckets_per_group * spec.max_open_groups
+            )
+            free, _ = torch.cuda.mem_get_info()
+            reclaimable = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+            # Leave at least half of what is free now for activations and
+            # logits of the streamed chunks' forward/backward passes.
+            if needed > 0.5 * (free + reclaimable):
+                raise ValueError(
+                    f"gradient streaming needs {needed / 2**30:.1f} GiB of fp32 "
+                    f"accumulators ({grad_bytes / 2**30:.1f} GiB per copy x "
+                    f"(1 + {spec.max_buckets_per_group} x {spec.max_open_groups} "
+                    f"open groups)) but only {(free + reclaimable) / 2**30:.1f} GiB "
+                    "is available (at most half may hold accumulators); lower "
+                    "max_open_groups or use storage_device=cpu"
+                )
+        else:
+            # Host buckets: the batch accumulator stays on device; check that
+            # this rank's share of available host memory can hold the buckets.
+            grad_bytes = sum(g.numel() for g in grads) * 4
+            needed = grad_bytes * spec.max_buckets_per_group * spec.max_open_groups
+            with open("/proc/meminfo") as f:
+                meminfo = dict(line.split(":", 1) for line in f)
+            available = int(meminfo["MemAvailable"].split()[0]) * 1024
+            # Exact on one node, conservative (over-counts) across nodes.
+            ranks_per_node = (
+                torch.distributed.get_world_size()
+                if torch.distributed.is_initialized()
+                else 1
+            )
+            share = 0.8 * available / ranks_per_node
+            if needed > share:
+                raise ValueError(
+                    f"gradient streaming needs {needed / 2**30:.1f} GiB of pinned "
+                    f"host memory per rank for buckets but this rank's share is "
+                    f"{share / 2**30:.1f} GiB; lower max_open_groups"
+                )
+        return StreamingGroupAccumulator(
+            grads,
+            storage_device=spec.storage_device,
+            max_buckets_per_group=spec.max_buckets_per_group,
+        )
+
+    def close_stream_groups(
+        self, closes: list[tuple[Hashable, dict[float, float]]]
+    ) -> None:
+        """Fold closed groups' streamed gradients into the batch accumulator.
+
+        Args:
+            closes: ``(group, {reward: advantage})`` for each group whose last
+                streamed chunk has already been passed to ``train_microbatch``.
+                Groups with no streamed chunk on this rank are ignored.
+        """
+        state = self._assert_step_open()
+        grad_stream: Optional[StreamingGroupAccumulator] = state["grad_stream"]
+        if grad_stream is None:
+            raise ValueError(
+                "close_stream_groups needs a step opened with grad_streaming"
+            )
+        for group, advantage_by_reward in closes:
+            grad_stream.close_group(group, advantage_by_reward)
+            state["grad_stream_group_counts"].pop(group, None)
+
+    def discard_stream_groups(self, groups: list[Hashable]) -> None:
+        """Drop open groups' streamed gradients and their normalization counts.
+
+        Used when a group's rollout is retried after some of its trajectories
+        were already backpropagated; the retry streams fresh trajectories.
+        """
+        state = self._assert_step_open()
+        grad_stream: Optional[StreamingGroupAccumulator] = state["grad_stream"]
+        if grad_stream is None:
+            raise ValueError(
+                "discard_stream_groups needs a step opened with grad_streaming"
+            )
+        for group in groups:
+            grad_stream.discard_group(group)
+            seqs, toks = state["grad_stream_group_counts"].pop(group, (0.0, 0.0))
+            state["local_valid_seqs"] = state["local_valid_seqs"] - seqs
+            state["local_valid_toks"] = state["local_valid_toks"] - toks
+
     def abort_train_step(self) -> None:
         state = getattr(self, "_train_step_state", None)
         if state is None:
@@ -2777,11 +2944,24 @@ class MegatronPolicyWorkerImpl(
             self.disable_forward_pre_hook()
 
         with torch.no_grad():
-            # Save original references
+            # Save original references. Keep the copy on the GPU when there is
+            # room for it (with headroom for the logprob pass): a device-side
+            # clone avoids a full GPU->CPU->GPU round trip on every call, which
+            # is paid once per chunk when the controller streams chunks.
+            policy_state = self.model.state_dict()
+            state_bytes = sum(
+                t.numel() * t.element_size()
+                for t in policy_state.values()
+                if isinstance(t, torch.Tensor)
+            )
+            free_bytes, _ = torch.cuda.mem_get_info()
+            save_device = "cuda" if state_bytes < 0.25 * free_bytes else "cpu"
             model_state_dict = {}
-            for name, item in self.model.state_dict().items():
+            for name, item in policy_state.items():
                 if isinstance(item, torch.Tensor):
-                    item = item.detach().to(device="cpu", non_blocking=True, copy=True)
+                    item = item.detach().to(
+                        device=save_device, non_blocking=True, copy=True
+                    )
                 model_state_dict[name] = item
 
             # Swap reference state into self.model. Use _apply_state_dict_to_model
@@ -4283,8 +4463,11 @@ class MegatronPolicyWorkerImpl(
         # follow the configured offload policy here too.
         self._release_opd_full_teacher_lm_head()
 
-        gc.collect()
-        torch.cuda.empty_cache()
+        # Mid-step (streaming chunks) nothing was offloaded above, so a full
+        # gc.collect() + empty_cache() per chunk only costs time.
+        if not keep_train_buffers:
+            gc.collect()
+            torch.cuda.empty_cache()
         self._log_gpu_mem("lp_prep_exit")
 
     def _build_colocated_inference_model(self, config: PolicyConfig) -> None:

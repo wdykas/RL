@@ -470,6 +470,37 @@ class WatchdogConfig(BaseModel, extra="allow"):
         return self
 
 
+class TrajectoryStreamingConfig(BaseModel, extra="forbid"):
+    """Trajectory-level gradient streaming (ThunderSyncRL, arXiv 2610.05935).
+
+    Each trajectory is backpropagated as soon as its reward arrives, before its
+    prompt group completes; per-(group, reward) gradient sums get the group's
+    advantage when it closes. The optimizer update is identical to
+    batch-synchronous GRPO. Requires zero staleness
+    (``sampler.max_lookahead_versions=0``) and the Megatron backend.
+
+    Zero staleness removes policy lag but not the numerical mismatch between
+    the inference engine and the trainer at the same weights. To correct for
+    it, enable ``loss_fn.use_importance_sampling_correction`` (optionally with
+    ``truncated_importance_sampling_ratio``): the weights are detached per-token
+    constants, so they are compatible with trajectory streaming.
+    """
+
+    # Where per-group gradient accumulators live: "cuda", or "cpu" (pinned).
+    storage_device: Literal["cuda", "cpu"] = "cuda"
+    # Distinct rewards per open group before collapsing to the affine
+    # (G1, G2) form; 2 is exact for binary rewards under any GRPO estimator.
+    max_buckets_per_group: int = 2
+    # Finished trajectories of a group are written to the data plane in
+    # batches coalesced over this window (seconds). 0 writes each one
+    # immediately; larger values mean fewer, bigger writes but later starts.
+    publish_coalesce_s: float = 0.2
+    # Cap on groups holding streamed gradient buckets at once (memory bound:
+    # about max_buckets_per_group * max_open_groups fp32 copies of the per-rank
+    # gradient). Rows of further open groups wait until their group finishes.
+    max_open_groups: int = 4
+
+
 class AsyncRLConfig(BaseModel, extra="allow"):
     # Staleness policy shared by the rollout and train pumps.
     sampler: SamplerConfig = Field(
@@ -493,6 +524,9 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     recompute_kv_cache_after_weight_updates: bool = False
     # Min ready groups the streaming trainer waits for before dispatching a batch.
     min_groups_for_streaming_train: int = 32
+    # Stream individual trajectories into the open optimizer step before their
+    # group completes. None disables it.
+    trajectory_streaming: Optional[TrajectoryStreamingConfig] = None
     # Cap on in-flight generate_and_push calls in the rollout pump.
     max_inflight_prompts: int = 32
     # Cap on unconsumed rollout groups buffered in the DataPlane (backpressure).
@@ -1264,6 +1298,71 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
         )
 
 
+def _validate_trajectory_streaming(master_config: MasterConfig) -> None:
+    """Reject trajectory streaming wherever it would not be exact."""
+    ts = master_config.async_rl.trajectory_streaming
+    if ts is None:
+        return
+    sampler = master_config.async_rl.sampler
+    if (
+        getattr(sampler, "name", None) != "in_order"
+        or sampler.max_lookahead_versions != 0
+    ):
+        raise ValueError(
+            "async_rl.trajectory_streaming requires the in_order sampler with "
+            "max_lookahead_versions=0: streamed gradients are only exact on-policy"
+        )
+    policy = master_config.policy
+    if not policy["megatron_cfg"]["enabled"]:
+        raise ValueError("async_rl.trajectory_streaming requires the Megatron backend")
+    if not policy["megatron_cfg"]["distributed_data_parallel_config"][
+        "grad_reduce_in_fp32"
+    ]:
+        raise ValueError(
+            "async_rl.trajectory_streaming requires "
+            "distributed_data_parallel_config.grad_reduce_in_fp32=true"
+        )
+    if is_ppo_run(master_config):
+        raise ValueError("async_rl.trajectory_streaming supports GRPO only")
+    # Streamed buckets are rescaled by the group advantage, so every loss term
+    # must be advantage-weighted.
+    mcfg = policy["megatron_cfg"]
+    if mcfg["mtp_num_layers"]:
+        raise ValueError("async_rl.trajectory_streaming does not support MTP losses")
+    if mcfg["moe_router_load_balancing_type"] != "none":
+        raise ValueError(
+            "async_rl.trajectory_streaming requires "
+            "moe_router_load_balancing_type='none' (aux losses are not "
+            "advantage-weighted)"
+        )
+    algo = algo_config(master_config)
+    if (
+        getattr(algo, "invalid_tool_call_advantage", None) is not None
+        or getattr(algo, "malformed_thinking_advantage", None) is not None
+    ):
+        raise ValueError(
+            "async_rl.trajectory_streaming cannot apply message-level advantage "
+            "penalties: they make advantages token-dependent, which per-(group, "
+            "reward) gradient buckets cannot represent"
+        )
+    if ts.max_buckets_per_group < 2:
+        raise ValueError(
+            "async_rl.trajectory_streaming.max_buckets_per_group must be >= 2"
+        )
+    if master_config.loss_fn.reference_policy_kl_penalty != 0:
+        raise ValueError(
+            "async_rl.trajectory_streaming requires loss_fn.reference_policy_kl_penalty"
+            "=0: the KL term carries no advantage, so it cannot be bucketed and "
+            "rescaled by the group advantage"
+        )
+    if algo.seq_logprob_error_threshold is not None:
+        raise ValueError(
+            "async_rl.trajectory_streaming does not support "
+            "grpo.seq_logprob_error_threshold: it changes the group baseline after "
+            "rows were already backpropagated"
+        )
+
+
 def validate_single_controller_config(master_config: MasterConfig) -> None:
     """Validate cross-section SingleController constraints before setup."""
     if master_config.loss_fn.seq_logprob_error_in_loss:
@@ -1276,6 +1375,7 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
 
     async_config = master_config.async_rl
     algo_cfg = algo_config(master_config)
+    _validate_trajectory_streaming(master_config)
 
     reward_penalties_enabled = any(
         getattr(master_config.reward_penalties, flag) for flag in _REWARD_PENALTY_FLAGS

@@ -1,0 +1,32 @@
+# Zero-staleness GRPO with trajectory-level gradient streaming (ThunderSyncRL, arXiv 2610.05935):
+# Megatron training (2 GPUs) + non-colocated Megatron inference (2 GPUs). Every trajectory is
+# backpropagated as its reward arrives; the update equals batch-synchronous GRPO.
+defaults: ./grpo-qwen2.5-math-1.5b-instruct-1n4g-megatron_generation-noncolocated-single-controller-async-lag4.yaml
+logger:
+  log_dir: logs/grpo-qwen2.5-math-1.5b-instruct-1n4g-megatron_generation-noncolocated-single-controller-trajectory-streaming
+  wandb:
+    name: grpo-qwen2.5-math-1.5b-instruct-1n4g-megatron_generation-noncolocated-single-controller-trajectory-streaming
+checkpointing:
+  checkpoint_dir: results/grpo-qwen2.5-math-1.5b-instruct-1n4g-megatron_generation-noncolocated-single-controller-trajectory-streaming
+async_rl:
+  sampler:
+    max_lookahead_versions: 0  # zero staleness: required for exact streaming
+  min_groups_for_streaming_train: 1
+  trajectory_streaming:
+    storage_device: cuda
+    max_buckets_per_group: 2
+    max_open_groups: 4
+    publish_coalesce_s: 0.2
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  # One optimizer step per batch at zero staleness: prev_logprobs == current logprobs, so skip
+  # the extra policy forward (measured: -2.7 s of learner work per step at 1.5B).
+  force_on_policy_ratio: true
+  # Optional inference/training mismatch correction; compatible with trajectory streaming.
+  use_importance_sampling_correction: false
+policy:
+  megatron_cfg:
+    # Non-colocated learner never yields memory to inference: skip per-chunk empty_cache.
+    empty_unused_memory_level: 0
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: true

@@ -14,8 +14,8 @@
 
 """Producer-side payload helpers for the async-RL TQ path."""
 
-from collections.abc import Mapping
-from typing import Any, cast
+from collections.abc import Mapping, Sequence
+from typing import Any, Optional, cast
 
 import numpy as np
 import torch
@@ -192,6 +192,7 @@ def pack_payload(
     weight_version: int,
     group_id: str,
     prompt_idx: int,
+    generation_indices: Optional[Sequence[int]] = None,
 ) -> tuple[list[str], TensorDict, list[dict[str, Any]]]:
     """Pack a producer batch into (sample_ids, fields, tags) for put_samples.
 
@@ -200,6 +201,10 @@ def pack_payload(
         weight_version: Trainer weight version stamped on every row's tag.
         group_id: Per-group identifier used as the sample_id prefix; the caller owns uniqueness.
         prompt_idx: Stable dataset prompt index stamped on every row's tag.
+        generation_indices: Position of each row within its prompt group, used
+            for the ``_g{i}`` key suffix. None means rows ``0..n-1``, i.e. the
+            batch is the whole group. Set when publishing trajectories of a
+            group one at a time (trajectory-level gradient streaming).
 
     Returns:
         Sample IDs of the form ``{group_id}_g{i}``, a jagged-packed TensorDict
@@ -224,7 +229,13 @@ def pack_payload(
     fields_td = pack_jagged_fields(
         tensor_fields, lengths=lengths, token_aligned_fields=TOKEN_ALIGNED_FIELDS
     )
-    sample_ids = [f"{group_id}_g{i}" for i in range(n)]
+    if generation_indices is None:
+        generation_indices = range(n)
+    elif len(generation_indices) != n:
+        raise ValueError(
+            f"pack_payload: {len(generation_indices)} generation_indices for {n} rows"
+        )
+    sample_ids = [f"{group_id}_g{i}" for i in generation_indices]
     violations = train_batch.get(_VIOLATION_COUNTS_KEY, [{}] * n)
     multimodal_tags = multimodal_row_tags(multimodal, n) or [{} for _ in range(n)]
     tags = [

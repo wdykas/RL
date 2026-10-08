@@ -528,6 +528,9 @@ class AsyncRolloutImpl:
         Args:
             input_sample: A single prompt (one DatumSpec entry).
             rollout_ids: Unsupported here — token capture is NeMo-Gym only.
+            on_completion: Awaited with ``(generation_index, completion)`` as
+                each sibling finishes, before the group completes (used by
+                trajectory-level gradient streaming).
 
         Returns:
             PromptGroupRecord with num_generations_per_prompt completions.
@@ -538,9 +541,6 @@ class AsyncRolloutImpl:
         assert generation_indices is None, (
             "partial sibling dispatch is only supported on the NeMo-Gym path"
         )
-        assert on_completion is None, (
-            "streamed completion callbacks are only supported on the NeMo-Gym path"
-        )
         assert recovery_granularity is RecoveryGranularity.SIBLING, (
             "recovery granularity is only supported on the NeMo-Gym path"
         )
@@ -549,11 +549,15 @@ class AsyncRolloutImpl:
         timer.start(f"{timer_prefix}/total")
 
         with timer.time(f"{timer_prefix}/run_rollouts"):
+
+            async def run_one(traj_idx: int):
+                result = await self._run_single_rollout(input_sample, traj_idx)
+                if on_completion is not None:
+                    await on_completion(traj_idx, result[0])
+                return result
+
             results = await _gather_cancelling_siblings(
-                [
-                    self._run_single_rollout(input_sample, traj_idx)
-                    for traj_idx in range(self._num_generations_per_prompt)
-                ]
+                [run_one(i) for i in range(self._num_generations_per_prompt)]
             )
             completions = [c for c, _ in results]
             all_sample_metrics = [m for _, m in results]
@@ -1576,8 +1580,92 @@ class AsyncNemoGymRolloutImpl:
         return rollout_metrics
 
 
+class _TrajectoryPublisher:
+    """Publishes a group's finished trajectories in coalesced batches.
+
+    Each ``add`` queues one completion; the first queued completion starts a
+    timer and everything queued when it fires is written with one
+    ``TQReplayBuffer.commit_trajectories`` call. ``drain`` flushes the rest
+    and surfaces any write error before the group is sealed.
+    """
+
+    def __init__(
+        self,
+        *,
+        tq_buffer: TQReplayBuffer,
+        group_id: str,
+        input_sample: DatumSpec,
+        start_weight_version: int,
+        coalesce_s: float,
+    ) -> None:
+        self._tq_buffer = tq_buffer
+        self._group_id = group_id
+        self._input_sample = input_sample
+        self._start_weight_version = start_weight_version
+        self._coalesce_s = coalesce_s
+        self._pending: list[tuple[int, Completion]] = []
+        self._flushes: list[asyncio.Task[None]] = []
+        self._timer: Optional[asyncio.Task[None]] = None
+
+    async def add(self, generation_index: int, completion: Completion) -> None:
+        self._pending.append((generation_index, completion))
+        if self._timer is None:
+            self._timer = asyncio.create_task(self._flush_after_delay())
+            self._flushes.append(self._timer)
+
+    async def _flush_after_delay(self) -> None:
+        await asyncio.sleep(self._coalesce_s)
+        self._timer = None
+        await self._flush()
+
+    async def _flush(self) -> None:
+        batch, self._pending = self._pending, []
+        if not batch:
+            return
+        sample = self._input_sample
+        record = PromptGroupRecord(
+            prompt_idx=sample["idx"],
+            prompt=sample["message_log"],
+            extra_env_info=sample["extra_env_info"],
+            metadata={"task_name": sample["task_name"]},
+            completions=[completion for _, completion in batch],
+            rollout_metrics={},
+            loss_multiplier=float(sample.get("loss_multiplier", 1.0)),
+        )
+        await self._tq_buffer.commit_trajectories(
+            self._group_id,
+            [index for index, _ in batch],
+            record,
+            start_weight_version=self._start_weight_version,
+        )
+
+    async def drain(self) -> None:
+        """Write everything still queued; raise if any earlier write failed."""
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+        await self._flush()
+        results = await asyncio.gather(*self._flushes, return_exceptions=True)
+        self._flushes = []
+        for result in results:
+            if isinstance(result, BaseException) and not isinstance(
+                result, asyncio.CancelledError
+            ):
+                raise result
+
+    def cancel(self) -> None:
+        """Drop queued rows and stop pending writes (the group is being removed)."""
+        self._pending = []
+        for task in self._flushes:
+            task.cancel()
+
+
 class RolloutManager:
     """Routes to AsyncRolloutImpl (native async) or AsyncNemoGymRolloutImpl (NeMo-Gym), and pushes results to a TQReplayBuffer."""
+
+    # Class-level default so subclasses/test doubles that skip __init__ keep
+    # whole-group publishing.
+    _trajectory_publish_coalesce_s: Optional[float] = None
 
     def __init__(
         self,
@@ -1597,7 +1685,16 @@ class RolloutManager:
         retry_policy: Optional[RolloutRetryPolicy] = None,
         effort_config: Optional[EffortLevelsConfig] = None,
         log_full_result_tables: bool = False,
+        trajectory_publish_coalesce_s: Optional[float] = None,
     ) -> None:
+        """See class docstring.
+
+        ``trajectory_publish_coalesce_s`` enables per-trajectory publishing for
+        trajectory-level gradient streaming (``async_rl.trajectory_streaming``):
+        finished trajectories of a group are written to the replay buffer in
+        batches coalesced over this many seconds, and the group is sealed at
+        the end. None publishes whole groups.
+        """
         assert num_generations_per_prompt >= 1, (
             "num_generations_per_prompt must be >= 1"
         )
@@ -1650,6 +1747,7 @@ class RolloutManager:
         self._num_generations_per_prompt = num_generations_per_prompt
         self._rollout_recovery_config = rollout_recovery_config
         self._tq_buffer = tq_buffer
+        self._trajectory_publish_coalesce_s = trajectory_publish_coalesce_s
         self._recovery_ledger = RolloutRecoveryLedger()
         self._data_plane_checkpoint_barrier: Optional[DataPlaneCheckpointBarrier] = None
         self._env_handles = task_to_env
@@ -1816,8 +1914,12 @@ class RolloutManager:
     ) -> PromptGroupRecord:
         if rollout_ids is None:
             assert generation_indices is None
-            assert on_completion is None
             assert recovery_granularity is RecoveryGranularity.SIBLING
+            if on_completion is not None:
+                # Trajectory publishing (no token capture): per-sibling callback.
+                return await self._impl.run_rollout(
+                    input_sample, on_completion=on_completion
+                )
             # Legacy path: keep the impl call signature byte-identical.
             return await self._impl.run_rollout(input_sample)
         return await self._impl.run_rollout(
@@ -1920,6 +2022,7 @@ class RolloutManager:
         # separately and terminates from within, since exhausting it is a statement
         # about the prompt rather than about the fleet.
         while infra_attempts < policy.max_infra_attempts:
+            publisher: Optional[_TrajectoryPublisher] = None
             start_version = self._weight_version
             # A lineage-tracked prompt reuses its durable logical ID only after the
             # prior attempt's buffer slot was removed successfully. Ordinary callers
@@ -1947,24 +2050,46 @@ class RolloutManager:
                         attempt_extra_env_info[NEMO_GYM_GROUP_ATTEMPT_KEY] = (
                             group_attempt
                         )
-                    record = await self.run_rollout(attempt_input_sample)
+                    if self._trajectory_publish_coalesce_s is not None:
+                        publisher = _TrajectoryPublisher(
+                            tq_buffer=self._tq_buffer,
+                            group_id=tq_group_id,
+                            input_sample=attempt_input_sample,
+                            start_weight_version=start_version,
+                            coalesce_s=self._trajectory_publish_coalesce_s,
+                        )
+                    record = await self.run_rollout(
+                        attempt_input_sample,
+                        on_completion=None if publisher is None else publisher.add,
+                    )
                 finally:
                     if inflight_registry is not None:
                         inflight_registry.pop(tq_group_id, None)
                 end_version = self._weight_version
-                await self._tq_buffer.commit(
-                    tq_group_id,
-                    record,
-                    start_weight_version=start_version,
-                    end_weight_version=end_version,
-                )
+                if publisher is not None:
+                    await publisher.drain()
+                    await self._tq_buffer.seal_group(
+                        tq_group_id, record, end_weight_version=end_version
+                    )
+                else:
+                    await self._tq_buffer.commit(
+                        tq_group_id,
+                        record,
+                        start_weight_version=start_version,
+                        end_weight_version=end_version,
+                    )
             except Exception as error:
                 # A failed rollout must not leave an unready slot that can block an
                 # in-order sampler. commit() rolls back any DataPlane rows it wrote.
                 # Cleanup failure must not mask the error that caused it.
                 cleanup_failed = False
+                if publisher is not None:
+                    publisher.cancel()
                 try:
-                    await self._tq_buffer.remove_group(tq_group_id)
+                    # Trajectory publishing may already have written rows.
+                    await self._tq_buffer.remove_group(
+                        tq_group_id, remove_in_dp=publisher is not None
+                    )
                 except Exception as cleanup_exc:
                     cleanup_failed = True
                     print(
@@ -2033,8 +2158,13 @@ class RolloutManager:
                 continue
             except BaseException:
                 # Cancellation and other non-Exception exits: clean up, never retry.
+                if publisher is not None:
+                    publisher.cancel()
                 try:
-                    await self._tq_buffer.remove_group(tq_group_id)
+                    # Trajectory publishing may already have written rows.
+                    await self._tq_buffer.remove_group(
+                        tq_group_id, remove_in_dp=publisher is not None
+                    )
                 except Exception as cleanup_exc:
                     print(
                         f"  warn: remove_group({tq_group_id}) cleanup failed: {cleanup_exc!r}",

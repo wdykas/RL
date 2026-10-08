@@ -2001,6 +2001,11 @@ def setup_single_controller(
         ),
         retry_policy=_build_retry_policy(master_config),
         effort_config=_get_effort_config(cast(GRPOMasterConfig, master_config)),
+        trajectory_publish_coalesce_s=(
+            None
+            if master_config.async_rl.trajectory_streaming is None
+            else master_config.async_rl.trajectory_streaming.publish_coalesce_s
+        ),
     )
 
     # Print setup timing metrics

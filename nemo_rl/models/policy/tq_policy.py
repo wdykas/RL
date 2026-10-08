@@ -40,6 +40,7 @@ from typing import Any, Optional
 
 import ray
 
+from nemo_rl.algorithms.grad_streaming import GradStreamingSpec, StreamBucket
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.data_plane import (
     KVBatchMeta,
@@ -608,8 +609,17 @@ class TQPolicy(TQDriverMixin, Policy):
         loss_fn: LossFunction,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
+        grad_streaming: Optional[GradStreamingSpec] = None,
     ) -> None:
-        """Open a logical train step on every worker."""
+        """Open a logical train step on every worker.
+
+        Args:
+            loss_fn: Loss for every chunk of the step.
+            gbs: Logical global batch size.
+            mbs: Micro-batch size.
+            grad_streaming: Enables trajectory-level gradient streaming for
+                the step (see ``nemo_rl.algorithms.grad_streaming``).
+        """
         batch_size = gbs or self.cfg["train_global_batch_size"]
         micro_batch_size = mbs or self.cfg["train_micro_batch_size"]
         if self.flops_tracker is not None:
@@ -622,6 +632,7 @@ class TQPolicy(TQDriverMixin, Policy):
             loss_fn=loss_fn,
             gbs=batch_size,
             mbs=micro_batch_size,
+            grad_streaming=grad_streaming,
             **trace_context_kwargs(),
         )
         ray.get(futures)
@@ -631,6 +642,7 @@ class TQPolicy(TQDriverMixin, Policy):
         meta: KVBatchMeta,
         timer: Optional[Timer] = None,
         train_fields: tuple[str, ...] = DP_TRAIN_FIELDS,
+        stream_bucket: Optional[StreamBucket] = None,
     ) -> None:
         """Dispatch one meta slice (DP-sharded) into an open train step.
 
@@ -650,6 +662,9 @@ class TQPolicy(TQDriverMixin, Policy):
             meta: Data-plane metadata for the samples in this chunk.
             timer: Optional timer for nested policy-training measurements.
             train_fields: Columns produced for this step and fetched by workers.
+            stream_bucket: For a gradient-streaming step, the (group, reward)
+                bucket every sample in ``meta`` belongs to; None when the
+                samples carry final advantages.
         """
         spa, dba = self._packing_args("train_mb_tokens")
         train_meta = self._with_route_fields(
@@ -677,7 +692,29 @@ class TQPolicy(TQDriverMixin, Policy):
                 dynamic_batching_args=dba,
             )
 
-        self._dispatch_train_microbatches(dp_metas, timer=timer)
+        self._dispatch_train_microbatches(
+            dp_metas, timer=timer, stream_bucket=stream_bucket
+        )
+
+    def close_stream_groups(self, closes: list[tuple[Any, dict[float, float]]]) -> None:
+        """Apply closed groups' advantages to their streamed gradients on every worker."""
+        ray.get(
+            self.worker_group.run_all_workers_single_data(
+                "close_stream_groups_presharded",
+                closes=closes,
+                **trace_context_kwargs(),
+            )
+        )
+
+    def discard_stream_groups(self, groups: list[Any]) -> None:
+        """Drop retried groups' streamed gradients on every worker."""
+        ray.get(
+            self.worker_group.run_all_workers_single_data(
+                "discard_stream_groups_presharded",
+                groups=groups,
+                **trace_context_kwargs(),
+            )
+        )
 
     def train_placed_microbatches(
         self,
@@ -751,6 +788,7 @@ class TQPolicy(TQDriverMixin, Policy):
         dp_metas: list[KVBatchMeta],
         *,
         timer: Optional[Timer],
+        stream_bucket: Optional[StreamBucket] = None,
     ) -> None:
         """Send prepared per-DP metadata into an open train step."""
         if self.flops_tracker is not None:
@@ -776,7 +814,14 @@ class TQPolicy(TQDriverMixin, Policy):
                     "tensor_parallel",
                     "pipeline_parallel",
                 ],
-                common_kwargs=trace_context_kwargs(),
+                common_kwargs={
+                    **trace_context_kwargs(),
+                    **(
+                        {}
+                        if stream_bucket is None
+                        else {"stream_bucket": stream_bucket}
+                    ),
+                },
             )
         # Wait for completion only — workers return None (metrics
         # accumulate in their open-step state until finish_train_step).
