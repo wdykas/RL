@@ -21,6 +21,7 @@ from typing import Any, Callable, Hashable, Optional
 import ray
 import torch
 
+from nemo_rl.algorithms.grad_streaming import pick_final_first
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.policy.lm_policy import Policy
@@ -73,25 +74,29 @@ class Dispatch:
 class _Group:
     size: int
     rewards: dict[int, float] = field(default_factory=dict)  # index -> reward
-    streamed_open: bool = False  # some trajectory was dispatched before close
+    # Set when the group closes: {reward: advantage} (equal rewards share one).
+    advantage_by_reward: Optional[dict[float, float]] = None
+    streaming: bool = False  # holds gradient buckets on the workers
     close_sent: bool = False
-    advantages: Optional[dict[int, float]] = None
 
 
 class StreamPlanner:
     """Turns trajectory arrivals into work-conserving backward dispatches.
 
-    A trajectory is dispatchable as soon as its reward is known. If its group
-    is still open, it goes into a (group, reward) bucket chunk with advantage
-    1; if its group has closed, it gets its final advantage directly. Groups
-    that had streamed (bucketed) trajectories are closed on the workers right
-    after their last bucket chunk has been dispatched.
+    What to dispatch is decided by :func:`pick_final_first` (shared with the
+    SingleController): rows of closed groups first, with their final
+    advantages; otherwise rows of one open group, which go into
+    (group, reward) bucket chunks with advantage 1 and are folded in when the
+    group closes. ``max_open_groups=0`` never streams an open group, which is
+    group-level streaming.
 
     Args:
         compute_group_advantages: maps the full reward list of a closed group
-            (in arrival-independent index order) to per-trajectory advantages.
-            Must be the same function the synchronous trainer uses.
+            to per-trajectory advantages; must be the same function the
+            synchronous trainer uses.
+        dp_size: number of data-parallel ranks to balance chunks over.
         max_chunk_trajectories: split chunks larger than this.
+        max_open_groups: cap on groups holding buckets (0 = group granularity).
     """
 
     def __init__(
@@ -100,14 +105,9 @@ class StreamPlanner:
         *,
         dp_size: int,
         max_chunk_trajectories: int,
-        group_only: bool,
         max_open_groups: int,
     ):
         self.compute_group_advantages = compute_group_advantages
-        # True: hold each trajectory until its group closes (group-level
-        # streaming); False: stream trajectories of open groups into buckets.
-        self.group_only = group_only
-        # Cap on groups with streamed (bucketed) trajectories at once.
         self.max_open_groups = max_open_groups
         self.dp_size = dp_size
         self.max_chunk_trajectories = max_chunk_trajectories
@@ -123,42 +123,35 @@ class StreamPlanner:
         assert traj.index not in g.rewards, f"duplicate trajectory {traj.index}"
         g.rewards[traj.index] = float(traj.reward)
         if len(g.rewards) == g.size:
-            idx = sorted(g.rewards)
-            advs = self.compute_group_advantages([g.rewards[i] for i in idx])
-            g.advantages = dict(zip(idx, (float(a) for a in advs)))
+            rewards = [g.rewards[i] for i in sorted(g.rewards)]
+            advantages = self.compute_group_advantages(rewards)
+            g.advantage_by_reward = dict(zip(rewards, map(float, advantages)))
         self.ready.append(traj)
+
+    def _pick(self) -> list[Trajectory]:
+        return pick_final_first(
+            [(t.group, t.reward, t) for t in self.ready],
+            closed={gid for gid, g in self.groups.items() if g.advantage_by_reward},
+            streaming={
+                gid
+                for gid, g in self.groups.items()
+                if g.streaming and not g.close_sent
+            },
+            max_open_groups=self.max_open_groups,
+            multiple_of=1,
+        )
 
     def _pending_closes(self) -> list[tuple[GroupId, dict[float, float]]]:
         closes = []
         for gid, g in self.groups.items():
-            if g.advantages is not None and g.streamed_open and not g.close_sent:
-                adv_by_reward: dict[float, float] = {}
-                for i, r in g.rewards.items():
-                    a = g.advantages[i]
-                    if r in adv_by_reward:
-                        assert abs(adv_by_reward[r] - a) <= 1e-6 * max(1.0, abs(a)), (
-                            f"group {gid}: equal rewards got different advantages; "
-                            "estimator is not group-symmetric"
-                        )
-                    adv_by_reward[r] = a
-                closes.append((gid, adv_by_reward))
+            if g.advantage_by_reward is not None and g.streaming and not g.close_sent:
+                closes.append((gid, g.advantage_by_reward))
                 g.close_sent = True
         return closes
 
-    def _dispatchable(self, t: Trajectory) -> bool:
-        g = self.groups[t.group]
-        if g.advantages is not None or g.streamed_open:
-            return True
-        if self.group_only:
-            return False
-        open_groups = sum(
-            1 for x in self.groups.values() if x.streamed_open and not x.close_sent
-        )
-        return open_groups < self.max_open_groups
-
     def has_work(self) -> bool:
-        return any(self._dispatchable(t) for t in self.ready) or any(
-            g.advantages is not None and g.streamed_open and not g.close_sent
+        return bool(self._pick()) or any(
+            g.advantage_by_reward is not None and g.streaming and not g.close_sent
             for g in self.groups.values()
         )
 
@@ -171,34 +164,17 @@ class StreamPlanner:
         )
 
     def next_dispatch(self) -> Dispatch:
-        # Final-first: work of closed groups (final advantages) always goes
-        # first; bucket work for open groups only fills otherwise-idle learner
-        # time, one open group per dispatch -- preferring one that already
-        # holds buckets, then the one with the most ready rows (largest, most
-        # efficient chunk). Bucket chunks then never delay closed-group work.
-        ready = [t for t in self.ready if self.groups[t.group].advantages is not None]
-        if not ready and not self.group_only:
-            by_group: dict[GroupId, list[Trajectory]] = {}
-            for t in self.ready:
-                if self._dispatchable(t):
-                    by_group.setdefault(t.group, []).append(t)
-            if by_group:
-                gid = max(
-                    by_group,
-                    key=lambda g: (self.groups[g].streamed_open, len(by_group[g])),
-                )
-                self.groups[gid].streamed_open = True
-                ready = by_group[gid]
-        taken = {id(t) for t in ready}
+        picked = self._pick()
+        taken = {id(t) for t in picked}
         self.ready = [t for t in self.ready if id(t) not in taken]
         final: list[Trajectory] = []
         buckets: dict[tuple[GroupId, float], list[Trajectory]] = {}
-        for t in ready:
+        for t in picked:
             g = self.groups[t.group]
-            if g.advantages is not None:
+            if g.advantage_by_reward is not None:
                 final.append(t)
             else:
-                g.streamed_open = True
+                g.streaming = True
                 buckets.setdefault((t.group, float(t.reward)), []).append(t)
 
         chunks: list[Chunk] = []
@@ -223,7 +199,8 @@ class StreamPlanner:
                     reward=None,
                     trajectories=trajs,
                     advantages=[
-                        self.groups[t.group].advantages[t.index] for t in trajs
+                        self.groups[t.group].advantage_by_reward[t.reward]
+                        for t in trajs
                     ],
                 )
             )
@@ -316,4 +293,4 @@ class StreamingLearner:
         return results[0]
 
     def abort(self) -> None:
-        ray.get(self.worker_group.run_all_workers_single_data("stream_abort_step"))
+        ray.get(self.worker_group.run_all_workers_single_data("abort_train_step"))

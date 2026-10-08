@@ -191,3 +191,6 @@ def fields_with_optional_opd_full(
 # Per-row tag carrying a trajectory-streaming gradient bucket:
 # ``[group_id, reward]`` for rows of a still-open group, None for final rows.
 STREAM_BUCKET_TAG = "stream_bucket"
+# Per-row tag with the trajectory's reward, stamped when trajectories are
+# published individually, so the trainer can bucket rows without a fetch.
+STREAM_REWARD_TAG = "stream_reward"

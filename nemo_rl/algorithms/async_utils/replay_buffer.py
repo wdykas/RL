@@ -51,6 +51,7 @@ from nemo_rl.data_plane.schema import (
     ROLLOUT_METRICS,
     ROUTE_PLAN_TAG,
     ROUTED_EXPERTS_FIELD,
+    STREAM_REWARD_TAG,
 )
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_TASK_INDEX_KEY,
@@ -1384,6 +1385,8 @@ class TQReplayBuffer:
             prompt_idx=record.prompt_idx,
             generation_indices=list(generation_indices),
         )
+        for tag, reward in zip(tags, train_batch["total_reward"].tolist()):
+            tag[STREAM_REWARD_TAG] = float(reward)
         trace_rollout_payload(keys=sample_ids, data=train_batch)
         async with self._data_plane_checkpoint_barrier.mutation("group_commits") as cut:
             # Reject duplicates before writing: the failure path below clears

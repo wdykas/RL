@@ -62,7 +62,7 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.r3_trace import trace_tq_fetch_payload
 
 if TYPE_CHECKING:
-    from nemo_rl.algorithms.grad_streaming import GradStreamingSpec, StreamBucket
+    from nemo_rl.algorithms.grad_streaming import GradStreamingSpec
     from nemo_rl.data_plane import KVBatchMeta
     from nemo_rl.data_plane.interfaces import (
         DataPlaneClient,
@@ -1148,7 +1148,6 @@ class TQWorkerMixin:
     def train_microbatch_presharded(
         self,
         meta: "KVBatchMeta",
-        stream_bucket: Optional["StreamBucket"] = None,
     ) -> None:
         """Per-rank microbatch entrypoint. Fetch → packing prep → forward+backward.
 
@@ -1157,16 +1156,13 @@ class TQWorkerMixin:
         accumulate in the backend's open-step state and surface once via
         ``finish_train_step_presharded``.
         """
-        tags = meta.tags or []
-        if stream_bucket is None and any(STREAM_BUCKET_TAG in t for t in tags):
+        if any(STREAM_BUCKET_TAG in t for t in meta.tags or []):
             self._train_tagged_stream_buckets(meta)
             return
         data = self._fetch(meta)
         data = self._attach_or_repack_pack_metadata(data, meta)
-        kwargs = {} if stream_bucket is None else {"stream_bucket": stream_bucket}
         self.train_microbatch(  # type: ignore[attr-defined]
             data=data,
-            **kwargs,
         )
 
     def _train_tagged_stream_buckets(self, meta: "KVBatchMeta") -> None:

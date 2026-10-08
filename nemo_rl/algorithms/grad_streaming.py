@@ -54,11 +54,12 @@ from __future__ import annotations
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Hashable, Iterator, Literal, Optional
+from typing import AbstractSet, Hashable, Iterator, Literal, Optional, Sequence, TypeVar
 
 import torch
 
 GroupId = Hashable
+T = TypeVar("T")
 
 
 @dataclass
@@ -142,7 +143,6 @@ class StreamingGroupAccumulator:
             torch.zeros(g.numel(), dtype=storage_dtype, device=g.device)
             for g in grad_tensors
         ]
-        self.num_captures = 0
         self.peak_open_buffers = 0
 
     # ── storage helpers ──
@@ -257,7 +257,6 @@ class StreamingGroupAccumulator:
         must have used advantage 1 for every trajectory, and all of them must
         belong to ``group`` and share ``reward``.
         """
-        self.num_captures += 1
         if group is None:
             self._add_grad_into(self.batch_acc)
             self._zero_grads()
@@ -347,3 +346,55 @@ class StreamingGroupAccumulator:
         for g, a in zip(self.grad_tensors, self.batch_acc):
             g.view(-1).copy_(a)
         self.batch_acc = []
+
+
+def pick_final_first(
+    rows: Sequence[tuple[GroupId, float, T]],
+    *,
+    closed: AbstractSet[GroupId],
+    streaming: AbstractSet[GroupId],
+    max_open_groups: int,
+    multiple_of: int,
+) -> list[T]:
+    """Choose which ready trajectories to backpropagate next.
+
+    Final-first scheduling: rows of closed groups (final advantages known)
+    always go first. Only when there are none does the learner spend its
+    otherwise idle time on bucket work, for a single still-open group: one
+    already streaming if possible (it holds buckets anyway), else the one with
+    the most ready rows (the largest, most efficient chunk), and only while
+    fewer than ``max_open_groups`` groups are streaming. Counts are trimmed to a
+    multiple of ``multiple_of`` (per bucket for open groups) so every chunk
+    shards evenly over data-parallel ranks; leftovers wait for more arrivals.
+
+    Args:
+        rows: ``(group, reward, item)`` for every ready, not yet dispatched row.
+        closed: groups whose rewards are all known.
+        streaming: open groups that already hold gradient buckets.
+        max_open_groups: cap on streaming groups (bounds accumulator memory).
+        multiple_of: required divisor of every chunk's row count.
+
+    Returns:
+        The items to dispatch now, in input order within each group.
+    """
+
+    def trim(items: list[T]) -> list[T]:
+        return items[: len(items) - len(items) % multiple_of]
+
+    final = trim([item for group, _, item in rows if group in closed])
+    if final:
+        return final
+    buckets: dict[GroupId, dict[float, list[T]]] = {}
+    for group, reward, item in rows:
+        if group not in closed:
+            buckets.setdefault(group, {}).setdefault(float(reward), []).append(item)
+    usable = {
+        group: [item for bucket in by_reward.values() for item in trim(bucket)]
+        for group, by_reward in buckets.items()
+        if group in streaming or len(streaming) < max_open_groups
+    }
+    usable = {group: items for group, items in usable.items() if items}
+    if not usable:
+        return []
+    best = max(usable, key=lambda g: (g in streaming, len(usable[g])))
+    return usable[best]

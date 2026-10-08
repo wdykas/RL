@@ -115,7 +115,7 @@ def main():
     p.add_argument("--tol", type=float, default=1e-3)
     p.add_argument(
         "--mode",
-        choices=["stream", "permuted_sync", "mbs_sync"],
+        choices=["stream", "permuted_sync"],
         default="stream",
         help="permuted_sync: control run where policy B does sync train() on a "
         "row-permuted batch, i.e. a batching perturbation without streaming",
@@ -125,11 +125,6 @@ def main():
         action="store_true",
         help="stream group 0's trajectories, then discard them as a retried "
         "rollout would, before the normal stream; the update must not change",
-    )
-    p.add_argument(
-        "--positive-advantages",
-        action="store_true",
-        help="use advantage 1 for every row (no sign cancellation in the gradient)",
     )
     args, overrides = p.parse_known_args()
 
@@ -179,7 +174,6 @@ def main():
             adv_fn,
             dp_size=learner.dp_size,
             max_chunk_trajectories=ts.max_chunk_trajectories,
-            group_only=False,
             max_open_groups=ts.max_open_groups,
         )
         for gi in range(args.num_groups):
@@ -231,7 +225,7 @@ def main():
             ray.get(learner.submit(per_rank, []))
             ray.get(
                 learner.worker_group.run_all_workers_single_data(
-                    "stream_discard", groups=[0]
+                    "discard_stream_groups", groups=[0]
                 )
             )
 
@@ -269,49 +263,14 @@ def main():
             torch.tensor(advs).unsqueeze(-1).expand_as(data["token_mask"]).clone()
         )
 
-        if args.positive_advantages:
-            sync_data["advantages"] = torch.ones_like(sync_data["advantages"])
         res_a = policy_a.train(sync_data, loss_fn)
-        if args.mode == "mbs_sync":
-            # Same data, same order: only the micro-batch size differs.
-            res_b = policy_b.train(sync_data, loss_fn, mbs=1)
-        elif args.mode == "permuted_sync":
+        if args.mode == "permuted_sync":
             perm = list(range(n))
             rng.shuffle(perm)
             res_b = policy_b.train(rows(sync_data, perm), loss_fn)
         else:
             res_b = run_streamed(data, rewards, rng)
 
-        if args.mode == "mbs_sync" and step == 0:
-            na = ray.get(
-                policy_a.worker_group.run_all_workers_single_data("get_named_grads")
-            )[0]
-            nb = ray.get(
-                policy_b.worker_group.run_all_workers_single_data("get_named_grads")
-            )[0]
-            rows_ = sorted(
-                (
-                    (((na[k] - nb[k]).norm() / na[k].norm().clamp_min(1e-30)).item(), k)
-                    for k in na
-                ),
-                reverse=True,
-            )
-            print("per-parameter grad rel err (worst 12):", flush=True)
-            for e, k in rows_[:12]:
-                print(f"  {e:.3e}  {k}", flush=True)
-            print(f"  median {rows_[len(rows_) // 2][0]:.3e}", flush=True)
-            for e, k in rows_:
-                if any(
-                    t in k
-                    for t in (
-                        "embedding",
-                        "output_layer",
-                        "final_layernorm",
-                        "layers.0.",
-                        "layers.23.",
-                    )
-                ):
-                    print(f"  [probe] {e:.3e}  {k}", flush=True)
         grad_err = float("nan")
         if compare_grads:
             ga, gb = get_grads(policy_a), get_grads(policy_b)

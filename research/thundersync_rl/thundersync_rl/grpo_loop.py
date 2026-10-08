@@ -212,12 +212,16 @@ async def _run_one_step(
     n = repeated.size
     mbs = master_config.policy["train_micro_batch_size"]
 
+    # Only trajectory granularity streams open groups; group and batch
+    # granularity are the same planner with no open-group buckets.
+    max_open_groups = (
+        ts_cfg.max_open_groups if ts_cfg.granularity == "trajectory" else 0
+    )
     planner = StreamPlanner(
         adv_fn,
         dp_size=learner.dp_size,
         max_chunk_trajectories=ts_cfg.max_chunk_trajectories,
-        group_only=ts_cfg.granularity == "group",
-        max_open_groups=ts_cfg.max_open_groups,
+        max_open_groups=max_open_groups,
     )
     for p in range(n // G):
         planner.register_group((step, p), G)
@@ -228,10 +232,7 @@ async def _run_one_step(
         mbs=mbs,
         storage_device=ts_cfg.storage_device,
         max_buckets_per_group=ts_cfg.max_buckets_per_group,
-        # Only trajectory granularity ever holds per-group buckets.
-        max_open_groups=(
-            ts_cfg.max_open_groups if ts_cfg.granularity == "trajectory" else 0
-        ),
+        max_open_groups=max_open_groups,
     )
 
     t_start = time.perf_counter()

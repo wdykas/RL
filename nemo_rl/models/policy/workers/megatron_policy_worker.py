@@ -1777,8 +1777,9 @@ class MegatronPolicyWorkerImpl(
                 "without grad_streaming"
             )
         try:
-            seqs_before = state["local_valid_seqs"].clone()
-            toks_before = state["local_valid_toks"].clone()
+            if stream_bucket is not None:
+                seqs_before = state["local_valid_seqs"].clone()
+                toks_before = state["local_valid_toks"].clone()
             self._train_microbatch_body(state, data)
             if stream_bucket is not None:
                 counts = state["grad_stream_group_counts"]
@@ -2313,7 +2314,6 @@ class MegatronPolicyWorkerImpl(
         self._train_step_state = None
         return metrics
 
-    @wrap_with_nvtx_name("megatron_policy_worker/abort_train_step")
     def _make_grad_stream_accumulator(
         self, spec: GradStreamingSpec
     ) -> StreamingGroupAccumulator:
@@ -2347,47 +2347,39 @@ class MegatronPolicyWorkerImpl(
                 "is incompatible with reusing them for MXFP8 param all-gather"
             )
         grads = [buf.grad_data for buf in buffers]
+        # Memory: one fp32 copy of this rank's gradients for the batch
+        # accumulator (always on device) plus up to max_buckets_per_group
+        # copies per streaming group (on storage_device).
+        copy_bytes = sum(g.numel() for g in grads) * 4
+        bucket_bytes = copy_bytes * spec.max_buckets_per_group * spec.max_open_groups
         if spec.storage_device == "cuda":
-            # Batch accumulator + up to max_buckets_per_group per open group,
-            # each an fp32 copy of this rank's gradient buffers.
-            grad_bytes = sum(g.numel() for g in grads) * 4
-            needed = grad_bytes * (
-                1 + spec.max_buckets_per_group * spec.max_open_groups
-            )
             free, _ = torch.cuda.mem_get_info()
-            reclaimable = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
-            # Leave at least half of what is free now for activations and
-            # logits of the streamed chunks' forward/backward passes.
-            if needed > 0.5 * (free + reclaimable):
-                raise ValueError(
-                    f"gradient streaming needs {needed / 2**30:.1f} GiB of fp32 "
-                    f"accumulators ({grad_bytes / 2**30:.1f} GiB per copy x "
-                    f"(1 + {spec.max_buckets_per_group} x {spec.max_open_groups} "
-                    f"open groups)) but only {(free + reclaimable) / 2**30:.1f} GiB "
-                    "is available (at most half may hold accumulators); lower "
-                    "max_open_groups or use storage_device=cpu"
-                )
+            free += torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+            # Keep at least half for the streamed chunks' activations/logits.
+            needed, budget = copy_bytes + bucket_bytes, 0.5 * free
+            where, hint = (
+                "GPU memory",
+                "lower max_open_groups or use storage_device=cpu",
+            )
         else:
-            # Host buckets: the batch accumulator stays on device; check that
-            # this rank's share of available host memory can hold the buckets.
-            grad_bytes = sum(g.numel() for g in grads) * 4
-            needed = grad_bytes * spec.max_buckets_per_group * spec.max_open_groups
             with open("/proc/meminfo") as f:
                 meminfo = dict(line.split(":", 1) for line in f)
             available = int(meminfo["MemAvailable"].split()[0]) * 1024
-            # Exact on one node, conservative (over-counts) across nodes.
-            ranks_per_node = (
+            # This rank's share; exact on one node, conservative across nodes.
+            ranks = (
                 torch.distributed.get_world_size()
                 if torch.distributed.is_initialized()
                 else 1
             )
-            share = 0.8 * available / ranks_per_node
-            if needed > share:
-                raise ValueError(
-                    f"gradient streaming needs {needed / 2**30:.1f} GiB of pinned "
-                    f"host memory per rank for buckets but this rank's share is "
-                    f"{share / 2**30:.1f} GiB; lower max_open_groups"
-                )
+            needed, budget = bucket_bytes, 0.8 * available / ranks
+            where, hint = "pinned host memory", "lower max_open_groups"
+        if needed > budget:
+            raise ValueError(
+                f"gradient streaming needs {needed / 2**30:.1f} GiB of {where} "
+                f"({copy_bytes / 2**30:.1f} GiB per gradient copy, "
+                f"{spec.max_buckets_per_group} x {spec.max_open_groups} bucket "
+                f"copies) but its budget is {budget / 2**30:.1f} GiB; {hint}"
+            )
         return StreamingGroupAccumulator(
             grads,
             storage_device=spec.storage_device,
@@ -2432,6 +2424,7 @@ class MegatronPolicyWorkerImpl(
             state["local_valid_seqs"] = state["local_valid_seqs"] - seqs
             state["local_valid_toks"] = state["local_valid_toks"] - toks
 
+    @wrap_with_nvtx_name("megatron_policy_worker/abort_train_step")
     def abort_train_step(self) -> None:
         state = getattr(self, "_train_step_state", None)
         if state is None:

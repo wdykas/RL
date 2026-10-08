@@ -90,7 +90,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     TransactionalAdmissionSampler,
     create_sampler,
 )
-from nemo_rl.algorithms.grad_streaming import GradStreamingSpec
+from nemo_rl.algorithms.grad_streaming import GradStreamingSpec, pick_final_first
 from nemo_rl.algorithms.grpo import (
     GRPOConfig,
     GRPOSaveState,
@@ -158,6 +158,7 @@ from nemo_rl.data_plane.schema import (
     ROLLOUT_METRICS,
     ROUTE_PLAN_TAG,
     STREAM_BUCKET_TAG,
+    STREAM_REWARD_TAG,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_context_lost
@@ -305,12 +306,9 @@ def _train_fields_for_step(
 class _TrajectoryStepState:
     """Per-step bookkeeping for trajectory-level gradient streaming."""
 
-    advantages: dict[str, float] = field(default_factory=dict)  # sample_id -> final
-    rewards: dict[str, float] = field(default_factory=dict)  # sample_id -> reward
-    # sample_id -> reward for every published row seen, so the 5 ms selection
-    # poll only fetches newly published rows from the data plane.
-    row_rewards: dict[str, float] = field(default_factory=dict)
-    sealed: set[str] = field(default_factory=set)  # groups with all rows published
+    # Sealed groups: {reward: final advantage} (trajectories with equal rewards
+    # in a group share an advantage).
+    group_advantages: dict[str, dict[float, float]] = field(default_factory=dict)
     bucketed: set[str] = field(default_factory=set)  # groups with streamed buckets
     closed: set[str] = field(default_factory=set)  # groups folded into the batch
     counted: set[str] = field(default_factory=set)  # sealed + fully claimed
@@ -3106,17 +3104,7 @@ class SingleControllerActor:
                                         await asyncio.to_thread(
                                             self._trainer.begin_train_step,
                                             self._loss_fn,
-                                            **(
-                                                {}
-                                                if traj_cfg is None
-                                                else {
-                                                    "grad_streaming": GradStreamingSpec(
-                                                        storage_device=traj_cfg.storage_device,
-                                                        max_buckets_per_group=traj_cfg.max_buckets_per_group,
-                                                        max_open_groups=traj_cfg.max_open_groups,
-                                                    )
-                                                }
-                                            ),
+                                            **self._begin_train_step_kwargs(),
                                         )
                                         step_open = True
                                     if traj_cfg is None:
@@ -5287,26 +5275,16 @@ class SingleControllerActor:
             select_fields=self._advantage_input_fields(),
         )
 
-        prompt_ids = tensor_field(data, adv_cfg.prompt_ids_field)
-        rewards = squeeze_trailing_unit_dim(
-            tensor_field(data, adv_cfg.reward_field)
-        ).float()
-        token_mask = tensor_field(data, adv_cfg.token_mask_field).float()
-        sample_mask = squeeze_trailing_unit_dim(
-            tensor_field(data, adv_cfg.sample_mask_field)
-        ).float()
-        mask_sample = squeeze_trailing_unit_dim(
-            tensor_field(data, adv_cfg.mask_sample_field)
-        ).bool()
-        truncated = squeeze_trailing_unit_dim(
-            tensor_field(data, adv_cfg.truncated_field)
-        ).bool()
-
+        (
+            prompt_ids,
+            rewards,
+            token_mask,
+            sample_mask,
+            mask_sample,
+            final_sample_mask,
+        ) = self._advantage_base_inputs(data)
         num_mask_sample_filtered = int(mask_sample.sum().item())
         self._step_log_dict["num_mask_sample_filtered"].append(num_mask_sample_filtered)
-        final_sample_mask = sample_mask * (~mask_sample).to(sample_mask.dtype)
-        if self._algo_cfg.overlong_filtering:
-            final_sample_mask = final_sample_mask * (~truncated).to(sample_mask.dtype)
 
         seq_logprob_error_threshold = self._algo_cfg.seq_logprob_error_threshold
         # Match the legacy path: whenever real policy logprobs are available,
@@ -5351,14 +5329,7 @@ class SingleControllerActor:
             self._step_log_dict["seq_logprob_error_metrics"].append(seq_error_metrics)
 
         mask = token_mask * final_sample_mask.unsqueeze(-1)
-
-        repeated_batch: dict[str, torch.Tensor] = {
-            "total_reward": rewards,
-        }
-        for field_name in adv_cfg.repeated_batch_fields:
-            repeated_batch[field_name] = squeeze_trailing_unit_dim(
-                tensor_field(data, field_name)
-            )
+        repeated_batch = self._repeated_batch(data, rewards)
 
         kwargs: dict[str, torch.Tensor] = {}
         if self._policy_logprobs_required:
@@ -5481,14 +5452,78 @@ class SingleControllerActor:
 
     # ── utility helpers ────────────────────────────────────────────────────
 
-    async def _trajectory_group_advantages(
-        self, meta: KVBatchMeta
-    ) -> tuple[dict[str, float], dict[str, float]]:
-        """Final advantages and rewards of a sealed group, keyed by sample_id.
+    def _begin_train_step_kwargs(self) -> dict[str, Any]:
+        """Extra ``begin_train_step`` kwargs: the streaming spec, if enabled."""
+        ts_cfg = self._async_cfg.trajectory_streaming
+        if ts_cfg is None:
+            return {}
+        return {
+            "grad_streaming": GradStreamingSpec(
+                storage_device=ts_cfg.storage_device,
+                max_buckets_per_group=ts_cfg.max_buckets_per_group,
+                max_open_groups=ts_cfg.max_open_groups,
+            )
+        }
 
-        Computes exactly what :meth:`_advantage_stage` would for the complete
-        group (same masks, estimator and clipping), so trajectory streaming
-        reproduces the batch-synchronous update.
+    def _advantage_base_inputs(
+        self, data: Any
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Advantage inputs shared by the chunk and the sealed-group paths.
+
+        Returns prompt ids, rewards, token mask, sample mask, the env
+        mask-sample flags and the final sample mask (sample mask minus
+        env-flagged and, with overlong filtering, truncated samples).
+        """
+        adv_cfg = self._advantage_cfg
+        rewards = squeeze_trailing_unit_dim(
+            tensor_field(data, adv_cfg.reward_field)
+        ).float()
+        token_mask = tensor_field(data, adv_cfg.token_mask_field).float()
+        sample_mask = squeeze_trailing_unit_dim(
+            tensor_field(data, adv_cfg.sample_mask_field)
+        ).float()
+        mask_sample = squeeze_trailing_unit_dim(
+            tensor_field(data, adv_cfg.mask_sample_field)
+        ).bool()
+        final_sample_mask = sample_mask * (~mask_sample).to(sample_mask.dtype)
+        if self._algo_cfg.overlong_filtering:
+            truncated = squeeze_trailing_unit_dim(
+                tensor_field(data, adv_cfg.truncated_field)
+            ).bool()
+            final_sample_mask = final_sample_mask * (~truncated).to(sample_mask.dtype)
+        prompt_ids = tensor_field(data, adv_cfg.prompt_ids_field)
+        return (
+            prompt_ids,
+            rewards,
+            token_mask,
+            sample_mask,
+            mask_sample,
+            final_sample_mask,
+        )
+
+    def _repeated_batch(
+        self, data: Any, rewards: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        repeated_batch: dict[str, torch.Tensor] = {"total_reward": rewards}
+        for field_name in self._advantage_cfg.repeated_batch_fields:
+            repeated_batch[field_name] = squeeze_trailing_unit_dim(
+                tensor_field(data, field_name)
+            )
+        return repeated_batch
+
+    async def _group_advantage_by_reward(self, meta: KVBatchMeta) -> dict[float, float]:
+        """Final advantage per reward value of a sealed group.
+
+        Exactly what :meth:`_advantage_stage` computes for the complete group
+        (same masks, estimator and clipping); trajectories with equal rewards
+        in a group share one advantage, which is what the gradient buckets need.
         """
         adv_cfg = self._advantage_cfg
         data = await call_data_plane(
@@ -5510,42 +5545,39 @@ class SingleControllerActor:
                 )
             ),
         )
-        rewards = squeeze_trailing_unit_dim(
-            tensor_field(data, adv_cfg.reward_field)
-        ).float()
-        token_mask = tensor_field(data, adv_cfg.token_mask_field).float()
-        sample_mask = squeeze_trailing_unit_dim(
-            tensor_field(data, adv_cfg.sample_mask_field)
-        ).float()
-        mask_sample = squeeze_trailing_unit_dim(
-            tensor_field(data, adv_cfg.mask_sample_field)
-        ).bool()
-        final_sample_mask = sample_mask * (~mask_sample).to(sample_mask.dtype)
-        if self._algo_cfg.overlong_filtering:
-            truncated = squeeze_trailing_unit_dim(
-                tensor_field(data, adv_cfg.truncated_field)
-            ).bool()
-            final_sample_mask = final_sample_mask * (~truncated).to(sample_mask.dtype)
-        mask = token_mask * final_sample_mask.unsqueeze(-1)
-        repeated_batch: dict[str, torch.Tensor] = {"total_reward": rewards}
-        for field_name in adv_cfg.repeated_batch_fields:
-            repeated_batch[field_name] = squeeze_trailing_unit_dim(
-                tensor_field(data, field_name)
-            )
+        prompt_ids, rewards, token_mask, _, _, final_sample_mask = (
+            self._advantage_base_inputs(data)
+        )
         advantages = self._advantage_estimator.compute_advantage(
-            prompt_ids=tensor_field(data, adv_cfg.prompt_ids_field),
+            prompt_ids=prompt_ids,
             rewards=rewards,
-            mask=mask,
-            repeated_batch=repeated_batch,
+            mask=token_mask * final_sample_mask.unsqueeze(-1),
+            repeated_batch=self._repeated_batch(data, rewards),
             valid_mask=final_sample_mask,
         )
         assert isinstance(self._algo_cfg, GRPOConfig)
         advantages = _clip_grpo_advantages(advantages, self._algo_cfg)
-        per_row = advantages[:, 0].tolist()
-        return (
-            dict(zip(meta.sample_ids, per_row)),
-            dict(zip(meta.sample_ids, rewards.tolist())),
-        )
+        return dict(zip(rewards.tolist(), advantages[:, 0].tolist()))
+
+    async def _drop_vanished_groups(
+        self, traj: "_TrajectoryStepState", live: set[str]
+    ) -> None:
+        """Forget groups removed from the buffer for a retry mid-step.
+
+        Their streamed buckets are discarded on the workers (with their
+        normalization counts) and their rows, already cleared by the rollout
+        manager, are skipped at step cleanup.
+        """
+        vanished = (traj.claimed | traj.bucketed) - live - traj.counted
+        if not vanished:
+            return
+        retried = sorted((vanished & traj.bucketed) - traj.closed)
+        if retried:
+            await asyncio.to_thread(self._trainer.discard_stream_groups, retried)
+        traj.bucketed -= vanished
+        traj.claimed -= vanished
+        traj.vanished |= vanished
+        self._buffer.release_trajectory_claims(sorted(vanished))
 
     async def _select_trajectory_chunk(
         self, traj: "_TrajectoryStepState"
@@ -5555,115 +5587,66 @@ class SingleControllerActor:
         Optional[torch.Tensor],
         list[Optional[tuple[str, float]]],
     ]:
-        """Claim every published, untrained row of the current step.
+        """Claim the next chunk of published, untrained rows of this step.
 
-        Returns the chunk metadata (None when no new rows), the number of
-        groups that became sealed and fully claimed, per-row advantages
-        (1 for rows of open groups, final otherwise) and per-row buckets
+        Returns the chunk metadata (None when nothing is ready), the number of
+        groups that became sealed and fully claimed, per-row advantages (1 for
+        rows of open groups, final otherwise) and per-row buckets
         (``(group_id, reward)`` for open groups, None for final rows).
         """
         version = self._trainer_version
         step_groups = self._buffer.trajectory_step_groups(version)
-        # A group whose rollout failed after some rows were trained is removed
-        # from the buffer and retried under a new slot: drop its gradients.
-        vanished = traj.claimed - {group_id for group_id, _, _ in step_groups}
-        vanished -= traj.counted
-        if vanished:
-            retried = sorted(vanished & traj.bucketed)
-            if retried:
-                await asyncio.to_thread(self._trainer.discard_stream_groups, retried)
-            traj.bucketed -= vanished
-            traj.claimed -= vanished
-            traj.vanished |= vanished
-            self._buffer.release_trajectory_claims(sorted(vanished))
+        await self._drop_vanished_groups(traj, {g for g, _, _ in step_groups})
         for group_id, sealed, meta in step_groups:
-            if sealed and group_id not in traj.sealed:
+            if sealed and group_id not in traj.group_advantages:
                 assert meta is not None
-                advantages, rewards = await self._trajectory_group_advantages(meta)
-                traj.advantages.update(advantages)
-                traj.rewards.update(rewards)
-                traj.sealed.add(group_id)
-        # Every training call is DP-sharded, so claim rows in multiples of the
-        # DP size: per (group, reward) bucket for open groups, and across groups
-        # for rows with final advantages. Leftovers wait for more arrivals; the
-        # step total is a multiple of DP, so the final remainder always divides.
-        dp = self._trainer.sharding_annotations.get_axis_size("data_parallel")
-        peeked = self._buffer.peek_trajectory_rows(target_step=version)
-        rows: list[tuple[str, KVBatchMeta]] = []
-        if peeked:
-            unseen = [m for _, m in peeked if m.sample_ids[0] not in traj.row_rewards]
-            if unseen:
-                unseen_meta = unseen[0].concat(*unseen[1:])
-                for sid, reward in zip(
-                    unseen_meta.sample_ids,
-                    await self._trajectory_row_rewards(unseen_meta),
-                ):
-                    traj.row_rewards[sid] = reward
-            peek_rewards = [traj.row_rewards[m.sample_ids[0]] for _, m in peeked]
-            final_rows: list[tuple[str, KVBatchMeta]] = []
-            bucket_rows: dict[tuple[str, float], list[tuple[str, KVBatchMeta]]] = {}
-            max_open = self._async_cfg.trajectory_streaming.max_open_groups
-            open_groups = traj.bucketed - traj.closed
-            for (group_id, row_meta), reward in zip(peeked, peek_rewards):
-                if group_id in traj.sealed:
-                    final_rows.append((group_id, row_meta))
-                elif group_id in open_groups or len(open_groups) < max_open:
-                    open_groups.add(group_id)
-                    bucket_rows.setdefault((group_id, float(reward)), []).append(
-                        (group_id, row_meta)
-                    )
-                # else: over the open-group cap; wait for the group to seal.
-            # Final-first: rows of sealed groups (final advantages) go first;
-            # bucket rows only fill otherwise-idle learner time, one open group
-            # per chunk (prefer one already holding buckets, then the most rows).
-            rows.extend(final_rows[: len(final_rows) - len(final_rows) % dp])
-            if not rows and bucket_rows:
-                by_group: dict[str, list[list[tuple[str, KVBatchMeta]]]] = {}
-                for (group_id, _), bucket in bucket_rows.items():
-                    usable = bucket[: len(bucket) - len(bucket) % dp]
-                    if usable:
-                        by_group.setdefault(group_id, []).append(usable)
-                if by_group:
-                    best = max(
-                        by_group,
-                        key=lambda g: (
-                            g in traj.bucketed,
-                            sum(len(b) for b in by_group[g]),
-                        ),
-                    )
-                    for usable in by_group[best]:
-                        rows.extend(usable)
-            for group_id, row_meta in rows:
-                self._buffer.claim_trajectory_sample_ids(
-                    group_id, list(row_meta.sample_ids)
+                traj.group_advantages[group_id] = await self._group_advantage_by_reward(
+                    meta
                 )
-                traj.claimed.add(group_id)
-        newly_complete = []
+
+        peeked = self._buffer.peek_trajectory_rows(target_step=version)
+        rows = pick_final_first(
+            [(g, m.tags[0][STREAM_REWARD_TAG], (g, m)) for g, m in peeked],
+            closed=traj.group_advantages.keys(),
+            streaming=traj.bucketed - traj.closed,
+            max_open_groups=self._async_cfg.trajectory_streaming.max_open_groups,
+            multiple_of=self._trainer.sharding_annotations.get_axis_size(
+                "data_parallel"
+            ),
+        )
+        for group_id, row_meta in rows:
+            self._buffer.claim_trajectory_sample_ids(
+                group_id, list(row_meta.sample_ids)
+            )
+            traj.claimed.add(group_id)
+
+        newly_complete = 0
         for group_id, _, meta in self._buffer.trajectory_step_groups(version):
             if (
-                group_id in traj.sealed
+                group_id in traj.group_advantages
                 and group_id not in traj.counted
                 and self._buffer.trajectory_group_fully_claimed(group_id)
             ):
-                newly_complete.append(group_id)
+                newly_complete += 1
+                traj.counted.add(group_id)
                 assert meta is not None
                 traj.rollout_metrics.extend(meta.extra_info.get(ROLLOUT_METRICS, []))
-        traj.counted.update(newly_complete)
         if not rows:
-            return None, len(newly_complete), None, []
-        metas = [m for _, m in rows]
-        meta = metas[0].concat(*metas[1:])
-        row_rewards = [traj.row_rewards[m.sample_ids[0]] for _, m in rows]
+            return None, newly_complete, None, []
+
         buckets: list[Optional[tuple[str, float]]] = []
         row_advantages: list[float] = []
-        for (group_id, row_meta), reward in zip(rows, row_rewards):
-            if group_id in traj.sealed:
+        for group_id, row_meta in rows:
+            reward = row_meta.tags[0][STREAM_REWARD_TAG]
+            if group_id in traj.group_advantages:
                 buckets.append(None)
-                row_advantages.append(traj.advantages[row_meta.sample_ids[0]])
+                row_advantages.append(traj.group_advantages[group_id][reward])
             else:
-                buckets.append((group_id, float(reward)))
+                buckets.append((group_id, reward))
                 row_advantages.append(1.0)
-        return meta, len(newly_complete), torch.tensor(row_advantages), buckets
+        metas = [m for _, m in rows]
+        meta = metas[0].concat(*metas[1:])
+        return meta, newly_complete, torch.tensor(row_advantages), buckets
 
     async def _train_trajectory_chunk(
         self,
@@ -5684,65 +5667,30 @@ class SingleControllerActor:
         )
 
     async def _finish_trajectory_step(self, traj: "_TrajectoryStepState") -> None:
-        """Last sweep before the optimizer step: no streamed bucket may stay open.
-
-        Drops buckets of groups that were retried (removed from the buffer)
-        and folds in every sealed group; anything still open would make the
-        update wrong, so it fails with the bookkeeping state.
-        """
+        """Last sweep before the optimizer step: no streamed bucket may stay open."""
         live = {
-            group_id
-            for group_id, _, _ in self._buffer.trajectory_step_groups(
-                self._trainer_version
-            )
+            g for g, _, _ in self._buffer.trajectory_step_groups(self._trainer_version)
         }
-        vanished = sorted((traj.bucketed - traj.closed) - live)
-        if vanished:
-            await asyncio.to_thread(self._trainer.discard_stream_groups, vanished)
-            traj.bucketed -= set(vanished)
+        await self._drop_vanished_groups(traj, live)
         await self._close_trajectory_groups(traj)
         still_open = sorted(traj.bucketed - traj.closed)
         if still_open:
             raise RuntimeError(
                 "trajectory streaming: groups with streamed gradients are neither "
-                f"sealed nor retried at the optimizer step: {still_open}; "
-                f"sealed={len(traj.sealed)} counted={len(traj.counted)} "
-                f"live={len(live)}"
+                f"sealed nor retried at the optimizer step: {still_open}"
             )
 
     async def _close_trajectory_groups(self, traj: "_TrajectoryStepState") -> None:
         """Apply sealed groups' advantages to their streamed gradient buckets."""
-        closes: list[tuple[str, dict[float, float]]] = []
-        for group_id in sorted(traj.sealed - traj.closed):
-            traj.closed.add(group_id)
-            if group_id not in traj.bucketed:
-                continue
-            prefix = f"{group_id}_g"
-            advantage_by_reward = {
-                traj.rewards[sid]: advantage
-                for sid, advantage in traj.advantages.items()
-                if sid.startswith(prefix)
-            }
-            closes.append((group_id, advantage_by_reward))
+        newly_sealed = sorted(set(traj.group_advantages) - traj.closed)
+        traj.closed.update(newly_sealed)
+        closes = [
+            (group_id, traj.group_advantages[group_id])
+            for group_id in newly_sealed
+            if group_id in traj.bucketed
+        ]
         if closes:
             await asyncio.to_thread(self._trainer.close_stream_groups, closes)
-
-    async def _trajectory_row_rewards(self, meta: KVBatchMeta) -> list[float]:
-        """Rewards of the rows in ``meta`` (to pick their gradient buckets)."""
-        data = await call_data_plane(
-            self._dp_client,
-            "get_samples",
-            sample_ids=meta.sample_ids,
-            partition_id=meta.partition_id,
-            select_fields=[self._advantage_cfg.reward_field],
-        )
-        return (
-            squeeze_trailing_unit_dim(
-                tensor_field(data, self._advantage_cfg.reward_field)
-            )
-            .float()
-            .tolist()
-        )
 
     def _advantage_input_fields(self) -> list[str]:
         adv_cfg = self._advantage_cfg

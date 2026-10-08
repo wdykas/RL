@@ -149,3 +149,47 @@ def test_discard_group_drops_only_that_group():
     acc.close_group("kept", {1.0: 2.0})
     acc.finalize()
     torch.testing.assert_close(grads[0], torch.full((3,), 2.0, dtype=torch.float64))
+
+
+def _rows(spec):
+    """spec: list of (group, reward) -> rows with item = index."""
+    return [(g, r, i) for i, (g, r) in enumerate(spec)]
+
+
+def test_pick_final_first_prefers_closed_groups_and_trims_to_multiple():
+    from nemo_rl.algorithms.grad_streaming import pick_final_first
+
+    rows = _rows([("a", 1.0), ("b", 0.0), ("a", 0.0), ("b", 1.0), ("a", 1.0)])
+    picked = pick_final_first(
+        rows, closed={"a"}, streaming=set(), max_open_groups=4, multiple_of=2
+    )
+    assert picked == [0, 2]  # a's rows only, trimmed from 3 to 2
+
+
+def test_pick_final_first_streams_one_open_group_per_buckets_multiple():
+    from nemo_rl.algorithms.grad_streaming import pick_final_first
+
+    rows = _rows([("a", 1.0), ("b", 1.0), ("b", 1.0), ("b", 0.0), ("a", 1.0)])
+    picked = pick_final_first(
+        rows, closed=set(), streaming=set(), max_open_groups=4, multiple_of=2
+    )
+    # b has a usable reward-1 pair, a has a usable reward-1 pair: tie on size,
+    # the first maximal group wins; per-bucket trimming drops b's lone reward 0.
+    assert picked in ([0, 4], [1, 2])
+    # an already-streaming group is preferred even if smaller
+    picked = pick_final_first(
+        rows, closed=set(), streaming={"a"}, max_open_groups=4, multiple_of=1
+    )
+    assert picked == [0, 4]
+
+
+def test_pick_final_first_respects_open_group_cap():
+    from nemo_rl.algorithms.grad_streaming import pick_final_first
+
+    rows = _rows([("c", 1.0), ("c", 1.0)])
+    assert (
+        pick_final_first(
+            rows, closed=set(), streaming={"a", "b"}, max_open_groups=2, multiple_of=1
+        )
+        == []
+    )

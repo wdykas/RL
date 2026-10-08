@@ -40,7 +40,7 @@ single optimizer step and the refit all happen once, at the batch barrier.
 | Piece | Where |
 |---|---|
 | Learner step lifecycle: zero grads, local accumulation under `no_sync`, deferred 1/N, single DP reduce, `optimizer.step()` | existing `MegatronPolicyWorker.begin_train_step` / `train_microbatch` / `finish_train_step` |
-| Moving each chunk's gradient out of the DDP `grad_data` buffers into per-(group, reward) accumulators; write-back at the barrier | `thundersync_rl/accumulator.py`, `thundersync_rl/worker.py` (worker extension via `policy.worker_extension_cls_fqn`) |
+| Moving each chunk's gradient out of the DDP `grad_data` buffers into per-(group, reward) accumulators; write-back at the barrier | `nemo_rl/algorithms/grad_streaming.py`, `thundersync_rl/worker.py` (worker extension via `policy.worker_extension_cls_fqn`) |
 | Arrival → dispatch planning (bucket chunks vs. final-advantage chunks, group closes, DP token balancing) | `thundersync_rl/streaming.py` |
 | Rollouts streamed per sample from the Megatron inference engine; learner loop; refit | `thundersync_rl/grpo_loop.py` |
 | Advantages | NeMo RL's own `_create_advantage_estimator` + `_clip_grpo_advantages`, applied per closed group |

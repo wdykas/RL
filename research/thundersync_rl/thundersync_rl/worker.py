@@ -113,52 +113,6 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         results["stream_learner_busy_s"] = self._stream_busy_s
         return results
 
-    def stream_discard(self, groups: list[Any]) -> None:
-        """Drop retried groups' streamed gradients and normalization counts."""
-        self.discard_stream_groups(groups)
-
-    def stream_abort_step(self) -> None:
-        self.abort_train_step()
-
-    def profile_stream_chunk(self, data: Any, reps: int = 5) -> dict[str, float]:
-        """Time one bucketed chunk's pieces inside an open streaming step (debug)."""
-        state = self._train_step_state
-        acc = state["grad_stream"]
-        out = {"body": 0.0, "capture": 0.0}
-        for i in range(reps + 1):
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
-            self._train_microbatch_body(state, data)
-            torch.cuda.synchronize()
-            t1 = time.perf_counter()
-            acc.capture(f"profile{i}", 1.0)
-            torch.cuda.synchronize()
-            t2 = time.perf_counter()
-            acc.discard_group(f"profile{i}")
-            if i > 0:
-                out["body"] += (t1 - t0) / reps
-                out["capture"] += (t2 - t1) / reps
-        return out
-
-    def torch_profile_chunk(self, data: Any, out_path: str) -> str:
-        """Profile one chunk's train_microbatch body with torch.profiler (debug)."""
-        from torch.profiler import ProfilerActivity, profile
-
-        state = self._train_step_state
-        self._train_microbatch_body(state, data)  # warmup
-        torch.cuda.synchronize()
-        with profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-            record_shapes=False,
-        ) as prof:
-            self._train_microbatch_body(state, data)
-            torch.cuda.synchronize()
-        table = prof.key_averages().table(sort_by="cpu_time_total", row_limit=40)
-        cuda_table = prof.key_averages().table(sort_by="cuda_time_total", row_limit=15)
-        with open(out_path, "w") as f:
-            f.write(table + "\n\n" + cuda_table)
-        return out_path
-
     def get_flat_grads(self) -> torch.Tensor:
         """Return this rank's gradient buffers on CPU (for equivalence tests).
 
@@ -167,14 +121,6 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         """
         buffers = self.model.buffers + self.model.expert_parallel_buffers
         return torch.cat([b.grad_data.detach().float().cpu() for b in buffers])
-
-    def get_named_grads(self) -> dict[str, torch.Tensor]:
-        """Per-parameter main_grad on CPU (debug; valid after a DP=1 step)."""
-        return {
-            name: p.main_grad.detach().float().cpu().clone()
-            for name, p in self.model.named_parameters()
-            if getattr(p, "main_grad", None) is not None
-        }
 
     def get_flat_params(self) -> dict[str, torch.Tensor]:
         """Return this rank's parameters on CPU (for equivalence tests)."""

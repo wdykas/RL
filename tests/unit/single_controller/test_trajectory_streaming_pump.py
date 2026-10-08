@@ -63,6 +63,7 @@ def _stub_record_to_train_batch(
         {
             "input_ids": torch.ones((n, 4), dtype=torch.long),
             "input_lengths": torch.full((n,), 4, dtype=torch.long),
+            "total_reward": torch.tensor([c.reward for c in record.completions]),
         }
     )
 
@@ -154,13 +155,13 @@ def _controller(buffer, dp_client, trainer, max_open_groups=100):
     return ctl
 
 
-def _record(n: int) -> PromptGroupRecord:
+def _record(rewards: list[float]) -> PromptGroupRecord:
     return PromptGroupRecord(
         prompt_idx=0,
         prompt=[],
         extra_env_info=None,
         metadata={},
-        completions=[object() for _ in range(n)],
+        completions=[SimpleNamespace(reward=r) for r in rewards],
         rollout_metrics={},
     )
 
@@ -242,10 +243,14 @@ async def _run(
         if gid in removed:
             continue
         publish_meta(gid, i)
-        await buffer.commit_trajectories(gid, [i], _record(1), start_weight_version=0)
+        await buffer.commit_trajectories(
+            gid, [i], _record([group_rewards[gid][i]]), start_weight_version=0
+        )
         published[gid] += 1
         if published[gid] == _G:
-            await buffer.seal_group(gid, _record(_G), end_weight_version=0)
+            await buffer.seal_group(
+                gid, _record(group_rewards[gid]), end_weight_version=0
+            )
             final_groups[gid] = group_rewards[gid]
         if rng.random() < 0.5:
             await pump_once()
@@ -261,9 +266,14 @@ async def _run(
             for j in range(_G):
                 publish_meta(new_gid, j)
             await buffer.commit_trajectories(
-                new_gid, list(range(_G)), _record(_G), start_weight_version=0
+                new_gid,
+                list(range(_G)),
+                _record(group_rewards[new_gid]),
+                start_weight_version=0,
             )
-            await buffer.seal_group(new_gid, _record(_G), end_weight_version=0)
+            await buffer.seal_group(
+                new_gid, _record(group_rewards[new_gid]), end_weight_version=0
+            )
             final_groups[new_gid] = group_rewards[new_gid]
     for _ in range(20):
         await pump_once()

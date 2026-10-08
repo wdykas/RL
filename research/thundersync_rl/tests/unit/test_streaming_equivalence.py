@@ -17,7 +17,7 @@ import random
 
 import pytest
 import torch
-from thundersync_rl.accumulator import StreamingGroupAccumulator
+from nemo_rl.algorithms.grad_streaming import StreamingGroupAccumulator
 from thundersync_rl.streaming import StreamPlanner, Trajectory
 
 from nemo_rl.algorithms.advantage_estimator import GRPOAdvantageEstimator
@@ -74,8 +74,7 @@ def _simulate(
         adv_fn,
         dp_size=dp_size,
         max_chunk_trajectories=chunk,
-        group_only=group_only,
-        max_open_groups=max_open_groups,
+        max_open_groups=0 if group_only else max_open_groups,
     )
     for g in range(len(rewards_per_group)):
         planner.register_group(g, G)
