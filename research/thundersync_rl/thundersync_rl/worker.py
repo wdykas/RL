@@ -442,13 +442,24 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
 
         t0 = time.perf_counter()
         if getattr(self, "_mfp32", None) is None:
+            from megatron.core import parallel_state as ps
+
+            if ps.get_context_parallel_world_size() > 1:
+                raise NotImplementedError(
+                    "speculative verification scorer does not shard sequences for "
+                    "context parallelism yet"
+                )
             # Shallow copy: only top-level dtype/recompute fields change; process
             # groups (not copyable) are shared with the training model.
             provider = copy.copy(self.megatron_cfg.model)
-            provider.params_dtype = torch.float32
-            provider.pipeline_dtype = torch.float32
-            provider.bf16 = False
-            provider.fp16 = False
+            # "fp32" (default): fp32 params/activations, removes bf16 rounding
+            # noise from p/q (~99% kept). "model": keep the training dtypes
+            # (half the memory, bf16 speed, ~91% kept).
+            if getattr(self, "_scorer_precision", "fp32") == "fp32":
+                provider.params_dtype = torch.float32
+                provider.pipeline_dtype = torch.float32
+                provider.bf16 = False
+                provider.fp16 = False
             provider.recompute_granularity = None
             provider.recompute_method = None
             provider.recompute_num_layers = None
@@ -466,7 +477,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 self._mfp32_map.append((p, src[match[0]]))
         with torch.no_grad():
             for dst, src in self._mfp32_map:
-                dst.copy_(src.detach().float())
+                dst.copy_(src.detach().to(dst.dtype))
         torch.cuda.synchronize()
         self._prof["export"] = self._prof.get("export", 0.0) + time.perf_counter() - t0
         return self._mfp32
@@ -695,9 +706,10 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
     # O(all draft tokens x vocab).
 
     @torch.no_grad()
-    def stash_weights(self, version: int, keep: list[int]) -> int:
+    def stash_weights(self, version: int, keep: list[int], precision: str = "fp32") -> int:
         """Stash the current training parameters as ``version``; drop others not in ``keep``."""
         self._prof = {}
+        self._scorer_precision = precision
         self._fp32_scorer()  # builds the scorer and its parameter map once
         if not hasattr(self, "_weight_stash"):
             self._weight_stash: dict[int, list[torch.Tensor]] = {}
@@ -731,6 +743,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         seed: int,
         keys: list[str],
         batch_tokens: int = 16384,
+        precision: str = "fp32",
     ) -> list[tuple[int, dict[str, Any]]]:
         """Block-verify drafts whose q is recomputed per batch from stashed weights.
 
@@ -742,6 +755,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         self._prof = {}
         t_all = time.perf_counter()
         self.model.eval()
+        self._scorer_precision = precision
         scorer = self._fp32_scorer()
         from megatron.core import parallel_state as ps
 

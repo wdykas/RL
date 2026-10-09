@@ -288,7 +288,10 @@ class SpeculativeGeneration:
                     keep.update(v for v, _, _ in d["segments"])
             ray.get(
                 self.learner_policy.worker_group.run_all_workers_single_data(
-                    "stash_weights", version=self.current_step, keep=sorted(keep)
+                    "stash_weights",
+                    version=self.current_step,
+                    keep=sorted(keep),
+                    precision="fp32" if self.verify_precision in ("fp32", "tf32") else "model",
                 )
             )
             return
@@ -333,6 +336,7 @@ class SpeculativeGeneration:
                     vocab_limit=self.vocab_limit,
                     seed=next(self._verify_seeds),
                     keys=[d[4] for _, d in flat],
+                    precision="fp32" if self.verify_precision in ("fp32", "tf32") else "model",
                 )
             )
         elif self.verify_mode == "block":

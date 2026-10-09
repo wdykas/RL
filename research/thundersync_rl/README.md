@@ -318,3 +318,21 @@ long trajectories (stragglers) plus ~1 s of scoring/verification.
 
 Tests: `tests/unit/test_block_verification.py` checks by exact enumeration that
 block verification returns the target distribution (to 1e-10).
+
+### Scaling to large models
+
+| piece | status |
+|---|---|
+| drafting / streaming / abort | Megatron inference client + coordinator: inherits inference TP/PP/EP/DP |
+| q for verification | `q_storage=stash` (default): bf16 stash of the drafting weights (2 B/param per model-parallel shard per pending version), q recomputed per batch at verification - memory O(params + batch x vocab), not O(draft tokens x vocab) |
+| scorer | second Megatron GPTModel from the training provider (same TP/PP/EP sharding); fp32 adds 4 B/param per shard; `verify_precision=model` keeps training dtypes (2 B/param, bf16 speed, ~90% vs ~98% tokens kept) |
+| TP | vocab-parallel logits gathered per batch; rows owned by DP rank; DP-seeded sampling so TP partners agree - validated TP=2 (99.9% kept) |
+| PP | forward-only Megatron pipeline schedule; last stage verifies - validated: scorer logprobs at PP=2 bitwise equal PP=1 (`tests/functional/check_scorer_parallelism.py`) |
+| CP | not yet: scorer raises NotImplementedError for context parallelism |
+| EP / MoE | provider copy carries the EP layout; untested (fp32 grouped GEMM support to check) |
+| compute | verification = 2 forwards over draft tokens (q, p); fp32/TF32 scorer costs more than a bf16 forward - for learner-bound runs use `verify_precision=model` or put scoring on idle capacity |
+| engine capacity | drafting uses inference capacity; at Qwen3-4B on 2 saturated inference GPUs it lost (57.7 vs 42.5 s/iter) - needs spare generation capacity |
+| zero-advantage skip | split train API, TP/PP-consistent; rejects sequence packing/dynamic batching (driver-side row dropping needed for those) |
+
+Known base-stack issue: with training PP=2 and inference PP=1 in this research loop, the
+initial refit produced a broken policy (reward ~0 at step 0, before any speculation).
