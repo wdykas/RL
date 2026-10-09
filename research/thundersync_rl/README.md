@@ -307,6 +307,8 @@ Results (2 gen + 2 train GPUs, 6 steps, group streaming):
 | + zero-adv skip + streaming drafts | 5.48 | 4.03 | 86% |
 | + fp32 LM head | 4.45 | 3.10 | 91% |
 | + Megatron fp32 scorer, TF32 GEMMs (`verify_precision=fp32`, `NVIDIA_TF32_OVERRIDE=1`) | 4.70-4.98 | 2.8-3.2 | 98-99% |
+| + verification split across learner and inference GPUs (`verify_on=both`) | 4.49 | - | 99.3% |
+| + multi-iteration drafts (`draft_lookahead=2`) | 4.57 (median 4.07) | - | 99.5% (97.5% drafts whole) |
 | reference: regular async, lag 4 (single controller) | 3.70 | - | - |
 
 Scorer: block verification scores p and q with a second Megatron GPTModel
