@@ -452,6 +452,9 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             provider.recompute_granularity = None
             provider.recompute_method = None
             provider.recompute_num_layers = None
+            # The fused SwiGLU kernel is ~4x off the memory bound in fp32; plain
+            # silu * mul computes the same values.
+            provider.bias_activation_fusion = False
             provider.finalize()
             self._mfp32 = provider.provide().cuda().eval()
             src_names = [n for n, _ in self.model.named_parameters()]
@@ -507,6 +510,15 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 prev = torch.get_float32_matmul_precision()
                 torch.set_float32_matmul_precision("high" if self._scorer_tf32 else "highest")
                 try:
+                    if os.environ.get("THUNDERSYNC_SPEC_TORCHPROF") and not getattr(self, "_profiled", False):
+                        self._profiled = True
+                        from torch.profiler import ProfilerActivity, profile
+
+                        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+                            scorer(input_ids=ids, position_ids=pos, attention_mask=None)
+                            torch.cuda.synchronize()
+                        print("[spec torchprof]\n" + prof.key_averages().table(
+                            sort_by="cuda_time_total", row_limit=14), flush=True)
                     logits = scorer(
                         input_ids=ids, position_ids=pos, attention_mask=None
                     ).float()
