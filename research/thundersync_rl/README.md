@@ -306,3 +306,15 @@ Results (2 gen + 2 train GPUs, 6 steps, group streaming):
 | block verification | 6.28 | 3.40 | 87% |
 | + zero-adv skip + streaming drafts | 5.48 | 4.03 | 86% |
 | + fp32 LM head | 4.45 | 3.10 | 91% |
+| + Megatron fp32 scorer, TF32 GEMMs (`verify_precision=fp32`, `NVIDIA_TF32_OVERRIDE=1`) | 4.70-4.98 | 2.8-3.2 | 98-99% |
+| reference: regular async, lag 4 (single controller) | 3.70 | - | - |
+
+Scorer: block verification scores p and q with a second Megatron GPTModel
+(training provider copy with fp32 dtypes, refreshed by copying the training
+parameters) - bf16 activation rounding, not policy change, caused nearly all
+rejections. Multi-iteration drafts (`draft_lookahead=2`) reach 86-100% of drafts
+accepted whole; the remaining iteration time is the few rejected/unfinished
+long trajectories (stragglers) plus ~1 s of scoring/verification.
+
+Tests: `tests/unit/test_block_verification.py` checks by exact enumeration that
+block verification returns the target distribution (to 1e-10).

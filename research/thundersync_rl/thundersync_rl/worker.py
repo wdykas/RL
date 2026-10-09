@@ -687,3 +687,147 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         return asyncio.run_coroutine_threadsafe(
             abort_and_snapshot(), self._inference_loop
         ).result()
+
+    # ---- Memory-scalable block verification: stash weights, not q ----
+    # q is recomputed at verification time from a bf16 stash of the weights that
+    # drafted each position (2 bytes/param per model-parallel shard per stashed
+    # version), so memory is O(params + one batch x vocab) instead of
+    # O(all draft tokens x vocab).
+
+    @torch.no_grad()
+    def stash_weights(self, version: int, keep: list[int]) -> int:
+        """Stash the current training parameters as ``version``; drop others not in ``keep``."""
+        self._prof = {}
+        self._fp32_scorer()  # builds the scorer and its parameter map once
+        if not hasattr(self, "_weight_stash"):
+            self._weight_stash: dict[int, list[torch.Tensor]] = {}
+        self._weight_stash[version] = [src.detach().clone() for _, src in self._mfp32_map]
+        for v in list(self._weight_stash):
+            if v not in keep and v != version:
+                del self._weight_stash[v]
+        return len(self._weight_stash)
+
+    @torch.no_grad()
+    def _load_scorer(self, version: int | None) -> None:
+        """Load stashed ``version`` (None: current training weights) into the scorer."""
+        t0 = time.perf_counter()
+        srcs = (
+            [src for _, src in self._mfp32_map]
+            if version is None
+            else self._weight_stash[version]
+        )
+        for (dst, _), src in zip(self._mfp32_map, srcs):
+            dst.copy_(src)
+        torch.cuda.synchronize()
+        self._prof["load"] = self._prof.get("load", 0.0) + time.perf_counter() - t0
+
+    @torch.no_grad()
+    def verify_drafts_block_stashed(
+        self,
+        rows: list[torch.Tensor],
+        prompt_lens: list[int],
+        segments: list[list[tuple[int, int, int]]],
+        vocab_limit: int,
+        seed: int,
+        keys: list[str],
+        batch_tokens: int = 16384,
+    ) -> list[tuple[int, dict[str, Any]]]:
+        """Block-verify drafts whose q is recomputed per batch from stashed weights.
+
+        ``segments[i]``: [(version, start, end)] - draft tokens [start, end) of row
+        i were drafted by stashed weights ``version``. p is the current weights.
+        """
+        from thundersync_rl.block_verification import block_verify
+
+        self._prof = {}
+        t_all = time.perf_counter()
+        self.model.eval()
+        scorer = self._fp32_scorer()
+        from megatron.core import parallel_state as ps
+
+        # Same stream on every TP rank of a replica: identical decisions.
+        gen = torch.Generator(device="cuda").manual_seed(
+            seed * 1_000_003 + ps.get_data_parallel_rank()
+        )
+        results = []
+        for group, ids in self._iter_row_id_batches(rows, batch_tokens, keys):
+            pos = torch.arange(ids.shape[1], device="cuda").expand(len(group), -1)
+            lq_rows: dict[int, list[tuple[int, torch.Tensor]]] = {i: [] for i in group}
+            versions = sorted({v for i in group for v, _, _ in segments[i]})
+            for v in versions:
+                self._load_scorer(v)
+                logits = self._score(scorer, ids, pos)
+                for r, i in enumerate(group):
+                    plen = prompt_lens[i]
+                    for sv, a, b in segments[i]:
+                        if sv == v and b > a:
+                            lq = torch.log_softmax(
+                                logits[r, plen - 1 + a : plen - 1 + b, :vocab_limit].float(), -1
+                            )
+                            lq_rows[i].append((a, lq))
+                del logits
+            self._load_scorer(None)
+            logits = self._score(scorer, ids, pos)
+            for r, i in enumerate(group):
+                n, plen = rows[i].numel(), prompt_lens[i]
+                g = n - plen
+                lp = torch.log_softmax(logits[r, plen - 1 : n, :vocab_limit].float(), -1)
+                parts = [t for _, t in sorted(lq_rows.pop(i), key=lambda x: x[0])]
+                lq = torch.cat(parts) if parts else lp[:0]
+                assert lq.shape[0] == g, (lq.shape, g)
+                draft = ids[r, plen:n]
+                tau, y = block_verify(lp, lq, draft, gen)
+                kept = torch.cat([draft[:tau], torch.tensor([y], device="cuda")])
+                lps = lp[torch.arange(tau + 1, device="cuda"), kept].tolist()
+                results.append((i, {"accepted": tau, "next": y, "logprobs": lps}))
+            del logits
+        if os.environ.get("THUNDERSYNC_SPEC_PROF"):
+            print(f"[spec prof] verify_stashed rank={self.rank} total={time.perf_counter() - t_all:.3f} {self._prof}", flush=True)
+        return results
+
+    def _score(self, scorer, ids, pos):
+        from megatron.core import parallel_state as ps
+
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        logits = scorer(input_ids=ids, position_ids=pos, attention_mask=None).float()
+        tp = ps.get_tensor_model_parallel_world_size()
+        if tp > 1:
+            # Vocab-parallel logits -> full vocab for this batch only (memory is
+            # bounded by batch_tokens, not by the number of draft tokens).
+            parts = [torch.empty_like(logits) for _ in range(tp)]
+            torch.distributed.all_gather(
+                parts, logits.contiguous(), group=ps.get_tensor_model_parallel_group()
+            )
+            logits = torch.cat(parts, dim=-1)
+        torch.cuda.synchronize()
+        self._prof["forward"] = self._prof.get("forward", 0.0) + time.perf_counter() - t0
+        return logits
+
+    def _iter_row_id_batches(self, rows, batch_tokens, keys):
+        """Like _iter_row_batches but yields token ids only (no forward).
+
+        Rows are owned by data-parallel rank (stable hash of the key), so the
+        tensor-parallel ranks of one replica process the same rows together.
+        """
+        import zlib
+
+        from megatron.core import parallel_state as ps
+
+        dp, dp_rank = ps.get_data_parallel_world_size(), ps.get_data_parallel_rank()
+        mine = sorted(
+            (i for i in range(len(rows)) if zlib.crc32(keys[i].encode()) % dp == dp_rank),
+            key=lambda i: rows[i].numel(),
+        )
+        b = 0
+        while b < len(mine):
+            e = b + 1
+            while e < len(mine) and rows[mine[e]].numel() * (e + 1 - b) <= batch_tokens:
+                e += 1
+            group = mine[b:e]
+            b = e
+            s = max(rows[i].numel() for i in group)
+            ids = torch.zeros((len(group), s), dtype=torch.long)
+            for r, i in enumerate(group):
+                ids[r, : rows[i].numel()] = rows[i]
+            yield group, ids.cuda()

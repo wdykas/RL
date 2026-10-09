@@ -125,6 +125,9 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # draft cut off at one deadline resumes (from its prefix, under the newer
     # weights) in the next iteration, so drafts can cover whole rollouts.
     draft_lookahead: int = 1
+    # Block mode q storage: "stash" recomputes q at verification from stashed
+    # weights (O(params) memory, scales); "full" stores full-vocab q per token.
+    q_storage: Literal["stash", "full"] = "stash"
 
 
 class ThunderSyncMasterConfig(MasterConfig):
@@ -671,6 +674,7 @@ def thundersync_grpo_train(
             variant_eps=ts_cfg.variant_eps,
             verify_mode=ts_cfg.verify_mode,
             verify_precision=ts_cfg.verify_precision,
+            q_storage=ts_cfg.q_storage,
         )
     G = master_config.grpo.num_generations_per_prompt
     if spec is not None and os.environ.get("THUNDERSYNC_SPEC_SELFTEST"):
@@ -700,6 +704,8 @@ def thundersync_grpo_train(
             policy_generation.prepare_for_generation()
         t_refit = time.perf_counter() - t0
         t_verify = 0.0
+        if spec is not None:
+            spec.current_step = step
         if cohort_mode:
             t1 = time.perf_counter()
             spec.verify_cohort(step)
