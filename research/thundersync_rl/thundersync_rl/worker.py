@@ -584,6 +584,8 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         self._prof = {}
         t_all = time.perf_counter()
         self.model.eval()
+        from thundersync_rl.block_verification import block_verify
+
         gen = torch.Generator(device="cuda").manual_seed(seed * 1_000_003 + self.rank)
         results = []
         self._scorer_tf32 = precision == "tf32"
@@ -596,24 +598,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 lq = self._spec_q.pop(keys[i] if keys is not None else i).float()  # [g, V]
                 assert lq.shape[0] == g, (lq.shape, g)
                 draft = ids[r, plen:n]
-                ar = torch.arange(g, device="cuda")
-                lr = lp[ar, draft] - lq[ar, draft]  # log p/q of draft tokens
-                s_cum = torch.cat([torch.zeros(1, device="cuda"), torch.cumsum(lr.double(), 0)])
-                log_b = s_cum - torch.cummax(s_cum, 0).values  # log b_i, i = 0..g
-                b = log_b.exp()
-                resid = (b[:g, None] * lp[:g].exp() - lq.exp()).clamp_(min=0)  # [g, V]
-                r_mass = resid.sum(-1).double()
-                denom = r_mass + 1 - b[:g]
-                h = torch.where(denom > 0, r_mass / denom.clamp(min=1e-300), torch.ones_like(denom))
-                h = torch.cat([h, b[g:]])  # h_g = b_g
-                eta = torch.rand(g + 1, device="cuda", generator=gen, dtype=torch.float64)
-                ok = torch.nonzero(eta <= h).flatten()
-                tau = int(ok.max())
-                if tau == g:
-                    dist = lp[g].exp()
-                else:
-                    dist = resid[tau]
-                y = int(torch.multinomial(dist / dist.sum(), 1, generator=gen))
+                tau, y = block_verify(lp, lq, draft, gen)
                 kept = torch.cat([draft[:tau], torch.tensor([y], device="cuda")])
                 lps = lp[torch.arange(tau + 1, device="cuda"), kept].tolist()
                 results.append((i, {"accepted": tau, "next": y, "logprobs": lps}))
