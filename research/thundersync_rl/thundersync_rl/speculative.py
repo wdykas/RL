@@ -51,6 +51,14 @@ class Plan:
     complete: bool = False
 
 
+@dataclass
+class CohortDrafts:
+    """Drafts advanced during one iteration (for scoring at its theta)."""
+
+    live: list[dict[str, Any]]
+    prev_lens: list[int]
+
+
 def _key(ids: torch.Tensor) -> tuple[int, ...]:
     return tuple(int(t) for t in ids.tolist())
 
@@ -101,6 +109,11 @@ class SpeculativeGeneration:
         self._verify_seeds = itertools.count(1)
         self.plans: dict[tuple[int, ...], list[Plan]] = defaultdict(list)
         self.stats: dict[str, float] = {}
+        # Multi-iteration drafts: target step -> drafts for that step's rollouts.
+        # A draft keeps growing across iterations (resumed from its prefix under
+        # whatever weights the engine holds); the learner stores, per position,
+        # the q of the weights that drafted it.
+        self.cohorts: dict[int, list[dict[str, Any]]] = {}
 
     # -- drafting (iteration k, for iteration k+1's prompts) --------------------
 
@@ -189,6 +202,55 @@ class SpeculativeGeneration:
 
         return collect
 
+    async def draft_cohorts(self, step: int, new: dict[int, list[torch.Tensor]]):
+        """Resume unfinished drafts of future steps and start new cohorts.
+
+        Returns a collector to call at this iteration's deadline; it appends the
+        streamed tokens and returns a ``CohortDrafts`` for ``score_prev``.
+        """
+        for target, prompts in new.items():
+            if target not in self.cohorts:
+                self.cohorts[target] = [
+                    {"prompt": p, "tokens": [], "finished": False, "key": f"{target}:{j}"}
+                    for j, p in enumerate(prompts)
+                ]
+        live = [
+            d
+            for target in sorted(self.cohorts)
+            if target > step
+            for d in self.cohorts[target]
+            if not d["finished"]
+        ]
+        rank0 = self.base._policy.worker_group.workers[0]
+        if live:
+            ray.get(
+                rank0.start_drafts.remote(
+                    [torch.cat([d["prompt"], torch.tensor(d["tokens"], dtype=torch.long)]).tolist()
+                     for d in live],
+                    [self.max_new_tokens - len(d["tokens"]) for d in live],
+                    self.stream_interval,
+                )
+            )
+
+        def collect():
+            res = ray.get(rank0.collect_drafts.remote()) if live else []
+            prev = [len(d["tokens"]) for d in live]
+            for d, (toks, done) in zip(live, res):
+                d["tokens"].extend(toks)
+                d["finished"] = done
+            return CohortDrafts(live, prev)
+
+        return collect
+
+    def verify_cohort(self, step: int) -> bool:
+        """Block-verify every draft of ``step``'s cohort (learner at theta_step)."""
+        cohort = self.cohorts.pop(step, None)
+        if cohort is None:
+            return False
+        drafts = [[(d["prompt"], -1, d["tokens"], d["finished"], d["key"])] for d in cohort]
+        self.verify(drafts)
+        return True
+
     # -- verification (start of iteration k+1, learner holds theta_{k+1}) -------
 
     @staticmethod
@@ -200,6 +262,24 @@ class SpeculativeGeneration:
     def score_prev(self, drafts) -> None:
         """Block mode, learner still at theta_k: store each draft's full log q."""
         if self.verify_mode != "block" or drafts is None:
+            return
+        if isinstance(drafts, CohortDrafts):
+            if not drafts.live:
+                return
+            ray.get(
+                self.learner_policy.worker_group.run_all_workers_single_data(
+                    "score_drafts_q",
+                    rows=[
+                        torch.cat([d["prompt"], torch.tensor(d["tokens"], dtype=torch.long)])
+                        for d in drafts.live
+                    ],
+                    prompt_lens=[d["prompt"].numel() for d in drafts.live],
+                    vocab_limit=self.vocab_limit,
+                    precision=self.verify_precision,
+                    keys=[d["key"] for d in drafts.live],
+                    from_lens=drafts.prev_lens,
+                )
+            )
             return
         flat, rows = self._flat_rows(drafts)
         ray.get(
@@ -223,6 +303,7 @@ class SpeculativeGeneration:
                     vocab_limit=self.vocab_limit,
                     seed=next(self._verify_seeds),
                     precision=self.verify_precision,
+                    keys=[d[4] for _, d in flat] if len(flat[0][1]) > 4 else None,
                 )
             )
         else:
@@ -255,7 +336,8 @@ class SpeculativeGeneration:
             # The draft terminated on its own (EOS/stop) rather than at the budget
             # or the deadline: a fully accepted draft is then a finished rollout.
             finished = d[3] if len(d) > 3 else True
-            stopped = finished and len(draft) < self.draft_budget
+            # Cohort drafts carry the full budget: finished means EOS or the cap.
+            stopped = finished and (len(d) > 4 or len(draft) < self.draft_budget)
             if n_acc == len(draft) and stopped:
                 plan = Plan(seed, draft, r["logprobs"][:n_acc], complete=True)
                 full += 1

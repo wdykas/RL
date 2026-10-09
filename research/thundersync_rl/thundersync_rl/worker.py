@@ -447,11 +447,23 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             self._hf32.tie_weights()
         return self._hf32
 
-    def _iter_row_batches(self, rows: list[torch.Tensor], batch_tokens: int):
-        """This rank's rows (i % world == rank), length-sorted, as padded batches."""
+    def _iter_row_batches(
+        self, rows: list[torch.Tensor], batch_tokens: int, keys: list[str] | None = None
+    ):
+        """This rank's rows, length-sorted, as padded batches.
+
+        Rows are owned by i % world, or by a stable hash of ``keys[i]`` so a draft
+        scored across several calls always lands on the same rank.
+        """
+        import zlib
+
         world = torch.distributed.get_world_size()
+
+        def owner(i):
+            return (zlib.crc32(keys[i].encode()) if keys is not None else i) % world
+
         mine = sorted(
-            (i for i in range(len(rows)) if i % world == self.rank),
+            (i for i in range(len(rows)) if owner(i) == self.rank),
             key=lambda i: rows[i].numel(),
         )
         b = 0
@@ -488,6 +500,8 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         vocab_limit: int,
         batch_tokens: int = 16384,
         precision: str = "model",
+        keys: list[str] | None = None,
+        from_lens: list[int] | None = None,
     ) -> int:
         """Learner at theta_k (before its step): keep each draft's full log q.
 
@@ -495,14 +509,24 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         for ``verify_drafts_block`` at the next iteration.
         """
         self.model.eval()
-        self._spec_q = {}
+        # Keyed mode appends the q of tokens drafted since the last deadline
+        # (from_lens[i] onwards) to what earlier iterations stored: each
+        # position keeps the q of the weights that actually drafted it.
+        if keys is None:
+            self._spec_q = {}
+        elif not hasattr(self, "_spec_q"):
+            self._spec_q = {}
         self._scorer_tf32 = precision == "tf32"
         self._active_scorer = self._fp32_scorer() if precision in ("fp32", "tf32") else None
-        for group, ids, logits in self._iter_row_batches(rows, batch_tokens):
+        for group, ids, logits in self._iter_row_batches(rows, batch_tokens, keys):
             for r, i in enumerate(group):
                 n, plen = rows[i].numel(), prompt_lens[i]
-                lq = torch.log_softmax(logits[r, plen - 1 : n - 1, :vocab_limit].float(), -1)
-                self._spec_q[i] = lq.to(torch.bfloat16)
+                start = plen - 1 + (from_lens[i] if from_lens is not None else 0)
+                lq = torch.log_softmax(logits[r, start : n - 1, :vocab_limit].float(), -1)
+                lq = lq.to(torch.bfloat16)
+                key = keys[i] if keys is not None else i
+                prev = self._spec_q.get(key) if keys is not None else None
+                self._spec_q[key] = lq if prev is None else torch.cat([prev, lq])
         self._active_scorer = None
         return len(self._spec_q)
 
@@ -515,6 +539,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         seed: int,
         batch_tokens: int = 16384,
         precision: str = "model",
+        keys: list[str] | None = None,
     ) -> list[tuple[int, dict[str, Any]]]:
         """Learner at theta_{k+1}: block-verify each draft against the stored q.
 
@@ -529,12 +554,13 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         results = []
         self._scorer_tf32 = precision == "tf32"
         self._active_scorer = self._fp32_scorer() if precision in ("fp32", "tf32") else None
-        for group, ids, logits in self._iter_row_batches(rows, batch_tokens):
+        for group, ids, logits in self._iter_row_batches(rows, batch_tokens, keys):
             for r, i in enumerate(group):
                 n, plen = rows[i].numel(), prompt_lens[i]
                 g = n - plen
                 lp = torch.log_softmax(logits[r, plen - 1 : n, :vocab_limit].float(), -1)
-                lq = self._spec_q.pop(i).float()  # [g, V]
+                lq = self._spec_q.pop(keys[i] if keys is not None else i).float()  # [g, V]
+                assert lq.shape[0] == g, (lq.shape, g)
                 draft = ids[r, plen:n]
                 ar = torch.arange(g, device="cuda")
                 lr = lp[ar, draft] - lq[ar, draft]  # log p/q of draft tokens
@@ -567,7 +593,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
     # ---- Deadline-truncated streaming drafts (generation rank 0) ----
 
     def start_drafts(
-        self, prompts: list[list[int]], max_new_tokens: int, stream_interval: int
+        self, prompts: list[list[int]], max_new_tokens: int | list[int], stream_interval: int
     ) -> bool:
         """Submit draft requests as streams and return immediately.
 
@@ -579,19 +605,25 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
 
         if self.inference_client is None or self._inference_loop is None:
             return False
-        self._draft_tokens = [[] for _ in prompts]
-        self._draft_done = [False] * len(prompts)
-        self._draft_streams = {}
+        # Fresh buffers per call, captured by the coroutines below: streams aborted
+        # at an earlier deadline may still deliver late frames, which must not
+        # land in this round's drafts.
+        tokens = [[] for _ in prompts]
+        done = [False] * len(prompts)
+        streams = {}
+        self._draft_tokens, self._draft_done, self._draft_streams = tokens, done, streams
 
         async def run_one(i, prompt):
             sp = self._build_sampling_params(greedy=False, stop_words=None)
-            sp.num_tokens_to_generate = max_new_tokens
+            sp.num_tokens_to_generate = (
+                max_new_tokens[i] if isinstance(max_new_tokens, list) else max_new_tokens
+            )
             sp.streaming_interval = stream_interval
             stream = self.inference_client.add_request_streaming(prompt, sp)
-            self._draft_streams[i] = stream
+            streams[i] = stream
             async for frame in stream:
                 if "partial" in frame:
-                    self._draft_tokens[i].extend(frame["partial"]["new_tokens"])
+                    tokens[i].extend(frame["partial"]["new_tokens"])
                 elif "final" in frame:
                     final = frame["final"]
                     toks = (
@@ -599,8 +631,8 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                         if isinstance(final, dict)
                         else final.generated_tokens
                     )
-                    self._draft_tokens[i] = list(toks)
-                    self._draft_done[i] = True
+                    tokens[i][:] = list(toks)
+                    done[i] = True
 
         for i, p in enumerate(prompts):
             asyncio.run_coroutine_threadsafe(run_one(i, list(p)), self._inference_loop)
@@ -610,11 +642,15 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         """Abort unfinished drafts; return (tokens, finished) per draft."""
         import asyncio
 
-        async def abort_all():
-            for i, stream in list(self._draft_streams.items()):
-                if not self._draft_done[i]:
-                    self.inference_client.abort_request(stream.request_id)
-            await asyncio.sleep(0)
+        tokens, done, streams = self._draft_tokens, self._draft_done, self._draft_streams
 
-        asyncio.run_coroutine_threadsafe(abort_all(), self._inference_loop).result()
-        return [(list(t), d) for t, d in zip(self._draft_tokens, self._draft_done)]
+        async def abort_and_snapshot():
+            # Snapshot on the loop thread so no frame is half-applied.
+            for i, stream in list(streams.items()):
+                if not done[i]:
+                    self.inference_client.abort_request(stream.request_id)
+            return [(list(t), d) for t, d in zip(tokens, done)]
+
+        return asyncio.run_coroutine_threadsafe(
+            abort_and_snapshot(), self._inference_loop
+        ).result()

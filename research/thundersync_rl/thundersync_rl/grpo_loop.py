@@ -35,6 +35,8 @@ finishes; ``granularity=batch`` defers everything until all rollouts finish
 from __future__ import annotations
 
 import asyncio
+import collections
+import itertools
 import os
 import time
 from types import SimpleNamespace
@@ -119,6 +121,10 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # learner's own bf16 forward) or "fp32" (HF fp32 copy with the same weights,
     # removing activation-rounding noise from the p/q ratio).
     verify_precision: Literal["model", "fp32", "tf32"] = "model"
+    # Block mode: number of future iterations drafted concurrently. With > 1 a
+    # draft cut off at one deadline resumes (from its prefix, under the newer
+    # weights) in the next iteration, so drafts can cover whole rollouts.
+    draft_lookahead: int = 1
 
 
 class ThunderSyncMasterConfig(MasterConfig):
@@ -674,10 +680,17 @@ def thundersync_grpo_train(
         print("[spec selftest]", asyncio.run(spec.self_test(prompts)), flush=True)
         spec.draft_budget = budget
     batches = iter(dataloader)
-    next_batch = next(batches, None)
+    upcoming = collections.deque(
+        b for b in itertools.islice(batches, max(1, ts_cfg.draft_lookahead) + 1)
+    )
     drafts = None
-    while next_batch is not None:
-        batch, next_batch = next_batch, next(batches, None)
+    cohort_mode = spec is not None and ts_cfg.verify_mode == "block" and ts_cfg.draft_lookahead > 1
+    while upcoming:
+        batch = upcoming.popleft()
+        nb = next(batches, None)
+        if nb is not None:
+            upcoming.append(nb)
+        next_batch = upcoming[0] if upcoming else None
         if step >= max_steps:
             break
         t0 = time.perf_counter()
@@ -687,12 +700,28 @@ def thundersync_grpo_train(
             policy_generation.prepare_for_generation()
         t_refit = time.perf_counter() - t0
         t_verify = 0.0
-        if spec is not None and drafts is not None:
+        if cohort_mode:
+            t1 = time.perf_counter()
+            spec.verify_cohort(step)
+            t_verify = time.perf_counter() - t1
+        elif spec is not None and drafts is not None:
             t1 = time.perf_counter()
             spec.verify(drafts)
             t_verify = time.perf_counter() - t1
         drafter = None
-        if spec is not None and next_batch is not None and step + 1 < max_steps:
+
+        def _prompts(b):
+            r = b.repeat_interleave(G)
+            return [torch.cat([m["token_ids"] for m in r["message_log"][i]]) for i in range(r.size)]
+
+        if cohort_mode:
+            new = {
+                step + 1 + j: _prompts(b)
+                for j, b in enumerate(list(upcoming)[: ts_cfg.draft_lookahead])
+                if step + 1 + j < max_steps
+            }
+            drafter = lambda new=new, step=step: spec.draft_cohorts(step, new)  # noqa: E731
+        elif spec is not None and next_batch is not None and step + 1 < max_steps:
             nxt = next_batch.repeat_interleave(G)
             next_prompts = [
                 torch.cat([m["token_ids"] for m in nxt["message_log"][i]])
