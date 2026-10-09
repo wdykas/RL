@@ -311,6 +311,14 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 jitter.append(
                     (float(getattr(sp, "draft_variant", 0)), float(getattr(sp, "variant_eps", 0.0)))
                 )
+            if os.environ.get("THUNDERSYNC_SPEC_DEBUG"):
+                ctx_len = context.get_active_sequence_lengths()[:n].tolist()
+                pre = context.request_in_prefill_status_tensor[lo:hi].tolist()[:n]
+                for j, rid in enumerate(context.request_ids[lo:hi].tolist()[:n]):
+                    if seeds[j] == 1 and positions[j] - len(engine.get_request(rid).prompt_tokens) < 8:
+                        print(f"[keyed dbg] call ctx_len={ctx_len[j]} prefill={pre[j]} "
+                              f"req_pos={positions[j]} prompt={len(engine.get_request(rid).prompt_tokens)}",
+                              flush=True)
             if all(s < 0 for s in seeds):
                 return orig_kernel(logits, n, context, gather_indices=gather_indices,
                                    output=output, **kw)
@@ -419,3 +427,105 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 )
             del logits
         return results
+
+    # ---- Block verification (Sun et al. 2024) with learner-side q ----
+
+    def _iter_row_batches(self, rows: list[torch.Tensor], batch_tokens: int):
+        """This rank's rows (i % world == rank), length-sorted, as padded batches."""
+        world = torch.distributed.get_world_size()
+        mine = sorted(
+            (i for i in range(len(rows)) if i % world == self.rank),
+            key=lambda i: rows[i].numel(),
+        )
+        b = 0
+        while b < len(mine):
+            e = b + 1
+            while e < len(mine) and rows[mine[e]].numel() * (e + 1 - b) <= batch_tokens:
+                e += 1
+            group = mine[b:e]
+            b = e
+            s = max(rows[i].numel() for i in group)
+            ids = torch.zeros((len(group), s), dtype=torch.long)
+            for r, i in enumerate(group):
+                ids[r, : rows[i].numel()] = rows[i]
+            ids = ids.cuda()
+            pos = torch.arange(s, device="cuda").expand(len(group), -1)
+            logits = self.model(input_ids=ids, position_ids=pos, attention_mask=None)
+            yield group, ids, logits
+            del logits
+
+    @torch.no_grad()
+    def score_drafts_q(
+        self,
+        rows: list[torch.Tensor],
+        prompt_lens: list[int],
+        vocab_limit: int,
+        batch_tokens: int = 16384,
+    ) -> int:
+        """Learner at theta_k (before its step): keep each draft's full log q.
+
+        Stores log q(. | prompt, draft[:i]) for i = 0..len(draft)-1 in bf16 on GPU
+        for ``verify_drafts_block`` at the next iteration.
+        """
+        self.model.eval()
+        self._spec_q = {}
+        for group, ids, logits in self._iter_row_batches(rows, batch_tokens):
+            for r, i in enumerate(group):
+                n, plen = rows[i].numel(), prompt_lens[i]
+                lq = torch.log_softmax(logits[r, plen - 1 : n - 1, :vocab_limit].float(), -1)
+                self._spec_q[i] = lq.to(torch.bfloat16)
+        return len(self._spec_q)
+
+    @torch.no_grad()
+    def verify_drafts_block(
+        self,
+        rows: list[torch.Tensor],
+        prompt_lens: list[int],
+        vocab_limit: int,
+        seed: int,
+        batch_tokens: int = 16384,
+    ) -> list[tuple[int, dict[str, Any]]]:
+        """Learner at theta_{k+1}: block-verify each draft against the stored q.
+
+        Keeps X[:tau] and emits Y: the bonus token from p if the whole draft is
+        accepted, else a sample from the block residual max(b_tau p - q, 0).
+        Output is distributed exactly as p given that q is the draft's sampling
+        distribution (Sun et al. 2024, "Block Verification Accelerates
+        Speculative Decoding").
+        """
+        self.model.eval()
+        gen = torch.Generator(device="cuda").manual_seed(seed * 1_000_003 + self.rank)
+        results = []
+        for group, ids, logits in self._iter_row_batches(rows, batch_tokens):
+            for r, i in enumerate(group):
+                n, plen = rows[i].numel(), prompt_lens[i]
+                g = n - plen
+                lp = torch.log_softmax(logits[r, plen - 1 : n, :vocab_limit].float(), -1)
+                lq = self._spec_q.pop(i).float()  # [g, V]
+                draft = ids[r, plen:n]
+                ar = torch.arange(g, device="cuda")
+                lr = lp[ar, draft] - lq[ar, draft]  # log p/q of draft tokens
+                s_cum = torch.cat([torch.zeros(1, device="cuda"), torch.cumsum(lr.double(), 0)])
+                log_b = s_cum - torch.cummax(s_cum, 0).values  # log b_i, i = 0..g
+                b = log_b.exp()
+                resid = (b[:g, None] * lp[:g].exp() - lq.exp()).clamp_(min=0)  # [g, V]
+                r_mass = resid.sum(-1).double()
+                denom = r_mass + 1 - b[:g]
+                h = torch.where(denom > 0, r_mass / denom.clamp(min=1e-300), torch.ones_like(denom))
+                h = torch.cat([h, b[g:]])  # h_g = b_g
+                eta = torch.rand(g + 1, device="cuda", generator=gen, dtype=torch.float64)
+                ok = torch.nonzero(eta <= h).flatten()
+                tau = int(ok.max())
+                if tau == g:
+                    dist = lp[g].exp()
+                else:
+                    dist = resid[tau]
+                y = int(torch.multinomial(dist / dist.sum(), 1, generator=gen))
+                kept = torch.cat([draft[:tau], torch.tensor([y], device="cuda")])
+                lps = lp[torch.arange(tau + 1, device="cuda"), kept].tolist()
+                results.append((i, {"accepted": tau, "next": y, "logprobs": lps}))
+        return results
+
+    def termination_id(self) -> int | None:
+        tok = getattr(self, "megatron_tokenizer", None)
+        return None if tok is None else int(tok.eod)

@@ -111,6 +111,10 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # the target may flip. The longest verified prefix is kept (exact).
     draft_variants: int = 1
     variant_eps: float = 0.02
+    # "block": randomized block verification (Sun et al. 2024) on the learner with
+    # the drafts' q scored at theta_k before the optimizer step (highest
+    # acceptance). "keyed": shared-noise Gumbel verification (no q needed).
+    verify_mode: Literal["block", "keyed"] = "block"
 
 
 class ThunderSyncMasterConfig(MasterConfig):
@@ -289,6 +293,7 @@ async def _run_one_step(
     ts_cfg: ThunderSyncConfig,
     adv_fn,
     drafter=None,
+    before_finish=None,
 ) -> dict[str, Any]:
     G = master_config.grpo.num_generations_per_prompt
     repeated = batch.repeat_interleave(G)
@@ -432,6 +437,10 @@ async def _run_one_step(
         t_wait = time.perf_counter()
         drafts = await draft_task if draft_task is not None else None
         draft_wait = time.perf_counter() - t_wait
+        t_score = time.perf_counter()
+        if before_finish is not None and drafts is not None:
+            before_finish(drafts)  # learner still holds theta_k
+        draft_score = time.perf_counter() - t_score
     except BaseException:
         if draft_task is not None:
             draft_task.cancel()
@@ -610,6 +619,7 @@ async def _run_one_step(
         "timeline/dispatches": dispatches,
         "timeline/step_end": t_end - t_start,
         "time/draft_wait": draft_wait,
+        "time/draft_score": draft_score,
         "_drafts": drafts,
         **drift,
     }
@@ -647,6 +657,7 @@ def thundersync_grpo_train(
             pad_token_id=tokenizer.pad_token_id,
             draft_variants=ts_cfg.draft_variants,
             variant_eps=ts_cfg.variant_eps,
+            verify_mode=ts_cfg.verify_mode,
         )
     G = master_config.grpo.num_generations_per_prompt
     if spec is not None and os.environ.get("THUNDERSYNC_SPEC_SELFTEST"):
@@ -695,6 +706,7 @@ def thundersync_grpo_train(
                 ts_cfg=ts_cfg,
                 adv_fn=adv_fn,
                 drafter=drafter,
+                before_finish=spec.score_prev if spec is not None else None,
             )
         )
         drafts = metrics.pop("_drafts")

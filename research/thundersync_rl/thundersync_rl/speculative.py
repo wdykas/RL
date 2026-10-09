@@ -68,6 +68,7 @@ class SpeculativeGeneration:
         pad_token_id: int,
         draft_variants: int = 1,
         variant_eps: float = 0.0,
+        verify_mode: str = "keyed",
     ):
         self.base = base
         self.learner_policy = learner_policy
@@ -78,14 +79,23 @@ class SpeculativeGeneration:
         self.pad_token_id = pad_token_id
         self.draft_variants = draft_variants
         self.variant_eps = variant_eps
+        self.verify_mode = verify_mode
+        if verify_mode == "block":
+            # Randomized block verification: drafts use the engine's own sampler,
+            # which draws from the full (padded) vocabulary, so p and q must too.
+            self.draft_variants = 1
+            self.vocab_limit = 1 << 30
         workers = base._policy.worker_group
         eods = ray.get(
             workers.run_all_workers_single_data(
                 "install_keyed_sampler", vocab_limit=vocab_limit, head_k=head_k
             )
+            if verify_mode == "keyed"
+            else workers.run_all_workers_single_data("termination_id")
         )
         self.eod = next(e for e in eods if e is not None)
         self._seeds = itertools.count(1)
+        self._verify_seeds = itertools.count(1)
         self.plans: dict[tuple[int, ...], list[Plan]] = defaultdict(list)
         self.stats: dict[str, float] = {}
 
@@ -106,18 +116,20 @@ class SpeculativeGeneration:
         ids = torch.full((len(rows), width), self.pad_token_id, dtype=torch.long)
         for r, (i, _) in enumerate(rows):
             ids[r, : prompts[i].numel()] = prompts[i]
-        data = BatchedDataDict(
-            {
-                "input_ids": ids,
-                "input_lengths": torch.tensor([prompts[i].numel() for i, _ in rows]),
-                "noise_seed": torch.tensor([seeds[i] for i, _ in rows]),
-                "max_new_tokens": torch.full((len(rows),), self.draft_budget),
-                "draft_variant": torch.tensor([v for _, v in rows]),
-                "variant_eps": torch.tensor(
-                    [self.variant_eps if v else 0.0 for _, v in rows], dtype=torch.float64
-                ),
-            }
-        )
+        fields = {
+            "input_ids": ids,
+            "input_lengths": torch.tensor([prompts[i].numel() for i, _ in rows]),
+            "max_new_tokens": torch.full((len(rows),), self.draft_budget),
+        }
+        if self.verify_mode == "keyed":
+            fields["noise_seed"] = torch.tensor([seeds[i] for i, _ in rows])
+            fields["draft_variant"] = torch.tensor([v for _, v in rows])
+            fields["variant_eps"] = torch.tensor(
+                [self.variant_eps if v else 0.0 for _, v in rows], dtype=torch.float64
+            )
+        else:
+            seeds = [-1] * len(prompts)
+        data = BatchedDataDict(fields)
         out: list[list[Any]] = [[None] * m for _ in prompts]
         async for r, res in self.base.generate_async(data):
             i, v = rows[r]
@@ -156,19 +168,49 @@ class SpeculativeGeneration:
 
     # -- verification (start of iteration k+1, learner holds theta_{k+1}) -------
 
-    def verify(self, drafts: list[list[tuple[torch.Tensor, int, list[int]]]]) -> None:
+    @staticmethod
+    def _flat_rows(drafts):
         flat = [(t, d) for t, variants in enumerate(drafts) for d in variants]
         rows = [torch.cat([p, torch.tensor(d, dtype=torch.long)]) for _, (p, _, d) in flat]
-        res = ray.get(
+        return flat, rows
+
+    def score_prev(self, drafts) -> None:
+        """Block mode, learner still at theta_k: store each draft's full log q."""
+        if self.verify_mode != "block" or drafts is None:
+            return
+        flat, rows = self._flat_rows(drafts)
+        ray.get(
             self.learner_policy.worker_group.run_all_workers_single_data(
-                "verify_drafts",
+                "score_drafts_q",
                 rows=rows,
                 prompt_lens=[p.numel() for _, (p, _, _) in flat],
-                seeds=[s for _, (_, s, _) in flat],
                 vocab_limit=self.vocab_limit,
-                head_k=self.head_k,
             )
         )
+
+    def verify(self, drafts: list[list[tuple[torch.Tensor, int, list[int]]]]) -> None:
+        flat, rows = self._flat_rows(drafts)
+        if self.verify_mode == "block":
+            res = ray.get(
+                self.learner_policy.worker_group.run_all_workers_single_data(
+                    "verify_drafts_block",
+                    rows=rows,
+                    prompt_lens=[p.numel() for _, (p, _, _) in flat],
+                    vocab_limit=self.vocab_limit,
+                    seed=next(self._verify_seeds),
+                )
+            )
+        else:
+            res = ray.get(
+                self.learner_policy.worker_group.run_all_workers_single_data(
+                    "verify_drafts",
+                    rows=rows,
+                    prompt_lens=[p.numel() for _, (p, _, _) in flat],
+                    seeds=[s for _, (_, s, _) in flat],
+                    vocab_limit=self.vocab_limit,
+                    head_k=self.head_k,
+                )
+            )
         by_row = dict(x for rank_res in res for x in rank_res)
         # Every verified prefix is a prefix of the same keyed target sequence, so
         # the longest one per trajectory is kept.
@@ -218,7 +260,9 @@ class SpeculativeGeneration:
         plen = int(datum["input_lengths"][0])
         prompt = datum["input_ids"][0, :plen]
         queue = self.plans.get(_key(prompt))
-        plan = queue.pop(0) if queue else Plan(seed=next(self._seeds))
+        plan = queue.pop(0) if queue else Plan(
+            seed=next(self._seeds) if self.verify_mode == "keyed" else -1
+        )
         gen = list(plan.prefix)
         lps = list(plan.prefix_logprobs)
         if not plan.complete:
@@ -227,10 +271,11 @@ class SpeculativeGeneration:
                 {
                     "input_ids": ids.view(1, -1),
                     "input_lengths": torch.tensor([ids.numel()]),
-                    "noise_seed": torch.tensor([plan.seed]),
                     "max_new_tokens": torch.tensor([self.max_new_tokens - len(gen)]),
                 }
             )
+            if plan.seed >= 0:
+                cont["noise_seed"] = torch.tensor([plan.seed])
             if "stop_strings" in datum:
                 cont["stop_strings"] = datum["stop_strings"]
             async for _, res in self.base.generate_async(cont):
