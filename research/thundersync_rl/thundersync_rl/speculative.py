@@ -104,9 +104,14 @@ class SpeculativeGeneration:
         # Where stash + block verification run: "learner" or "inference" (the
         # generation workers hold theta_k until the refit and theta_{k+1} after
         # it, and sit idle while rollouts wait for verification).
-        self.verifier = (
-            base._policy.worker_group if verify_on == "inference" else learner_policy.worker_group
-        )
+        groups = {
+            "learner": [learner_policy.worker_group],
+            "inference": [base._policy.worker_group],
+            # Split rows across both pools: all GPUs are idle at verification.
+            "both": [learner_policy.worker_group, base._policy.worker_group],
+        }[verify_on]
+        self.verifiers = groups
+        self.verifier = groups[0]
         self.current_step = 0
         if verify_mode == "block":
             # Randomized block verification: drafts use the engine's own sampler,
@@ -298,12 +303,16 @@ class SpeculativeGeneration:
                 for d in cohort:
                     keep.update(v for v, _, _ in d["segments"])
             ray.get(
-                self.verifier.run_all_workers_single_data(
-                    "stash_weights",
-                    version=self.current_step,
-                    keep=sorted(keep),
-                    precision="fp32" if self.verify_precision in ("fp32", "tf32") else "model",
-                )
+                [
+                    ref
+                    for g in self.verifiers
+                    for ref in g.run_all_workers_single_data(
+                        "stash_weights",
+                        version=self.current_step,
+                        keep=sorted(keep),
+                        precision="fp32" if self.verify_precision in ("fp32", "tf32") else "model",
+                    )
+                ]
             )
             return
         if isinstance(drafts, CohortDrafts):
@@ -338,19 +347,28 @@ class SpeculativeGeneration:
     def verify(self, drafts: list[list[tuple[torch.Tensor, int, list[int]]]]) -> None:
         flat, rows = self._flat_rows(drafts)
         if self.verify_mode == "block" and self.q_storage == "stash":
-            res = ray.get(
-                self.verifier.run_all_workers_single_data(
+            # Contiguous row slices per verifier pool, verified concurrently.
+            k = len(self.verifiers)
+            cuts = [round(j * len(flat) / k) for j in range(k + 1)]
+            seed = next(self._verify_seeds)
+            futs = []
+            for g, a, b in zip(self.verifiers, cuts, cuts[1:]):
+                futs.append((a, g.run_all_workers_single_data(
                     "verify_drafts_block_stashed",
-                    rows=rows,
-                    prompt_lens=[d[0].numel() for _, d in flat],
-                    segments=[d[5] for _, d in flat],
+                    rows=rows[a:b],
+                    prompt_lens=[d[0].numel() for _, d in flat[a:b]],
+                    segments=[d[5] for _, d in flat[a:b]],
                     vocab_limit=self.vocab_limit,
-                    seed=next(self._verify_seeds),
-                    keys=[d[4] for _, d in flat],
+                    seed=seed * 7 + a,
+                    keys=[d[4] for _, d in flat[a:b]],
                     precision="fp32" if self.verify_precision in ("fp32", "tf32") else "model",
                     batch_tokens=self.verify_batch_tokens,
-                )
-            )
+                )))
+            res = [
+                [(a + j, r) for j, r in rank_res]
+                for a, refs in futs
+                for rank_res in ray.get(refs)
+            ]
         elif self.verify_mode == "block":
             res = ray.get(
                 self.learner_policy.worker_group.run_all_workers_single_data(

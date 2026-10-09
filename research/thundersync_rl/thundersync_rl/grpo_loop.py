@@ -140,7 +140,7 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # "inference" (generation) workers. EXPERIMENTAL: "inference" currently hangs
     # at the first verification (the stash call works; the awaited verify call
     # never runs on the generation actors) - see RESUME.md.
-    verify_on: Literal["learner", "inference"] = "learner"
+    verify_on: Literal["learner", "inference", "both"] = "learner"
 
 
 class ThunderSyncMasterConfig(MasterConfig):
@@ -727,7 +727,12 @@ def thundersync_grpo_train(
         if spec is not None:
             spec.current_step = step
         pre_rollout = None
-        chunked = spec is not None and ts_cfg.verify_mode == "block" and ts_cfg.q_storage == "stash"
+        chunked = (
+            spec is not None
+            and ts_cfg.verify_mode == "block"
+            and ts_cfg.q_storage == "stash"
+            and ts_cfg.verify_on == "learner"  # inference: blocking path (see verify_on)
+        )
         if cohort_mode and chunked:
             cohort = spec.cohorts.pop(step, None)
             if cohort is not None:

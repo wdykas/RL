@@ -812,8 +812,20 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
 
         torch.cuda.synchronize()
         t0 = time.perf_counter()
+        # On generation workers Megatron's global InferenceMode is active while the
+        # engine runs; it requires gathered TP logits from any forward.
+        gather_kw = {}
+        try:
+            from megatron.core.inference.utils import InferenceMode
+
+            if InferenceMode.is_active():
+                gather_kw["runtime_gather_output"] = True
+        except ImportError:
+            pass
         if ps.get_pipeline_model_parallel_world_size() == 1:
-            logits = scorer(input_ids=ids, position_ids=pos, attention_mask=None).float()
+            logits = scorer(
+                input_ids=ids, position_ids=pos, attention_mask=None, **gather_kw
+            ).float()
         else:
             # Run the pipeline schedule forward-only; logits exist on the last stage.
             from megatron.core.pipeline_parallel import get_forward_backward_func
@@ -845,7 +857,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 return None
             logits = captured[0]
         tp = ps.get_tensor_model_parallel_world_size()
-        if tp > 1:
+        if tp > 1 and not gather_kw:
             # Vocab-parallel logits -> full vocab for this batch only (memory is
             # bounded by batch_tokens, not by the number of draft tokens).
             parts = [torch.empty_like(logits) for _ in range(tp)]
