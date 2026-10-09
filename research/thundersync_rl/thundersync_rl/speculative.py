@@ -376,28 +376,81 @@ class SpeculativeGeneration:
         kept = total = full = 0
         for i in range(len(drafts)):
             d, r = best[i]
-            prompt, seed, draft = d[0], d[1], d[2]
-            n_acc = r["accepted"]
-            # The draft terminated on its own (EOS/stop) rather than at the budget
-            # or the deadline: a fully accepted draft is then a finished rollout.
-            finished = d[3] if len(d) > 3 else True
-            # Cohort drafts carry the full budget: finished means EOS or the cap.
-            stopped = finished and (len(d) > 4 or len(draft) < self.draft_budget)
-            if n_acc == len(draft) and stopped:
-                plan = Plan(seed, draft, r["logprobs"][:n_acc], complete=True)
-                full += 1
-            else:
-                prefix = draft[:n_acc] + [r["next"]]
-                done = r["next"] == self.eod or len(prefix) >= self.max_new_tokens
-                plan = Plan(seed, prefix, r["logprobs"], complete=done)
-            kept += n_acc
-            total += len(draft)
-            self.plans[_key(prompt)].append(plan)
+            plan = self._plan(d, r)
+            full += plan.complete and r["accepted"] == len(d[2])
+            kept += r["accepted"]
+            total += len(d[2])
+            self.plans[_key(d[0])].append(plan)
         self.stats = {
             "spec/draft_tokens": float(total),
             "spec/accepted_frac": kept / max(total, 1),
             "spec/full_accept": full / max(len(drafts), 1),
             "spec/variant_wins": float(variant_wins),
+        }
+
+    def _plan(self, d, r) -> Plan:
+        """Turn one draft and its verification result into a rollout plan."""
+        prompt, seed, draft = d[0], d[1], d[2]
+        n_acc = r["accepted"]
+        # The draft terminated on its own (EOS/stop) rather than at the budget
+        # or the deadline: a fully accepted draft is then a finished rollout.
+        finished = d[3] if len(d) > 3 else True
+        # Cohort/streamed drafts carry the full budget: finished = EOS or the cap.
+        stopped = finished and (len(d) > 4 or len(draft) < self.draft_budget)
+        if n_acc == len(draft) and stopped:
+            return Plan(seed, draft, r["logprobs"][:n_acc], complete=True)
+        prefix = draft[:n_acc] + [r["next"]]
+        done = r["next"] == self.eod or len(prefix) >= self.max_new_tokens
+        return Plan(seed, prefix, r["logprobs"], complete=done)
+
+    async def verify_chunked(self, drafts, chunks: int) -> None:
+        """Stash-mode verification in ``chunks`` pieces, publishing plans as each
+        chunk finishes so rollouts start without waiting for the whole batch.
+
+        Chunks keep the drafts' order (no prioritization); every chunk call is
+        queued on the learner at once and processed in order.
+        """
+        flat, rows = self._flat_rows(drafts)
+        self.plans.clear()
+        self._pending = defaultdict(int)
+        for _, d in flat:
+            self._pending[_key(d[0])] += 1
+        self._plan_cv = asyncio.Condition()
+        n = len(flat)
+        bounds = [round(c * n / chunks) for c in range(chunks + 1)]
+        calls = []
+        for a, b in zip(bounds, bounds[1:]):
+            if b <= a:
+                continue
+            refs = self.learner_policy.worker_group.run_all_workers_single_data(
+                "verify_drafts_block_stashed",
+                rows=rows[a:b],
+                prompt_lens=[d[0].numel() for _, d in flat[a:b]],
+                segments=[d[5] for _, d in flat[a:b]],
+                vocab_limit=self.vocab_limit,
+                seed=next(self._verify_seeds),
+                keys=[d[4] for _, d in flat[a:b]],
+                precision="fp32" if self.verify_precision in ("fp32", "tf32") else "model",
+            )
+            calls.append((a, refs))
+        kept = total = full = 0
+        for a, refs in calls:
+            res = await asyncio.gather(*[asyncio.wrap_future(r.future()) for r in refs])
+            by_row = dict(x for rank_res in res for x in rank_res)
+            async with self._plan_cv:
+                for j, r in by_row.items():
+                    d = flat[a + j][1]
+                    plan = self._plan(d, r)
+                    full += plan.complete and r["accepted"] == len(d[2])
+                    kept += r["accepted"]
+                    total += len(d[2])
+                    self.plans[_key(d[0])].append(plan)
+                    self._pending[_key(d[0])] -= 1
+                self._plan_cv.notify_all()
+        self.stats = {
+            "spec/draft_tokens": float(total),
+            "spec/accepted_frac": kept / max(total, 1),
+            "spec/full_accept": full / max(n, 1),
         }
 
     # -- GenerationInterface used by the rollout ----------------------------------
@@ -415,7 +468,14 @@ class SpeculativeGeneration:
     async def _one(self, index: int, datum: BatchedDataDict):
         plen = int(datum["input_lengths"][0])
         prompt = datum["input_ids"][0, :plen]
-        queue = self.plans.get(_key(prompt))
+        key = _key(prompt)
+        cv = getattr(self, "_plan_cv", None)
+        if cv is not None:
+            # Chunked verification: wait until this trajectory's plan is published.
+            async with cv:
+                while not self.plans.get(key) and self._pending.get(key, 0) > 0:
+                    await cv.wait()
+        queue = self.plans.get(key)
         plan = queue.pop(0) if queue else Plan(
             seed=next(self._seeds) if self.verify_mode == "keyed" else -1
         )

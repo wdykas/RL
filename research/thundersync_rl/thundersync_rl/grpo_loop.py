@@ -128,6 +128,9 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # Block mode q storage: "stash" recomputes q at verification from stashed
     # weights (O(params) memory, scales); "full" stores full-vocab q per token.
     q_storage: Literal["stash", "full"] = "stash"
+    # Stash mode: verify in this many chunks concurrently with the rollouts,
+    # publishing each chunk's plans as soon as it is verified.
+    verify_chunks: int = 1
 
 
 class ThunderSyncMasterConfig(MasterConfig):
@@ -307,6 +310,7 @@ async def _run_one_step(
     adv_fn,
     drafter=None,
     before_finish=None,
+    pre_rollout=None,
 ) -> dict[str, Any]:
     G = master_config.grpo.num_generations_per_prompt
     repeated = batch.repeat_interleave(G)
@@ -408,6 +412,7 @@ async def _run_one_step(
             if rollouts_done and not planner.has_work():
                 return
 
+    verify_task = asyncio.create_task(pre_rollout()) if pre_rollout is not None else None
     learner_task = asyncio.create_task(learner_loop())
     draft_task = None
     n_done = 0
@@ -447,6 +452,8 @@ async def _run_one_step(
         rollouts_done = True
         wake.set()
         await learner_task
+        if verify_task is not None:
+            await verify_task
         t_wait = time.perf_counter()
         drafts = await draft_task if draft_task is not None else None
         if callable(drafts):  # streaming drafts: cut them off at this deadline
@@ -706,7 +713,19 @@ def thundersync_grpo_train(
         t_verify = 0.0
         if spec is not None:
             spec.current_step = step
-        if cohort_mode:
+        pre_rollout = None
+        chunked = spec is not None and ts_cfg.verify_mode == "block" and ts_cfg.q_storage == "stash"
+        if cohort_mode and chunked:
+            cohort = spec.cohorts.pop(step, None)
+            if cohort is not None:
+                cdrafts = [
+                    [(d["prompt"], -1, d["tokens"], d["finished"], d["key"], d["segments"])]
+                    for d in cohort
+                ]
+                pre_rollout = lambda c=cdrafts: spec.verify_chunked(c, ts_cfg.verify_chunks)  # noqa: E731
+        elif chunked and drafts is not None:
+            pre_rollout = lambda d=drafts: spec.verify_chunked(d, ts_cfg.verify_chunks)  # noqa: E731
+        elif cohort_mode:
             t1 = time.perf_counter()
             spec.verify_cohort(step)
             t_verify = time.perf_counter() - t1
@@ -753,6 +772,7 @@ def thundersync_grpo_train(
                 adv_fn=adv_fn,
                 drafter=drafter,
                 before_finish=spec.score_prev if spec is not None else None,
+                pre_rollout=pre_rollout,
             )
         )
         drafts = metrics.pop("_drafts")
