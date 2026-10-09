@@ -131,6 +131,8 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # Stash mode: verify in this many chunks concurrently with the rollouts,
     # publishing each chunk's plans as soon as it is verified.
     verify_chunks: int = 1
+    # Tokens per scorer forward batch at verification (bounds logits memory).
+    verify_batch_tokens: int = 16384
 
 
 class ThunderSyncMasterConfig(MasterConfig):
@@ -682,6 +684,7 @@ def thundersync_grpo_train(
             verify_mode=ts_cfg.verify_mode,
             verify_precision=ts_cfg.verify_precision,
             q_storage=ts_cfg.q_storage,
+            verify_batch_tokens=ts_cfg.verify_batch_tokens,
         )
     G = master_config.grpo.num_generations_per_prompt
     if spec is not None and os.environ.get("THUNDERSYNC_SPEC_SELFTEST"):

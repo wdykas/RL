@@ -79,6 +79,7 @@ class SpeculativeGeneration:
         verify_mode: str = "keyed",
         verify_precision: str = "model",
         q_storage: str = "full",
+        verify_batch_tokens: int = 16384,
     ):
         self.base = base
         self.learner_policy = learner_policy
@@ -96,6 +97,7 @@ class SpeculativeGeneration:
         # "stash": stash theta_k's weights and recompute q per batch at
         # verification (O(params + batch x vocab)); scales to large models.
         self.q_storage = q_storage
+        self.verify_batch_tokens = verify_batch_tokens
         self.current_step = 0
         if verify_mode == "block":
             # Randomized block verification: drafts use the engine's own sampler,
@@ -337,6 +339,7 @@ class SpeculativeGeneration:
                     seed=next(self._verify_seeds),
                     keys=[d[4] for _, d in flat],
                     precision="fp32" if self.verify_precision in ("fp32", "tf32") else "model",
+                    batch_tokens=self.verify_batch_tokens,
                 )
             )
         elif self.verify_mode == "block":
@@ -430,6 +433,7 @@ class SpeculativeGeneration:
                 vocab_limit=self.vocab_limit,
                 seed=next(self._verify_seeds),
                 keys=[d[4] for _, d in flat[a:b]],
+                batch_tokens=self.verify_batch_tokens,
                 precision="fp32" if self.verify_precision in ("fp32", "tf32") else "model",
             )
             calls.append((a, refs))
