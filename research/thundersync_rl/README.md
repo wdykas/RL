@@ -259,3 +259,50 @@ and the cap).
 - DP-sharded accumulators (reduce-scatter on capture): would divide accumulator memory by the DP size.
 - Lower per-micro-batch CPU overhead in the Megatron training path (CUDA graphs or larger packed
   micro-batches). This is what limits trajectory granularity on small models.
+
+## Cross-iteration speculative rollouts (`thundersync.speculate`)
+
+Zero staleness forces a drain at every update: iteration k+1 cannot sample until
+theta_{k+1} exists. We draft iteration k+1's rollouts *during* iteration k under
+theta_k and verify them exactly once theta_{k+1} is available.
+
+Key measurements (Qwen2.5-Math-1.5B, bf16):
+
+* One update moves the policy less than bf16 rounding noise: per-token rejection
+  pi_k -> pi_{k+1} is ~1.7e-3 and identical for drafts made 1-4 iterations earlier
+  (lag-flat), and identical between engines at equal weights. In fp32 the true
+  one-step drift is ~3e-4. Forecasting theta_{k+1} (momentum, exact Adam state)
+  does not help at bf16; precision does (fp32 LM head: 1.7e-3 -> 1.1e-3).
+* Token-level verification keeps ~60% of draft tokens; block verification (Sun
+  et al. 2024) ~87-91%, because the noise has random sign and cancels across a
+  block.
+
+Design (`speculative.py`, worker methods in `worker.py`):
+
+1. Once `draft_start_frac` of iteration k's rollouts finished, the engine streams
+   drafts for iteration k+1's prompts (`start_drafts`); they are aborted at the
+   deadline right before the optimizer step (`collect_drafts`) - any prefix is a
+   valid draft.
+2. Still at theta_k, the learner scores every draft's full q (`score_drafts_q`).
+3. After the step, the learner block-verifies the drafts against theta_{k+1}
+   (`verify_drafts_block`) and samples the bonus/residual token; the engine decodes
+   only the remainders. The rollout code is unchanged (`SpeculativeGeneration`
+   wraps the generation interface).
+
+Exactness: block verification returns exact samples of p given the drafts' true
+q. q is computed with trainer numerics while drafts are sampled by the inference
+engine, so samples are exact up to the train/inference numerical mismatch (the
+same envelope ordinary RL already has); with batch-invariant kernels (NeMo-RL PR
+3208) q is bitwise the sampling distribution. `verify_mode=keyed` is an exactly
+on-policy alternative (position-keyed Gumbel-max sampling, Triton kernel
+`keyed_sampling.py`) with token-level acceptance.
+
+Results (2 gen + 2 train GPUs, 6 steps, group streaming):
+
+| config | iteration s | rollout s | draft tokens kept |
+|---|---|---|---|
+| baseline | 7.65 | 7.02 | - |
+| keyed verification | 6.92 | 5.65 | 51% |
+| block verification | 6.28 | 3.40 | 87% |
+| + zero-adv skip + streaming drafts | 5.48 | 4.03 | 86% |
+| + fp32 LM head | 4.45 | 3.10 | 91% |
