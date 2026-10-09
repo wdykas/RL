@@ -35,6 +35,7 @@ finishes; ``granularity=batch`` defers everything until all rollouts finish
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from types import SimpleNamespace
 from typing import Any, Literal, Optional
@@ -59,6 +60,7 @@ from nemo_rl.experience.rollouts import run_sample_multi_turn_rollout
 from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.logger import Logger
+from thundersync_rl.speculative import SpeculativeGeneration
 from thundersync_rl.streaming import (
     Chunk,
     StreamingLearner,
@@ -95,6 +97,20 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # forward passes) and log how much of it cross-iteration speculative
     # rollouts would keep (see policy_drift_metrics).
     measure_policy_drift: bool = False
+    # Exact cross-iteration speculative rollouts (speculative.py): draft the next
+    # iteration's rollouts under the current weights once ``draft_start_frac`` of
+    # this iteration's rollouts have finished (up to ``draft_budget`` tokens
+    # each), verify them on the learner under the next weights, and decode only
+    # the rejected remainders.
+    speculate: bool = False
+    draft_budget: int = 1024
+    draft_start_frac: float = 0.5
+    spec_head_k: int = 64
+    # Drafts per trajectory sharing its keys; variants > 0 jitter the head
+    # log-probs by keyed logistic noise of scale ``variant_eps`` to explore races
+    # the target may flip. The longest verified prefix is kept (exact).
+    draft_variants: int = 1
+    variant_eps: float = 0.02
 
 
 class ThunderSyncMasterConfig(MasterConfig):
@@ -272,6 +288,7 @@ async def _run_one_step(
     master_config: ThunderSyncMasterConfig,
     ts_cfg: ThunderSyncConfig,
     adv_fn,
+    drafter=None,
 ) -> dict[str, Any]:
     G = master_config.grpo.num_generations_per_prompt
     repeated = batch.repeat_interleave(G)
@@ -374,9 +391,16 @@ async def _run_one_step(
                 return
 
     learner_task = asyncio.create_task(learner_loop())
+    draft_task = None
+    n_done = 0
     try:
         for fut in asyncio.as_completed([rollout(i) for i in range(n)]):
             i, state, metrics = await fut
+            n_done += 1
+            if drafter is not None and draft_task is None and (
+                n_done >= ts_cfg.draft_start_frac * n
+            ):
+                draft_task = asyncio.create_task(drafter())
             if learner_task.done():
                 # Surface learner failures now instead of after the last rollout.
                 learner_task.result()
@@ -405,7 +429,12 @@ async def _run_one_step(
         rollouts_done = True
         wake.set()
         await learner_task
+        t_wait = time.perf_counter()
+        drafts = await draft_task if draft_task is not None else None
+        draft_wait = time.perf_counter() - t_wait
     except BaseException:
+        if draft_task is not None:
+            draft_task.cancel()
         learner_task.cancel()
         learner.abort()
         raise
@@ -426,6 +455,31 @@ async def _run_one_step(
         )
         lp_old = learner.policy.get_logprobs(drift_data)["logprobs"]
         _run_workers(learner.policy, "save_master_weights", tag="k")
+        # Shared-randomness couplings: same per-(row, position) noise at theta_k
+        # and theta_{k+1}; the emitted tokens agree where a draft would be kept.
+        coupling_rows = [
+            drift_data["input_ids"][i, : int(drift_data["input_lengths"][i])]
+            for i in range(drift_data.size)
+            if float(drift_data["sample_mask"][i]) > 0
+        ]
+        coupled_old = [
+            x
+            for x in _run_workers(
+                learner.policy, "coupled_samples", rows=coupling_rows, seed=step
+            )
+            if x is not None
+        ][0]
+        # Multi-iteration lookahead: drafts from theta_{k-m} verified by theta_k.
+        lag_lps = {}
+        for m in range(1, 5):
+            if step - m < 0:
+                continue
+            _run_workers(
+                learner.policy, "load_master_combination", coeffs={f"hist{step - m}": 1.0}
+            )
+            lag_lps[m] = learner.policy.get_logprobs(drift_data)["logprobs"]
+        if lag_lps:
+            _run_workers(learner.policy, "load_master_combination", coeffs={"k": 1.0})
         # Optimizer-state forecast of theta_{k+1} (zero new gradient). Scored
         # now, then theta_k is restored bit-exactly before the real step.
         lp_adam = None
@@ -457,6 +511,36 @@ async def _run_one_step(
         # on the training engine: drift plus the engine mismatch.
         drift.update(policy_drift_metrics(gen, lp_new, mask, "drift_vs_gen"))
         drift.update(policy_drift_metrics(lp_old, lp_old_rev, mask, "batchvar"))
+        coupled_new = [
+            x
+            for x in _run_workers(
+                learner.policy, "coupled_samples", rows=coupling_rows, seed=step
+            )
+            if x is not None
+        ][0]
+        live = [
+            i for i in range(drift_data.size) if float(drift_data["sample_mask"][i]) > 0
+        ]
+        # Position j predicts token j+1: compare where token j+1 is generated.
+        gen_mask = torch.zeros(coupled_old.shape[:2], dtype=torch.bool)
+        for r, i in enumerate(live):
+            n = int(drift_data["input_lengths"][i])
+            gen_mask[r, : n - 1] = drift_data["token_mask"][i, 1:n].bool()
+        for c, name in enumerate(("crn_cdf_id", "crn_cdf_sorted", "crn_gumbel")):
+            differ = (coupled_old[..., c] != coupled_new[..., c]) & gen_mask
+            fracs, w = [], []
+            for r in range(differ.shape[0]):
+                pos = torch.nonzero(gen_mask[r]).flatten()
+                if pos.numel() == 0:
+                    continue
+                d = differ[r, pos]
+                first = int(torch.nonzero(d)[0]) if d.any() else pos.numel()
+                fracs.append(first / pos.numel())
+                w.append(pos.numel())
+            w_ = np.array(w, float)
+            drift[f"{name}/token_reject_rate"] = float(differ.sum() / gen_mask.sum())
+            drift[f"{name}/accepted_token_frac"] = float(np.sum(np.array(fracs) * w_) / w_.sum())
+            drift[f"{name}/full_accept"] = float(np.mean(np.array(fracs) == 1.0))
         # Forecast drafter: extrapolate the fp32 master weights along the last
         # update, theta_hat = theta_k + c (theta_k - theta_{k-1}), round to the
         # model dtype, and score the same tokens. Drafts would be sampled from
@@ -481,7 +565,7 @@ async def _run_one_step(
                 _run_workers(
                     learner.policy,
                     "load_master_combination",
-                    coeffs={"k": 1.0 + c, "km1": -c},
+                    coeffs={"k": 1.0 + c, f"hist{step - 1}": -c},
                 )
                 lp_hat = learner.policy.get_logprobs(drift_data)["logprobs"]
                 tag = f"forecast_c{c}"
@@ -495,7 +579,11 @@ async def _run_one_step(
             _run_workers(learner.policy, "load_master_combination", coeffs={"k1": 1.0})
             lp_check = learner.policy.get_logprobs(drift_data)["logprobs"]
             assert torch.equal(lp_check * mask, lp_new * mask), "restore failed"
-        _run_workers(learner.policy, "rename_master_weights", src="k", dst="km1")
+        mask_ = drift_data["token_mask"] * drift_data["sample_mask"].unsqueeze(-1)
+        for m, lp_m in lag_lps.items():
+            drift.update(policy_drift_metrics(lp_m, lp_old, mask_, f"lag{m}"))
+        _run_workers(learner.policy, "rename_master_weights", src="k", dst=f"hist{step}")
+        _run_workers(learner.policy, "drop_master_weights", tag=f"hist{step - 5}")
         # Mismatch floor: theta_k on both, different engines.
         drift.update(policy_drift_metrics(gen, lp_old, mask, "mismatch"))
 
@@ -521,6 +609,8 @@ async def _run_one_step(
         "timeline/arrivals": arrivals,
         "timeline/dispatches": dispatches,
         "timeline/step_end": t_end - t_start,
+        "time/draft_wait": draft_wait,
+        "_drafts": drafts,
         **drift,
     }
     return out
@@ -544,7 +634,32 @@ def thundersync_grpo_train(
     history = []
     stale = False  # setup() already performed the initial refit
     step = 0
-    for batch in dataloader:
+    spec = None
+    if ts_cfg.speculate:
+        policy_generation.prepare_for_generation()
+        spec = SpeculativeGeneration(
+            policy_generation,
+            policy,
+            vocab_limit=len(tokenizer),
+            head_k=ts_cfg.spec_head_k,
+            draft_budget=ts_cfg.draft_budget,
+            max_new_tokens=master_config.policy["generation"]["max_new_tokens"],
+            pad_token_id=tokenizer.pad_token_id,
+            draft_variants=ts_cfg.draft_variants,
+            variant_eps=ts_cfg.variant_eps,
+        )
+    G = master_config.grpo.num_generations_per_prompt
+    if spec is not None and os.environ.get("THUNDERSYNC_SPEC_SELFTEST"):
+        first = next(iter(dataloader))
+        prompts = [torch.cat([m["token_ids"] for m in first["message_log"][i]]) for i in range(4)]
+        spec.draft_budget, budget = 256, spec.draft_budget
+        print("[spec selftest]", asyncio.run(spec.self_test(prompts)), flush=True)
+        spec.draft_budget = budget
+    batches = iter(dataloader)
+    next_batch = next(batches, None)
+    drafts = None
+    while next_batch is not None:
+        batch, next_batch = next_batch, next(batches, None)
         if step >= max_steps:
             break
         t0 = time.perf_counter()
@@ -553,21 +668,40 @@ def thundersync_grpo_train(
         else:
             policy_generation.prepare_for_generation()
         t_refit = time.perf_counter() - t0
+        t_verify = 0.0
+        if spec is not None and drafts is not None:
+            t1 = time.perf_counter()
+            spec.verify(drafts)
+            t_verify = time.perf_counter() - t1
+        drafter = None
+        if spec is not None and next_batch is not None and step + 1 < max_steps:
+            nxt = next_batch.repeat_interleave(G)
+            next_prompts = [
+                torch.cat([m["token_ids"] for m in nxt["message_log"][i]])
+                for i in range(nxt.size)
+            ]
+            drafter = lambda prompts=next_prompts: spec.draft(prompts)  # noqa: E731
         policy.prepare_for_training()
         metrics = asyncio.run(
             _run_one_step(
                 step=step,
                 batch=batch,
                 learner=learner,
-                policy_generation=policy_generation,
+                policy_generation=spec if spec is not None else policy_generation,
                 tokenizer=tokenizer,
                 task_to_env=task_to_env,
                 loss_fn=loss_fn,
                 master_config=master_config,
                 ts_cfg=ts_cfg,
                 adv_fn=adv_fn,
+                drafter=drafter,
             )
         )
+        drafts = metrics.pop("_drafts")
+        metrics["time/verify"] = t_verify
+        if spec is not None:
+            metrics.update(spec.stats)
+            spec.stats = {}
         policy_generation.finish_generation()
         stale = True
         metrics["time/refit"] = t_refit

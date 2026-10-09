@@ -24,6 +24,7 @@ group closes. At the barrier, the folded batch gradient is written back into
 the grad buffers and the regular ``finish_train_step`` runs unchanged.
 """
 
+import os
 import time
 from typing import Any
 
@@ -215,3 +216,206 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             out[f"{tag}/l2"] = sq**0.5
             out[f"{tag}/bf16_flips"] = flips
         return out
+
+    def drop_master_weights(self, tag: str) -> None:
+        getattr(self, "_master_snapshots", {}).pop(tag, None)
+
+    @torch.no_grad()
+    def coupled_samples(
+        self, rows: list[torch.Tensor], seed: int, chunk: int = 256
+    ) -> torch.Tensor | None:
+        """Teacher-forced shared-randomness samples under the current weights.
+
+        For each row and position j (predicting token j+1) returns the token each
+        coupling scheme would emit given a fixed per-(row, position) random
+        draw: [:, :, 0] inverse CDF in token-id order, [:, :, 1] inverse CDF in
+        descending-probability order, [:, :, 2] Gumbel-max. Two calls with
+        different weights and the same ``seed`` disagree exactly where a
+        drafter/verifier pair would. Returns a [num_rows, max_len, 3] int32
+        tensor on rank 0, None elsewhere.
+        """
+        self.model.eval()
+        max_len = max(int(r.numel()) for r in rows)
+        out = torch.full((len(rows), max_len, 3), -1, dtype=torch.int32)
+        for i, ids in enumerate(rows):
+            ids = ids.cuda().view(1, -1)
+            s = ids.shape[1]
+            pos = torch.arange(s, device="cuda").view(1, -1)
+            logits = self.model(input_ids=ids, position_ids=pos, attention_mask=None)
+            logits = logits[0].float()  # [s, V]
+            g_u = torch.Generator(device="cuda").manual_seed(seed * 1_000_003 + i)
+            u = torch.rand(s, device="cuda", generator=g_u)
+            g_g = torch.Generator(device="cuda").manual_seed(seed * 1_000_033 + i)
+            for a in range(0, s, chunk):
+                lg = logits[a : a + chunk]
+                p = torch.softmax(lg, dim=-1)
+                uu = u[a : a + chunk].unsqueeze(-1)
+                cdf = torch.cumsum(p, dim=-1)
+                x_id = torch.searchsorted(cdf, uu).clamp(max=p.shape[-1] - 1)
+                ps, idx = torch.sort(p, dim=-1, descending=True)
+                x_s = torch.searchsorted(torch.cumsum(ps, dim=-1), uu).clamp(
+                    max=p.shape[-1] - 1
+                )
+                x_sorted = idx.gather(-1, x_s)
+                gumbel = -torch.log(
+                    -torch.log(
+                        torch.rand(lg.shape, device="cuda", generator=g_g).clamp_min(
+                            1e-20
+                        )
+                    )
+                )
+                x_g = torch.argmax(torch.log_softmax(lg, -1) + gumbel, dim=-1, keepdim=True)
+                out[i, a : a + lg.shape[0]] = torch.cat(
+                    [x_id, x_sorted, x_g], dim=-1
+                ).int().cpu()
+        return out if self.rank == 0 else None
+
+    # ---- Exact cross-iteration speculative rollouts (keyed sampling) ----
+
+    def install_keyed_sampler(self, vocab_limit: int, head_k: int) -> int | None:
+        """Generation workers: sample requests that carry ``noise_seed`` with keyed noise.
+
+        The token at absolute position L of a request with seed s is
+        ``keyed_sample(p, s, L)``, so a continuation request (prompt + accepted
+        prefix) reproduces the uninterrupted decode exactly. Rows without a seed
+        use the engine's own sampler. Also routes per-row ``noise_seed`` and
+        ``max_new_tokens`` fields of the generation data into SamplingParams.
+        """
+        from thundersync_rl.keyed_sampling import keyed_sample_logits
+
+        engine = getattr(self, "dynamic_inference_engine", None)
+        if engine is None:
+            return None
+        eod = int(self.megatron_tokenizer.eod)
+        sampling = engine.controller._sampling
+        if getattr(sampling, "_keyed_installed", False):
+            return eod
+        orig_kernel = sampling.sample_kernel
+
+        def keyed_kernel(logits, n, context, *, gather_indices=None,
+                         token_to_request_index=None, output=None, **kw):
+            if token_to_request_index is not None:
+                return orig_kernel(logits, n, context, gather_indices=gather_indices,
+                                   token_to_request_index=token_to_request_index,
+                                   output=output, **kw)
+            lo, hi = context.paused_request_count, context.total_request_count
+            # Key = (seed, index of the token being sampled). The context's
+            # sequence length counts the current step's input token during
+            # decode, so take the index from the request itself.
+            seeds, positions, jitter = [], [], []
+            for rid in context.request_ids[lo:hi].tolist()[:n]:
+                req = engine.get_request(rid)
+                sp = req.sampling_params
+                seeds.append(int(getattr(sp, "noise_seed", -1)))
+                positions.append(len(req.prompt_tokens) + len(req.generated_tokens))
+                jitter.append(
+                    (float(getattr(sp, "draft_variant", 0)), float(getattr(sp, "variant_eps", 0.0)))
+                )
+            if all(s < 0 for s in seeds):
+                return orig_kernel(logits, n, context, gather_indices=gather_indices,
+                                   output=output, **kw)
+            if all(s >= 0 for s in seeds):
+                out = output if output is not None else torch.empty(
+                    n, device=logits.device, dtype=torch.int64
+                )
+            else:
+                out = orig_kernel(logits, n, context, gather_indices=gather_indices,
+                                  output=output, **kw)
+            rows = logits[gather_indices[:n]] if gather_indices is not None else logits[:n]
+            # Pinned host tensors + non-blocking copies: no per-step stream sync,
+            # so the engine's async scheduling overlap is preserved.
+            seed_c = torch.tensor(seeds, dtype=torch.long).pin_memory()
+            pos_c = torch.tensor(positions, dtype=torch.long).pin_memory()
+            jit_c = torch.tensor(jitter, dtype=torch.float64).pin_memory()
+            if all(s >= 0 for s in seeds):
+                out.copy_(keyed_sample_logits(rows, seed_c, pos_c, vocab_limit, jit_c))
+            else:
+                idx = [j for j, s in enumerate(seeds) if s >= 0]
+                idx_t = torch.tensor(idx, dtype=torch.long).pin_memory().to(rows.device, non_blocking=True)
+                out[idx_t] = keyed_sample_logits(
+                    rows[idx_t], seed_c[idx], pos_c[idx], vocab_limit, jit_c[idx]
+                ).to(out.dtype)
+            return out
+
+        sampling.sample_kernel = keyed_kernel
+        sampling._keyed_installed = True
+
+        orig_prepare = self._prepare_data_for_generation
+
+        def prepare(data, greedy=False):
+            prompts, mm, sps = orig_prepare(data, greedy)
+            if "noise_seed" in data:
+                for i, sp in enumerate(sps):
+                    sp.noise_seed = int(data["noise_seed"][i])
+            if "max_new_tokens" in data:
+                for i, sp in enumerate(sps):
+                    sp.num_tokens_to_generate = int(data["max_new_tokens"][i])
+            if "draft_variant" in data:
+                for i, sp in enumerate(sps):
+                    sp.draft_variant = int(data["draft_variant"][i])
+                    sp.variant_eps = float(data["variant_eps"][i])
+            return prompts, mm, sps
+
+        self._prepare_data_for_generation = prepare
+        return eod
+
+    @torch.no_grad()
+    def verify_drafts(
+        self,
+        rows: list[torch.Tensor],
+        prompt_lens: list[int],
+        seeds: list[int],
+        vocab_limit: int,
+        head_k: int,
+        batch_tokens: int = 32768,
+        position_shift: int = 0,
+    ) -> list[tuple[int, dict[str, Any]]]:
+        """Learner: keep each draft's longest prefix the current policy would emit.
+
+        ``rows[i]`` = prompt + draft tokens. Position j (predicting token j+1) emits
+        ``keyed_sample(p_theta(. | row[:j+1]), seed, j+1)``; the draft is kept up to
+        the first disagreement, where the emitted token replaces it. If the whole
+        draft agrees, the next token after it is emitted too. Rows are split across
+        DP ranks and batched right-padded (causal attention). Returns
+        [(row_index, {"accepted", "next", "logprobs"})] for this rank's rows.
+        """
+        from thundersync_rl.keyed_sampling import keyed_sample_logits
+
+        self.model.eval()
+        world = torch.distributed.get_world_size()
+        mine = sorted(
+            (i for i in range(len(rows)) if i % world == self.rank),
+            key=lambda i: rows[i].numel(),
+        )
+        results = []
+        b = 0
+        while b < len(mine):
+            e = b + 1
+            while e < len(mine) and rows[mine[e]].numel() * (e + 1 - b) <= batch_tokens:
+                e += 1
+            group = mine[b:e]
+            b = e
+            s = max(rows[i].numel() for i in group)
+            ids = torch.zeros((len(group), s), dtype=torch.long)
+            for r, i in enumerate(group):
+                ids[r, : rows[i].numel()] = rows[i]
+            ids = ids.cuda()
+            pos = torch.arange(s, device="cuda").expand(len(group), -1)
+            logits = self.model(input_ids=ids, position_ids=pos, attention_mask=None)
+            for r, i in enumerate(group):
+                n, plen = rows[i].numel(), prompt_lens[i]
+                lp = torch.log_softmax(logits[r, plen - 1 : n, :vocab_limit].float(), -1)
+                positions = torch.arange(plen, n + 1, device="cuda") + position_shift
+                emitted = keyed_sample_logits(
+                    lp, torch.full_like(positions, seeds[i]), positions
+                )
+                draft = ids[r, plen:n]
+                agree = emitted[: draft.numel()] == draft
+                n_acc = int(agree.long().cumprod(0).sum())
+                kept = torch.cat([draft[:n_acc], emitted[n_acc : n_acc + 1]])
+                lps = lp[torch.arange(n_acc + 1, device="cuda"), kept].tolist()
+                results.append(
+                    (i, {"accepted": n_acc, "next": int(emitted[n_acc]), "logprobs": lps})
+                )
+            del logits
+        return results
