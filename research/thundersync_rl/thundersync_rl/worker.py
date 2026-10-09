@@ -757,6 +757,8 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             for v in versions:
                 self._load_scorer(v)
                 logits = self._score(scorer, ids, pos)
+                if logits is None:  # not the last pipeline stage
+                    continue
                 for r, i in enumerate(group):
                     plen = prompt_lens[i]
                     for sv, a, b in segments[i]:
@@ -768,6 +770,8 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 del logits
             self._load_scorer(None)
             logits = self._score(scorer, ids, pos)
+            if logits is None:
+                continue
             for r, i in enumerate(group):
                 n, plen = rows[i].numel(), prompt_lens[i]
                 g = n - plen
@@ -790,7 +794,38 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
 
         torch.cuda.synchronize()
         t0 = time.perf_counter()
-        logits = scorer(input_ids=ids, position_ids=pos, attention_mask=None).float()
+        if ps.get_pipeline_model_parallel_world_size() == 1:
+            logits = scorer(input_ids=ids, position_ids=pos, attention_mask=None).float()
+        else:
+            # Run the pipeline schedule forward-only; logits exist on the last stage.
+            from megatron.core.pipeline_parallel import get_forward_backward_func
+
+            captured: list[torch.Tensor] = []
+
+            def fwd_step(data_iterator, model):
+                b_ids, b_pos = next(data_iterator)
+                out = model(input_ids=b_ids, position_ids=b_pos, attention_mask=None)
+
+                def collect(output_tensor):
+                    captured.append(output_tensor.detach().float())
+                    return torch.zeros((), device=output_tensor.device), {}
+
+                return out, collect
+
+            get_forward_backward_func()(
+                forward_step_func=fwd_step,
+                data_iterator=iter([(ids, pos)]),
+                model=[scorer],
+                num_microbatches=1,
+                seq_length=ids.shape[1],
+                micro_batch_size=ids.shape[0],
+                forward_only=True,
+            )
+            if not ps.is_pipeline_last_stage(ignore_virtual=True):
+                torch.cuda.synchronize()
+                self._prof["forward"] = self._prof.get("forward", 0.0) + time.perf_counter() - t0
+                return None
+            logits = captured[0]
         tp = ps.get_tensor_model_parallel_world_size()
         if tp > 1:
             # Vocab-parallel logits -> full vocab for this batch only (memory is
@@ -831,3 +866,23 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             for r, i in enumerate(group):
                 ids[r, : rows[i].numel()] = rows[i]
             yield group, ids.cuda()
+
+    @torch.no_grad()
+    def scorer_token_logprobs(self, rows: list[torch.Tensor]) -> list[torch.Tensor] | None:
+        """Debug/validation: next-token logprobs of ``rows`` under the fp32 scorer
+        (current weights), returned on last-pipeline-stage DP-rank-0 workers."""
+        from megatron.core import parallel_state as ps
+
+        self._prof = {}
+        scorer = self._fp32_scorer()
+        out = []
+        for row in rows:
+            ids = row.view(1, -1).cuda()
+            pos = torch.arange(ids.shape[1], device="cuda").view(1, -1)
+            logits = self._score(scorer, ids, pos)
+            if logits is None:
+                continue
+            lp = torch.log_softmax(logits[0, :-1].float(), -1)
+            out.append(lp.gather(-1, ids[0, 1:, None]).squeeze(-1).cpu())
+        last = ps.is_pipeline_last_stage(ignore_virtual=True)
+        return out if (last and ps.get_data_parallel_rank() == 0 and ps.get_tensor_model_parallel_rank() == 0) else None
