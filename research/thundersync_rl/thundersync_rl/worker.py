@@ -431,21 +431,42 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
     # ---- Block verification (Sun et al. 2024) with learner-side q ----
 
     def _fp32_scorer(self):
-        """HF copy of the policy in fp32 activations, loaded with the current
-        (bf16-valued) Megatron weights. Scoring p and q with it removes the bf16
-        activation-rounding noise that dominates the p/q ratio."""
-        from transformers import AutoConfig, AutoModelForCausalLM
+        """Megatron copy of the policy with fp32 params/activations.
 
-        if getattr(self, "_hf32", None) is None:
-            cfg = AutoConfig.from_pretrained(self.cfg["model_name"], local_files_only=True)
-            self._hf32 = AutoModelForCausalLM.from_config(cfg, torch_dtype=torch.float32).cuda().eval()
-        state = self._hf32.state_dict()
-        for name, tensor in self.megatron_bridge.export_hf_weights([self.model], show_progress=False):
-            if name in state:
-                state[name].copy_(tensor.to(state[name].dtype))
-        if getattr(self._hf32.config, "tie_word_embeddings", False):
-            self._hf32.tie_weights()
-        return self._hf32
+        Built from a deep copy of the training model provider (same architecture
+        and layer spec, fp32 dtypes, no DDP/optimizer) and refreshed by copying
+        the training model's own bf16-valued parameters. Scoring p and q with it
+        removes the bf16 activation-rounding noise that dominates the p/q ratio.
+        """
+        import copy
+
+        t0 = time.perf_counter()
+        if getattr(self, "_mfp32", None) is None:
+            # Shallow copy: only top-level dtype/recompute fields change; process
+            # groups (not copyable) are shared with the training model.
+            provider = copy.copy(self.megatron_cfg.model)
+            provider.params_dtype = torch.float32
+            provider.pipeline_dtype = torch.float32
+            provider.bf16 = False
+            provider.fp16 = False
+            provider.recompute_granularity = None
+            provider.recompute_method = None
+            provider.recompute_num_layers = None
+            provider.finalize()
+            self._mfp32 = provider.provide().cuda().eval()
+            src_names = [n for n, _ in self.model.named_parameters()]
+            self._mfp32_map = []
+            src = dict(self.model.named_parameters())
+            for name, p in self._mfp32.named_parameters():
+                match = [n for n in src_names if n == name or n.endswith("." + name)]
+                assert len(match) == 1, (name, match[:3])
+                self._mfp32_map.append((p, src[match[0]]))
+        with torch.no_grad():
+            for dst, src in self._mfp32_map:
+                dst.copy_(src.detach().float())
+        torch.cuda.synchronize()
+        self._prof["export"] = self._prof.get("export", 0.0) + time.perf_counter() - t0
+        return self._mfp32
 
     def _iter_row_batches(
         self, rows: list[torch.Tensor], batch_tokens: int, keys: list[str] | None = None
@@ -479,16 +500,23 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 ids[r, : rows[i].numel()] = rows[i]
             ids = ids.cuda()
             pos = torch.arange(s, device="cuda").expand(len(group), -1)
+            torch.cuda.synchronize()
+            t_fwd = time.perf_counter()
             scorer = getattr(self, "_active_scorer", None)
             if scorer is not None:
                 prev = torch.get_float32_matmul_precision()
                 torch.set_float32_matmul_precision("high" if self._scorer_tf32 else "highest")
                 try:
-                    logits = scorer(input_ids=ids, position_ids=pos).logits.float()
+                    logits = scorer(
+                        input_ids=ids, position_ids=pos, attention_mask=None
+                    ).float()
                 finally:
                     torch.set_float32_matmul_precision(prev)
             else:
                 logits = self.model(input_ids=ids, position_ids=pos, attention_mask=None)
+            torch.cuda.synchronize()
+            self._prof["forward"] = self._prof.get("forward", 0.0) + time.perf_counter() - t_fwd
+            self._prof["tokens"] = self._prof.get("tokens", 0) + int(ids.numel())
             yield group, ids, logits
             del logits
 
@@ -508,6 +536,8 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         Stores log q(. | prompt, draft[:i]) for i = 0..len(draft)-1 in bf16 on GPU
         for ``verify_drafts_block`` at the next iteration.
         """
+        self._prof = {}
+        t_all = time.perf_counter()
         self.model.eval()
         # Keyed mode appends the q of tokens drafted since the last deadline
         # (from_lens[i] onwards) to what earlier iterations stored: each
@@ -528,6 +558,8 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 prev = self._spec_q.get(key) if keys is not None else None
                 self._spec_q[key] = lq if prev is None else torch.cat([prev, lq])
         self._active_scorer = None
+        if os.environ.get("THUNDERSYNC_SPEC_PROF"):
+            print(f"[spec prof] score rank={self.rank} total={time.perf_counter() - t_all:.3f} {self._prof}", flush=True)
         return len(self._spec_q)
 
     @torch.no_grad()
@@ -549,6 +581,8 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         distribution (Sun et al. 2024, "Block Verification Accelerates
         Speculative Decoding").
         """
+        self._prof = {}
+        t_all = time.perf_counter()
         self.model.eval()
         gen = torch.Generator(device="cuda").manual_seed(seed * 1_000_003 + self.rank)
         results = []
@@ -584,6 +618,8 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 lps = lp[torch.arange(tau + 1, device="cuda"), kept].tolist()
                 results.append((i, {"accepted": tau, "next": y, "logprobs": lps}))
         self._active_scorer = None
+        if os.environ.get("THUNDERSYNC_SPEC_PROF"):
+            print(f"[spec prof] verify rank={self.rank} total={time.perf_counter() - t_all:.3f} {self._prof}", flush=True)
         return results
 
     def termination_id(self) -> int | None:
