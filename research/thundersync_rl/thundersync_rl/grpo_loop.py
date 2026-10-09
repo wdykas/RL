@@ -115,6 +115,10 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # the drafts' q scored at theta_k before the optimizer step (highest
     # acceptance). "keyed": shared-noise Gumbel verification (no q needed).
     verify_mode: Literal["block", "keyed"] = "block"
+    # Activations used to score p and q for block verification: "model" (the
+    # learner's own bf16 forward) or "fp32" (HF fp32 copy with the same weights,
+    # removing activation-rounding noise from the p/q ratio).
+    verify_precision: Literal["model", "fp32", "tf32"] = "model"
 
 
 class ThunderSyncMasterConfig(MasterConfig):
@@ -660,6 +664,7 @@ def thundersync_grpo_train(
             draft_variants=ts_cfg.draft_variants,
             variant_eps=ts_cfg.variant_eps,
             verify_mode=ts_cfg.verify_mode,
+            verify_precision=ts_cfg.verify_precision,
         )
     G = master_config.grpo.num_generations_per_prompt
     if spec is not None and os.environ.get("THUNDERSYNC_SPEC_SELFTEST"):

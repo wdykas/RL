@@ -430,6 +430,23 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
 
     # ---- Block verification (Sun et al. 2024) with learner-side q ----
 
+    def _fp32_scorer(self):
+        """HF copy of the policy in fp32 activations, loaded with the current
+        (bf16-valued) Megatron weights. Scoring p and q with it removes the bf16
+        activation-rounding noise that dominates the p/q ratio."""
+        from transformers import AutoConfig, AutoModelForCausalLM
+
+        if getattr(self, "_hf32", None) is None:
+            cfg = AutoConfig.from_pretrained(self.cfg["model_name"], local_files_only=True)
+            self._hf32 = AutoModelForCausalLM.from_config(cfg, torch_dtype=torch.float32).cuda().eval()
+        state = self._hf32.state_dict()
+        for name, tensor in self.megatron_bridge.export_hf_weights([self.model], show_progress=False):
+            if name in state:
+                state[name].copy_(tensor.to(state[name].dtype))
+        if getattr(self._hf32.config, "tie_word_embeddings", False):
+            self._hf32.tie_weights()
+        return self._hf32
+
     def _iter_row_batches(self, rows: list[torch.Tensor], batch_tokens: int):
         """This rank's rows (i % world == rank), length-sorted, as padded batches."""
         world = torch.distributed.get_world_size()
@@ -450,7 +467,16 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 ids[r, : rows[i].numel()] = rows[i]
             ids = ids.cuda()
             pos = torch.arange(s, device="cuda").expand(len(group), -1)
-            logits = self.model(input_ids=ids, position_ids=pos, attention_mask=None)
+            scorer = getattr(self, "_active_scorer", None)
+            if scorer is not None:
+                prev = torch.get_float32_matmul_precision()
+                torch.set_float32_matmul_precision("high" if self._scorer_tf32 else "highest")
+                try:
+                    logits = scorer(input_ids=ids, position_ids=pos).logits.float()
+                finally:
+                    torch.set_float32_matmul_precision(prev)
+            else:
+                logits = self.model(input_ids=ids, position_ids=pos, attention_mask=None)
             yield group, ids, logits
             del logits
 
@@ -461,6 +487,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         prompt_lens: list[int],
         vocab_limit: int,
         batch_tokens: int = 16384,
+        precision: str = "model",
     ) -> int:
         """Learner at theta_k (before its step): keep each draft's full log q.
 
@@ -469,11 +496,14 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         """
         self.model.eval()
         self._spec_q = {}
+        self._scorer_tf32 = precision == "tf32"
+        self._active_scorer = self._fp32_scorer() if precision in ("fp32", "tf32") else None
         for group, ids, logits in self._iter_row_batches(rows, batch_tokens):
             for r, i in enumerate(group):
                 n, plen = rows[i].numel(), prompt_lens[i]
                 lq = torch.log_softmax(logits[r, plen - 1 : n - 1, :vocab_limit].float(), -1)
                 self._spec_q[i] = lq.to(torch.bfloat16)
+        self._active_scorer = None
         return len(self._spec_q)
 
     @torch.no_grad()
@@ -484,6 +514,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         vocab_limit: int,
         seed: int,
         batch_tokens: int = 16384,
+        precision: str = "model",
     ) -> list[tuple[int, dict[str, Any]]]:
         """Learner at theta_{k+1}: block-verify each draft against the stored q.
 
@@ -496,6 +527,8 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         self.model.eval()
         gen = torch.Generator(device="cuda").manual_seed(seed * 1_000_003 + self.rank)
         results = []
+        self._scorer_tf32 = precision == "tf32"
+        self._active_scorer = self._fp32_scorer() if precision in ("fp32", "tf32") else None
         for group, ids, logits in self._iter_row_batches(rows, batch_tokens):
             for r, i in enumerate(group):
                 n, plen = rows[i].numel(), prompt_lens[i]
@@ -524,6 +557,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 kept = torch.cat([draft[:tau], torch.tensor([y], device="cuda")])
                 lps = lp[torch.arange(tau + 1, device="cuda"), kept].tolist()
                 results.append((i, {"accepted": tau, "next": y, "logprobs": lps}))
+        self._active_scorer = None
         return results
 
     def termination_id(self) -> int | None:

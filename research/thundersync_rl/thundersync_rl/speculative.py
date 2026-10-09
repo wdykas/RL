@@ -69,6 +69,7 @@ class SpeculativeGeneration:
         draft_variants: int = 1,
         variant_eps: float = 0.0,
         verify_mode: str = "keyed",
+        verify_precision: str = "model",
     ):
         self.base = base
         self.learner_policy = learner_policy
@@ -81,6 +82,7 @@ class SpeculativeGeneration:
         self.variant_eps = variant_eps
         self.stream_interval = 16
         self.verify_mode = verify_mode
+        self.verify_precision = verify_precision
         if verify_mode == "block":
             # Randomized block verification: drafts use the engine's own sampler,
             # which draws from the full (padded) vocabulary, so p and q must too.
@@ -206,6 +208,7 @@ class SpeculativeGeneration:
                 rows=rows,
                 prompt_lens=[d[0].numel() for _, d in flat],
                 vocab_limit=self.vocab_limit,
+                precision=self.verify_precision,
             )
         )
 
@@ -219,6 +222,7 @@ class SpeculativeGeneration:
                     prompt_lens=[d[0].numel() for _, d in flat],
                     vocab_limit=self.vocab_limit,
                     seed=next(self._verify_seeds),
+                    precision=self.verify_precision,
                 )
             )
         else:
