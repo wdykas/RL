@@ -436,6 +436,8 @@ async def _run_one_step(
         await learner_task
         t_wait = time.perf_counter()
         drafts = await draft_task if draft_task is not None else None
+        if callable(drafts):  # streaming drafts: cut them off at this deadline
+            drafts = drafts()
         draft_wait = time.perf_counter() - t_wait
         t_score = time.perf_counter()
         if before_finish is not None and drafts is not None:
@@ -691,7 +693,11 @@ def thundersync_grpo_train(
                 torch.cat([m["token_ids"] for m in nxt["message_log"][i]])
                 for i in range(nxt.size)
             ]
-            drafter = lambda prompts=next_prompts: spec.draft(prompts)  # noqa: E731
+            drafter = (  # noqa: E731
+                (lambda prompts=next_prompts: spec.draft_streaming(prompts))
+                if ts_cfg.verify_mode == "block"
+                else (lambda prompts=next_prompts: spec.draft(prompts))
+            )
         policy.prepare_for_training()
         metrics = asyncio.run(
             _run_one_step(

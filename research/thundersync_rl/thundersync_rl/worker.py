@@ -529,3 +529,58 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
     def termination_id(self) -> int | None:
         tok = getattr(self, "megatron_tokenizer", None)
         return None if tok is None else int(tok.eod)
+
+    # ---- Deadline-truncated streaming drafts (generation rank 0) ----
+
+    def start_drafts(
+        self, prompts: list[list[int]], max_new_tokens: int, stream_interval: int
+    ) -> bool:
+        """Submit draft requests as streams and return immediately.
+
+        Tokens accumulate in ``self._draft_tokens`` as partial frames arrive;
+        ``collect_drafts`` aborts whatever is unfinished at the deadline. Any
+        prefix of a draft is a valid draft, so truncation is harmless.
+        """
+        import asyncio
+
+        if self.inference_client is None or self._inference_loop is None:
+            return False
+        self._draft_tokens = [[] for _ in prompts]
+        self._draft_done = [False] * len(prompts)
+        self._draft_streams = {}
+
+        async def run_one(i, prompt):
+            sp = self._build_sampling_params(greedy=False, stop_words=None)
+            sp.num_tokens_to_generate = max_new_tokens
+            sp.streaming_interval = stream_interval
+            stream = self.inference_client.add_request_streaming(prompt, sp)
+            self._draft_streams[i] = stream
+            async for frame in stream:
+                if "partial" in frame:
+                    self._draft_tokens[i].extend(frame["partial"]["new_tokens"])
+                elif "final" in frame:
+                    final = frame["final"]
+                    toks = (
+                        final["generated_tokens"]
+                        if isinstance(final, dict)
+                        else final.generated_tokens
+                    )
+                    self._draft_tokens[i] = list(toks)
+                    self._draft_done[i] = True
+
+        for i, p in enumerate(prompts):
+            asyncio.run_coroutine_threadsafe(run_one(i, list(p)), self._inference_loop)
+        return True
+
+    def collect_drafts(self) -> list[tuple[list[int], bool]]:
+        """Abort unfinished drafts; return (tokens, finished) per draft."""
+        import asyncio
+
+        async def abort_all():
+            for i, stream in list(self._draft_streams.items()):
+                if not self._draft_done[i]:
+                    self.inference_client.abort_request(stream.request_id)
+            await asyncio.sleep(0)
+
+        asyncio.run_coroutine_threadsafe(abort_all(), self._inference_loop).result()
+        return [(list(t), d) for t, d in zip(self._draft_tokens, self._draft_done)]

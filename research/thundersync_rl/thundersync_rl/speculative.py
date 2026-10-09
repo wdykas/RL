@@ -79,6 +79,7 @@ class SpeculativeGeneration:
         self.pad_token_id = pad_token_id
         self.draft_variants = draft_variants
         self.variant_eps = variant_eps
+        self.stream_interval = 16
         self.verify_mode = verify_mode
         if verify_mode == "block":
             # Randomized block verification: drafts use the engine's own sampler,
@@ -166,12 +167,32 @@ class SpeculativeGeneration:
             ]
         return out
 
+    async def draft_streaming(self, prompts: list[torch.Tensor]):
+        """Start drafts on the engine without waiting; return a collector.
+
+        The collector, called at the deadline (right before the optimizer step),
+        aborts unfinished drafts and returns every draft's tokens so far. Any
+        prefix of a draft is a valid draft for verification.
+        """
+        rank0 = self.base._policy.worker_group.workers[0]
+        ray.get(
+            rank0.start_drafts.remote(
+                [p.tolist() for p in prompts], self.draft_budget, self.stream_interval
+            )
+        )
+
+        def collect():
+            res = ray.get(rank0.collect_drafts.remote())
+            return [[(prompts[i], -1, toks, done)] for i, (toks, done) in enumerate(res)]
+
+        return collect
+
     # -- verification (start of iteration k+1, learner holds theta_{k+1}) -------
 
     @staticmethod
     def _flat_rows(drafts):
         flat = [(t, d) for t, variants in enumerate(drafts) for d in variants]
-        rows = [torch.cat([p, torch.tensor(d, dtype=torch.long)]) for _, (p, _, d) in flat]
+        rows = [torch.cat([d[0], torch.tensor(d[2], dtype=torch.long)]) for _, d in flat]
         return flat, rows
 
     def score_prev(self, drafts) -> None:
@@ -183,7 +204,7 @@ class SpeculativeGeneration:
             self.learner_policy.worker_group.run_all_workers_single_data(
                 "score_drafts_q",
                 rows=rows,
-                prompt_lens=[p.numel() for _, (p, _, _) in flat],
+                prompt_lens=[d[0].numel() for _, d in flat],
                 vocab_limit=self.vocab_limit,
             )
         )
@@ -195,7 +216,7 @@ class SpeculativeGeneration:
                 self.learner_policy.worker_group.run_all_workers_single_data(
                     "verify_drafts_block",
                     rows=rows,
-                    prompt_lens=[p.numel() for _, (p, _, _) in flat],
+                    prompt_lens=[d[0].numel() for _, d in flat],
                     vocab_limit=self.vocab_limit,
                     seed=next(self._verify_seeds),
                 )
@@ -205,8 +226,8 @@ class SpeculativeGeneration:
                 self.learner_policy.worker_group.run_all_workers_single_data(
                     "verify_drafts",
                     rows=rows,
-                    prompt_lens=[p.numel() for _, (p, _, _) in flat],
-                    seeds=[s for _, (_, s, _) in flat],
+                    prompt_lens=[d[0].numel() for _, d in flat],
+                    seeds=[d[1] for _, d in flat],
                     vocab_limit=self.vocab_limit,
                     head_k=self.head_k,
                 )
@@ -224,9 +245,13 @@ class SpeculativeGeneration:
         self.plans.clear()
         kept = total = full = 0
         for i in range(len(drafts)):
-            (prompt, seed, draft), r = best[i]
+            d, r = best[i]
+            prompt, seed, draft = d[0], d[1], d[2]
             n_acc = r["accepted"]
-            stopped = len(draft) < self.draft_budget  # the draft itself terminated
+            # The draft terminated on its own (EOS/stop) rather than at the budget
+            # or the deadline: a fully accepted draft is then a finished rollout.
+            finished = d[3] if len(d) > 3 else True
+            stopped = finished and len(draft) < self.draft_budget
             if n_acc == len(draft) and stopped:
                 plan = Plan(seed, draft, r["logprobs"][:n_acc], complete=True)
                 full += 1
