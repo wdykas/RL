@@ -80,6 +80,8 @@ class SpeculativeGeneration:
         verify_precision: str = "model",
         q_storage: str = "full",
         verify_batch_tokens: int = 16384,
+        longest_first: bool = False,
+        verify_on: str = "learner",
     ):
         self.base = base
         self.learner_policy = learner_policy
@@ -98,6 +100,13 @@ class SpeculativeGeneration:
         # verification (O(params + batch x vocab)); scales to large models.
         self.q_storage = q_storage
         self.verify_batch_tokens = verify_batch_tokens
+        self.longest_first = longest_first
+        # Where stash + block verification run: "learner" or "inference" (the
+        # generation workers hold theta_k until the refit and theta_{k+1} after
+        # it, and sit idle while rollouts wait for verification).
+        self.verifier = (
+            base._policy.worker_group if verify_on == "inference" else learner_policy.worker_group
+        )
         self.current_step = 0
         if verify_mode == "block":
             # Randomized block verification: drafts use the engine's own sampler,
@@ -289,7 +298,7 @@ class SpeculativeGeneration:
                 for d in cohort:
                     keep.update(v for v, _, _ in d["segments"])
             ray.get(
-                self.learner_policy.worker_group.run_all_workers_single_data(
+                self.verifier.run_all_workers_single_data(
                     "stash_weights",
                     version=self.current_step,
                     keep=sorted(keep),
@@ -330,7 +339,7 @@ class SpeculativeGeneration:
         flat, rows = self._flat_rows(drafts)
         if self.verify_mode == "block" and self.q_storage == "stash":
             res = ray.get(
-                self.learner_policy.worker_group.run_all_workers_single_data(
+                self.verifier.run_all_workers_single_data(
                     "verify_drafts_block_stashed",
                     rows=rows,
                     prompt_lens=[d[0].numel() for _, d in flat],
@@ -414,6 +423,12 @@ class SpeculativeGeneration:
         queued on the learner at once and processed in order.
         """
         flat, rows = self._flat_rows(drafts)
+        if self.longest_first:
+            # Longest drafts first: their continuations (the likely critical path)
+            # start earliest. Verification order does not change any outcome.
+            order = sorted(range(len(flat)), key=lambda j: -len(flat[j][1][2]))
+            flat = [flat[j] for j in order]
+            rows = [rows[j] for j in order]
         self.plans.clear()
         self._pending = defaultdict(int)
         for _, d in flat:
@@ -425,7 +440,7 @@ class SpeculativeGeneration:
         for a, b in zip(bounds, bounds[1:]):
             if b <= a:
                 continue
-            refs = self.learner_policy.worker_group.run_all_workers_single_data(
+            refs = self.verifier.run_all_workers_single_data(
                 "verify_drafts_block_stashed",
                 rows=rows[a:b],
                 prompt_lens=[d[0].numel() for _, d in flat[a:b]],
@@ -441,6 +456,13 @@ class SpeculativeGeneration:
         for a, refs in calls:
             res = await asyncio.gather(*[asyncio.wrap_future(r.future()) for r in refs])
             by_row = dict(x for rank_res in res for x in rank_res)
+            ends = [c[0] for c in calls[1:]] + [len(flat)]
+            chunk_rows = ends[[c[0] for c in calls].index(a)] - a
+            if len(by_row) != chunk_rows:
+                raise RuntimeError(
+                    f"verification returned {len(by_row)} of {chunk_rows} rows "
+                    f"(per-rank counts {[len(x) for x in res]}): row ownership mismatch"
+                )
             async with self._plan_cv:
                 for j, r in by_row.items():
                     d = flat[a + j][1]

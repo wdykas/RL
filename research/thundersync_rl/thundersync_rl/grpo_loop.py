@@ -133,6 +133,14 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     verify_chunks: int = 1
     # Tokens per scorer forward batch at verification (bounds logits memory).
     verify_batch_tokens: int = 16384
+    # Verify the longest drafts first (with verify_chunks > 1) so the likely
+    # stragglers' continuations start earliest.
+    verify_longest_first: bool = False
+    # Run the weight stash + block verification on the "learner" or on the
+    # "inference" (generation) workers. EXPERIMENTAL: "inference" currently hangs
+    # at the first verification (the stash call works; the awaited verify call
+    # never runs on the generation actors) - see RESUME.md.
+    verify_on: Literal["learner", "inference"] = "learner"
 
 
 class ThunderSyncMasterConfig(MasterConfig):
@@ -685,6 +693,8 @@ def thundersync_grpo_train(
             verify_precision=ts_cfg.verify_precision,
             q_storage=ts_cfg.q_storage,
             verify_batch_tokens=ts_cfg.verify_batch_tokens,
+            longest_first=ts_cfg.verify_longest_first,
+            verify_on=ts_cfg.verify_on,
         )
     G = master_config.grpo.num_generations_per_prompt
     if spec is not None and os.environ.get("THUNDERSYNC_SPEC_SELFTEST"):
