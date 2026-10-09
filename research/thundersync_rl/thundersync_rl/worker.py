@@ -445,9 +445,13 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             from megatron.core import parallel_state as ps
 
             if ps.get_context_parallel_world_size() > 1:
+                # NeMo-RL runs MCore context parallelism only with sequence
+                # packing (THD); the scorer would have to score packed, CP-sharded
+                # batches through that path, which also needs packing support in
+                # the streaming trainer.
                 raise NotImplementedError(
-                    "speculative verification scorer does not shard sequences for "
-                    "context parallelism yet"
+                    "speculative verification scorer does not support context "
+                    "parallelism (requires packed THD scoring)"
                 )
             # Shallow copy: only top-level dtype/recompute fields change; process
             # groups (not copyable) are shared with the training model.
