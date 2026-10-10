@@ -419,12 +419,10 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             if getattr(self, "_scorer_precision", "fp32") == "fp32":
                 # Batch-invariant kernels are BF16-only; an fp32 scorer is built
                 # outside batch-invariant mode (its higher precision, not
-                # bitwise parity with training, is what it is for).
-                if getattr(provider, "batch_invariant_mode", False):
-                    from megatron.core.transformer.enums import AttnBackend
-
-                    provider.batch_invariant_mode = False
-                    provider.attention_backend = AttnBackend.auto
+                # bitwise parity with training, is what it is for). TE attention
+                # settings are process-wide, so they stay as configured; its
+                # attention is replaced by SDPA below.
+                provider.batch_invariant_mode = False
                 provider.params_dtype = torch.float32
                 provider.pipeline_dtype = torch.float32
                 provider.bf16 = False
