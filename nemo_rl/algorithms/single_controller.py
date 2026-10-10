@@ -2816,8 +2816,6 @@ class SingleControllerActor:
                                 consumed_group_count += num_groups
                                 continue
                         else:
-                            selected_group_ids: list[str] = []
-                            selected_training_claim_ids: list[str] = []
                             training_claim_ids_before = (
                                 self._buffer.training_owned_group_ids()
                             )
@@ -5418,9 +5416,12 @@ class SingleControllerActor:
                 self._algo_cfg,
             )
             response_advantages = torch.masked_select(advantages, mask.bool())
-        self._step_log_dict["masked_advantages"].append(
-            response_advantages.detach().cpu()
-        )
+        # Trajectory streaming logs each group's final advantages once, when
+        # it seals; rows of open groups carry a placeholder 1 here.
+        if row_advantages is None:
+            self._step_log_dict["masked_advantages"].append(
+                response_advantages.detach().cpu()
+            )
 
         fields_to_put = {adv_cfg.output_field: advantages}
         if not torch.equal(final_sample_mask, sample_mask):
@@ -5540,15 +5541,20 @@ class SingleControllerActor:
         prompt_ids, rewards, token_mask, _, _, final_sample_mask = (
             self._advantage_base_inputs(data)
         )
+        mask = token_mask * final_sample_mask.unsqueeze(-1)
         advantages = self._advantage_estimator.compute_advantage(
             prompt_ids=prompt_ids,
             rewards=rewards,
-            mask=token_mask * final_sample_mask.unsqueeze(-1),
+            mask=mask,
             repeated_batch=self._repeated_batch(data, rewards),
             valid_mask=final_sample_mask,
         )
         assert isinstance(self._algo_cfg, GRPOConfig)
         advantages = _clip_grpo_advantages(advantages, self._algo_cfg)
+        # Same metric the batch path logs, once per group (chunks skip it).
+        self._step_log_dict["masked_advantages"].append(
+            torch.masked_select(advantages, mask.bool()).detach().cpu()
+        )
         # Masked rows (overlong, env-flagged) are left out of the baseline, so
         # their advantage differs from valid rows with the same reward; it is
         # never trained on (zero sample mask), so valid rows take precedence.

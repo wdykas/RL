@@ -148,6 +148,7 @@ def _controller(buffer, dp_client, trainer, max_open_groups=100):
         trajectory_streaming=SimpleNamespace(max_open_groups=max_open_groups)
     )
     ctl._train_fields = ()
+    ctl._step_log_dict = {"masked_advantages": []}
     ctl._advantage_cfg = AdvantageConfig()
     ctl._advantage_estimator = GRPOAdvantageEstimator(
         SimpleNamespace(use_leave_one_out_baseline=True, normalize_rewards=True), None
@@ -342,6 +343,10 @@ def test_sealed_group_advantage_ignores_masked_rows_with_equal_reward():
     )[:, 0]
     assert want[0] != want[1]  # the masked row really differs
     assert by_reward == {1.0: want[0].item(), 0.0: want[2].item()}
+    # The advantage metric gets the group's final, valid-token advantages
+    # (token mask is 4 wide), not chunk placeholders.
+    (logged,) = ctl._step_log_dict["masked_advantages"]
+    torch.testing.assert_close(logged, want[[0, 2, 3]].repeat_interleave(4))
 
 
 def test_group_size_not_divisible_by_dp_fails_loudly():
