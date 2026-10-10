@@ -144,6 +144,8 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # Run verification concurrently with the rollouts (awaited inside the step's
     # event loop) even when verify_on != "learner".
     verify_overlap: bool = False
+    # Chunks per pool in the round-robin, in verify_on order (learner, inference).
+    verify_pool_weights: Optional[list[int]] = None
 
 
 class ThunderSyncMasterConfig(MasterConfig):
@@ -698,6 +700,7 @@ def thundersync_grpo_train(
             verify_batch_tokens=ts_cfg.verify_batch_tokens,
             longest_first=ts_cfg.verify_longest_first,
             verify_on=ts_cfg.verify_on,
+            pool_weights=ts_cfg.verify_pool_weights,
         )
     G = master_config.grpo.num_generations_per_prompt
     if spec is not None and os.environ.get("THUNDERSYNC_SPEC_SELFTEST"):

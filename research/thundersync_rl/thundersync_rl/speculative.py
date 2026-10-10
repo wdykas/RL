@@ -83,6 +83,7 @@ class SpeculativeGeneration:
         verify_batch_tokens: int = 16384,
         longest_first: bool = False,
         verify_on: str = "learner",
+        pool_weights: tuple[int, ...] | None = None,
     ):
         self.base = base
         self.learner_policy = learner_policy
@@ -113,6 +114,9 @@ class SpeculativeGeneration:
         }[verify_on]
         self.verifiers = groups
         self.verifier = groups[0]
+        # Chunk assignment pattern, e.g. weights (1, 2) -> [learner, inf, inf].
+        w = list(pool_weights) if pool_weights else [1] * len(groups)
+        self._chunk_pools = [g for g, k in zip(groups, w) for _ in range(k)]
         self.current_step = 0
         if verify_mode == "block":
             # Randomized block verification: drafts use the engine's own sampler,
@@ -490,8 +494,8 @@ class SpeculativeGeneration:
         for c, (a, b) in enumerate(zip(bounds, bounds[1:])):
             if b <= a:
                 continue
-            # Round-robin chunks over the verifier pools (learner/inference).
-            group = self.verifiers[c % len(self.verifiers)]
+            # Weighted round-robin of chunks over the verifier pools.
+            group = self._chunk_pools[c % len(self._chunk_pools)]
             refs = group.run_all_workers_single_data(
                 "verify_drafts_block_stashed",
                 rows=rows[a:b],

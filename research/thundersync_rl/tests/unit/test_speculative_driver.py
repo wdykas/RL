@@ -194,7 +194,7 @@ def _accept_all(rows, prompt_lens, segments, keys, **_):
 def test_chunked_verification_uses_all_pools_and_publishes_every_plan():
     s = _spec({})
     pools = [_RefGroup({"verify_drafts_block_stashed": _accept_all}) for _ in range(2)]
-    s.verifiers = pools
+    s.verifiers = s._chunk_pools = pools
     asyncio.run(s.verify_chunked(_drafts(6), chunks=4))
     assert [len(p.calls) for p in pools] == [2, 2]
     assert sorted(k[0] for k in s.plans) == [50, 51, 52, 53, 54, 55]
@@ -206,7 +206,7 @@ def test_verification_failure_surfaces_instead_of_hanging():
         raise ValueError("scorer failed")
 
     s = _spec({})
-    s.verifiers = [_RefGroup({"verify_drafts_block_stashed": boom})]
+    s.verifiers = s._chunk_pools = [_RefGroup({"verify_drafts_block_stashed": boom})]
     data = BatchedDataDict({"input_ids": torch.tensor([[50]]), "input_lengths": torch.tensor([1])})
 
     async def scenario():
