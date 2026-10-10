@@ -44,6 +44,7 @@ def _config(**overrides: Callable[[MasterConfig], Any]) -> MasterConfig:
             "megatron_cfg": {
                 "enabled": True,
                 "mtp_num_layers": None,
+                "expert_model_parallel_size": 1,
                 "moe_router_load_balancing_type": "none",
                 "distributed_data_parallel_config": {"grad_reduce_in_fp32": True},
             },
@@ -109,3 +110,11 @@ def test_fixed_size_microbatches_require_mbs_one():
         mc.policy["dynamic_batching"]["enabled"] = True
 
     _validate_trajectory_streaming(_config(dynamic=dynamic))
+
+
+def test_rejects_expert_parallelism():
+    def ep2(mc):
+        mc.policy["megatron_cfg"]["expert_model_parallel_size"] = 2
+
+    with pytest.raises(ValueError, match="expert_model_parallel_size=1"):
+        _validate_trajectory_streaming(_config(ep=ep2))

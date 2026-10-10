@@ -1576,6 +1576,7 @@ class MegatronPolicyWorkerImpl(
             self._require_advantage_weighted_gradients(
                 "loss_fn.skip_zero_advantage_rows"
             )
+            self._require_no_expert_parallel("loss_fn.skip_zero_advantage_rows")
             # Packed / dynamic microbatches are laid out by the driver for the
             # full row set; dropping rows on the worker would invalidate them.
             if (
@@ -2420,6 +2421,21 @@ class MegatronPolicyWorkerImpl(
             raise ValueError(
                 f"{feature} requires moe_router_load_balancing_type='none': "
                 "MoE auxiliary losses are not advantage-weighted"
+            )
+
+    def _require_no_expert_parallel(self, feature: str) -> None:
+        """Reject expert parallelism for features that vary per-rank forward counts.
+
+        Zero-advantage skipping drops a different number of rows (or whole
+        calls) on each DP rank, so ranks run different numbers of
+        forward/backward passes; with expert parallelism the EP group spans
+        DP ranks and its token all-to-all would hang.
+        """
+        if self.cfg["megatron_cfg"]["expert_model_parallel_size"] > 1:
+            raise ValueError(
+                f"{feature} requires expert_model_parallel_size=1: data-parallel "
+                "ranks may run different numbers of forward passes, which "
+                "deadlocks the expert-parallel all-to-all"
             )
 
     def _make_grad_stream_accumulator(

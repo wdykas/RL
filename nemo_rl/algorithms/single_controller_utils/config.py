@@ -1329,6 +1329,14 @@ def _validate_trajectory_streaming(master_config: MasterConfig) -> None:
     mcfg = policy["megatron_cfg"]
     if mcfg["mtp_num_layers"]:
         raise ValueError("async_rl.trajectory_streaming does not support MTP losses")
+    if mcfg["expert_model_parallel_size"] > 1:
+        # Workers split each chunk per gradient bucket, so DP ranks run
+        # different numbers of forward passes; the EP all-to-all spans them.
+        raise ValueError(
+            "async_rl.trajectory_streaming requires expert_model_parallel_size=1: "
+            "data-parallel ranks run different numbers of forward passes per "
+            "chunk, which deadlocks the expert-parallel all-to-all"
+        )
     if mcfg["moe_router_load_balancing_type"] != "none":
         raise ValueError(
             "async_rl.trajectory_streaming requires "
