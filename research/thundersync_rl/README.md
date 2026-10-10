@@ -337,5 +337,9 @@ block verification returns the target distribution (to 1e-10).
 | engine capacity | drafting uses inference capacity; at Qwen3-4B on 2 saturated inference GPUs it lost (57.7 vs 42.5 s/iter) - needs spare generation capacity |
 | zero-advantage skip | split train API, TP/PP-consistent; rejects sequence packing/dynamic batching (driver-side row dropping needed for those) |
 
-Known base-stack issue: with training PP=2 and inference PP=1 in this research loop, the
-initial refit produced a broken policy (reward ~0 at step 0, before any speculation).
+PP end-to-end: training PP=2 with inference pinned to PP=1
+(`++policy.generation.mcore_generation_config.pipeline_model_parallel_size=1`) runs
+speculation normally (98.7-99.8% draft tokens kept, rewards as usual). Without the override
+the dedicated inference model inherits the training PP=2 and generates garbage (Megatron
+inference with PP>1 in this setup); the refit export itself is correct at PP=2
+(`tests/functional/check_refit_export_parallelism.py`: same 28 layers and checksum as PP=1).

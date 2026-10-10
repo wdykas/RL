@@ -923,3 +923,12 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
     def model_param_checksum(self) -> float:
         """Debug: sum of the (refit target) model parameters, to compare pools."""
         return float(sum(p.detach().double().sum() for p in self.model.parameters()))
+
+    def debug_refit_export_names(self) -> dict[str, Any]:
+        """Debug: names (and a checksum) this rank would send at refit."""
+        names, total = [], 0.0
+        for name, t in self._iter_params_with_optional_kv_scales(kv_scales=None):
+            names.append(name)
+            total += float(t.detach().double().sum())
+        layers = sorted({int(n.split("layers.")[1].split(".")[0]) for n in names if "layers." in n})
+        return {"rank": self.rank, "n": len(names), "layers": (layers[:3], layers[-3:], len(layers)), "sum": total}
