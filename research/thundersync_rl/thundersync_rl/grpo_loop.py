@@ -146,6 +146,9 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     verify_overlap: bool = False
     # Chunks per pool in the round-robin, in verify_on order (learner, inference).
     verify_pool_weights: Optional[list[int]] = None
+    # Start drafting when this iteration's (overlapped) verification finishes,
+    # instead of at draft_start_frac of completed rollouts.
+    draft_after_verify: bool = False
 
 
 class ThunderSyncMasterConfig(MasterConfig):
@@ -431,11 +434,21 @@ async def _run_one_step(
     learner_task = asyncio.create_task(learner_loop())
     draft_task = None
     n_done = 0
+    after_verify = ts_cfg.draft_after_verify and verify_task is not None and drafter is not None
+    if after_verify:
+        # Draft only once this iteration's verification is done, so verification
+        # runs uncontended on the GPUs it shares with the drafting engine.
+        def _start_drafts(_task):
+            nonlocal draft_task
+            if draft_task is None:
+                draft_task = asyncio.create_task(drafter())
+
+        verify_task.add_done_callback(_start_drafts)
     try:
         for fut in asyncio.as_completed([rollout(i) for i in range(n)]):
             i, state, metrics = await fut
             n_done += 1
-            if drafter is not None and draft_task is None and (
+            if drafter is not None and draft_task is None and not after_verify and (
                 n_done >= ts_cfg.draft_start_frac * n
             ):
                 draft_task = asyncio.create_task(drafter())

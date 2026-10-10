@@ -804,7 +804,9 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 results.append((i, {"accepted": tau, "next": y, "logprobs": lps}))
             del logits
         if os.environ.get("THUNDERSYNC_SPEC_PROF"):
-            print(f"[spec prof] verify_stashed rank={self.rank} total={time.perf_counter() - t_all:.3f} {self._prof}", flush=True)
+            pool = "gen" if getattr(self, "dynamic_inference_engine", None) is not None else "learner"
+            ntok = sum(rows[i].numel() for i in range(len(rows)))
+            print(f"[spec prof] verify_stashed pool={pool} rank={self.rank} rows={len(rows)} tok={ntok} total={time.perf_counter() - t_all:.3f} {self._prof}", flush=True)
         return results
 
     def _score(self, scorer, ids, pos):
