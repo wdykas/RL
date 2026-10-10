@@ -187,3 +187,57 @@ def test_multi_row_commit_is_one_put_and_rejects_overlap():
 
     asyncio.run(scenario())
     assert [c["sample_ids"] for c in dp.put_calls][0] == [f"{gid}_g2", f"{gid}_g0"]
+
+
+def test_removal_keeps_claimed_rows_for_the_open_step():
+    # A retry removing a partially trained group must not clear rows the train
+    # step already claimed (it may still be fetching them); the step clears them.
+    dp = FakeDataPlaneClient()
+    buf = _buffer(dp)
+    gid = buf.reserve(weight_version=0, target_step=0)
+
+    async def scenario():
+        await buf.commit_trajectories(gid, [0], _record(1), start_weight_version=0)
+        _claim_all(buf, 0)
+        await buf.commit_trajectories(gid, [1], _record(1), start_weight_version=0)
+        await buf.remove_group(gid, remove_in_dp=True)
+
+    asyncio.run(scenario())
+    cleared = [sid for call in dp.clear_calls for sid in call]
+    assert cleared == [f"{gid}_g1"]
+    assert f"{gid}_g0" in dp._rows
+
+
+def test_same_id_retry_is_refused_until_the_step_releases_claims():
+    # Lineage-tracked retries reuse the group ID. Rows of the removed attempt
+    # are still owned by the step under the same sample IDs, so the retry must
+    # fail loudly rather than overwrite them or inherit their claims.
+    dp = FakeDataPlaneClient()
+    buf = _buffer(dp)
+    gid = buf.reserve(weight_version=0, target_step=0, group_id="lineage")
+
+    async def scenario():
+        await buf.commit_trajectories(gid, [0], _record(1), start_weight_version=0)
+        _claim_all(buf, 0)
+        await buf.remove_group(gid, remove_in_dp=True)
+
+    asyncio.run(scenario())
+    with pytest.raises(RuntimeError, match="cannot be reserved again"):
+        buf.reserve(weight_version=0, target_step=0, group_id="lineage")
+    buf.release_trajectory_claims(["lineage"])
+    assert buf.reserve(weight_version=0, target_step=0, group_id="lineage")
+
+
+def test_same_id_retry_without_claims_starts_clean():
+    dp = FakeDataPlaneClient()
+    buf = _buffer(dp)
+    gid = buf.reserve(weight_version=0, target_step=0, group_id="lineage")
+
+    async def scenario():
+        await buf.commit_trajectories(gid, [0], _record(1), start_weight_version=0)
+        await buf.remove_group(gid, remove_in_dp=True)
+        buf.reserve(weight_version=0, target_step=0, group_id="lineage")
+        await buf.commit_trajectories(gid, [0], _record(1), start_weight_version=0)
+
+    asyncio.run(scenario())
+    assert [m.sample_ids for _, m in _claim_all(buf, 0)] == [["lineage_g0"]]

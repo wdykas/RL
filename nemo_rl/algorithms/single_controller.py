@@ -313,8 +313,8 @@ class _TrajectoryStepState:
     closed: set[str] = field(default_factory=set)  # groups folded into the batch
     counted: set[str] = field(default_factory=set)  # sealed + fully claimed
     claimed: set[str] = field(default_factory=set)  # groups with any claimed row
-    # Groups removed for a retry after some rows were claimed: the rollout
-    # manager already cleared their rows, so step cleanup must skip them.
+    # Groups removed for a retry after some rows were claimed. Their claimed
+    # rows stay in the data plane until the step's cleanup clears them.
     vanished: set[str] = field(default_factory=set)
     # Rollout metrics of groups completed since the last drain.
     rollout_metrics: list[dict[str, Any]] = field(default_factory=list)
@@ -3241,24 +3241,16 @@ class SingleControllerActor:
                 async with self._data_plane_checkpoint_barrier.mutation(
                     "sample_clears"
                 ) as cut:
-                    if traj_cfg is not None and traj.vanished:
-                        consumed_metas = [
-                            m.subset(keep)
-                            for m in consumed_metas
-                            if (
-                                keep := [
-                                    i
-                                    for i, sid in enumerate(m.sample_ids)
-                                    if sid.rsplit("_g", 1)[0] not in traj.vanished
-                                ]
-                            )
-                        ]
                     await self._cleanup_consumed_metas_unlocked(cut, consumed_metas)
                     self._buffer.release_training_claims(consumed_training_claim_ids)
                 if traj_cfg is not None:
+                    # Every claimed row, including those of groups removed for a
+                    # retry mid-step, was just cleared with the consumed metas.
+                    self._buffer.release_trajectory_claims(
+                        sorted(traj.counted | traj.vanished)
+                    )
                     for group_id in traj.counted:
                         await self._buffer.remove_group(group_id)
-                    self._buffer.release_trajectory_claims(list(traj.counted))
                 for _ in range(consumed_group_count):
                     self._buffer_capacity.release()
                 step_metrics.update(
@@ -5565,8 +5557,8 @@ class SingleControllerActor:
         """Forget groups removed from the buffer for a retry mid-step.
 
         Their streamed buckets are discarded on the workers (with their
-        normalization counts) and their rows, already cleared by the rollout
-        manager, are skipped at step cleanup.
+        normalization counts). The buffer keeps their claimed rows (and their
+        claims) until step cleanup clears them.
         """
         vanished = (traj.claimed | traj.bucketed) - live - traj.counted
         if not vanished:
@@ -5577,7 +5569,6 @@ class SingleControllerActor:
         traj.bucketed -= vanished
         traj.claimed -= vanished
         traj.vanished |= vanished
-        self._buffer.release_trajectory_claims(sorted(vanished))
 
     async def _select_trajectory_chunk(
         self, traj: "_TrajectoryStepState"
