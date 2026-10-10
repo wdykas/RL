@@ -95,10 +95,39 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             state = self._train_step_state
             step_mbs = state["mbs"]
             state["mbs"] = min(item["data"].size, step_mbs)
+            prof = os.environ.get("THUNDERSYNC_LEARNER_PROF")
+            if prof:
+                torch.cuda.synchronize()
+                t_item = time.perf_counter()
+            tprof = os.environ.get("THUNDERSYNC_LEARNER_TORCHPROF")
+            adv0 = item["data"].get("advantages")
+            if adv0 is None or bool((adv0 != 0).any()):
+                self._n_items = getattr(self, "_n_items", 0) + 1
             try:
-                self.train_microbatch(item["data"], stream_bucket=bucket)
+                if tprof and getattr(self, "_n_items", 0) == int(tprof) and not getattr(self, "_tprof_done", False):
+                    self._tprof_done = True
+                    from torch.profiler import ProfilerActivity, profile
+
+                    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as tp:
+                        self.train_microbatch(item["data"], stream_bucket=bucket)
+                        torch.cuda.synchronize()
+                    print(f"[learner torchprof] shape={tuple(item['data']['input_ids'].shape)}\n"
+                          + tp.key_averages().table(sort_by="cpu_time_total", row_limit=30,
+                                                    max_name_column_width=60), flush=True)
+                else:
+                    self.train_microbatch(item["data"], stream_bucket=bucket)
             finally:
                 state["mbs"] = step_mbs
+            if prof:
+                torch.cuda.synchronize()
+                d = item["data"]
+                adv = d.get("advantages")
+                nz = int((adv.abs().sum(-1) > 0).sum()) if adv is not None else -1
+                print(
+                    f"[learner prof] rank={self.rank} rows={d.size} nonzero={nz} "
+                    f"len={tuple(d['input_ids'].shape)} secs={time.perf_counter() - t_item:.4f}",
+                    flush=True,
+                )
         if closes:
             self.close_stream_groups(closes)
         torch.cuda.synchronize()
