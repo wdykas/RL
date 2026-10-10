@@ -777,10 +777,13 @@ def thundersync_grpo_train(
             return [torch.cat([m["token_ids"] for m in r["message_log"][i]]) for i in range(r.size)]
 
         if cohort_mode:
+            # Ramp: start only the farthest cohort each step (plus the next one at
+            # step 0), so warm-up does not launch draft_lookahead cohorts at once.
+            L = ts_cfg.draft_lookahead
             new = {
                 step + 1 + j: _prompts(b)
-                for j, b in enumerate(list(upcoming)[: ts_cfg.draft_lookahead])
-                if step + 1 + j < max_steps
+                for j, b in enumerate(list(upcoming)[:L])
+                if step + 1 + j < max_steps and (j == L - 1 or (step == 0 and j == 0))
             }
             drafter = lambda new=new, step=step: spec.draft_cohorts(step, new)  # noqa: E731
         elif spec is not None and next_batch is not None and step + 1 < max_steps:
