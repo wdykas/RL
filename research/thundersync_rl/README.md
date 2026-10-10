@@ -280,14 +280,19 @@ Key measurements (Qwen2.5-Math-1.5B, bf16):
 Design (`speculative.py`, worker methods in `worker.py`):
 
 1. Once `draft_start_frac` of iteration k's rollouts finished, the engine streams
-   drafts for iteration k+1's prompts (`start_drafts`); they are aborted at the
-   deadline right before the optimizer step (`collect_drafts`) - any prefix is a
-   valid draft.
-2. Still at theta_k, the learner scores every draft's full q (`score_drafts_q`).
-3. After the step, the learner block-verifies the drafts against theta_{k+1}
-   (`verify_drafts_block`) and samples the bonus/residual token; the engine decodes
-   only the remainders. The rollout code is unchanged (`SpeculativeGeneration`
-   wraps the generation interface).
+   drafts for the next `draft_lookahead` iterations' prompts (`start_drafts`);
+   they are aborted at the deadline right before the optimizer step
+   (`collect_drafts`) - any prefix is a valid draft - and resume from their
+   prefixes under the newer weights in the following iteration. Each draft
+   records which weight version drafted which positions.
+2. Still at theta_k, the verifiers stash theta_k's weights (`stash_weights`,
+   bf16, one copy per version that drafted pending tokens).
+3. At iteration k+1, the verifiers recompute q per batch from the stashes and p
+   from theta_{k+1}, block-verify each draft (`verify_drafts_block_stashed`) in
+   chunks overlapped with the rollouts, and publish each trajectory's plan
+   (kept prefix + bonus/residual token); the engine decodes only the remainders.
+   The rollout code is unchanged (`SpeculativeGeneration` wraps the generation
+   interface).
 
 Exactness: block verification returns exact samples of p given the drafts' true
 q. q is computed with trainer numerics while drafts are sampled by the inference
@@ -310,15 +315,33 @@ Results (2 gen + 2 train GPUs, 6 steps, group streaming):
 | + verification split across learner and inference GPUs (`verify_on=both`) | 4.49 | - | 99.3% |
 | + multi-iteration drafts (`draft_lookahead=2`) | 4.57 (median 4.07) | - | 99.5% (97.5% drafts whole) |
 | + verification overlapped with rollouts on both pools (`verify_overlap`, 4 chunks, longest first), lookahead 2 - 22 steps | **4.21 (median 3.73)** | - | 99.3% (97.8% drafts whole) |
-| + lookahead 3, drafting from iteration start - **40 steps** | **3.97 (median 3.84, p90 4.59)** | - | 99.1% (98.6% drafts whole) |
-| reference: regular async, lag 4 (single controller) | 3.70 | - | - |
+| + lookahead 3, drafting from iteration start - 40 steps | 3.97 (median 3.84, p90 4.59) | - | 99.1% (98.6% drafts whole) |
+| + fused fp32 scorer kernels (SDPA attention, Triton SwiGLU) - 30 steps | 3.55 (median 3.35) | - | 99.2% |
+| + scoring only needed positions (per-version forwards stop at the segment end, LM head on segment positions only) | 3.31 (median 3.07) | - | 99.2% |
+| + zero-advantage rows in chunks of their own (learner 2.04 -> 1.55 s) - 30 steps | **3.03 (median 2.79)** | - | 99.4% (98.5% drafts whole) |
+| same, **100 steps** (zero-staleness baseline without speculation, same settings: 6.13, median 5.86) | **3.02 (median 2.70, p90 4.28)** | - | 99.5% (98.4% drafts whole) |
+| reference: regular async, lag 4 (single controller), same settings (zero-adv skip, fp32 head) | 4.26 (median 2.40, p90 7.75; generation-bound, bursty) | - | - |
 
 Scorer: block verification scores p and q with a second Megatron GPTModel
 (training provider copy with fp32 dtypes, refreshed by copying the training
 parameters) - bf16 activation rounding, not policy change, caused nearly all
-rejections. Multi-iteration drafts (`draft_lookahead=2`) reach 86-100% of drafts
-accepted whole; the remaining iteration time is the few rejected/unfinished
-long trajectories (stragglers) plus ~1 s of scoring/verification.
+rejections. Its fp32 forward replaces Megatron's unfused fp32 paths with torch
+SDPA attention and a Triton SwiGLU (`scorer_kernels.py`), and the LM head runs
+only on positions whose logits verification needs (bitwise identical logits).
+Attention needs fp32-level accuracy: bf16 attention inside the fp32 scorer
+drops acceptance from 99.2% to 96.4% and slows iterations by 25%.
+Block verification itself runs from raw logits (`block_verification_fused.py`,
+draw-for-draw identical to the reference, no [g, V] temporaries).
+
+Where the remaining time goes (1.5B, 2+2): a step whose drafts are all
+accepted takes ~2.3 s (learner-bound: ~0.6 s until the first verified groups,
+1.55 s training, 0.2 s refit). About one draft per step (of 128) is rejected:
+rejections occur at ~1.5e-5 per token, independent of how many versions old
+the drafting weights are (lookahead is free), so they reflect the one-step
+policy change. The rejected trajectory's remainder (median ~450 tokens) then
+decodes serially at ~3 ms/token, which is the straggler tail on top of the
+2.3 s. Pausing future-cohort drafts while such continuations decode does not
+help (drafting time is worth more than the contention it causes).
 
 Tests: `tests/unit/test_block_verification.py` checks by exact enumeration that
 block verification returns the target distribution (to 1e-10).
@@ -353,11 +376,16 @@ zero-staleness iteration) into next-iteration rollouts. It cannot create capacit
 
 | setting | baseline | speculative (steady state) |
 |---|---|---|
-| Qwen2.5-Math-1.5B, 2+2 GPUs (tail-bound) | 6.47 s | 3.97 s (-39%) |
+| Qwen2.5-Math-1.5B, 2+2 GPUs (tail-bound), 100 steps | 6.13 s | 3.02 s (-51%; async lag 4: 4.26 s) |
 | Qwen3-4B, 2+2 GPUs (generation saturated) | ~42.5 s | ~43-47 s |
-| Qwen3-4B, 3 gen + 1 train (generation throughput-bound, learner mostly idle) | ~31 s | ~37 s |
+| Qwen3-4B, 3 gen + 1 train (generation throughput-bound, learner mostly idle) | 31.3 s (async lag 4: 31.3 s) | ~37 s; learner-side verification 41-64 s |
+
+Speculation can at most close the gap between the zero-staleness baseline and
+an async pipeline, and at Qwen3-4B (3+1) that gap is zero: nearly every rollout
+runs to the length cap, the engine is throughput-bound all iteration, and
+gradient streaming already hides the learner.
 
 Use it when the rollout phase is dominated by a few long stragglers on mostly idle GPUs;
-disable or limit it (late `draft_start_frac`) when the decode batch stays large for the
-whole iteration. An adaptive policy (draft only while the engine's active batch is small)
-is the natural next step.
+disable it when the decode batch stays large for the whole iteration. Gating drafting on
+the number of in-flight rollouts (`draft_max_inflight`) does not help at 1.5B: drafting
+time is worth more there than the decode capacity it shares.
