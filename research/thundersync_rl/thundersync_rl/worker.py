@@ -577,13 +577,22 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 )
 
                 attn_bf16 = os.environ.get("THUNDERSYNC_SCORER_ATTN_BF16") == "1"
-                use_sdpa_attention(
+                n_attn = use_sdpa_attention(
                     self._mfp32, provider, torch.bfloat16 if attn_bf16 else None
                 )
-                use_fused_swiglu(self._mfp32)
+                n_mlp = use_fused_swiglu(self._mfp32)
+            else:
+                n_attn = n_mlp = 0
             from thundersync_rl.scorer_kernels import use_selective_output
 
-            self._scorer_select = use_selective_output(self._mfp32)
+            selective = use_selective_output(self._mfp32)
+            if self.rank == 0:
+                print(
+                    f"[thundersync scorer] dtype={provider.params_dtype} "
+                    f"sdpa_attention={n_attn} fused_swiglu={n_mlp} "
+                    f"selective_lm_head={selective}",
+                    flush=True,
+                )
             src_names = [n for n, _ in self.model.named_parameters()]
             self._mfp32_map = []
             src = dict(self.model.named_parameters())
@@ -1013,25 +1022,33 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
 
     def _score(self, scorer, ids, pos, select=None):
         """Scorer logits: [b, s, V], or [n, V] at ``select = (seq_idx, batch_idx)``."""
-        native = select is not None and getattr(self, "_scorer_select", False)
-        if native:
-            scorer.output_layer.ts_select = select
-        try:
+        from megatron.core import parallel_state as ps
+        from thundersync_rl.scorer_kernels import select_positions, supports_selection
+
+        if select is None:
+            return self._score_full(scorer, ids, pos)
+        if not supports_selection(scorer):  # e.g. sequence parallelism
             logits = self._score_full(scorer, ids, pos)
-        finally:
-            if native:
-                scorer.output_layer.ts_select = None
-        if logits is None or select is None:
-            return logits
-        if native and os.environ.get("THUNDERSYNC_SELECT_CHECK"):
+            return None if logits is None else logits[select[1], select[0]]
+        with select_positions(scorer, select):
+            logits = self._score_full(scorer, ids, pos)
+        if logits is None:  # not the last pipeline stage
+            return None
+        if (
+            os.environ.get("THUNDERSYNC_SELECT_CHECK")
+            and ps.get_pipeline_model_parallel_world_size() == 1
+        ):
+            # Debug: selected logits vs the full forward (PP=1 only: a second
+            # pipeline schedule on the last stage alone would deadlock).
             full = self._score_full(scorer, ids, pos)[select[1], select[0]]
-            lp_a = torch.log_softmax(logits[0].float(), -1)
-            lp_b = torch.log_softmax(full.float(), -1)
+            diff = torch.log_softmax(logits[0].float(), -1) - torch.log_softmax(
+                full.float(), -1
+            )
             print(
-                f"[select check] n={full.shape[0]} max|dlogp|={(lp_a - lp_b).abs().max().item():.3e}",
+                f"[select check] n={full.shape[0]} max|dlogp|={diff.abs().max().item():.3e}",
                 flush=True,
             )
-        return logits[0] if native else logits[select[1], select[0]]
+        return logits[0]
 
     def _score_full(self, scorer, ids, pos):
         from megatron.core import parallel_state as ps
@@ -1048,9 +1065,12 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 gather_kw["runtime_gather_output"] = True
         except ImportError:
             pass
-        if os.environ.get("THUNDERSYNC_SPEC_TORCHPROF") and not getattr(
-            self, "_profiled", False
+        if (
+            os.environ.get("THUNDERSYNC_SPEC_TORCHPROF")
+            and not getattr(self, "_profiled", False)
+            and ps.get_pipeline_model_parallel_world_size() == 1
         ):
+            # Debug: profile one extra forward (PP=1 only: outside the schedule).
             self._profiled = True
             from torch.profiler import ProfilerActivity, profile
 

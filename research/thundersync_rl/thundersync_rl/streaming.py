@@ -189,29 +189,29 @@ class StreamPlanner:
                         advantages=None,
                     )
                 )
-        # Final trajectories from different groups can share a chunk. Zero-
-        # advantage rows go into chunks of their own: with
-        # loss_fn.skip_zero_advantage_rows the worker counts and drops such a
-        # chunk without a forward, instead of running part-empty micro-batches.
-        final.sort(
-            key=lambda t: (
-                self.groups[t.group].advantage_by_reward[t.reward] == 0.0,
-                t.num_tokens,
-            )
-        )
-        for s in range(0, len(final), m):
-            trajs = final[s : s + m]
-            chunks.append(
-                Chunk(
-                    group=None,
-                    reward=None,
-                    trajectories=trajs,
-                    advantages=[
-                        self.groups[t.group].advantage_by_reward[t.reward]
-                        for t in trajs
-                    ],
+
+        # Final trajectories from different groups can share a chunk (length-
+        # sorted). Zero-advantage rows are chunked separately: with
+        # loss_fn.skip_zero_advantage_rows the worker counts and drops an
+        # all-zero chunk without a forward, and no chunk mixes the two kinds.
+        def advantage(t: Trajectory) -> float:
+            return self.groups[t.group].advantage_by_reward[t.reward]
+
+        final.sort(key=lambda t: t.num_tokens)
+        for rows in (
+            [t for t in final if advantage(t) != 0.0],
+            [t for t in final if advantage(t) == 0.0],
+        ):
+            for s in range(0, len(rows), m):
+                trajs = rows[s : s + m]
+                chunks.append(
+                    Chunk(
+                        group=None,
+                        reward=None,
+                        trajectories=trajs,
+                        advantages=[advantage(t) for t in trajs],
+                    )
                 )
-            )
 
         # Greedy longest-first token balancing over DP ranks.
         per_rank: list[list[Chunk]] = [[] for _ in range(self.dp_size)]

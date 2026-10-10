@@ -136,12 +136,6 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # Verify the longest drafts first (with verify_chunks > 1) so the likely
     # stragglers' continuations start earliest.
     verify_longest_first: bool = False
-    # Put this many of the cheapest groups in a small first verification chunk
-    # (chunks then align to group boundaries) so the learner starts sooner.
-    verify_first_chunk_groups: int = 0
-    # Cut verification chunks at group boundaries (groups longest first), so
-    # each finished chunk hands the learner complete groups.
-    verify_group_aligned: bool = False
     # Run the weight stash + block verification on the "learner" or on the
     # "inference" (generation) workers. EXPERIMENTAL: "inference" currently hangs
     # at the first verification (the stash call works; the awaited verify call
@@ -155,10 +149,23 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # Start drafting when this iteration's (overlapped) verification finishes,
     # instead of at draft_start_frac of completed rollouts.
     draft_after_verify: bool = False
-    # Also wait until at most this many of this iteration's rollouts are still
-    # in flight, so drafts only fill decode capacity the tail leaves idle (for
-    # throughput-bound generation). None: draft_start_frac alone decides.
-    draft_max_inflight: Optional[int] = None
+
+
+def new_cohort_targets(
+    step: int,
+    lookahead: int,
+    max_steps: int,
+    existing,
+    per_step: int = 2,
+) -> list[int]:
+    """Iterations whose draft cohorts start at ``step``.
+
+    The nearest iterations in the lookahead window without a cohort, at most
+    ``per_step`` per step: warm-up ramps up instead of launching every cohort
+    at once, and every iteration after the first gets drafts.
+    """
+    window = range(step + 1, min(step + 1 + lookahead, max_steps))
+    return [t for t in window if t not in existing][:per_step]
 
 
 class ThunderSyncMasterConfig(MasterConfig):
@@ -466,11 +473,7 @@ async def _run_one_step(
                 drafter is not None
                 and draft_task is None
                 and not after_verify
-                and (n_done >= ts_cfg.draft_start_frac * n)
-                and (
-                    ts_cfg.draft_max_inflight is None
-                    or n - n_done <= ts_cfg.draft_max_inflight
-                )
+                and n_done >= ts_cfg.draft_start_frac * n
             ):
                 draft_task = asyncio.create_task(drafter())
             if learner_task.done():
@@ -741,8 +744,6 @@ def thundersync_grpo_train(
             q_storage=ts_cfg.q_storage,
             verify_batch_tokens=ts_cfg.verify_batch_tokens,
             longest_first=ts_cfg.verify_longest_first,
-            first_chunk_groups=ts_cfg.verify_first_chunk_groups,
-            group_aligned=ts_cfg.verify_group_aligned,
             verify_on=ts_cfg.verify_on,
             pool_weights=ts_cfg.verify_pool_weights,
         )
@@ -829,14 +830,11 @@ def thundersync_grpo_train(
             ]
 
         if cohort_mode:
-            # Ramp: start only the farthest cohort each step (plus the next one at
-            # step 0), so warm-up does not launch draft_lookahead cohorts at once.
-            L = ts_cfg.draft_lookahead
-            new = {
-                step + 1 + j: _prompts(b)
-                for j, b in enumerate(list(upcoming)[:L])
-                if step + 1 + j < max_steps and (j == L - 1 or (step == 0 and j == 0))
-            }
+            ahead = list(upcoming)[: ts_cfg.draft_lookahead]
+            targets = new_cohort_targets(
+                step, len(ahead), max_steps, existing=spec.cohorts.keys()
+            )
+            new = {t: _prompts(ahead[t - step - 1]) for t in targets}
             drafter = lambda new=new, step=step: spec.draft_cohorts(step, new)  # noqa: E731
         elif spec is not None and next_batch is not None and step + 1 < max_steps:
             nxt = next_batch.repeat_interleave(G)

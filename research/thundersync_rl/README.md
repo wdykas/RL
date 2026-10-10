@@ -386,6 +386,7 @@ runs to the length cap, the engine is throughput-bound all iteration, and
 gradient streaming already hides the learner.
 
 Use it when the rollout phase is dominated by a few long stragglers on mostly idle GPUs;
-disable it when the decode batch stays large for the whole iteration. Gating drafting on
-the number of in-flight rollouts (`draft_max_inflight`) does not help at 1.5B: drafting
-time is worth more there than the decode capacity it shares.
+disable it when the decode batch stays large for the whole iteration. Delaying or pausing
+drafting to free decode capacity (for example until few rollouts remain in flight, or
+while continuations decode) was tried and does not help at 1.5B: drafting time is worth
+more there than the decode capacity it shares.

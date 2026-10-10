@@ -33,6 +33,41 @@ from __future__ import annotations
 import torch
 
 
+def acceptance_weights(log_ratio: torch.Tensor) -> torch.Tensor:
+    """Acceptance weights b [g+1] (fp64) from log p(x_i) - log q(x_i) [g].
+
+    Closed form of b_i = min(1, b_{i-1} p/q): log b_i = S_i - max_{j<=i} S_j.
+    """
+    s_cum = torch.cat(
+        [
+            torch.zeros(1, dtype=torch.float64, device=log_ratio.device),
+            torch.cumsum(log_ratio.double(), 0),
+        ]
+    )
+    return (s_cum - torch.cummax(s_cum, 0).values).exp()
+
+
+def stop_probabilities(r: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Stop probabilities h [g+1] from the residual masses r [g] and b [g+1]."""
+    denom = r + 1 - b[:-1]
+    h = torch.where(denom > 0, r / denom.clamp(min=1e-300), torch.ones_like(denom))
+    return torch.cat([h, b[-1:]])
+
+
+def emit_distribution(
+    p_row: torch.Tensor, q_row: torch.Tensor | None, b_tau: torch.Tensor
+) -> torch.Tensor:
+    """Unnormalized law of the emitted token: p (bonus, ``q_row=None``) or the residual.
+
+    An empty residual happens only when p_tau == q_tau exactly (measure zero,
+    e.g. equal weights); then fall back to p.
+    """
+    if q_row is None:
+        return p_row
+    dist = (b_tau * p_row - q_row).clamp(min=0)
+    return dist if bool(dist.sum() > 0) else p_row
+
+
 def block_weights(
     lp: torch.Tensor, lq: torch.Tensor, draft: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -43,27 +78,15 @@ def block_weights(
     """
     g = draft.numel()
     ar = torch.arange(g, device=lp.device)
-    lr = (lp[ar, draft] - lq[ar, draft]).double()
-    s_cum = torch.cat(
-        [torch.zeros(1, dtype=torch.float64, device=lp.device), torch.cumsum(lr, 0)]
-    )
-    # log b_i = S_i - max_{j<=i} S_j  (closed form of the min(1, b r) recursion)
-    b = (s_cum - torch.cummax(s_cum, 0).values).exp()
+    b = acceptance_weights(lp[ar, draft] - lq[ar, draft])
     resid = (b[:g, None] * lp[:g].double().exp() - lq.double().exp()).clamp_(min=0)
-    r = resid.sum(-1)
-    denom = r + 1 - b[:g]
-    h = torch.where(denom > 0, r / denom.clamp(min=1e-300), torch.ones_like(denom))
-    return torch.cat([h, b[g:]]), b, resid
+    return stop_probabilities(resid.sum(-1), b), b, resid
 
 
-def _emit_dist(lp, resid, tau: int, g: int) -> torch.Tensor:
+def _emit_dist(lp, lq, b, tau: int, g: int) -> torch.Tensor:
     """Distribution of the emitted token after keeping draft[:tau]."""
-    if tau == g:
-        return lp[g].double().exp()
-    dist = resid[tau]
-    # Empty residual only when p_tau == q_tau exactly (measure zero, e.g. equal
-    # weights); fall back to p.
-    return dist if bool(dist.sum() > 0) else lp[tau].double().exp()
+    q_row = None if tau == g else lq[tau].double().exp()
+    return emit_distribution(lp[tau].double().exp(), q_row, b[tau])
 
 
 def block_verify(
@@ -74,10 +97,10 @@ def block_verify(
 ) -> tuple[int, int]:
     """Sample (tau, y): keep draft[:tau], then emit y."""
     g = draft.numel()
-    h, _, resid = block_weights(lp, lq, draft)
+    h, b, _ = block_weights(lp, lq, draft)
     eta = torch.rand(g + 1, generator=generator, dtype=torch.float64, device=lp.device)
     tau = int(torch.nonzero(eta <= h).flatten().max())
-    dist = _emit_dist(lp, resid, tau, g)
+    dist = _emit_dist(lp, lq, b, tau, g)
     y = int(torch.multinomial((dist / dist.sum()).float(), 1, generator=generator))
     return tau, y
 
@@ -87,10 +110,10 @@ def output_distribution_given_draft(
 ) -> list[tuple[int, torch.Tensor]]:
     """Exact law of (tau, y) for a fixed draft: [(tau, P(tau) * P(y | tau))]."""
     g = draft.numel()
-    h, _, resid = block_weights(lp, lq, draft)
+    h, b, _ = block_weights(lp, lq, draft)
     out = []
     for i in range(g + 1):
         p_tau = h[i] * torch.prod(1 - h[i + 1 :])
-        dist = _emit_dist(lp, resid, i, g)
+        dist = _emit_dist(lp, lq, b, i, g)
         out.append((i, p_tau * dist / dist.sum()))
     return out

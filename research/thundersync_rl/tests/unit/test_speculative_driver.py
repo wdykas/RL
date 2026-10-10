@@ -242,51 +242,18 @@ def test_verification_failure_surfaces_instead_of_hanging():
     asyncio.run(scenario())
 
 
-def _group_drafts(lengths_per_group, group_size=2):
-    """Group g has prompt [70 + g]; member m has a draft of lengths_per_group[g] tokens."""
-    return [
-        [(torch.tensor([70 + g]), -1, [4] * n, True, f"1:{g}:{m}", [(0, 0, n)])]
-        for g, n in enumerate(lengths_per_group)
-        for m in range(group_size)
-    ]
+def test_every_iteration_after_the_first_gets_a_cohort():
+    from thundersync_rl.grpo_loop import new_cohort_targets
 
-
-def test_group_chunks_cheapest_groups_first_then_longest_aligned_to_groups():
-    s = _spec({})
-    s.first_chunk_groups = 1
-    flat, rows = s._flat_rows(_group_drafts([5, 1, 9, 3]))
-    flat, rows, bounds = s._group_chunks(flat, rows, chunks=3)
-    groups = [int(d[0][0]) - 70 for _, d in flat]
-    assert groups == [1, 1, 2, 2, 0, 0, 3, 3]  # cheapest first, then longest first
-    assert bounds[0] == 0 and bounds[1] == 2 and bounds[-1] == 8
-    assert all(b % 2 == 0 for b in bounds)  # never splits a group
-    assert len(bounds) <= 4
-
-
-def test_group_chunked_verification_publishes_every_plan():
-    s = _spec({})
-    s.first_chunk_groups = 1
-    pools = [_RefGroup({"verify_drafts_block_stashed": _accept_all}) for _ in range(2)]
-    s.verifiers = s._chunk_pools = pools
-
-    def accept(rows, prompt_lens, segments, keys, **_):
-        return [
-            (j, {"accepted": len(r) - 1, "next": 0, "logprobs": [-0.1] * len(r)})
-            for j, r in enumerate(rows)
-        ]
-
-    for p in pools:
-        p.handlers["verify_drafts_block_stashed"] = accept
-    asyncio.run(s.verify_chunked(_group_drafts([5, 1, 9, 3]), chunks=3))
-    assert sorted(k[0] for k in s.plans) == [70, 71, 72, 73]
-    assert all(len(v) == 2 for v in s.plans.values())
-
-
-def test_group_aligned_chunks_without_first_chunk():
-    s = _spec({})
-    s.group_aligned = True
-    flat, rows = s._flat_rows(_group_drafts([5, 1, 9, 3]))
-    flat, rows, bounds = s._group_chunks(flat, rows, chunks=2)
-    assert [int(d[0][0]) - 70 for _, d in flat] == [2, 2, 0, 0, 3, 3, 1, 1]
-    assert bounds[0] == 0 and bounds[-1] == 8 and len(bounds) == 3
-    assert all(b % 2 == 0 for b in bounds)
+    for lookahead in (2, 3, 4):
+        started: set[int] = set()
+        for step in range(12):
+            new = new_cohort_targets(step, lookahead, max_steps=12, existing=started)
+            assert len(new) <= 2 and all(step < t < step + 1 + lookahead for t in new)
+            started.update(new)
+            started.discard(step)  # verified (popped) at its own iteration
+            assert step + 1 >= 12 or step + 1 in started or step + 1 in new
+        assert started.union(range(1, 12)) == set(range(1, 12))
+    assert new_cohort_targets(0, 3, max_steps=12, existing=set()) == [1, 2]
+    assert new_cohort_targets(1, 3, max_steps=12, existing={2}) == [3, 4]
+    assert new_cohort_targets(10, 3, max_steps=12, existing=set()) == [11]

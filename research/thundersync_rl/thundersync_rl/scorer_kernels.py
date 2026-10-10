@@ -14,15 +14,21 @@
 """Fast fp32 forward pieces for the verification scorer (Megatron GPTModel copy).
 
 Megatron/TE kernels are tuned for bf16; in fp32 the scorer falls back to
-unfused paths. These replacements compute the same functions:
+unfused paths. These replacements compute the same functions and are applied
+only where that holds:
 
 * ``swiglu``: one Triton pass over the fc1 output instead of strided silu,
-  ``+ glu_linear_offset`` and mul kernels on non-contiguous halves.
+  ``+ glu_linear_offset`` and mul kernels on non-contiguous halves (dense
+  ``MLP`` modules only; MoE experts keep their own forward).
 * ``SDPACoreAttention``: causal attention through torch SDPA (fused fp32)
-  instead of the unfused score-matrix path with TF32 score GEMMs.
+  instead of the unfused score-matrix path with TF32 score GEMMs (plain causal
+  softmax attention only: no sliding window, no attention sinks).
+* ``select_positions``: run the LM head on chosen positions only.
 """
 
 from __future__ import annotations
+
+import contextlib
 
 import torch
 import torch.nn.functional as F
@@ -42,7 +48,7 @@ def _swiglu_kernel(x_ptr, out_ptr, h, BLOCK: tl.constexpr):
 
 
 def swiglu(x: torch.Tensor) -> torch.Tensor:
-    """silu(x[..., :h]) * x[..., h:] for a contiguous [..., 2h] tensor."""
+    """silu(x[..., :h]) * x[..., h:] for a [..., 2h] tensor."""
     x = x.contiguous()
     h = x.shape[-1] // 2
     rows = x.numel() // (2 * h)
@@ -53,25 +59,29 @@ def swiglu(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def _plain_swiglu(cfg) -> bool:
+    return bool(
+        cfg.gated_linear_unit
+        and cfg.activation_func is F.silu
+        and not getattr(cfg, "use_te_activation_func", False)
+        and getattr(cfg, "activation_func_clamp_value", None) is None
+        and getattr(cfg, "activation_func_tanh_clamp_scale", None) is None
+        and not getattr(cfg, "glu_linear_offset", 0.0)
+    )
+
+
 def use_fused_swiglu(model: torch.nn.Module) -> int:
-    """Route every plain SwiGLU Megatron MLP of ``model`` through ``swiglu``."""
+    """Route every dense SwiGLU ``MLP`` of ``model`` through ``swiglu``; return count.
+
+    Only modules whose type is exactly Megatron's ``MLP``: MoE experts
+    (``TEGroupedMLP``, ``SequentialMLP``) and ``SharedExpertMLP`` have other call
+    signatures and outputs, and keep their own forward.
+    """
+    from megatron.core.transformer.mlp import MLP
+
     n = 0
     for mod in list(model.modules()):
-        cfg = getattr(mod, "config", None)
-        if not (
-            hasattr(mod, "linear_fc1")
-            and hasattr(mod, "linear_fc2")
-            and cfg is not None
-        ):
-            continue
-        if not (
-            cfg.gated_linear_unit
-            and cfg.activation_func is F.silu
-            and not getattr(cfg, "use_te_activation_func", False)
-            and getattr(cfg, "activation_func_clamp_value", None) is None
-            and getattr(cfg, "activation_func_tanh_clamp_scale", None) is None
-            and not getattr(cfg, "glu_linear_offset", 0.0)
-        ):
+        if type(mod) is not MLP or not _plain_swiglu(mod.config):
             continue
 
         def forward(hidden_states, per_token_scale=None, _m=mod, **kw):
@@ -91,14 +101,12 @@ class SDPACoreAttention(torch.nn.Module):
 
     Inputs are Megatron's [s, b, heads, dim] (GQA: fewer kv heads); output is
     [s, b, heads * dim]. Rows are right-padded, so causal masking alone is exact
-    for the real tokens.
+    for the real tokens. ``softmax_scale`` must be the replaced module's own
+    scale (it differs from 1/sqrt(dim) for e.g. MLA with YaRN).
     """
 
-    def __init__(
-        self, orig: torch.nn.Module, softmax_scale: float | None, attn_dtype=None
-    ):
+    def __init__(self, softmax_scale: float, attn_dtype: torch.dtype | None = None):
         super().__init__()
-        self.orig = orig
         self.softmax_scale = softmax_scale
         # Optional lower-precision attention (e.g. bf16 flash) inside an fp32 model.
         self.attn_dtype = attn_dtype
@@ -122,11 +130,7 @@ class SDPACoreAttention(torch.nn.Module):
             v = v.repeat_interleave(rep, dim=1)
         dtype = q.dtype
         if self.attn_dtype is not None:
-            q, k, v = (
-                q.to(self.attn_dtype),
-                k.to(self.attn_dtype),
-                v.to(self.attn_dtype),
-            )
+            q, k, v = (t.to(self.attn_dtype) for t in (q, k, v))
         out = F.scaled_dot_product_attention(
             q, k, v, is_causal=True, scale=self.softmax_scale
         )
@@ -134,35 +138,62 @@ class SDPACoreAttention(torch.nn.Module):
         return out.to(dtype).permute(2, 0, 1, 3).reshape(s, b, -1)
 
 
+def _replaceable_scale(core_attention: torch.nn.Module, config) -> float | None:
+    """The module's softmax scale if it is plain causal softmax attention, else None.
+
+    Megatron's local ``DotProductAttention`` keeps ``softmax_scale`` itself; TE's
+    keeps it on its backends (``unfused_attention``). Modules with parameters
+    (learnable attention sinks), a sliding window or a non-vanilla softmax are
+    left alone.
+    """
+    if any(True for _ in core_attention.parameters()):
+        return None
+    if getattr(config, "window_size", None) is not None:
+        return None
+    window = getattr(core_attention, "window_size", None)
+    if window is not None and tuple(window) not in ((-1, 0), (-1, -1)):
+        return None
+    softmax_type = getattr(
+        core_attention, "softmax_type", getattr(config, "softmax_type", "vanilla")
+    )
+    if softmax_type != "vanilla":
+        return None
+    scale = getattr(core_attention, "softmax_scale", None)
+    if scale is None:
+        scale = getattr(
+            getattr(core_attention, "unfused_attention", None), "softmax_scale", None
+        )
+    return None if scale is None else float(scale)
+
+
 def use_sdpa_attention(model: torch.nn.Module, config, attn_dtype=None) -> int:
-    """Replace every core_attention submodule of ``model`` with SDPA; return count."""
+    """Replace each plain causal core_attention of ``model`` with SDPA; return count."""
     n = 0
     for mod in list(model.modules()):
         ca = getattr(mod, "core_attention", None)
-        if isinstance(ca, torch.nn.Module) and not isinstance(ca, SDPACoreAttention):
-            mod.core_attention = SDPACoreAttention(
-                ca, getattr(config, "softmax_scale", None), attn_dtype
-            )
+        if not isinstance(ca, torch.nn.Module) or isinstance(ca, SDPACoreAttention):
+            continue
+        scale = _replaceable_scale(ca, config)
+        if scale is not None:
+            mod.core_attention = SDPACoreAttention(scale, attn_dtype)
             n += 1
     return n
 
 
 def use_selective_output(model: torch.nn.Module) -> bool:
-    """Let callers pick which hidden positions reach the LM head.
+    """Patch ``model``'s LM head so ``select_positions`` can restrict it.
 
-    Set ``model.output_layer.ts_select = (seq_idx, batch_idx)`` before a forward
-    to get logits of shape [1, n, V] for just those positions (prompt tokens and
-    positions outside a draft segment need no logits). Not available with
-    sequence parallelism, where the output layer gathers sharded hidden states.
+    Not available with sequence parallelism, where the output layer gathers
+    sequence-sharded hidden states itself. Returns whether it was applied.
     """
     layer = getattr(model, "output_layer", None)
     if layer is None or getattr(layer, "sequence_parallel", False):
         return False
     orig_forward = layer.forward
-    layer.ts_select = None
+    layer._ts_select = None
 
     def forward(input_, weight=None, runtime_gather_output=None, **kw):
-        sel = layer.ts_select
+        sel = layer._ts_select
         if sel is not None:
             input_ = input_[sel[0], sel[1]].unsqueeze(1)  # [n, 1, h]
         return orig_forward(
@@ -171,3 +202,23 @@ def use_selective_output(model: torch.nn.Module) -> bool:
 
     layer.forward = forward
     return True
+
+
+def supports_selection(model: torch.nn.Module) -> bool:
+    """Whether ``use_selective_output`` was applied to ``model``."""
+    return hasattr(getattr(model, "output_layer", None), "_ts_select")
+
+
+@contextlib.contextmanager
+def select_positions(model: torch.nn.Module, select):
+    """Restrict ``model``'s LM head to ``select = (seq_idx, batch_idx)`` in the block.
+
+    Forwards inside the block return logits [1, n, V] for those positions only.
+    """
+    layer = model.output_layer
+    prev = layer._ts_select
+    layer._ts_select = select
+    try:
+        yield
+    finally:
+        layer._ts_select = prev

@@ -83,8 +83,6 @@ class SpeculativeGeneration:
         q_storage: str = "full",
         verify_batch_tokens: int = 16384,
         longest_first: bool = False,
-        first_chunk_groups: int = 0,
-        group_aligned: bool = False,
         verify_on: str = "learner",
         pool_weights: tuple[int, ...] | None = None,
     ):
@@ -106,8 +104,6 @@ class SpeculativeGeneration:
         self.q_storage = q_storage
         self.verify_batch_tokens = verify_batch_tokens
         self.longest_first = longest_first
-        self.first_chunk_groups = first_chunk_groups
-        self.group_aligned = group_aligned
         # Where stash + block verification run: "learner" or "inference" (the
         # generation workers hold theta_k until the refit and theta_{k+1} after
         # it, and sit idle while rollouts wait for verification).
@@ -519,54 +515,13 @@ class SpeculativeGeneration:
             flush=True,
         )
 
-    def _group_chunks(self, flat, rows, chunks: int):
-        """Order rows group by group and cut chunks at group boundaries.
-
-        The learner trains on complete groups, so chunks never split a group.
-        An optional first chunk holds the ``first_chunk_groups`` cheapest fully
-        drafted groups (fast to verify, no decoding left); the other groups follow
-        longest first (likely stragglers' continuations start early), split into
-        chunks of equal token counts.
-        """
-        groups: dict[tuple[int, ...], list[int]] = defaultdict(list)
-        for j, (_, d) in enumerate(flat):
-            groups[_key(d[0])].append(j)
-        cost = {k: sum(rows[j].numel() for j in js) for k, js in groups.items()}
-        # Groups whose drafts all finished complete as soon as they verify;
-        # unfinished (deadline-truncated) drafts still need decoding.
-        finished = {
-            k: all(len(flat[j][1]) <= 3 or flat[j][1][3] for j in js)
-            for k, js in groups.items()
-        }
-        by_cost = sorted(groups, key=lambda k: (not finished[k], cost[k]))
-        first = by_cost[: self.first_chunk_groups]
-        rest = sorted(
-            by_cost[self.first_chunk_groups :],
-            key=lambda k: -max(len(flat[j][1][2]) for j in groups[k]),
-        )
-        order = [j for k in first + rest for j in groups[k]]
-        bounds = [0] + ([sum(len(groups[k]) for k in first)] if first else [])
-        rest_chunks = chunks - len(bounds) + 1
-        total = sum(cost[k] for k in rest)
-        acc, pos = 0, bounds[-1]
-        for k in rest:
-            acc += cost[k]
-            pos += len(groups[k])
-            done = len(bounds) - (2 if first else 1)  # rest chunks closed so far
-            if done + 1 < rest_chunks and acc >= total * (done + 1) / rest_chunks:
-                bounds.append(pos)
-        if bounds[-1] != len(order):
-            bounds.append(len(order))
-        return [flat[j] for j in order], [rows[j] for j in order], bounds
-
     async def _verify_chunked(self, drafts, chunks: int) -> None:
         """Stash-mode verification in ``chunks`` pieces, publishing plans per chunk.
 
         Rollouts start as soon as their chunk is verified instead of waiting for
-        the whole batch. Rows are ordered longest draft first
-        (``longest_first``) or group by group (``group_aligned`` /
-        ``first_chunk_groups``); chunks go round-robin over the verifier pools,
-        and every chunk call is queued at once (each pool runs its calls in order).
+        the whole batch. Rows are ordered longest draft first with
+        ``longest_first``; chunks go round-robin over the verifier pools, and
+        every chunk call is queued at once (each pool runs its calls in order).
         """
         flat, rows = self._flat_rows(drafts)
         if os.environ.get("THUNDERSYNC_SPEC_CHECK") and len(self.verifiers) > 1:
@@ -584,8 +539,6 @@ class SpeculativeGeneration:
         self._plan_cv = asyncio.Condition()
         n = len(flat)
         bounds = [round(c * n / chunks) for c in range(chunks + 1)]
-        if (self.group_aligned or self.first_chunk_groups) and chunks > 1:
-            flat, rows, bounds = self._group_chunks(flat, rows, chunks)
         calls = []
         for c, (a, b) in enumerate(zip(bounds, bounds[1:])):
             if b <= a:

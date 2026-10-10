@@ -44,7 +44,7 @@ def test_sdpa_core_attention_matches_fp64_reference_with_gqa():
     q = torch.randn(s, b, h, d, device="cuda")
     k = torch.randn(s, b, hk, d, device="cuda")
     v = torch.randn(s, b, hk, d, device="cuda")
-    out = SDPACoreAttention(torch.nn.Identity(), softmax_scale=None)(q, k, v, None)
+    out = SDPACoreAttention(softmax_scale=1 / math.sqrt(d))(q, k, v, None)
     assert out.shape == (s, b, h * d) and out.dtype == torch.float32
     torch.testing.assert_close(
         out.double(), _reference_attention(q, k, v), atol=1e-5, rtol=0
@@ -55,22 +55,72 @@ def test_sdpa_core_attention_bf16_option_keeps_output_dtype():
     from thundersync_rl.scorer_kernels import SDPACoreAttention
 
     q = torch.randn(8, 2, 4, 64, device="cuda")
-    attn = SDPACoreAttention(torch.nn.Identity(), None, attn_dtype=torch.bfloat16)
+    attn = SDPACoreAttention(1 / 8, attn_dtype=torch.bfloat16)
     assert attn(q, q, q, None).dtype == torch.float32
 
 
-def test_use_sdpa_attention_replaces_every_core_attention_once():
+class _LocalAttention(torch.nn.Module):
+    """Stands in for Megatron's local DotProductAttention (keeps softmax_scale)."""
+
+    def __init__(self, scale, window_size=None):
+        super().__init__()
+        self.softmax_scale = scale
+        if window_size is not None:
+            self.window_size = window_size
+
+
+class _Layer(torch.nn.Module):
+    def __init__(self, core):
+        super().__init__()
+        self.core_attention = core
+
+
+def test_use_sdpa_attention_keeps_each_modules_scale_and_skips_unsupported():
     from thundersync_rl.scorer_kernels import SDPACoreAttention, use_sdpa_attention
 
-    class Layer(torch.nn.Module):
+    class Sink(_LocalAttention):  # learnable attention sink: has parameters
+        def __init__(self):
+            super().__init__(0.1)
+            self.softmax_offset = torch.nn.Parameter(torch.zeros(2))
+
+    cfg = SimpleNamespace(softmax_scale=None, window_size=None, softmax_type="vanilla")
+    model = torch.nn.Sequential(
+        _Layer(_LocalAttention(0.25)),  # MLA/YaRN-style custom scale
+        _Layer(_LocalAttention(0.125, window_size=(128, 0))),  # sliding window
+        _Layer(Sink()),
+        _Layer(torch.nn.Identity()),  # scale unknown
+    )
+    assert use_sdpa_attention(model, cfg) == 1
+    assert use_sdpa_attention(model, cfg) == 0
+    assert isinstance(model[0].core_attention, SDPACoreAttention)
+    assert model[0].core_attention.softmax_scale == 0.25
+    assert not any(isinstance(m.core_attention, SDPACoreAttention) for m in model[1:])
+    windowed_cfg = SimpleNamespace(softmax_scale=None, window_size=(64, 0))
+    assert (
+        use_sdpa_attention(
+            torch.nn.Sequential(_Layer(_LocalAttention(0.2))), windowed_cfg
+        )
+        == 0
+    )
+
+
+def test_fused_swiglu_patches_only_dense_mlp():
+    from megatron.core.transformer.mlp import MLP
+    from thundersync_rl.scorer_kernels import use_fused_swiglu
+
+    cfg = SimpleNamespace(gated_linear_unit=True, activation_func=F.silu)
+
+    class NotDense(torch.nn.Module):  # e.g. an MoE expert container
         def __init__(self):
             super().__init__()
-            self.core_attention = torch.nn.Identity()
+            self.config, self.linear_fc1, self.linear_fc2 = cfg, None, None
 
-    model = torch.nn.Sequential(Layer(), Layer())
-    assert use_sdpa_attention(model, SimpleNamespace(softmax_scale=None)) == 2
-    assert use_sdpa_attention(model, SimpleNamespace(softmax_scale=None)) == 0
-    assert all(isinstance(m.core_attention, SDPACoreAttention) for m in model)
+    dense = MLP.__new__(MLP)
+    torch.nn.Module.__init__(dense)
+    dense.config = cfg
+    model = torch.nn.Sequential(dense, NotDense())
+    assert use_fused_swiglu(model) == 1
+    assert "forward" in vars(dense) and "forward" not in vars(model[1])
 
 
 @pytest.mark.parametrize("shape", [(5, 3, 2 * 1000), (7, 2 * 4096)])
@@ -83,7 +133,11 @@ def test_swiglu_matches_silu_times_linear(shape):
 
 
 def test_selective_output_returns_logits_of_selected_positions_only():
-    from thundersync_rl.scorer_kernels import use_selective_output
+    from thundersync_rl.scorer_kernels import (
+        select_positions,
+        supports_selection,
+        use_selective_output,
+    )
 
     class Out(torch.nn.Module):  # stands in for Megatron's ColumnParallelLinear
         def __init__(self):
@@ -95,14 +149,17 @@ def test_selective_output_returns_logits_of_selected_positions_only():
             return input_ @ self.weight.t(), None
 
     model = SimpleNamespace(output_layer=Out())
-    assert use_selective_output(model)
+    assert not supports_selection(model)
+    assert use_selective_output(model) and supports_selection(model)
     hidden = torch.randn(6, 2, 4, device="cuda")  # [s, b, h]
     full, _ = model.output_layer(hidden)
     sel = (
         torch.tensor([0, 3, 5], device="cuda"),
         torch.tensor([1, 0, 1], device="cuda"),
     )
-    model.output_layer.ts_select = sel
-    part, _ = model.output_layer(hidden)
+    with select_positions(model, sel):
+        part, _ = model.output_layer(hidden)
     assert part.shape == (3, 1, 11)
     torch.testing.assert_close(part[:, 0], full[sel[0], sel[1]])
+    after, _ = model.output_layer(hidden)  # selection ends with the block
+    assert after.shape == full.shape

@@ -13,7 +13,9 @@
 # limitations under the License.
 """Block verification from raw logits without materializing [g, V] tensors.
 
-Same algorithm and outputs as ``block_verification.block_verify`` (see there),
+Same algorithm as ``block_verification.block_verify`` (see there), sharing its
+acceptance math (``acceptance_weights``, ``stop_probabilities``,
+``emit_distribution``) and its rounding (fp32 log-probs, exponentiated in fp64),
 computed as: one logsumexp per row of p and q, the draft-token ratios and b on
 [g] vectors, and one Triton pass per row for r_i = sum_v max(b_i p_i - q_i, 0).
 Only the residual row that is actually sampled from is materialized.
@@ -24,6 +26,12 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+
+from thundersync_rl.block_verification import (
+    acceptance_weights,
+    emit_distribution,
+    stop_probabilities,
+)
 
 
 @triton.jit
@@ -38,15 +46,12 @@ def _residual_mass_kernel(
     for off in range(0, vocab, BLOCK):
         cols = off + tl.arange(0, BLOCK)
         mask = cols < vocab
-        p = tl.exp(
-            tl.load(P + row.to(tl.int64) * sp + cols, mask=mask, other=float("-inf"))
-            - lp0
-        )
-        q = tl.exp(
-            tl.load(Q + row.to(tl.int64) * sq + cols, mask=mask, other=float("-inf"))
-            - lq0
-        )
-        d = bi * p.to(tl.float64) - q.to(tl.float64)
+        lp = tl.load(P + row.to(tl.int64) * sp + cols, mask=mask, other=float("-inf"))
+        lq = tl.load(Q + row.to(tl.int64) * sq + cols, mask=mask, other=float("-inf"))
+        # Same rounding as the reference: fp32 log-probs, exponentiated in fp64.
+        p = tl.exp((lp.to(tl.float32) - lp0).to(tl.float64))
+        q = tl.exp((lq.to(tl.float32) - lq0).to(tl.float64))
+        d = bi * p - q
         acc += tl.where(d > 0, d, 0.0)
     tl.store(out + row, tl.sum(acc, 0))
 
@@ -74,13 +79,7 @@ def block_verify_logits(
     ar = torch.arange(g, device=dev)
     lpx = p_logits[ar, draft].float() - lse_p[:g]
     lqx = q_logits[ar, draft].float() - lse_q
-    s_cum = torch.cat(
-        [
-            torch.zeros(1, dtype=torch.float64, device=dev),
-            torch.cumsum((lpx - lqx).double(), 0),
-        ]
-    )
-    b = (s_cum - torch.cummax(s_cum, 0).values).exp()  # [g+1]
+    b = acceptance_weights(lpx - lqx)  # [g+1]
     r = torch.empty(g, dtype=torch.float64, device=dev)
     if g:
         _residual_mass_kernel[(g,)](
@@ -95,23 +94,15 @@ def block_verify_logits(
             p_logits.shape[-1],
             BLOCK=2048,
         )
-    denom = r + 1 - b[:g]
-    h = torch.cat(
-        [
-            torch.where(denom > 0, r / denom.clamp(min=1e-300), torch.ones_like(denom)),
-            b[g:],
-        ]
-    )
+    h = stop_probabilities(r, b)
     eta = torch.rand(g + 1, generator=generator, dtype=torch.float64, device=dev)
     tau = int(torch.nonzero(eta <= h).flatten().max())
-    p_row = (p_logits[tau].double() - lse_p[tau].double()).exp()
-    if tau == g:
-        dist = p_row
-    else:
-        q_row = (q_logits[tau].double() - lse_q[tau].double()).exp()
-        dist = (b[tau] * p_row - q_row).clamp_(min=0)
-        if not bool(dist.sum() > 0):  # p_tau == q_tau exactly: fall back to p
-            dist = p_row
+
+    def probs(logits, lse, i):
+        return (logits[i].float() - lse[i]).double().exp()
+
+    q_row = None if tau == g else probs(q_logits, lse_q, tau)
+    dist = emit_distribution(probs(p_logits, lse_p, tau), q_row, b[tau])
     y = int(torch.multinomial((dist / dist.sum()).float(), 1, generator=generator))
     kept = torch.cat([draft[:tau], torch.tensor([y], device=dev)])
     logp = p_logits[torch.arange(tau + 1, device=dev), kept].float() - lse_p[: tau + 1]

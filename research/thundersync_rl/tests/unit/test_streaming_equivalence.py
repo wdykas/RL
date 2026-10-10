@@ -189,3 +189,28 @@ def test_open_group_cap_exact_and_bounds_buffers(cap, seed):
     for g, w in zip(got, want):
         torch.testing.assert_close(g, w, rtol=1e-12, atol=1e-12)
     assert accs[0].peak_open_buffers <= 2 * cap
+
+
+def test_zero_advantage_rows_never_share_a_chunk_with_trained_rows():
+    planner = StreamPlanner(
+        lambda rs: [r - sum(rs) / len(rs) for r in rs],
+        dp_size=1,
+        max_open_groups=0,
+        max_chunk_trajectories=4,
+    )
+    # Group 0: mixed rewards (nonzero advantages); groups 1-2: all equal (zero).
+    members = {0: [1.0, 0.0, 1.0, 0.0, 1.0], 1: [1.0, 1.0], 2: [0.0]}
+    idx = 0
+    for g, rewards in members.items():
+        planner.register_group(g, len(rewards))
+        for r in rewards:
+            planner.add(
+                Trajectory(
+                    group=g, index=idx, reward=r, payload=None, num_tokens=idx + 1
+                )
+            )
+            idx += 1
+    d = planner.next_dispatch()
+    kinds = [{a == 0.0 for a in c.advantages} for c in d.per_rank[0]]
+    assert all(len(k) == 1 for k in kinds)  # every chunk is all-zero or all-nonzero
+    assert sorted(len(c.trajectories) for c in d.per_rank[0]) == [1, 3, 4]
