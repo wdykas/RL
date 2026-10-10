@@ -1388,6 +1388,20 @@ def _validate_trajectory_streaming(master_config: MasterConfig) -> None:
             "async_rl.trajectory_streaming supports the native rollout path only "
             "(env.should_use_nemo_gym=false, token_capture.enabled=false)"
         )
+    # Workers backpropagate each gradient bucket of a chunk separately, and a
+    # bucket can hold any number of rows: fixed-size microbatching needs mbs=1.
+    packing = "sequence_packing" in policy and policy["sequence_packing"]["enabled"]
+    if (
+        not packing
+        and not policy["dynamic_batching"]["enabled"]
+        and policy["train_micro_batch_size"] != 1
+    ):
+        raise ValueError(
+            "async_rl.trajectory_streaming splits chunks into per-bucket "
+            "microbatches of arbitrary size: enable policy.sequence_packing or "
+            "policy.dynamic_batching, or set policy.train_micro_batch_size=1 "
+            f"(got {policy['train_micro_batch_size']})"
+        )
 
 
 def validate_single_controller_config(master_config: MasterConfig) -> None:

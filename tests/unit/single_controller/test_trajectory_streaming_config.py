@@ -89,3 +89,23 @@ def test_rejects_positive_example_nll():
 def test_rejects_rollout_paths_without_per_trajectory_publishing(apply):
     with pytest.raises(ValueError, match="native rollout path"):
         _validate_trajectory_streaming(_config(path=apply))
+
+
+def test_fixed_size_microbatches_require_mbs_one():
+    def fixed(mc):
+        mc.policy["sequence_packing"]["enabled"] = False
+
+    with pytest.raises(ValueError, match="train_micro_batch_size=1"):
+        _validate_trajectory_streaming(_config(fixed=fixed))
+
+    def fixed_mbs1(mc):
+        fixed(mc)
+        mc.policy["train_micro_batch_size"] = 1
+
+    _validate_trajectory_streaming(_config(fixed=fixed_mbs1))
+
+    def dynamic(mc):
+        fixed(mc)
+        mc.policy["dynamic_batching"]["enabled"] = True
+
+    _validate_trajectory_streaming(_config(dynamic=dynamic))
