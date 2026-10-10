@@ -149,6 +149,10 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # Start drafting when this iteration's (overlapped) verification finishes,
     # instead of at draft_start_frac of completed rollouts.
     draft_after_verify: bool = False
+    # Also wait until at most this many of this iteration's rollouts are still
+    # in flight, so drafts only fill decode capacity the tail leaves idle (for
+    # throughput-bound generation). None: draft_start_frac alone decides.
+    draft_max_inflight: Optional[int] = None
 
 
 class ThunderSyncMasterConfig(MasterConfig):
@@ -450,6 +454,8 @@ async def _run_one_step(
             n_done += 1
             if drafter is not None and draft_task is None and not after_verify and (
                 n_done >= ts_cfg.draft_start_frac * n
+            ) and (
+                ts_cfg.draft_max_inflight is None or n - n_done <= ts_cfg.draft_max_inflight
             ):
                 draft_task = asyncio.create_task(drafter())
             if learner_task.done():
