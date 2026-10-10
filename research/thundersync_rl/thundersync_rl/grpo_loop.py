@@ -198,6 +198,19 @@ def validate_config(master_config: ThunderSyncMasterConfig) -> None:
     assert ddp["grad_reduce_in_fp32"], (
         "per-trajectory gradients are moved out of the grad buffer; keep it fp32"
     )
+    ts_cfg = master_config.thundersync
+    if (
+        ts_cfg.speculate
+        and master_config.policy["megatron_cfg"].get("batch_invariant_mode")
+        and ts_cfg.verify_on != "learner"
+    ):
+        # The fp32 verification scorer inside a batch-invariant inference process
+        # (CUDA-graph engine running concurrently) hits an out-of-bounds index in
+        # the engine after a few steps; on the learner it is stable.
+        raise ValueError(
+            "thundersync.speculate with batch_invariant_mode requires "
+            f"thundersync.verify_on='learner' (got {ts_cfg.verify_on!r})."
+        )
 
 
 def make_group_advantage_fn(master_config: MasterConfig):
