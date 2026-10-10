@@ -359,10 +359,10 @@ block verification returns the target distribution (to 1e-10).
 | TP | vocab-parallel logits gathered per batch; rows owned by DP rank; DP-seeded sampling so TP partners agree - validated TP=2 (99.9% kept) |
 | PP | forward-only Megatron pipeline schedule; last stage verifies - validated: scorer logprobs at PP=2 bitwise equal PP=1 (`tests/functional/check_scorer_parallelism.py`) |
 | CP | not yet: scorer raises NotImplementedError for context parallelism |
-| EP / MoE | provider copy carries the EP layout; untested (fp32 grouped GEMM support to check) |
+| EP / MoE | provider copy carries the EP layout; the fused scorer kernels skip MoE modules (expert MLPs keep their own forward); untested end to end (fp32 grouped GEMM support to check) |
 | compute | verification = 2 forwards over draft tokens (q, p); fp32/TF32 scorer costs more than a bf16 forward - for learner-bound runs use `verify_precision=model` or put scoring on idle capacity |
 | engine capacity | speculation fills idle generation capacity; at Qwen3-4B on 2 saturated inference GPUs steady state only matches the baseline (~43 s) and lookahead-3 warm-up is slow - needs spare generation capacity |
-| memory | per pending draft version a bf16 stash (2 B/param) + the fp32 scorer (4 B/param): at 4B this OOMs the learner with `verify_on=both`; use `verify_on=inference` (or fewer versions / bf16 scorer) |
+| memory | per pending draft version a bf16 stash (2 B/param) + the fp32 scorer (4 B/param). The default `verify_on=both` fits 1.5B; at Qwen3-4B with one learner GPU it OOMs the learner: use `verify_on=inference`, or `verify_batch_tokens=4096` with `verify_precision=model` |
 | zero-advantage skip | split train API, TP/PP-consistent; rejects sequence packing/dynamic batching (driver-side row dropping needed for those) |
 
 PP end-to-end: training PP=2 with inference pinned to PP=1
