@@ -310,6 +310,7 @@ Results (2 gen + 2 train GPUs, 6 steps, group streaming):
 | + verification split across learner and inference GPUs (`verify_on=both`) | 4.49 | - | 99.3% |
 | + multi-iteration drafts (`draft_lookahead=2`) | 4.57 (median 4.07) | - | 99.5% (97.5% drafts whole) |
 | + verification overlapped with rollouts on both pools (`verify_overlap`, 4 chunks, longest first), lookahead 2 - 22 steps | **4.21 (median 3.73)** | - | 99.3% (97.8% drafts whole) |
+| + lookahead 3, drafting from iteration start - **40 steps** | **3.97 (median 3.84, p90 4.59)** | - | 99.1% (98.6% drafts whole) |
 | reference: regular async, lag 4 (single controller) | 3.70 | - | - |
 
 Scorer: block verification scores p and q with a second Megatron GPTModel
