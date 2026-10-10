@@ -335,7 +335,8 @@ block verification returns the target distribution (to 1e-10).
 | CP | not yet: scorer raises NotImplementedError for context parallelism |
 | EP / MoE | provider copy carries the EP layout; untested (fp32 grouped GEMM support to check) |
 | compute | verification = 2 forwards over draft tokens (q, p); fp32/TF32 scorer costs more than a bf16 forward - for learner-bound runs use `verify_precision=model` or put scoring on idle capacity |
-| engine capacity | drafting uses inference capacity; at Qwen3-4B on 2 saturated inference GPUs it lost (57.7 vs 42.5 s/iter) - needs spare generation capacity |
+| engine capacity | speculation fills idle generation capacity; at Qwen3-4B on 2 saturated inference GPUs steady state only matches the baseline (~43 s) and lookahead-3 warm-up is slow - needs spare generation capacity |
+| memory | per pending draft version a bf16 stash (2 B/param) + the fp32 scorer (4 B/param): at 4B this OOMs the learner with `verify_on=both`; use `verify_on=inference` (or fewer versions / bf16 scorer) |
 | zero-advantage skip | split train API, TP/PP-consistent; rejects sequence packing/dynamic batching (driver-side row dropping needed for those) |
 
 PP end-to-end: training PP=2 with inference pinned to PP=1
