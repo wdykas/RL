@@ -5606,15 +5606,23 @@ class SingleControllerActor:
                     meta
                 )
 
+        dp_size = self._trainer.sharding_annotations.get_axis_size("data_parallel")
+        # Chunks are trimmed to a multiple of the DP size, so a step can only
+        # drain completely if every group's row count is one too (a dropped
+        # prompt or an odd group size would leave rows that are never claimed).
+        if self._algo_cfg.num_generations_per_prompt % dp_size:
+            raise ValueError(
+                "async_rl.trajectory_streaming requires num_generations_per_prompt "
+                f"({self._algo_cfg.num_generations_per_prompt}) to be a multiple "
+                f"of the training data-parallel size ({dp_size})"
+            )
         peeked = self._buffer.peek_trajectory_rows(target_step=version)
         rows = pick_final_first(
             [(g, m.tags[0][STREAM_REWARD_TAG], (g, m)) for g, m in peeked],
             closed=traj.group_advantages.keys(),
             streaming=traj.bucketed - traj.closed,
             max_open_groups=self._async_cfg.trajectory_streaming.max_open_groups,
-            multiple_of=self._trainer.sharding_annotations.get_axis_size(
-                "data_parallel"
-            ),
+            multiple_of=dp_size,
         )
         for group_id, row_meta in rows:
             self._buffer.claim_trajectory_sample_ids(

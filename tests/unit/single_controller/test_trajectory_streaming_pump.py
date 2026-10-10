@@ -153,7 +153,10 @@ def _controller(buffer, dp_client, trainer, max_open_groups=100):
         SimpleNamespace(use_leave_one_out_baseline=True, normalize_rewards=True), None
     )
     ctl._algo_cfg = GRPOConfig.model_construct(
-        overlong_filtering=False, advantage_clip_low=None, advantage_clip_high=None
+        overlong_filtering=False,
+        advantage_clip_low=None,
+        advantage_clip_high=None,
+        num_generations_per_prompt=_G,
     )
     return ctl
 
@@ -339,3 +342,27 @@ def test_sealed_group_advantage_ignores_masked_rows_with_equal_reward():
     )[:, 0]
     assert want[0] != want[1]  # the masked row really differs
     assert by_reward == {1.0: want[0].item(), 0.0: want[2].item()}
+
+
+def test_group_size_not_divisible_by_dp_fails_loudly():
+    # With G=3 and DP=2 the last row of a step can never be claimed (chunks are
+    # trimmed to multiples of DP), so the pump would poll forever.
+    from nemo_rl.algorithms.grad_streaming import pick_final_first
+
+    rows = [("g", 1.0, i) for i in range(3)]
+    picked = pick_final_first(
+        rows, closed={"g"}, streaming=set(), max_open_groups=4, multiple_of=2
+    )
+    assert picked == [0, 1]
+    assert (
+        pick_final_first(
+            rows[2:], closed={"g"}, streaming=set(), max_open_groups=4, multiple_of=2
+        )
+        == []
+    )
+
+    ctl = _controller(None, _DataPlane({}), _Trainer({}, dp=2))
+    ctl._algo_cfg.num_generations_per_prompt = 3
+    ctl._buffer = SimpleNamespace(trajectory_step_groups=lambda version: [])
+    with pytest.raises(ValueError, match="multiple of the training data-parallel"):
+        asyncio.run(ctl._select_trajectory_chunk(_TrajectoryStepState()))
