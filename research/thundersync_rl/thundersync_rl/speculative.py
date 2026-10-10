@@ -434,6 +434,20 @@ class SpeculativeGeneration:
         return Plan(seed, prefix, r["logprobs"], complete=done)
 
     async def verify_chunked(self, drafts, chunks: int) -> None:
+        """Run ``_verify_chunked``; on failure wake every waiting rollout so the
+        error surfaces instead of the rollouts waiting forever for plans."""
+        self._verify_error = None
+        try:
+            await self._verify_chunked(drafts, chunks)
+        except BaseException as e:
+            self._verify_error = e
+            cv = getattr(self, "_plan_cv", None)
+            if cv is not None:
+                async with cv:
+                    cv.notify_all()
+            raise
+
+    async def _verify_chunked(self, drafts, chunks: int) -> None:
         """Stash-mode verification in ``chunks`` pieces, publishing plans as each
         chunk finishes so rollouts start without waiting for the whole batch.
 
@@ -455,10 +469,12 @@ class SpeculativeGeneration:
         n = len(flat)
         bounds = [round(c * n / chunks) for c in range(chunks + 1)]
         calls = []
-        for a, b in zip(bounds, bounds[1:]):
+        for c, (a, b) in enumerate(zip(bounds, bounds[1:])):
             if b <= a:
                 continue
-            refs = self.verifier.run_all_workers_single_data(
+            # Round-robin chunks over the verifier pools (learner/inference).
+            group = self.verifiers[c % len(self.verifiers)]
+            refs = group.run_all_workers_single_data(
                 "verify_drafts_block_stashed",
                 rows=rows[a:b],
                 prompt_lens=[d[0].numel() for _, d in flat[a:b]],
@@ -471,8 +487,14 @@ class SpeculativeGeneration:
             )
             calls.append((a, refs))
         kept = total = full = 0
-        for a, refs in calls:
-            res = await asyncio.gather(*[asyncio.wrap_future(r.future()) for r in refs])
+
+        async def fetch(a, refs):
+            return a, refs, await asyncio.gather(
+                *[asyncio.wrap_future(r.future()) for r in refs]
+            )
+
+        for fut in asyncio.as_completed([fetch(a, refs) for a, refs in calls]):
+            a, refs, res = await fut
             by_row = dict(x for rank_res in res for x in rank_res)
             ends = [c[0] for c in calls[1:]] + [len(flat)]
             chunk_rows = ends[[c[0] for c in calls].index(a)] - a
@@ -518,6 +540,8 @@ class SpeculativeGeneration:
             # Chunked verification: wait until this trajectory's plan is published.
             async with cv:
                 while not self.plans.get(key) and self._pending.get(key, 0) > 0:
+                    if getattr(self, "_verify_error", None) is not None:
+                        raise RuntimeError("draft verification failed") from self._verify_error
                     await cv.wait()
         queue = self.plans.get(key)
         plan = queue.pop(0) if queue else Plan(

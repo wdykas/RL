@@ -153,3 +153,68 @@ def test_complete_plan_needs_no_engine_request():
 
 async def _collect(agen):
     return [x async for x in agen]
+
+
+class _Ref:
+    """Stands in for a Ray ObjectRef: ``future()`` returns a resolved future."""
+
+    def __init__(self, value=None, error=None):
+        import concurrent.futures
+
+        self._f = concurrent.futures.Future()
+        if error is not None:
+            self._f.set_exception(error)
+        else:
+            self._f.set_result(value)
+
+    def future(self):
+        return self._f
+
+
+class _RefGroup(_WorkerGroup):
+    def run_all_workers_single_data(self, method, **kwargs):
+        self.calls.append((method, kwargs))
+        try:
+            return [_Ref(self.handlers[method](**kwargs))]
+        except Exception as e:  # surfaces when awaited, like a failed Ray task
+            return [_Ref(error=e)]
+
+
+def _drafts(n):
+    return [
+        [(torch.tensor([50 + i]), -1, [4, EOD], True, f"1:{i}", [(0, 0, 2)])]
+        for i in range(n)
+    ]
+
+
+def _accept_all(rows, prompt_lens, segments, keys, **_):
+    return [(j, {"accepted": 2, "next": 0, "logprobs": [-0.1, -0.1]}) for j in range(len(rows))]
+
+
+def test_chunked_verification_uses_all_pools_and_publishes_every_plan():
+    s = _spec({})
+    pools = [_RefGroup({"verify_drafts_block_stashed": _accept_all}) for _ in range(2)]
+    s.verifiers = pools
+    asyncio.run(s.verify_chunked(_drafts(6), chunks=4))
+    assert [len(p.calls) for p in pools] == [2, 2]
+    assert sorted(k[0] for k in s.plans) == [50, 51, 52, 53, 54, 55]
+    assert all(p[0].complete for p in s.plans.values())
+
+
+def test_verification_failure_surfaces_instead_of_hanging():
+    def boom(**_):
+        raise ValueError("scorer failed")
+
+    s = _spec({})
+    s.verifiers = [_RefGroup({"verify_drafts_block_stashed": boom})]
+    data = BatchedDataDict({"input_ids": torch.tensor([[50]]), "input_lengths": torch.tensor([1])})
+
+    async def scenario():
+        verify = asyncio.create_task(s.verify_chunked(_drafts(1), chunks=1))
+        rollout = asyncio.create_task(_collect(s.generate_async(data)))
+        done, _ = await asyncio.wait({verify, rollout}, timeout=5)
+        assert verify in done and rollout in done, "rollout hung on a failed verification"
+        with pytest.raises(RuntimeError, match="verification failed"):
+            rollout.result()
+
+    asyncio.run(scenario())

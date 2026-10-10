@@ -141,6 +141,9 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # at the first verification (the stash call works; the awaited verify call
     # never runs on the generation actors) - see RESUME.md.
     verify_on: Literal["learner", "inference", "both"] = "learner"
+    # Run verification concurrently with the rollouts (awaited inside the step's
+    # event loop) even when verify_on != "learner".
+    verify_overlap: bool = False
 
 
 class ThunderSyncMasterConfig(MasterConfig):
@@ -731,7 +734,7 @@ def thundersync_grpo_train(
             spec is not None
             and ts_cfg.verify_mode == "block"
             and ts_cfg.q_storage == "stash"
-            and ts_cfg.verify_on == "learner"  # inference: blocking path (see verify_on)
+            and (ts_cfg.verify_on == "learner" or ts_cfg.verify_overlap)
         )
         if cohort_mode and chunked:
             cohort = spec.cohorts.pop(step, None)
