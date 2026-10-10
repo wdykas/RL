@@ -117,3 +117,27 @@ def use_sdpa_attention(model: torch.nn.Module, config) -> int:
             mod.core_attention = SDPACoreAttention(ca, getattr(config, "softmax_scale", None))
             n += 1
     return n
+
+
+def use_selective_output(model: torch.nn.Module) -> bool:
+    """Let callers pick which hidden positions reach the LM head.
+
+    Set ``model.output_layer.ts_select = (seq_idx, batch_idx)`` before a forward
+    to get logits of shape [1, n, V] for just those positions (prompt tokens and
+    positions outside a draft segment need no logits). Not available with
+    sequence parallelism, where the output layer gathers sharded hidden states.
+    """
+    layer = getattr(model, "output_layer", None)
+    if layer is None or getattr(layer, "sequence_parallel", False):
+        return False
+    orig_forward = layer.forward
+    layer.ts_select = None
+
+    def forward(input_, weight=None, runtime_gather_output=None, **kw):
+        sel = layer.ts_select
+        if sel is not None:
+            input_ = input_[sel[0], sel[1]].unsqueeze(1)  # [n, 1, h]
+        return orig_forward(input_, weight=weight, runtime_gather_output=runtime_gather_output, **kw)
+
+    layer.forward = forward
+    return True

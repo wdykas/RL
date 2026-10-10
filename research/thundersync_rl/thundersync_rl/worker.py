@@ -478,6 +478,9 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
 
                 use_sdpa_attention(self._mfp32, provider)
                 use_fused_swiglu(self._mfp32)
+            from thundersync_rl.scorer_kernels import use_selective_output
+
+            self._scorer_select = use_selective_output(self._mfp32)
             src_names = [n for n, _ in self.model.named_parameters()]
             self._mfp32_map = []
             src = dict(self.model.named_parameters())
@@ -779,27 +782,58 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             lq_rows: dict[int, list[tuple[int, torch.Tensor]]] = {i: [] for i in group}
             versions = sorted({v for i in group for v, _, _ in segments[i]})
             for v in versions:
+                # q of version v is needed only at its segments' positions; causal
+                # attention lets each row stop at its last such position.
+                segs = [
+                    (r, i, a, b)
+                    for r, i in enumerate(group)
+                    for sv, a, b in segments[i]
+                    if sv == v and b > a
+                ]
+                if not segs:
+                    continue
+                sub_rows = sorted({r for r, _, _, _ in segs})
+                local = {r: k for k, r in enumerate(sub_rows)}
+                width = max(prompt_lens[i] - 1 + b for _, i, _, b in segs)
+                s_idx = torch.cat([
+                    torch.arange(prompt_lens[i] - 1 + a, prompt_lens[i] - 1 + b) for _, i, a, b in segs
+                ])
+                b_idx = torch.cat([torch.full((b - a,), local[r]) for r, _, a, b in segs])
                 self._load_scorer(v)
-                logits = self._score(scorer, ids, pos)
+                logits = self._score(
+                    scorer,
+                    ids[sub_rows, :width],
+                    pos[: len(sub_rows), :width],
+                    select=(s_idx.cuda(), b_idx.cuda()),
+                )
                 if logits is None:  # not the last pipeline stage
                     continue
-                for r, i in enumerate(group):
-                    plen = prompt_lens[i]
-                    for sv, a, b in segments[i]:
-                        if sv == v and b > a:
-                            lq = torch.log_softmax(
-                                logits[r, plen - 1 + a : plen - 1 + b, :vocab_limit].float(), -1
-                            )
-                            lq_rows[i].append((a, lq))
+                off = 0
+                for _, i, a, b in segs:
+                    lq_rows[i].append(
+                        (a, torch.log_softmax(logits[off : off + b - a, :vocab_limit].float(), -1))
+                    )
+                    off += b - a
                 del logits
             self._load_scorer(None)
-            logits = self._score(scorer, ids, pos)
+            spans = [(prompt_lens[i] - 1, rows[i].numel()) for i in group]
+            logits = self._score(
+                scorer,
+                ids,
+                pos,
+                select=(
+                    torch.cat([torch.arange(a, e) for a, e in spans]).cuda(),
+                    torch.cat([torch.full((e - a,), r) for r, (a, e) in enumerate(spans)]).cuda(),
+                ),
+            )
             if logits is None:
                 continue
+            off = 0
             for r, i in enumerate(group):
                 n, plen = rows[i].numel(), prompt_lens[i]
                 g = n - plen
-                lp = torch.log_softmax(logits[r, plen - 1 : n, :vocab_limit].float(), -1)
+                lp = torch.log_softmax(logits[off : off + g + 1, :vocab_limit].float(), -1)
+                off += g + 1
                 parts = [t for _, t in sorted(lq_rows.pop(i), key=lambda x: x[0])]
                 lq = torch.cat(parts) if parts else lp[:0]
                 assert lq.shape[0] == g, (lq.shape, g)
@@ -815,7 +849,26 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             print(f"[spec prof] verify_stashed pool={pool} rank={self.rank} rows={len(rows)} tok={ntok} total={time.perf_counter() - t_all:.3f} {self._prof}", flush=True)
         return results
 
-    def _score(self, scorer, ids, pos):
+    def _score(self, scorer, ids, pos, select=None):
+        """Scorer logits: [b, s, V], or [n, V] at ``select = (seq_idx, batch_idx)``."""
+        native = select is not None and getattr(self, "_scorer_select", False)
+        if native:
+            scorer.output_layer.ts_select = select
+        try:
+            logits = self._score_full(scorer, ids, pos)
+        finally:
+            if native:
+                scorer.output_layer.ts_select = None
+        if logits is None or select is None:
+            return logits
+        if native and os.environ.get("THUNDERSYNC_SELECT_CHECK"):
+            full = self._score_full(scorer, ids, pos)[select[1], select[0]]
+            lp_a = torch.log_softmax(logits[0].float(), -1)
+            lp_b = torch.log_softmax(full.float(), -1)
+            print(f"[select check] n={full.shape[0]} max|dlogp|={(lp_a - lp_b).abs().max().item():.3e}", flush=True)
+        return logits[0] if native else logits[select[1], select[0]]
+
+    def _score_full(self, scorer, ids, pos):
         from megatron.core import parallel_state as ps
 
         torch.cuda.synchronize()
