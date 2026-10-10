@@ -1376,6 +1376,18 @@ def _validate_trajectory_streaming(master_config: MasterConfig) -> None:
             "loss_fn.positive_example_nll_weight=0: the NLL term carries no "
             "advantage, so it cannot be bucketed and rescaled by the group advantage"
         )
+    # Per-trajectory rows are built from the dataset sample, which matches the
+    # sealed group record only on the native rollout path: NeMo-Gym rebuilds
+    # the prompt and metadata, and token-capture groups are committed by the
+    # finalizer without the per-row reward tags the train pump buckets by.
+    if (
+        master_config.env.get("should_use_nemo_gym")
+        or master_config.token_capture.enabled
+    ):
+        raise ValueError(
+            "async_rl.trajectory_streaming supports the native rollout path only "
+            "(env.should_use_nemo_gym=false, token_capture.enabled=false)"
+        )
 
 
 def validate_single_controller_config(master_config: MasterConfig) -> None:

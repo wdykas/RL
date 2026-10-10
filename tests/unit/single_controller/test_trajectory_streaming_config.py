@@ -76,3 +76,16 @@ def test_rejects_positive_example_nll():
     mc = _config(nll=lambda mc: setattr(mc.loss_fn, "positive_example_nll_weight", 0.1))
     with pytest.raises(ValueError, match="positive_example_nll_weight=0"):
         _validate_trajectory_streaming(mc)
+
+
+@pytest.mark.parametrize(
+    "apply",
+    [
+        lambda mc: mc.env.update(should_use_nemo_gym=True),
+        lambda mc: setattr(mc.token_capture, "enabled", True),
+    ],
+    ids=["nemo_gym", "token_capture"],
+)
+def test_rejects_rollout_paths_without_per_trajectory_publishing(apply):
+    with pytest.raises(ValueError, match="native rollout path"):
+        _validate_trajectory_streaming(_config(path=apply))
