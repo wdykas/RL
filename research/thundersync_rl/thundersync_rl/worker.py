@@ -348,6 +348,10 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             group = mine[b:e]
             b = e
             s = max(rows[i].numel() for i in group)
+            # Pad like training (make_sequence_length_divisible_by): batch-invariant
+            # kernels are invariant within a token-count shape class only.
+            m = self.cfg["make_sequence_length_divisible_by"]
+            s = -(-s // m) * m
             ids = torch.zeros((len(group), s), dtype=torch.long)
             for r, i in enumerate(group):
                 ids[r, : rows[i].numel()] = rows[i]
@@ -413,6 +417,14 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             # noise from p/q (~99% kept). "model": keep the training dtypes
             # (half the memory, bf16 speed, ~91% kept).
             if getattr(self, "_scorer_precision", "fp32") == "fp32":
+                # Batch-invariant kernels are BF16-only; an fp32 scorer is built
+                # outside batch-invariant mode (its higher precision, not
+                # bitwise parity with training, is what it is for).
+                if getattr(provider, "batch_invariant_mode", False):
+                    from megatron.core.transformer.enums import AttnBackend
+
+                    provider.batch_invariant_mode = False
+                    provider.attention_backend = AttnBackend.auto
                 provider.params_dtype = torch.float32
                 provider.pipeline_dtype = torch.float32
                 provider.bf16 = False
@@ -420,9 +432,12 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             provider.recompute_granularity = None
             provider.recompute_method = None
             provider.recompute_num_layers = None
-            # The fused bias-SwiGLU kernel is ~4x off the memory bound in fp32;
-            # the unfused path is replaced by a Triton SwiGLU below.
-            provider.bias_activation_fusion = False
+            if provider.params_dtype == torch.float32:
+                # The fused bias-SwiGLU kernel is ~4x off the memory bound in
+                # fp32; the unfused path is replaced by a Triton SwiGLU below.
+                # (A training-dtype scorer keeps the training op sequence, which
+                # batch-invariant kernels need to reproduce training numerics.)
+                provider.bias_activation_fusion = False
             provider.finalize()
             self._mfp32 = provider.provide().cuda().eval()
             if provider.params_dtype == torch.float32:
@@ -680,6 +695,13 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 draft = ids[r, plen:n]
                 # Raw logits in, no [g, V] log-softmax / fp64 temporaries.
                 tau, y, logp = block_verify_logits(p_logits, q_logits, draft, gen)
+                if self._batch_invariant:
+                    # Report log-probs exactly as training computes them (fp32
+                    # log-softmax + gather), so they match the trainer bitwise.
+                    kept = torch.cat([draft[:tau], torch.tensor([y], device="cuda")])
+                    logp = torch.log_softmax(p_logits[: tau + 1].float(), -1).gather(
+                        -1, kept.unsqueeze(-1)
+                    )[:, 0]
                 results.append(
                     (i, {"accepted": tau, "next": y, "logprobs": logp.tolist()})
                 )
@@ -697,6 +719,10 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             )
         return results
 
+    @property
+    def _batch_invariant(self) -> bool:
+        return bool(self.cfg["megatron_cfg"].get("batch_invariant_mode"))
+
     def _score(self, scorer, ids, pos, select=None):
         """Scorer logits: [b, s, V], or [n, V] at ``select = (seq_idx, batch_idx)``."""
         from megatron.core import parallel_state as ps
@@ -704,7 +730,9 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
 
         if select is None:
             return self._score_full(scorer, ids, pos)
-        if not supports_selection(scorer):  # e.g. sequence parallelism
+        # Batch-invariant GEMMs are invariant within a token-count shape class
+        # only: score full rows, as training does, to reproduce its numerics.
+        if not supports_selection(scorer) or self._batch_invariant:
             logits = self._score_full(scorer, ids, pos)
             return None if logits is None else logits[select[1], select[0]]
         with select_positions(scorer, select):
