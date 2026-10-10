@@ -1361,6 +1361,21 @@ def _validate_trajectory_streaming(master_config: MasterConfig) -> None:
             "grpo.seq_logprob_error_threshold: it changes the group baseline after "
             "rows were already backpropagated"
         )
+    # A sealed group's advantages are recomputed from that group alone and
+    # must be a function of each trajectory's total_reward.
+    if algo.adv_estimator.name != "grpo":
+        raise ValueError(
+            "async_rl.trajectory_streaming requires grpo.adv_estimator.name='grpo' "
+            f"(got {algo.adv_estimator.name!r}): gdpo weights reward components, "
+            "reinforce_plus_plus normalizes across groups and opd is token-level, "
+            "so per-(group, reward) gradient buckets cannot represent them"
+        )
+    if master_config.loss_fn.positive_example_nll_weight != 0:
+        raise ValueError(
+            "async_rl.trajectory_streaming requires "
+            "loss_fn.positive_example_nll_weight=0: the NLL term carries no "
+            "advantage, so it cannot be bucketed and rescaled by the group advantage"
+        )
 
 
 def validate_single_controller_config(master_config: MasterConfig) -> None:
