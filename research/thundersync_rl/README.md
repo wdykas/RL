@@ -354,7 +354,7 @@ block verification returns the target distribution (to 1e-10).
 | piece | status |
 |---|---|
 | drafting / streaming / abort | Megatron inference client + coordinator: inherits inference TP/PP/EP/DP |
-| q for verification | `q_storage=stash` (default): bf16 stash of the drafting weights (2 B/param per model-parallel shard per pending version), q recomputed per batch at verification - memory O(params + batch x vocab), not O(draft tokens x vocab) |
+| q for verification | bf16 stash of the drafting weights (2 B/param per model-parallel shard per pending version), q recomputed per batch at verification - memory O(params + batch x vocab), not O(draft tokens x vocab) |
 | scorer | second Megatron GPTModel from the training provider (same TP/PP/EP sharding); fp32 adds 4 B/param per shard; `verify_precision=model` keeps training dtypes (2 B/param, bf16 speed, ~90% vs ~98% tokens kept) |
 | TP | vocab-parallel logits gathered per batch; rows owned by DP rank; DP-seeded sampling so TP partners agree - validated TP=2 (99.9% kept) |
 | PP | forward-only Megatron pipeline schedule; last stage verifies - validated: scorer logprobs at PP=2 bitwise equal PP=1 (`tests/functional/check_scorer_parallelism.py`) |

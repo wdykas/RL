@@ -171,150 +171,6 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             for name, p in self.model.named_parameters()
         }
 
-    # ---- Cross-iteration speculation experiments (policy forecasting) ----
-    # Snapshots and linear combinations of this rank's fp32 master-weight
-    # shards. Requires the distributed optimizer without the precision-aware
-    # optimizer, so master weights live in ``shard_fp32_from_float16_groups``.
-
-    def _master_shards(self) -> list[torch.Tensor]:
-        shards = []
-        for opt in getattr(self.optimizer, "chained_optimizers", [self.optimizer]):
-            assert not opt.config.use_precision_aware_optimizer, (
-                "forecasting needs master weights in the dist optimizer; set "
-                "policy.megatron_cfg.optimizer.use_precision_aware_optimizer=false"
-            )
-            for group in opt.shard_fp32_from_float16_groups + opt.shard_fp32_groups:
-                shards.extend(group)
-        return shards
-
-    def save_master_weights(self, tag: str) -> None:
-        """Snapshot the fp32 master shards under ``tag``."""
-        if not hasattr(self, "_master_snapshots"):
-            self._master_snapshots: dict[str, list[torch.Tensor]] = {}
-        self._master_snapshots[tag] = [
-            s.detach().clone() for s in self._master_shards()
-        ]
-
-    def rename_master_weights(self, src: str, dst: str) -> None:
-        self._master_snapshots[dst] = self._master_snapshots.pop(src)
-
-    @torch.no_grad()
-    def load_master_combination(self, coeffs: dict[str, float]) -> None:
-        """Set master weights to sum_tag coeff * snapshot[tag] and refresh the model.
-
-        Copies master shards into the model's param buffers and all-gathers them
-        across DP, exactly as the optimizer does after a step.
-        """
-        for i, shard in enumerate(self._master_shards()):
-            acc = torch.zeros_like(shard)
-            for tag, c in coeffs.items():
-                acc.add_(self._master_snapshots[tag][i], alpha=c)
-            shard.copy_(acc)
-        for opt in getattr(self.optimizer, "chained_optimizers", [self.optimizer]):
-            opt._copy_main_params_to_model_params()
-            opt.start_param_sync_for_bucket_group_subset()
-        torch.cuda.synchronize()
-
-    @torch.no_grad()
-    def save_adam_forecast(self, tag: str) -> dict[str, float]:
-        """Snapshot the next Adam(W) step's weights assuming a zero gradient.
-
-        theta_hat = theta - lr * (m_hat / (sqrt(v_hat) + eps) + wd * theta), with
-        m, v decayed one step and bias-corrected at t + 1: the part of the next
-        update the optimizer state already determines. Call before the step.
-        """
-        shards, n_missing = [], 0
-        for opt in getattr(self.optimizer, "chained_optimizers", [self.optimizer]):
-            inner = opt.optimizer
-            for group in inner.param_groups:
-                b1, b2 = group["betas"]
-                for p in group["params"]:
-                    st = inner.state.get(p, {})
-                    if "exp_avg" not in st:
-                        n_missing += 1
-                        shards.append((p, p.detach().clone()))
-                        continue
-                    t = int(st.get("step", group.get("step", 0))) + 1
-                    m_hat = st["exp_avg"].float() * b1 / (1 - b1**t)
-                    v_hat = st["exp_avg_sq"].float() * b2 / (1 - b2**t)
-                    upd = m_hat / (v_hat.sqrt() + group["eps"])
-                    upd.add_(p, alpha=group["weight_decay"])
-                    shards.append((p, p - group["lr"] * upd))
-        # Order must match _master_shards(): map by identity.
-        by_id = {id(p): hat for p, hat in shards}
-        self._master_snapshots[tag] = [by_id[id(s)] for s in self._master_shards()]
-        return {"params_without_state": float(n_missing)}
-
-    @torch.no_grad()
-    def master_distances(self, ref: str, others: list[str]) -> dict[str, float]:
-        """fp32 L2 distance and bf16 disagreement count of snapshots vs ``ref``."""
-        out: dict[str, float] = {}
-        refs = self._master_snapshots[ref]
-        out["numel"] = float(sum(r.numel() for r in refs))
-        for tag in others:
-            sq = flips = 0.0
-            for a, b in zip(self._master_snapshots[tag], refs):
-                sq += float((a - b).double().pow(2).sum())
-                flips += float((a.bfloat16() != b.bfloat16()).sum())
-            out[f"{tag}/l2"] = sq**0.5
-            out[f"{tag}/bf16_flips"] = flips
-        return out
-
-    def drop_master_weights(self, tag: str) -> None:
-        getattr(self, "_master_snapshots", {}).pop(tag, None)
-
-    @torch.no_grad()
-    def coupled_samples(
-        self, rows: list[torch.Tensor], seed: int, chunk: int = 256
-    ) -> torch.Tensor | None:
-        """Teacher-forced shared-randomness samples under the current weights.
-
-        For each row and position j (predicting token j+1) returns the token each
-        coupling scheme would emit given a fixed per-(row, position) random
-        draw: [:, :, 0] inverse CDF in token-id order, [:, :, 1] inverse CDF in
-        descending-probability order, [:, :, 2] Gumbel-max. Two calls with
-        different weights and the same ``seed`` disagree exactly where a
-        drafter/verifier pair would. Returns a [num_rows, max_len, 3] int32
-        tensor on rank 0, None elsewhere.
-        """
-        self.model.eval()
-        max_len = max(int(r.numel()) for r in rows)
-        out = torch.full((len(rows), max_len, 3), -1, dtype=torch.int32)
-        for i, ids in enumerate(rows):
-            ids = ids.cuda().view(1, -1)
-            s = ids.shape[1]
-            pos = torch.arange(s, device="cuda").view(1, -1)
-            logits = self.model(input_ids=ids, position_ids=pos, attention_mask=None)
-            logits = logits[0].float()  # [s, V]
-            g_u = torch.Generator(device="cuda").manual_seed(seed * 1_000_003 + i)
-            u = torch.rand(s, device="cuda", generator=g_u)
-            g_g = torch.Generator(device="cuda").manual_seed(seed * 1_000_033 + i)
-            for a in range(0, s, chunk):
-                lg = logits[a : a + chunk]
-                p = torch.softmax(lg, dim=-1)
-                uu = u[a : a + chunk].unsqueeze(-1)
-                cdf = torch.cumsum(p, dim=-1)
-                x_id = torch.searchsorted(cdf, uu).clamp(max=p.shape[-1] - 1)
-                ps, idx = torch.sort(p, dim=-1, descending=True)
-                x_s = torch.searchsorted(torch.cumsum(ps, dim=-1), uu).clamp(
-                    max=p.shape[-1] - 1
-                )
-                x_sorted = idx.gather(-1, x_s)
-                gumbel = -torch.log(
-                    -torch.log(
-                        torch.rand(lg.shape, device="cuda", generator=g_g).clamp_min(
-                            1e-20
-                        )
-                    )
-                )
-                x_g = torch.argmax(
-                    torch.log_softmax(lg, -1) + gumbel, dim=-1, keepdim=True
-                )
-                out[i, a : a + lg.shape[0]] = (
-                    torch.cat([x_id, x_sorted, x_g], dim=-1).int().cpu()
-                )
-        return out if self.rank == 0 else None
-
     # ---- Exact cross-iteration speculative rollouts (keyed sampling) ----
 
     def install_keyed_sampler(self, vocab_limit: int, head_k: int) -> int | None:
@@ -525,13 +381,13 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             del logits
         return results
 
-    # ---- Block verification (Sun et al. 2024) with learner-side q ----
+    # ---- Verification scorer: fp32 Megatron copy of the policy ----
 
     def _fp32_scorer(self):
         """Megatron copy of the policy with fp32 params/activations.
 
-        Built from a deep copy of the training model provider (same architecture
-        and layer spec, fp32 dtypes, no DDP/optimizer) and refreshed by copying
+        Built from a shallow copy of the training model provider (same
+        architecture, layer spec and process groups; fp32 dtypes; no DDP/optimizer) and refreshed by copying
         the training model's own bf16-valued parameters. Scoring p and q with it
         removes the bf16 activation-rounding noise that dominates the p/q ratio.
         """
@@ -606,155 +462,6 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         torch.cuda.synchronize()
         self._prof["export"] = self._prof.get("export", 0.0) + time.perf_counter() - t0
         return self._mfp32
-
-    def _iter_row_batches(
-        self, rows: list[torch.Tensor], batch_tokens: int, keys: list[str] | None = None
-    ):
-        """This rank's rows, length-sorted, as padded batches.
-
-        Rows are owned by i % world, or by a stable hash of ``keys[i]`` so a draft
-        scored across several calls always lands on the same rank.
-        """
-        import zlib
-
-        world = torch.distributed.get_world_size()
-
-        def owner(i):
-            return (zlib.crc32(keys[i].encode()) if keys is not None else i) % world
-
-        mine = sorted(
-            (i for i in range(len(rows)) if owner(i) == self.rank),
-            key=lambda i: rows[i].numel(),
-        )
-        b = 0
-        while b < len(mine):
-            e = b + 1
-            while e < len(mine) and rows[mine[e]].numel() * (e + 1 - b) <= batch_tokens:
-                e += 1
-            group = mine[b:e]
-            b = e
-            s = max(rows[i].numel() for i in group)
-            ids = torch.zeros((len(group), s), dtype=torch.long)
-            for r, i in enumerate(group):
-                ids[r, : rows[i].numel()] = rows[i]
-            ids = ids.cuda()
-            pos = torch.arange(s, device="cuda").expand(len(group), -1)
-            torch.cuda.synchronize()
-            t_fwd = time.perf_counter()
-            scorer = getattr(self, "_active_scorer", None)
-            if scorer is not None:
-                # TF32 GEMMs, if wanted, come from NVIDIA_TF32_OVERRIDE=1.
-                logits = scorer(
-                    input_ids=ids, position_ids=pos, attention_mask=None
-                ).float()
-            else:
-                logits = self.model(
-                    input_ids=ids, position_ids=pos, attention_mask=None
-                )
-            torch.cuda.synchronize()
-            self._prof["forward"] = (
-                self._prof.get("forward", 0.0) + time.perf_counter() - t_fwd
-            )
-            self._prof["tokens"] = self._prof.get("tokens", 0) + int(ids.numel())
-            yield group, ids, logits
-            del logits
-
-    @torch.no_grad()
-    def score_drafts_q(
-        self,
-        rows: list[torch.Tensor],
-        prompt_lens: list[int],
-        vocab_limit: int,
-        batch_tokens: int,
-        precision: str,
-        keys: list[str] | None = None,
-        from_lens: list[int] | None = None,
-    ) -> int:
-        """Learner at theta_k (before its step): keep each draft's full log q.
-
-        Stores log q(. | prompt, draft[:i]) for i = 0..len(draft)-1 in bf16 on GPU
-        for ``verify_drafts_block`` at the next iteration.
-        """
-        self._prof = {}
-        t_all = time.perf_counter()
-        self.model.eval()
-        # Keyed mode appends the q of tokens drafted since the last deadline
-        # (from_lens[i] onwards) to what earlier iterations stored: each
-        # position keeps the q of the weights that actually drafted it.
-        if keys is None:
-            self._spec_q = {}
-        elif not hasattr(self, "_spec_q"):
-            self._spec_q = {}
-        self._active_scorer = self._fp32_scorer() if precision == "fp32" else None
-        for group, ids, logits in self._iter_row_batches(rows, batch_tokens, keys):
-            for r, i in enumerate(group):
-                n, plen = rows[i].numel(), prompt_lens[i]
-                start = plen - 1 + (from_lens[i] if from_lens is not None else 0)
-                lq = torch.log_softmax(
-                    logits[r, start : n - 1, :vocab_limit].float(), -1
-                )
-                lq = lq.to(torch.bfloat16)
-                key = keys[i] if keys is not None else i
-                prev = self._spec_q.get(key) if keys is not None else None
-                self._spec_q[key] = lq if prev is None else torch.cat([prev, lq])
-        self._active_scorer = None
-        if os.environ.get("THUNDERSYNC_SPEC_PROF"):
-            print(
-                f"[spec prof] score rank={self.rank} total={time.perf_counter() - t_all:.3f} {self._prof}",
-                flush=True,
-            )
-        return len(self._spec_q)
-
-    @torch.no_grad()
-    def verify_drafts_block(
-        self,
-        rows: list[torch.Tensor],
-        prompt_lens: list[int],
-        vocab_limit: int,
-        seed: int,
-        batch_tokens: int,
-        precision: str,
-        keys: list[str] | None = None,
-    ) -> list[tuple[int, dict[str, Any]]]:
-        """Learner at theta_{k+1}: block-verify each draft against the stored q.
-
-        Keeps X[:tau] and emits Y: the bonus token from p if the whole draft is
-        accepted, else a sample from the block residual max(b_tau p - q, 0).
-        Output is distributed exactly as p given that q is the draft's sampling
-        distribution (Sun et al. 2024, "Block Verification Accelerates
-        Speculative Decoding").
-        """
-        self._prof = {}
-        t_all = time.perf_counter()
-        self.model.eval()
-        from thundersync_rl.block_verification import block_verify
-
-        gen = torch.Generator(device="cuda").manual_seed(seed * 1_000_003 + self.rank)
-        results = []
-        self._active_scorer = self._fp32_scorer() if precision == "fp32" else None
-        for group, ids, logits in self._iter_row_batches(rows, batch_tokens, keys):
-            for r, i in enumerate(group):
-                n, plen = rows[i].numel(), prompt_lens[i]
-                g = n - plen
-                lp = torch.log_softmax(
-                    logits[r, plen - 1 : n, :vocab_limit].float(), -1
-                )
-                lq = self._spec_q.pop(
-                    keys[i] if keys is not None else i
-                ).float()  # [g, V]
-                assert lq.shape[0] == g, (lq.shape, g)
-                draft = ids[r, plen:n]
-                tau, y = block_verify(lp, lq, draft, gen)
-                kept = torch.cat([draft[:tau], torch.tensor([y], device="cuda")])
-                lps = lp[torch.arange(tau + 1, device="cuda"), kept].tolist()
-                results.append((i, {"accepted": tau, "next": y, "logprobs": lps}))
-        self._active_scorer = None
-        if os.environ.get("THUNDERSYNC_SPEC_PROF"):
-            print(
-                f"[spec prof] verify rank={self.rank} total={time.perf_counter() - t_all:.3f} {self._prof}",
-                flush=True,
-            )
-        return results
 
     def termination_id(self) -> int | None:
         tok = getattr(self, "megatron_tokenizer", None)
@@ -1114,7 +821,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         return logits
 
     def _iter_row_id_batches(self, rows, batch_tokens, keys):
-        """Like _iter_row_batches but yields token ids only (no forward).
+        """This rank's rows, length-sorted, as padded token-id batches.
 
         Rows are owned by data-parallel rank (stable hash of the key), so the
         tensor-parallel ranks of one replica process the same rows together.

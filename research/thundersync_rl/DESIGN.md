@@ -180,9 +180,9 @@ slowing iterations from 3.31 to 4.12 s. A Triton flash-attention kernel with `tf
 dots matched fp32 accuracy but was 2x slower than SDPA.
 
 **q storage scales with parameters, not tokens.** Storing each draft's full-vocabulary q
-costs O(draft tokens x vocabulary). The default `q_storage=stash` keeps one bf16 weight
-copy per pending version (2 bytes per parameter per model-parallel shard) and recomputes q
-per batch: memory O(parameters + one batch x vocabulary).
+costs O(draft tokens x vocabulary), about 150k floats per token. Instead the verifiers keep
+one bf16 weight copy per pending version (2 bytes per parameter per model-parallel shard)
+and recompute q per batch: memory O(parameters + one batch x vocabulary).
 
 ## 6. Overlapped verification pipeline
 
@@ -316,7 +316,6 @@ Best 1.5B configuration, on top of the ThunderSync GRPO config:
 NVIDIA_TF32_OVERRIDE=1
 ++thundersync.speculate=true
 ++thundersync.verify_mode=block
-++thundersync.q_storage=stash
 ++thundersync.verify_precision=fp32
 ++thundersync.draft_budget=4096
 ++thundersync.draft_lookahead=3

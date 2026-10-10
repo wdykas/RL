@@ -216,7 +216,7 @@ keep x_1..x_τ, then emit y ~ p_g                       if τ = g   (bonus token
   </ul>
   <div class="callout"><strong>Attention needs fp32-level accuracy.</strong> Running only attention in bf16 inside the fp32 scorer drops tokens kept from 99.2% to 96.4% and fully accepted drafts from 98.5% to 94.7%, which slows iterations from 3.31 to 4.12 s. A Triton flash-attention kernel with <code>tf32x3</code> dots matched fp32 accuracy but was 2× slower than SDPA.</div>
   <h3>q storage scales with parameters, not tokens</h3>
-  <p>The first version stored each draft's full-vocabulary q: O(draft tokens × vocabulary), about 150k floats per token. The default <code>q_storage=stash</code> keeps one bf16 weight copy per pending version (2 bytes per parameter per model-parallel shard) and recomputes q per batch at verification. Memory is O(parameters + one batch × vocabulary).</p>
+  <p>Storing each draft's full-vocabulary q costs O(draft tokens × vocabulary), about 150k floats per token. Instead the verifiers keep one bf16 weight copy per pending version (2 bytes per parameter per model-parallel shard) and recompute q per batch. Memory is O(parameters + one batch × vocabulary).</p>
 </section>
 
 <section id="pipeline" class="wide">
@@ -351,7 +351,6 @@ keep x_1..x_τ, then emit y ~ p_g                       if τ = g   (bonus token
 <pre><code>NVIDIA_TF32_OVERRIDE=1
 ++thundersync.speculate=true
 ++thundersync.verify_mode=block
-++thundersync.q_storage=stash
 ++thundersync.verify_precision=fp32
 ++thundersync.draft_budget=4096
 ++thundersync.draft_lookahead=3

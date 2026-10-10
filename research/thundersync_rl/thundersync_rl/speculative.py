@@ -55,10 +55,9 @@ class Plan:
 
 @dataclass
 class CohortDrafts:
-    """Drafts advanced during one iteration (for scoring at its theta)."""
+    """Drafts advanced during one iteration (their tokens were drafted at its theta)."""
 
     live: list[dict[str, Any]]
-    prev_lens: list[int]
 
 
 def _key(ids: torch.Tensor) -> tuple[int, ...]:
@@ -80,7 +79,6 @@ class SpeculativeGeneration:
         variant_eps: float,
         verify_mode: str,
         verify_precision: str,
-        q_storage: str,
         verify_batch_tokens: int,
         longest_first: bool,
         verify_on: str,
@@ -98,10 +96,6 @@ class SpeculativeGeneration:
         self.stream_interval = 16
         self.verify_mode = verify_mode
         self.verify_precision = verify_precision
-        # "full": store each draft's full-vocab q at theta_k (O(tokens x vocab)).
-        # "stash": stash theta_k's weights and recompute q per batch at
-        # verification (O(params + batch x vocab)); scales to large models.
-        self.q_storage = q_storage
         self.verify_batch_tokens = verify_batch_tokens
         self.longest_first = longest_first
         # Where stash + block verification run: "learner" or "inference" (the
@@ -293,13 +287,12 @@ class SpeculativeGeneration:
 
         def collect():
             res = ray.get(rank0.collect_drafts.remote()) if live else []
-            prev = [len(d["tokens"]) for d in live]
             for d, (toks, done) in zip(live, res):
                 start = len(d["tokens"])
                 d["tokens"].extend(toks)
                 d["finished"] = done
                 d["segments"].append((step, start, len(d["tokens"])))
-            return CohortDrafts(live, prev)
+            return CohortDrafts(live)
 
         return collect
 
@@ -326,65 +319,33 @@ class SpeculativeGeneration:
         return flat, rows
 
     def score_prev(self, drafts) -> None:
-        """Block mode, learner still at theta_k: store each draft's full log q."""
+        """Block mode, verifiers still at theta_k: stash theta_k's weights.
+
+        q of every token drafted at theta_k is recomputed from this stash at
+        verification. Only versions that pending drafts were drafted with are kept.
+        """
         if self.verify_mode != "block" or drafts is None:
             return
-        if self.q_storage == "stash":
-            # Learner still at theta_k: stash its weights; keep only versions that
-            # pending drafts were drafted with.
-            keep = {self.current_step}
-            for cohort in self.cohorts.values():
-                for d in cohort:
-                    keep.update(v for v, _, _ in d["segments"])
-            ray.get(
-                [
-                    ref
-                    for g in self.verifiers
-                    for ref in g.run_all_workers_single_data(
-                        "stash_weights",
-                        version=self.current_step,
-                        keep=sorted(keep),
-                        precision=self.verify_precision,
-                    )
-                ]
-            )
-            return
-        if isinstance(drafts, CohortDrafts):
-            if not drafts.live:
-                return
-            ray.get(
-                self.learner_policy.worker_group.run_all_workers_single_data(
-                    "score_drafts_q",
-                    rows=[
-                        torch.cat(
-                            [d["prompt"], torch.tensor(d["tokens"], dtype=torch.long)]
-                        )
-                        for d in drafts.live
-                    ],
-                    prompt_lens=[d["prompt"].numel() for d in drafts.live],
-                    vocab_limit=self.vocab_limit,
-                    batch_tokens=self.verify_batch_tokens,
-                    precision=self.verify_precision,
-                    keys=[d["key"] for d in drafts.live],
-                    from_lens=drafts.prev_lens,
-                )
-            )
-            return
-        flat, rows = self._flat_rows(drafts)
+        keep = {self.current_step}
+        for cohort in self.cohorts.values():
+            for d in cohort:
+                keep.update(v for v, _, _ in d["segments"])
         ray.get(
-            self.learner_policy.worker_group.run_all_workers_single_data(
-                "score_drafts_q",
-                rows=rows,
-                prompt_lens=[d[0].numel() for _, d in flat],
-                vocab_limit=self.vocab_limit,
-                batch_tokens=self.verify_batch_tokens,
-                precision=self.verify_precision,
-            )
+            [
+                ref
+                for g in self.verifiers
+                for ref in g.run_all_workers_single_data(
+                    "stash_weights",
+                    version=self.current_step,
+                    keep=sorted(keep),
+                    precision=self.verify_precision,
+                )
+            ]
         )
 
     def verify(self, drafts: list[list[tuple[torch.Tensor, int, list[int]]]]) -> None:
         flat, rows = self._flat_rows(drafts)
-        if self.verify_mode == "block" and self.q_storage == "stash":
+        if self.verify_mode == "block":
             # Contiguous row slices per verifier pool, verified concurrently.
             k = len(self.verifiers)
             cuts = [round(j * len(flat) / k) for j in range(k + 1)]
@@ -412,19 +373,6 @@ class SpeculativeGeneration:
                 for a, refs in futs
                 for rank_res in ray.get(refs)
             ]
-        elif self.verify_mode == "block":
-            res = ray.get(
-                self.learner_policy.worker_group.run_all_workers_single_data(
-                    "verify_drafts_block",
-                    rows=rows,
-                    prompt_lens=[d[0].numel() for _, d in flat],
-                    vocab_limit=self.vocab_limit,
-                    seed=next(self._verify_seeds),
-                    batch_tokens=self.verify_batch_tokens,
-                    precision=self.verify_precision,
-                    keys=[d[4] for _, d in flat] if len(flat[0][1]) > 4 else None,
-                )
-            )
         else:
             res = ray.get(
                 self.learner_policy.worker_group.run_all_workers_single_data(
