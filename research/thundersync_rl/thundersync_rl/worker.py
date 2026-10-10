@@ -467,11 +467,17 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             provider.recompute_granularity = None
             provider.recompute_method = None
             provider.recompute_num_layers = None
-            # The fused SwiGLU kernel is ~4x off the memory bound in fp32; plain
-            # silu * mul computes the same values.
+            # The fused bias-SwiGLU kernel is ~4x off the memory bound in fp32;
+            # the unfused path is replaced by a Triton SwiGLU below.
             provider.bias_activation_fusion = False
             provider.finalize()
             self._mfp32 = provider.provide().cuda().eval()
+            if provider.params_dtype == torch.float32:
+                # Megatron/TE fall back to unfused fp32 attention and GLU paths.
+                from thundersync_rl.scorer_kernels import use_fused_swiglu, use_sdpa_attention
+
+                use_sdpa_attention(self._mfp32, provider)
+                use_fused_swiglu(self._mfp32)
             src_names = [n for n, _ in self.model.named_parameters()]
             self._mfp32_map = []
             src = dict(self.model.named_parameters())
@@ -824,6 +830,18 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 gather_kw["runtime_gather_output"] = True
         except ImportError:
             pass
+        if os.environ.get("THUNDERSYNC_SPEC_TORCHPROF") and not getattr(self, "_profiled", False):
+            self._profiled = True
+            from torch.profiler import ProfilerActivity, profile
+
+            with profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True
+            ) as prof:
+                scorer(input_ids=ids, position_ids=pos, attention_mask=None, **gather_kw)
+                torch.cuda.synchronize()
+            print(f"[spec torchprof] ids={tuple(ids.shape)}\n" + prof.key_averages(
+                group_by_input_shape=True).table(sort_by="self_cuda_time_total", row_limit=25,
+                max_name_column_width=40, max_shapes_column_width=90), flush=True)
         if ps.get_pipeline_model_parallel_world_size() == 1:
             logits = scorer(
                 input_ids=ids, position_ids=pos, attention_mask=None, **gather_kw
