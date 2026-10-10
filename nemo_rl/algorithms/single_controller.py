@@ -5549,7 +5549,18 @@ class SingleControllerActor:
         )
         assert isinstance(self._algo_cfg, GRPOConfig)
         advantages = _clip_grpo_advantages(advantages, self._algo_cfg)
-        return dict(zip(rewards.tolist(), advantages[:, 0].tolist()))
+        # Masked rows (overlong, env-flagged) are left out of the baseline, so
+        # their advantage differs from valid rows with the same reward; it is
+        # never trained on (zero sample mask), so valid rows take precedence.
+        by_reward: dict[float, float] = {}
+        valid_rows = final_sample_mask.bool().tolist()
+        for valid_pass in (True, False):
+            for reward, advantage, valid in zip(
+                rewards.tolist(), advantages[:, 0].tolist(), valid_rows
+            ):
+                if valid is valid_pass:
+                    by_reward.setdefault(reward, advantage)
+        return by_reward
 
     async def _drop_vanished_groups(
         self, traj: "_TrajectoryStepState", live: set[str]
