@@ -38,8 +38,14 @@ def _residual_mass_kernel(
     for off in range(0, vocab, BLOCK):
         cols = off + tl.arange(0, BLOCK)
         mask = cols < vocab
-        p = tl.exp(tl.load(P + row.to(tl.int64) * sp + cols, mask=mask, other=float("-inf")) - lp0)
-        q = tl.exp(tl.load(Q + row.to(tl.int64) * sq + cols, mask=mask, other=float("-inf")) - lq0)
+        p = tl.exp(
+            tl.load(P + row.to(tl.int64) * sp + cols, mask=mask, other=float("-inf"))
+            - lp0
+        )
+        q = tl.exp(
+            tl.load(Q + row.to(tl.int64) * sq + cols, mask=mask, other=float("-inf"))
+            - lq0
+        )
         d = bi * p.to(tl.float64) - q.to(tl.float64)
         acc += tl.where(d > 0, d, 0.0)
     tl.store(out + row, tl.sum(acc, 0))
@@ -69,19 +75,33 @@ def block_verify_logits(
     lpx = p_logits[ar, draft].float() - lse_p[:g]
     lqx = q_logits[ar, draft].float() - lse_q
     s_cum = torch.cat(
-        [torch.zeros(1, dtype=torch.float64, device=dev), torch.cumsum((lpx - lqx).double(), 0)]
+        [
+            torch.zeros(1, dtype=torch.float64, device=dev),
+            torch.cumsum((lpx - lqx).double(), 0),
+        ]
     )
     b = (s_cum - torch.cummax(s_cum, 0).values).exp()  # [g+1]
     r = torch.empty(g, dtype=torch.float64, device=dev)
     if g:
         _residual_mass_kernel[(g,)](
-            p_logits, q_logits, lse_p.contiguous(), lse_q.contiguous(), b[:g].contiguous(), r,
-            p_logits.stride(0), q_logits.stride(0), p_logits.shape[-1], BLOCK=2048,
+            p_logits,
+            q_logits,
+            lse_p.contiguous(),
+            lse_q.contiguous(),
+            b[:g].contiguous(),
+            r,
+            p_logits.stride(0),
+            q_logits.stride(0),
+            p_logits.shape[-1],
+            BLOCK=2048,
         )
     denom = r + 1 - b[:g]
-    h = torch.cat([
-        torch.where(denom > 0, r / denom.clamp(min=1e-300), torch.ones_like(denom)), b[g:]
-    ])
+    h = torch.cat(
+        [
+            torch.where(denom > 0, r / denom.clamp(min=1e-300), torch.ones_like(denom)),
+            b[g:],
+        ]
+    )
     eta = torch.rand(g + 1, generator=generator, dtype=torch.float64, device=dev)
     tau = int(torch.nonzero(eta <= h).flatten().max())
     p_row = (p_logits[tau].double() - lse_p[tau].double()).exp()

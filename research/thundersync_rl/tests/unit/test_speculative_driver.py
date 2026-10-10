@@ -17,11 +17,11 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
-import torch
-
 import thundersync_rl.speculative as spec_mod
-from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+import torch
 from thundersync_rl.speculative import Plan, SpeculativeGeneration
+
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 EOD = 2
 
@@ -53,11 +53,16 @@ class _Base:
         n = int(data["input_lengths"][0])
         ids = data["input_ids"][0, :n]
         tail = torch.tensor(self.gen_tail)
-        yield 0, {
-            "output_ids": torch.cat([ids, tail]).view(1, -1),
-            "logprobs": torch.cat([torch.zeros(n), torch.full((len(tail),), -0.5)]).view(1, -1),
-            "generation_lengths": torch.tensor([len(tail)]),
-        }
+        yield (
+            0,
+            {
+                "output_ids": torch.cat([ids, tail]).view(1, -1),
+                "logprobs": torch.cat(
+                    [torch.zeros(n), torch.full((len(tail),), -0.5)]
+                ).view(1, -1),
+                "generation_lengths": torch.tensor([len(tail)]),
+            },
+        )
 
 
 @pytest.fixture(autouse=True)
@@ -86,8 +91,10 @@ def test_verify_builds_complete_and_continuation_plans():
     results = {0: (3, 0), 1: (1, 7), 2: (0, EOD)}  # row -> (accepted, next)
 
     def verify(rows, prompt_lens, segments, keys, **_):
-        return [(i, {"accepted": a, "next": y, "logprobs": [-0.1] * (a + 1)})
-                for i, (a, y) in results.items()]
+        return [
+            (i, {"accepted": a, "next": y, "logprobs": [-0.1] * (a + 1)})
+            for i, (a, y) in results.items()
+        ]
 
     s = _spec({"verify_drafts_block_stashed": verify})
     p = [torch.tensor([10 + i, 20 + i]) for i in range(3)]
@@ -101,7 +108,7 @@ def test_verify_builds_complete_and_continuation_plans():
     assert plans[(10, 20)] == Plan(-1, [4, 5, EOD], [-0.1] * 3, complete=True)
     assert plans[(11, 21)] == Plan(-1, [4, 7], [-0.1] * 2, complete=False)
     assert plans[(12, 22)] == Plan(-1, [EOD], [-0.1], complete=True)
-    (_, kw), = s.learner_policy.worker_group.calls
+    ((_, kw),) = s.learner_policy.worker_group.calls
     assert kw["keys"] == ["1:0", "1:1", "1:2"]
     assert kw["segments"][1] == [(0, 0, 3)]
 
@@ -111,7 +118,9 @@ def test_cohort_drafts_resume_and_track_versions():
     s = _spec(
         {"stash_weights": lambda **kw: 1},
         base_handlers={
-            "start_drafts": lambda prompts, budgets, interval: started.append((prompts, budgets)),
+            "start_drafts": lambda prompts, budgets, interval: started.append(
+                (prompts, budgets)
+            ),
             "collect_drafts": lambda: collected.pop(0),
         },
     )
@@ -132,11 +141,15 @@ def test_rollout_request_continues_from_verified_prefix():
     s = _spec({})
     prompt = torch.tensor([30, 31, 32])
     s.plans[(30, 31, 32)] = [Plan(-1, [5, 6], [-0.1, -0.2], complete=False)]
-    data = BatchedDataDict({"input_ids": prompt.view(1, -1), "input_lengths": torch.tensor([3])})
+    data = BatchedDataDict(
+        {"input_ids": prompt.view(1, -1), "input_lengths": torch.tensor([3])}
+    )
     out = [o for o in asyncio.run(_collect(s.generate_async(data)))]
-    (_, res), = out
+    ((_, res),) = out
     assert res["output_ids"][0].tolist() == [30, 31, 32, 5, 6, 9, EOD]
-    assert res["logprobs"][0].tolist() == pytest.approx([0, 0, 0, -0.1, -0.2, -0.5, -0.5])
+    assert res["logprobs"][0].tolist() == pytest.approx(
+        [0, 0, 0, -0.1, -0.2, -0.5, -0.5]
+    )
     assert int(res["generation_lengths"][0]) == 4
     (req,) = s.base.requests
     assert req["input_ids"][0].tolist() == [30, 31, 32, 5, 6]
@@ -146,8 +159,10 @@ def test_rollout_request_continues_from_verified_prefix():
 def test_complete_plan_needs_no_engine_request():
     s = _spec({})
     s.plans[(1, 2)] = [Plan(-1, [3, EOD], [-0.3, -0.4], complete=True)]
-    data = BatchedDataDict({"input_ids": torch.tensor([[1, 2]]), "input_lengths": torch.tensor([2])})
-    (_, res), = asyncio.run(_collect(s.generate_async(data)))
+    data = BatchedDataDict(
+        {"input_ids": torch.tensor([[1, 2]]), "input_lengths": torch.tensor([2])}
+    )
+    ((_, res),) = asyncio.run(_collect(s.generate_async(data)))
     assert res["output_ids"][0].tolist() == [1, 2, 3, EOD] and not s.base.requests
 
 
@@ -188,7 +203,10 @@ def _drafts(n):
 
 
 def _accept_all(rows, prompt_lens, segments, keys, **_):
-    return [(j, {"accepted": 2, "next": 0, "logprobs": [-0.1, -0.1]}) for j in range(len(rows))]
+    return [
+        (j, {"accepted": 2, "next": 0, "logprobs": [-0.1, -0.1]})
+        for j in range(len(rows))
+    ]
 
 
 def test_chunked_verification_uses_all_pools_and_publishes_every_plan():
@@ -207,13 +225,17 @@ def test_verification_failure_surfaces_instead_of_hanging():
 
     s = _spec({})
     s.verifiers = s._chunk_pools = [_RefGroup({"verify_drafts_block_stashed": boom})]
-    data = BatchedDataDict({"input_ids": torch.tensor([[50]]), "input_lengths": torch.tensor([1])})
+    data = BatchedDataDict(
+        {"input_ids": torch.tensor([[50]]), "input_lengths": torch.tensor([1])}
+    )
 
     async def scenario():
         verify = asyncio.create_task(s.verify_chunked(_drafts(1), chunks=1))
         rollout = asyncio.create_task(_collect(s.generate_async(data)))
         done, _ = await asyncio.wait({verify, rollout}, timeout=5)
-        assert verify in done and rollout in done, "rollout hung on a failed verification"
+        assert verify in done and rollout in done, (
+            "rollout hung on a failed verification"
+        )
         with pytest.raises(RuntimeError, match="verification failed"):
             rollout.result()
 
@@ -248,8 +270,10 @@ def test_group_chunked_verification_publishes_every_plan():
     s.verifiers = s._chunk_pools = pools
 
     def accept(rows, prompt_lens, segments, keys, **_):
-        return [(j, {"accepted": len(r) - 1, "next": 0, "logprobs": [-0.1] * len(r)})
-                for j, r in enumerate(rows)]
+        return [
+            (j, {"accepted": len(r) - 1, "next": 0, "logprobs": [-0.1] * len(r)})
+            for j, r in enumerate(rows)
+        ]
 
     for p in pools:
         p.handlers["verify_drafts_block_stashed"] = accept

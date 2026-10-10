@@ -66,14 +66,14 @@ def _batch(live_rows: list[int], n: int = 8, toks: int = 256) -> BatchedDataDict
     )
 
 
-def _trained_rows(mock_module_symbols) -> list[list[int]]:
+def _trained_rows(mock_module_symbols) -> list[list[int]]:  # noqa: F811
     return [
         call.args[0]["input_ids"][:, 0].tolist()
         for call in mock_module_symbols["gmi"].call_args_list
     ]
 
 
-def test_only_live_rows_are_trained_but_all_rows_are_counted(mock_module_symbols):
+def test_only_live_rows_are_trained_but_all_rows_are_counted(mock_module_symbols):  # noqa: F811
     w = _worker()
     w.begin_train_step(loss_fn=_skip_loss())
     w.train_microbatch(_batch([0, 2, 4, 7]))
@@ -83,7 +83,7 @@ def test_only_live_rows_are_trained_but_all_rows_are_counted(mock_module_symbols
     assert float(state["trained_valid_toks"]) == pytest.approx(4 * 256)
 
 
-def test_kept_rows_are_topped_up_to_the_microbatch_size(mock_module_symbols):
+def test_kept_rows_are_topped_up_to_the_microbatch_size(mock_module_symbols):  # noqa: F811
     w = _worker()  # train_micro_batch_size = 4
     w.begin_train_step(loss_fn=_skip_loss())
     w.train_microbatch(_batch([1, 5, 6]))
@@ -91,7 +91,7 @@ def test_kept_rows_are_topped_up_to_the_microbatch_size(mock_module_symbols):
     assert _trained_rows(mock_module_symbols) == [[0, 1, 5, 6]]
 
 
-def test_all_zero_chunk_runs_once_per_step_then_skips(mock_module_symbols):
+def test_all_zero_chunk_runs_once_per_step_then_skips(mock_module_symbols):  # noqa: F811
     w = _worker()
     w.begin_train_step(loss_fn=_skip_loss())
     w.train_microbatch(_batch([]))  # first chunk: one microbatch keeps metrics
@@ -100,7 +100,7 @@ def test_all_zero_chunk_runs_once_per_step_then_skips(mock_module_symbols):
     assert float(w._train_step_state["local_valid_toks"]) == pytest.approx(16 * 256)
 
 
-def test_without_flag_every_row_is_trained(mock_module_symbols):
+def test_without_flag_every_row_is_trained(mock_module_symbols):  # noqa: F811
     w = _worker()
     loss = ClippedPGLossFn(
         ClippedPGLossConfig(reference_policy_kl_penalty=0.0, force_on_policy_ratio=True)
@@ -111,15 +111,20 @@ def test_without_flag_every_row_is_trained(mock_module_symbols):
 
 
 @pytest.mark.parametrize(
-    "override", [{"reference_policy_kl_penalty": 0.01}, {"positive_example_nll_weight": 0.1}]
+    "override",
+    [{"reference_policy_kl_penalty": 0.01}, {"positive_example_nll_weight": 0.1}],
 )
 def test_loss_rejects_non_advantage_weighted_terms(override):
-    cfg = {"reference_policy_kl_penalty": 0.0, "skip_zero_advantage_rows": True, **override}
+    cfg = {
+        "reference_policy_kl_penalty": 0.0,
+        "skip_zero_advantage_rows": True,
+        **override,
+    }
     with pytest.raises(ValueError, match="advantage-weighted"):
         ClippedPGLossFn(ClippedPGLossConfig(**cfg))
 
 
-def test_worker_rejects_sequence_packing(mock_module_symbols):
+def test_worker_rejects_sequence_packing(mock_module_symbols):  # noqa: F811
     w = _worker()
     w.cfg["sequence_packing"] = {"enabled": True}
     with pytest.raises(ValueError, match="fixed-size"):

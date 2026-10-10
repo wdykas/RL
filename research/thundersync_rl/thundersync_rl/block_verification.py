@@ -11,8 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Block verification (Sun et al. 2024, "Block Verification Accelerates
-Speculative Decoding") for one draft.
+"""Block verification of one draft.
+
+Sun et al. 2024, "Block Verification Accelerates Speculative Decoding".
 
 Given a draft x_1..x_g sampled from q and the target p, keep x_1..x_tau and emit
 one more token y, such that the result is distributed exactly as p:
@@ -43,7 +44,9 @@ def block_weights(
     g = draft.numel()
     ar = torch.arange(g, device=lp.device)
     lr = (lp[ar, draft] - lq[ar, draft]).double()
-    s_cum = torch.cat([torch.zeros(1, dtype=torch.float64, device=lp.device), torch.cumsum(lr, 0)])
+    s_cum = torch.cat(
+        [torch.zeros(1, dtype=torch.float64, device=lp.device), torch.cumsum(lr, 0)]
+    )
     # log b_i = S_i - max_{j<=i} S_j  (closed form of the min(1, b r) recursion)
     b = (s_cum - torch.cummax(s_cum, 0).values).exp()
     resid = (b[:g, None] * lp[:g].double().exp() - lq.double().exp()).clamp_(min=0)

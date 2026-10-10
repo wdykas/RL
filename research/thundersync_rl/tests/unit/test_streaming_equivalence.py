@@ -17,10 +17,10 @@ import random
 
 import pytest
 import torch
-from nemo_rl.algorithms.grad_streaming import StreamingGroupAccumulator
 from thundersync_rl.streaming import StreamPlanner, Trajectory
 
 from nemo_rl.algorithms.advantage_estimator import GRPOAdvantageEstimator
+from nemo_rl.algorithms.grad_streaming import StreamingGroupAccumulator
 
 
 class _Cfg:

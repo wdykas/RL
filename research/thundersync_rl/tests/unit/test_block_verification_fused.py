@@ -13,10 +13,11 @@
 # limitations under the License.
 import pytest
 import torch
-
 from thundersync_rl.block_verification import block_verify
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA (Triton)")
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="needs CUDA (Triton)"
+)
 
 
 @pytest.mark.parametrize("noise", [0.01, 0.3])

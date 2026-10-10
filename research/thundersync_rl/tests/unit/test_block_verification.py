@@ -18,7 +18,6 @@ import math
 
 import pytest
 import torch
-
 from thundersync_rl.block_verification import (
     block_verify,
     block_weights,
@@ -28,7 +27,9 @@ from thundersync_rl.block_verification import (
 
 def _random_lm(vocab: int, depth: int, gen: torch.Generator, temp: float):
     return {
-        pre: torch.log_softmax(torch.randn(vocab, generator=gen, dtype=torch.float64) * temp, -1)
+        pre: torch.log_softmax(
+            torch.randn(vocab, generator=gen, dtype=torch.float64) * temp, -1
+        )
         for n in range(depth + 1)
         for pre in itertools.product(range(vocab), repeat=n)
     }
@@ -38,7 +39,9 @@ def _logprob(lm, seq):
     return sum(float(lm[tuple(seq[:i])][t]) for i, t in enumerate(seq))
 
 
-@pytest.mark.parametrize("vocab,g,temp,seed", [(3, 3, 1.0, 0), (2, 4, 2.0, 1), (4, 2, 0.3, 2)])
+@pytest.mark.parametrize(
+    "vocab,g,temp,seed", [(3, 3, 1.0, 0), (2, 4, 2.0, 1), (4, 2, 0.3, 2)]
+)
 def test_block_verification_output_is_exactly_p(vocab, g, temp, seed):
     gen = torch.Generator().manual_seed(seed)
     P = _random_lm(vocab, g, gen, temp)

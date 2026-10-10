@@ -30,12 +30,12 @@ unchanged: a request for a prompt that has a verified plan returns immediately
 from __future__ import annotations
 
 import asyncio
+import itertools
 import os
 import time
-import itertools
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, AsyncGenerator, Optional
+from typing import Any, AsyncGenerator
 
 import ray
 import torch
@@ -149,7 +149,9 @@ class SpeculativeGeneration:
 
     # -- drafting (iteration k, for iteration k+1's prompts) --------------------
 
-    async def draft(self, prompts: list[torch.Tensor]) -> list[list[tuple[torch.Tensor, int, list[int]]]]:
+    async def draft(
+        self, prompts: list[torch.Tensor]
+    ) -> list[list[tuple[torch.Tensor, int, list[int]]]]:
         """Decode up to ``draft_budget`` tokens per prompt with fresh keys.
 
         Each prompt gets ``draft_variants`` drafts sharing its seed: variant 0 is an
@@ -183,7 +185,11 @@ class SpeculativeGeneration:
             i, v = rows[r]
             plen = prompts[i].numel()
             glen = int(res["generation_lengths"][0])
-            out[i][v] = (prompts[i], seeds[i], res["output_ids"][0, plen : plen + glen].tolist())
+            out[i][v] = (
+                prompts[i],
+                seeds[i],
+                res["output_ids"][0, plen : plen + glen].tolist(),
+            )
         return out
 
     async def self_test(self, prompts: list[torch.Tensor]) -> dict[str, Any]:
@@ -233,7 +239,16 @@ class SpeculativeGeneration:
         def collect():
             res = ray.get(rank0.collect_drafts.remote())
             return [
-                [(prompts[i], -1, toks, done, f"{step + 1}:{i}", [(step, 0, len(toks))])]
+                [
+                    (
+                        prompts[i],
+                        -1,
+                        toks,
+                        done,
+                        f"{step + 1}:{i}",
+                        [(step, 0, len(toks))],
+                    )
+                ]
                 for i, (toks, done) in enumerate(res)
             ]
 
@@ -248,7 +263,13 @@ class SpeculativeGeneration:
         for target, prompts in new.items():
             if target not in self.cohorts:
                 self.cohorts[target] = [
-                    {"prompt": p, "tokens": [], "finished": False, "key": f"{target}:{j}", "segments": []}
+                    {
+                        "prompt": p,
+                        "tokens": [],
+                        "finished": False,
+                        "key": f"{target}:{j}",
+                        "segments": [],
+                    }
                     for j, p in enumerate(prompts)
                 ]
         live = [
@@ -262,8 +283,12 @@ class SpeculativeGeneration:
         if live:
             ray.get(
                 rank0.start_drafts.remote(
-                    [torch.cat([d["prompt"], torch.tensor(d["tokens"], dtype=torch.long)]).tolist()
-                     for d in live],
+                    [
+                        torch.cat(
+                            [d["prompt"], torch.tensor(d["tokens"], dtype=torch.long)]
+                        ).tolist()
+                        for d in live
+                    ],
                     [self.max_new_tokens - len(d["tokens"]) for d in live],
                     self.stream_interval,
                 )
@@ -298,7 +323,9 @@ class SpeculativeGeneration:
     @staticmethod
     def _flat_rows(drafts):
         flat = [(t, d) for t, variants in enumerate(drafts) for d in variants]
-        rows = [torch.cat([d[0], torch.tensor(d[2], dtype=torch.long)]) for _, d in flat]
+        rows = [
+            torch.cat([d[0], torch.tensor(d[2], dtype=torch.long)]) for _, d in flat
+        ]
         return flat, rows
 
     def score_prev(self, drafts) -> None:
@@ -320,7 +347,9 @@ class SpeculativeGeneration:
                         "stash_weights",
                         version=self.current_step,
                         keep=sorted(keep),
-                        precision="fp32" if self.verify_precision in ("fp32", "tf32") else "model",
+                        precision="fp32"
+                        if self.verify_precision in ("fp32", "tf32")
+                        else "model",
                     )
                 ]
             )
@@ -332,7 +361,9 @@ class SpeculativeGeneration:
                 self.learner_policy.worker_group.run_all_workers_single_data(
                     "score_drafts_q",
                     rows=[
-                        torch.cat([d["prompt"], torch.tensor(d["tokens"], dtype=torch.long)])
+                        torch.cat(
+                            [d["prompt"], torch.tensor(d["tokens"], dtype=torch.long)]
+                        )
                         for d in drafts.live
                     ],
                     prompt_lens=[d["prompt"].numel() for d in drafts.live],
@@ -363,17 +394,24 @@ class SpeculativeGeneration:
             seed = next(self._verify_seeds)
             futs = []
             for g, a, b in zip(self.verifiers, cuts, cuts[1:]):
-                futs.append((a, g.run_all_workers_single_data(
-                    "verify_drafts_block_stashed",
-                    rows=rows[a:b],
-                    prompt_lens=[d[0].numel() for _, d in flat[a:b]],
-                    segments=[d[5] for _, d in flat[a:b]],
-                    vocab_limit=self.vocab_limit,
-                    seed=seed * 7 + a,
-                    keys=[d[4] for _, d in flat[a:b]],
-                    precision="fp32" if self.verify_precision in ("fp32", "tf32") else "model",
-                    batch_tokens=self.verify_batch_tokens,
-                )))
+                futs.append(
+                    (
+                        a,
+                        g.run_all_workers_single_data(
+                            "verify_drafts_block_stashed",
+                            rows=rows[a:b],
+                            prompt_lens=[d[0].numel() for _, d in flat[a:b]],
+                            segments=[d[5] for _, d in flat[a:b]],
+                            vocab_limit=self.vocab_limit,
+                            seed=seed * 7 + a,
+                            keys=[d[4] for _, d in flat[a:b]],
+                            precision="fp32"
+                            if self.verify_precision in ("fp32", "tf32")
+                            else "model",
+                            batch_tokens=self.verify_batch_tokens,
+                        ),
+                    )
+                )
             res = [
                 [(a + j, r) for j, r in rank_res]
                 for a, refs in futs
@@ -444,8 +482,10 @@ class SpeculativeGeneration:
         return Plan(seed, prefix, r["logprobs"], complete=done)
 
     async def verify_chunked(self, drafts, chunks: int) -> None:
-        """Run ``_verify_chunked``; on failure wake every waiting rollout so the
-        error surfaces instead of the rollouts waiting forever for plans."""
+        """Run ``_verify_chunked``; on failure, wake every waiting rollout.
+
+        The error then surfaces instead of the rollouts waiting forever for plans.
+        """
         self._verify_error = None
         try:
             await self._verify_chunked(drafts, chunks)
@@ -458,8 +498,10 @@ class SpeculativeGeneration:
             raise
 
     async def _debug_compare_pools(self, rows) -> None:
-        """THUNDERSYNC_SPEC_CHECK: score the same rows on every verifier pool,
-        concurrently with live rollouts, and report the largest difference."""
+        """Score the same rows on every verifier pool and report the largest difference.
+
+        Debug check (THUNDERSYNC_SPEC_CHECK), run concurrently with live rollouts.
+        """
         outs = []
         for g in self.verifiers:
             refs = g.run_all_workers_single_data("scorer_token_logprobs", rows=rows)
@@ -468,9 +510,14 @@ class SpeculativeGeneration:
         sums = []
         for g in self.verifiers:
             refs = g.run_all_workers_single_data("model_param_checksum")
-            sums.append(await asyncio.gather(*[asyncio.wrap_future(r.future()) for r in refs]))
+            sums.append(
+                await asyncio.gather(*[asyncio.wrap_future(r.future()) for r in refs])
+            )
         diffs = [float((a - b).abs().max()) for a, b in zip(outs[0], outs[-1])]
-        print(f"[spec check] pools={len(outs)} max|p diff| per row={[round(d, 6) for d in diffs]} param sums={sums}", flush=True)
+        print(
+            f"[spec check] pools={len(outs)} max|p diff| per row={[round(d, 6) for d in diffs]} param sums={sums}",
+            flush=True,
+        )
 
     def _group_chunks(self, flat, rows, chunks: int):
         """Order rows group by group and cut chunks at group boundaries.
@@ -488,12 +535,15 @@ class SpeculativeGeneration:
         # Groups whose drafts all finished complete as soon as they verify;
         # unfinished (deadline-truncated) drafts still need decoding.
         finished = {
-            k: all(len(flat[j][1]) <= 3 or flat[j][1][3] for j in js) for k, js in groups.items()
+            k: all(len(flat[j][1]) <= 3 or flat[j][1][3] for j in js)
+            for k, js in groups.items()
         }
         by_cost = sorted(groups, key=lambda k: (not finished[k], cost[k]))
         first = by_cost[: self.first_chunk_groups]
-        rest = sorted(by_cost[self.first_chunk_groups :], key=lambda k: -max(
-            len(flat[j][1][2]) for j in groups[k]))
+        rest = sorted(
+            by_cost[self.first_chunk_groups :],
+            key=lambda k: -max(len(flat[j][1][2]) for j in groups[k]),
+        )
         order = [j for k in first + rest for j in groups[k]]
         bounds = [0] + ([sum(len(groups[k]) for k in first)] if first else [])
         rest_chunks = chunks - len(bounds) + 1
@@ -510,11 +560,13 @@ class SpeculativeGeneration:
         return [flat[j] for j in order], [rows[j] for j in order], bounds
 
     async def _verify_chunked(self, drafts, chunks: int) -> None:
-        """Stash-mode verification in ``chunks`` pieces, publishing plans as each
-        chunk finishes so rollouts start without waiting for the whole batch.
+        """Stash-mode verification in ``chunks`` pieces, publishing plans per chunk.
 
-        Chunks keep the drafts' order (no prioritization); every chunk call is
-        queued on the learner at once and processed in order.
+        Rollouts start as soon as their chunk is verified instead of waiting for
+        the whole batch. Rows are ordered longest draft first
+        (``longest_first``) or group by group (``group_aligned`` /
+        ``first_chunk_groups``); chunks go round-robin over the verifier pools,
+        and every chunk call is queued at once (each pool runs its calls in order).
         """
         flat, rows = self._flat_rows(drafts)
         if os.environ.get("THUNDERSYNC_SPEC_CHECK") and len(self.verifiers) > 1:
@@ -549,14 +601,18 @@ class SpeculativeGeneration:
                 seed=next(self._verify_seeds),
                 keys=[d[4] for _, d in flat[a:b]],
                 batch_tokens=self.verify_batch_tokens,
-                precision="fp32" if self.verify_precision in ("fp32", "tf32") else "model",
+                precision="fp32"
+                if self.verify_precision in ("fp32", "tf32")
+                else "model",
             )
             calls.append((a, refs))
         kept = total = full = 0
 
         async def fetch(a, refs):
-            return a, refs, await asyncio.gather(
-                *[asyncio.wrap_future(r.future()) for r in refs]
+            return (
+                a,
+                refs,
+                await asyncio.gather(*[asyncio.wrap_future(r.future()) for r in refs]),
             )
 
         for fut in asyncio.as_completed([fetch(a, refs) for a, refs in calls]):
@@ -576,11 +632,18 @@ class SpeculativeGeneration:
                 with open(log_path, "a") as f:
                     for j, r in by_row.items():
                         d = flat[a + j][1]
-                        f.write(json.dumps({
-                            "step": self.current_step, "accepted": r["accepted"],
-                            "draft_len": len(d[2]), "finished": bool(d[3]) if len(d) > 3 else True,
-                            "segments": d[5] if len(d) > 5 else None,
-                        }) + "\n")
+                        f.write(
+                            json.dumps(
+                                {
+                                    "step": self.current_step,
+                                    "accepted": r["accepted"],
+                                    "draft_len": len(d[2]),
+                                    "finished": bool(d[3]) if len(d) > 3 else True,
+                                    "segments": d[5] if len(d) > 5 else None,
+                                }
+                            )
+                            + "\n"
+                        )
             async with self._plan_cv:
                 for j, r in by_row.items():
                     d = flat[a + j][1]
@@ -604,7 +667,8 @@ class SpeculativeGeneration:
     ) -> AsyncGenerator[tuple[int, BatchedDataDict], None]:
         assert not greedy
         tasks = [
-            asyncio.create_task(self._one(i, data.get_batch(i, 1))) for i in range(data.size)
+            asyncio.create_task(self._one(i, data.get_batch(i, 1)))
+            for i in range(data.size)
         ]
         for fut in asyncio.as_completed(tasks):
             yield await fut
@@ -619,11 +683,15 @@ class SpeculativeGeneration:
             async with cv:
                 while not self.plans.get(key) and self._pending.get(key, 0) > 0:
                     if getattr(self, "_verify_error", None) is not None:
-                        raise RuntimeError("draft verification failed") from self._verify_error
+                        raise RuntimeError(
+                            "draft verification failed"
+                        ) from self._verify_error
                     await cv.wait()
         queue = self.plans.get(key)
-        plan = queue.pop(0) if queue else Plan(
-            seed=next(self._seeds) if self.verify_mode == "keyed" else -1
+        plan = (
+            queue.pop(0)
+            if queue
+            else Plan(seed=next(self._seeds) if self.verify_mode == "keyed" else -1)
         )
         gen = list(plan.prefix)
         lps = list(plan.prefix_logprobs)
@@ -651,16 +719,27 @@ class SpeculativeGeneration:
                 import json
 
                 with open(log_path, "a") as f:
-                    f.write(json.dumps({
-                        "cont_step": self.current_step, "prefix": len(plan.prefix),
-                        "cont_tokens": len(gen) - len(plan.prefix),
-                        "t_start": t0, "secs": time.perf_counter() - t0,
-                    }) + "\n")
+                    f.write(
+                        json.dumps(
+                            {
+                                "cont_step": self.current_step,
+                                "prefix": len(plan.prefix),
+                                "cont_tokens": len(gen) - len(plan.prefix),
+                                "t_start": t0,
+                                "secs": time.perf_counter() - t0,
+                            }
+                        )
+                        + "\n"
+                    )
         n = plen + len(gen)
         out = BatchedDataDict(
             {
-                "output_ids": torch.cat([prompt, torch.tensor(gen, dtype=torch.long)]).view(1, -1),
-                "logprobs": torch.cat([torch.zeros(plen), torch.tensor(lps, dtype=torch.float)]).view(1, -1),
+                "output_ids": torch.cat(
+                    [prompt, torch.tensor(gen, dtype=torch.long)]
+                ).view(1, -1),
+                "logprobs": torch.cat(
+                    [torch.zeros(plen), torch.tensor(lps, dtype=torch.float)]
+                ).view(1, -1),
                 "generation_lengths": torch.tensor([len(gen)]),
                 "unpadded_sequence_lengths": torch.tensor([n]),
                 "gen_leader_worker_idx": [0],

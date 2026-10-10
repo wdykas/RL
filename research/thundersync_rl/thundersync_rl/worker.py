@@ -31,12 +31,12 @@ from typing import Any
 import ray
 import torch
 
+from nemo_rl.algorithms.grad_streaming import GradStreamingSpec, StreamBucket
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.megatron_policy_worker import (
     MegatronPolicyWorkerImpl,
 )
-from nemo_rl.algorithms.grad_streaming import GradStreamingSpec, StreamBucket
 
 WORKER_FQN = "thundersync_rl.worker.ThunderSyncMegatronPolicyWorker"
 
@@ -104,16 +104,28 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             if adv0 is None or bool((adv0 != 0).any()):
                 self._n_items = getattr(self, "_n_items", 0) + 1
             try:
-                if tprof and getattr(self, "_n_items", 0) == int(tprof) and not getattr(self, "_tprof_done", False):
+                if (
+                    tprof
+                    and getattr(self, "_n_items", 0) == int(tprof)
+                    and not getattr(self, "_tprof_done", False)
+                ):
                     self._tprof_done = True
                     from torch.profiler import ProfilerActivity, profile
 
-                    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as tp:
+                    with profile(
+                        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]
+                    ) as tp:
                         self.train_microbatch(item["data"], stream_bucket=bucket)
                         torch.cuda.synchronize()
-                    print(f"[learner torchprof] shape={tuple(item['data']['input_ids'].shape)}\n"
-                          + tp.key_averages().table(sort_by="cpu_time_total", row_limit=30,
-                                                    max_name_column_width=60), flush=True)
+                    print(
+                        f"[learner torchprof] shape={tuple(item['data']['input_ids'].shape)}\n"
+                        + tp.key_averages().table(
+                            sort_by="cpu_time_total",
+                            row_limit=30,
+                            max_name_column_width=60,
+                        ),
+                        flush=True,
+                    )
                 else:
                     self.train_microbatch(item["data"], stream_bucket=bucket)
             finally:
@@ -179,7 +191,9 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         """Snapshot the fp32 master shards under ``tag``."""
         if not hasattr(self, "_master_snapshots"):
             self._master_snapshots: dict[str, list[torch.Tensor]] = {}
-        self._master_snapshots[tag] = [s.detach().clone() for s in self._master_shards()]
+        self._master_snapshots[tag] = [
+            s.detach().clone() for s in self._master_shards()
+        ]
 
     def rename_master_weights(self, src: str, dst: str) -> None:
         self._master_snapshots[dst] = self._master_snapshots.pop(src)
@@ -293,10 +307,12 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                         )
                     )
                 )
-                x_g = torch.argmax(torch.log_softmax(lg, -1) + gumbel, dim=-1, keepdim=True)
-                out[i, a : a + lg.shape[0]] = torch.cat(
-                    [x_id, x_sorted, x_g], dim=-1
-                ).int().cpu()
+                x_g = torch.argmax(
+                    torch.log_softmax(lg, -1) + gumbel, dim=-1, keepdim=True
+                )
+                out[i, a : a + lg.shape[0]] = (
+                    torch.cat([x_id, x_sorted, x_g], dim=-1).int().cpu()
+                )
         return out if self.rank == 0 else None
 
     # ---- Exact cross-iteration speculative rollouts (keyed sampling) ----
@@ -321,12 +337,26 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             return eod
         orig_kernel = sampling.sample_kernel
 
-        def keyed_kernel(logits, n, context, *, gather_indices=None,
-                         token_to_request_index=None, output=None, **kw):
+        def keyed_kernel(
+            logits,
+            n,
+            context,
+            *,
+            gather_indices=None,
+            token_to_request_index=None,
+            output=None,
+            **kw,
+        ):
             if token_to_request_index is not None:
-                return orig_kernel(logits, n, context, gather_indices=gather_indices,
-                                   token_to_request_index=token_to_request_index,
-                                   output=output, **kw)
+                return orig_kernel(
+                    logits,
+                    n,
+                    context,
+                    gather_indices=gather_indices,
+                    token_to_request_index=token_to_request_index,
+                    output=output,
+                    **kw,
+                )
             lo, hi = context.paused_request_count, context.total_request_count
             # Key = (seed, index of the token being sampled). The context's
             # sequence length counts the current step's input token during
@@ -338,27 +368,52 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 seeds.append(int(getattr(sp, "noise_seed", -1)))
                 positions.append(len(req.prompt_tokens) + len(req.generated_tokens))
                 jitter.append(
-                    (float(getattr(sp, "draft_variant", 0)), float(getattr(sp, "variant_eps", 0.0)))
+                    (
+                        float(getattr(sp, "draft_variant", 0)),
+                        float(getattr(sp, "variant_eps", 0.0)),
+                    )
                 )
             if os.environ.get("THUNDERSYNC_SPEC_DEBUG"):
                 ctx_len = context.get_active_sequence_lengths()[:n].tolist()
                 pre = context.request_in_prefill_status_tensor[lo:hi].tolist()[:n]
                 for j, rid in enumerate(context.request_ids[lo:hi].tolist()[:n]):
-                    if seeds[j] == 1 and positions[j] - len(engine.get_request(rid).prompt_tokens) < 8:
-                        print(f"[keyed dbg] call ctx_len={ctx_len[j]} prefill={pre[j]} "
-                              f"req_pos={positions[j]} prompt={len(engine.get_request(rid).prompt_tokens)}",
-                              flush=True)
+                    if (
+                        seeds[j] == 1
+                        and positions[j] - len(engine.get_request(rid).prompt_tokens)
+                        < 8
+                    ):
+                        print(
+                            f"[keyed dbg] call ctx_len={ctx_len[j]} prefill={pre[j]} "
+                            f"req_pos={positions[j]} prompt={len(engine.get_request(rid).prompt_tokens)}",
+                            flush=True,
+                        )
             if all(s < 0 for s in seeds):
-                return orig_kernel(logits, n, context, gather_indices=gather_indices,
-                                   output=output, **kw)
+                return orig_kernel(
+                    logits,
+                    n,
+                    context,
+                    gather_indices=gather_indices,
+                    output=output,
+                    **kw,
+                )
             if all(s >= 0 for s in seeds):
-                out = output if output is not None else torch.empty(
-                    n, device=logits.device, dtype=torch.int64
+                out = (
+                    output
+                    if output is not None
+                    else torch.empty(n, device=logits.device, dtype=torch.int64)
                 )
             else:
-                out = orig_kernel(logits, n, context, gather_indices=gather_indices,
-                                  output=output, **kw)
-            rows = logits[gather_indices[:n]] if gather_indices is not None else logits[:n]
+                out = orig_kernel(
+                    logits,
+                    n,
+                    context,
+                    gather_indices=gather_indices,
+                    output=output,
+                    **kw,
+                )
+            rows = (
+                logits[gather_indices[:n]] if gather_indices is not None else logits[:n]
+            )
             # Pinned host tensors + non-blocking copies: no per-step stream sync,
             # so the engine's async scheduling overlap is preserved.
             seed_c = torch.tensor(seeds, dtype=torch.long).pin_memory()
@@ -368,7 +423,11 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 out.copy_(keyed_sample_logits(rows, seed_c, pos_c, vocab_limit, jit_c))
             else:
                 idx = [j for j, s in enumerate(seeds) if s >= 0]
-                idx_t = torch.tensor(idx, dtype=torch.long).pin_memory().to(rows.device, non_blocking=True)
+                idx_t = (
+                    torch.tensor(idx, dtype=torch.long)
+                    .pin_memory()
+                    .to(rows.device, non_blocking=True)
+                )
                 out[idx_t] = keyed_sample_logits(
                     rows[idx_t], seed_c[idx], pos_c[idx], vocab_limit, jit_c[idx]
                 ).to(out.dtype)
@@ -441,7 +500,9 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             logits = self.model(input_ids=ids, position_ids=pos, attention_mask=None)
             for r, i in enumerate(group):
                 n, plen = rows[i].numel(), prompt_lens[i]
-                lp = torch.log_softmax(logits[r, plen - 1 : n, :vocab_limit].float(), -1)
+                lp = torch.log_softmax(
+                    logits[r, plen - 1 : n, :vocab_limit].float(), -1
+                )
                 positions = torch.arange(plen, n + 1, device="cuda") + position_shift
                 emitted = keyed_sample_logits(
                     lp, torch.full_like(positions, seeds[i]), positions
@@ -452,7 +513,14 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 kept = torch.cat([draft[:n_acc], emitted[n_acc : n_acc + 1]])
                 lps = lp[torch.arange(n_acc + 1, device="cuda"), kept].tolist()
                 results.append(
-                    (i, {"accepted": n_acc, "next": int(emitted[n_acc]), "logprobs": lps})
+                    (
+                        i,
+                        {
+                            "accepted": n_acc,
+                            "next": int(emitted[n_acc]),
+                            "logprobs": lps,
+                        },
+                    )
                 )
             del logits
         return results
@@ -503,7 +571,10 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             self._mfp32 = provider.provide().cuda().eval()
             if provider.params_dtype == torch.float32:
                 # Megatron/TE fall back to unfused fp32 attention and GLU paths.
-                from thundersync_rl.scorer_kernels import use_fused_swiglu, use_sdpa_attention
+                from thundersync_rl.scorer_kernels import (
+                    use_fused_swiglu,
+                    use_sdpa_attention,
+                )
 
                 attn_bf16 = os.environ.get("THUNDERSYNC_SCORER_ATTN_BF16") == "1"
                 use_sdpa_attention(
@@ -564,26 +635,39 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             scorer = getattr(self, "_active_scorer", None)
             if scorer is not None:
                 prev = torch.get_float32_matmul_precision()
-                torch.set_float32_matmul_precision("high" if self._scorer_tf32 else "highest")
+                torch.set_float32_matmul_precision(
+                    "high" if self._scorer_tf32 else "highest"
+                )
                 try:
-                    if os.environ.get("THUNDERSYNC_SPEC_TORCHPROF") and not getattr(self, "_profiled", False):
+                    if os.environ.get("THUNDERSYNC_SPEC_TORCHPROF") and not getattr(
+                        self, "_profiled", False
+                    ):
                         self._profiled = True
                         from torch.profiler import ProfilerActivity, profile
 
                         with profile(activities=[ProfilerActivity.CUDA]) as prof:
                             scorer(input_ids=ids, position_ids=pos, attention_mask=None)
                             torch.cuda.synchronize()
-                        print("[spec torchprof]\n" + prof.key_averages().table(
-                            sort_by="cuda_time_total", row_limit=14), flush=True)
+                        print(
+                            "[spec torchprof]\n"
+                            + prof.key_averages().table(
+                                sort_by="cuda_time_total", row_limit=14
+                            ),
+                            flush=True,
+                        )
                     logits = scorer(
                         input_ids=ids, position_ids=pos, attention_mask=None
                     ).float()
                 finally:
                     torch.set_float32_matmul_precision(prev)
             else:
-                logits = self.model(input_ids=ids, position_ids=pos, attention_mask=None)
+                logits = self.model(
+                    input_ids=ids, position_ids=pos, attention_mask=None
+                )
             torch.cuda.synchronize()
-            self._prof["forward"] = self._prof.get("forward", 0.0) + time.perf_counter() - t_fwd
+            self._prof["forward"] = (
+                self._prof.get("forward", 0.0) + time.perf_counter() - t_fwd
+            )
             self._prof["tokens"] = self._prof.get("tokens", 0) + int(ids.numel())
             yield group, ids, logits
             del logits
@@ -615,19 +699,26 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         elif not hasattr(self, "_spec_q"):
             self._spec_q = {}
         self._scorer_tf32 = precision == "tf32"
-        self._active_scorer = self._fp32_scorer() if precision in ("fp32", "tf32") else None
+        self._active_scorer = (
+            self._fp32_scorer() if precision in ("fp32", "tf32") else None
+        )
         for group, ids, logits in self._iter_row_batches(rows, batch_tokens, keys):
             for r, i in enumerate(group):
                 n, plen = rows[i].numel(), prompt_lens[i]
                 start = plen - 1 + (from_lens[i] if from_lens is not None else 0)
-                lq = torch.log_softmax(logits[r, start : n - 1, :vocab_limit].float(), -1)
+                lq = torch.log_softmax(
+                    logits[r, start : n - 1, :vocab_limit].float(), -1
+                )
                 lq = lq.to(torch.bfloat16)
                 key = keys[i] if keys is not None else i
                 prev = self._spec_q.get(key) if keys is not None else None
                 self._spec_q[key] = lq if prev is None else torch.cat([prev, lq])
         self._active_scorer = None
         if os.environ.get("THUNDERSYNC_SPEC_PROF"):
-            print(f"[spec prof] score rank={self.rank} total={time.perf_counter() - t_all:.3f} {self._prof}", flush=True)
+            print(
+                f"[spec prof] score rank={self.rank} total={time.perf_counter() - t_all:.3f} {self._prof}",
+                flush=True,
+            )
         return len(self._spec_q)
 
     @torch.no_grad()
@@ -657,13 +748,19 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         gen = torch.Generator(device="cuda").manual_seed(seed * 1_000_003 + self.rank)
         results = []
         self._scorer_tf32 = precision == "tf32"
-        self._active_scorer = self._fp32_scorer() if precision in ("fp32", "tf32") else None
+        self._active_scorer = (
+            self._fp32_scorer() if precision in ("fp32", "tf32") else None
+        )
         for group, ids, logits in self._iter_row_batches(rows, batch_tokens, keys):
             for r, i in enumerate(group):
                 n, plen = rows[i].numel(), prompt_lens[i]
                 g = n - plen
-                lp = torch.log_softmax(logits[r, plen - 1 : n, :vocab_limit].float(), -1)
-                lq = self._spec_q.pop(keys[i] if keys is not None else i).float()  # [g, V]
+                lp = torch.log_softmax(
+                    logits[r, plen - 1 : n, :vocab_limit].float(), -1
+                )
+                lq = self._spec_q.pop(
+                    keys[i] if keys is not None else i
+                ).float()  # [g, V]
                 assert lq.shape[0] == g, (lq.shape, g)
                 draft = ids[r, plen:n]
                 tau, y = block_verify(lp, lq, draft, gen)
@@ -672,7 +769,10 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 results.append((i, {"accepted": tau, "next": y, "logprobs": lps}))
         self._active_scorer = None
         if os.environ.get("THUNDERSYNC_SPEC_PROF"):
-            print(f"[spec prof] verify rank={self.rank} total={time.perf_counter() - t_all:.3f} {self._prof}", flush=True)
+            print(
+                f"[spec prof] verify rank={self.rank} total={time.perf_counter() - t_all:.3f} {self._prof}",
+                flush=True,
+            )
         return results
 
     def termination_id(self) -> int | None:
@@ -682,7 +782,10 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
     # ---- Deadline-truncated streaming drafts (generation rank 0) ----
 
     def start_drafts(
-        self, prompts: list[list[int]], max_new_tokens: int | list[int], stream_interval: int
+        self,
+        prompts: list[list[int]],
+        max_new_tokens: int | list[int],
+        stream_interval: int,
     ) -> bool:
         """Submit draft requests as streams and return immediately.
 
@@ -700,12 +803,18 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         tokens = [[] for _ in prompts]
         done = [False] * len(prompts)
         streams = {}
-        self._draft_tokens, self._draft_done, self._draft_streams = tokens, done, streams
+        self._draft_tokens, self._draft_done, self._draft_streams = (
+            tokens,
+            done,
+            streams,
+        )
 
         async def run_one(i, prompt):
             sp = self._build_sampling_params(greedy=False, stop_words=None)
             sp.num_tokens_to_generate = (
-                max_new_tokens[i] if isinstance(max_new_tokens, list) else max_new_tokens
+                max_new_tokens[i]
+                if isinstance(max_new_tokens, list)
+                else max_new_tokens
             )
             sp.streaming_interval = stream_interval
             stream = self.inference_client.add_request_streaming(prompt, sp)
@@ -731,7 +840,11 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         """Abort unfinished drafts; return (tokens, finished) per draft."""
         import asyncio
 
-        tokens, done, streams = self._draft_tokens, self._draft_done, self._draft_streams
+        tokens, done, streams = (
+            self._draft_tokens,
+            self._draft_done,
+            self._draft_streams,
+        )
 
         async def abort_and_snapshot():
             # Snapshot on the loop thread so no frame is half-applied.
@@ -751,14 +864,18 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
     # O(all draft tokens x vocab).
 
     @torch.no_grad()
-    def stash_weights(self, version: int, keep: list[int], precision: str = "fp32") -> int:
+    def stash_weights(
+        self, version: int, keep: list[int], precision: str = "fp32"
+    ) -> int:
         """Stash the current training parameters as ``version``; drop others not in ``keep``."""
         self._prof = {}
         self._scorer_precision = precision
         self._fp32_scorer()  # builds the scorer and its parameter map once
         if not hasattr(self, "_weight_stash"):
             self._weight_stash: dict[int, list[torch.Tensor]] = {}
-        self._weight_stash[version] = [src.detach().clone() for _, src in self._mfp32_map]
+        self._weight_stash[version] = [
+            src.detach().clone() for _, src in self._mfp32_map
+        ]
         for v in list(self._weight_stash):
             if v not in keep and v != version:
                 del self._weight_stash[v]
@@ -827,10 +944,15 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 sub_rows = sorted({r for r, _, _, _ in segs})
                 local = {r: k for k, r in enumerate(sub_rows)}
                 width = max(prompt_lens[i] - 1 + b for _, i, _, b in segs)
-                s_idx = torch.cat([
-                    torch.arange(prompt_lens[i] - 1 + a, prompt_lens[i] - 1 + b) for _, i, a, b in segs
-                ])
-                b_idx = torch.cat([torch.full((b - a,), local[r]) for r, _, a, b in segs])
+                s_idx = torch.cat(
+                    [
+                        torch.arange(prompt_lens[i] - 1 + a, prompt_lens[i] - 1 + b)
+                        for _, i, a, b in segs
+                    ]
+                )
+                b_idx = torch.cat(
+                    [torch.full((b - a,), local[r]) for r, _, a, b in segs]
+                )
                 self._load_scorer(v)
                 logits = self._score(
                     scorer,
@@ -853,7 +975,9 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 pos,
                 select=(
                     torch.cat([torch.arange(a, e) for a, e in spans]).cuda(),
-                    torch.cat([torch.full((e - a,), r) for r, (a, e) in enumerate(spans)]).cuda(),
+                    torch.cat(
+                        [torch.full((e - a,), r) for r, (a, e) in enumerate(spans)]
+                    ).cuda(),
                 ),
             )
             if logits is None:
@@ -870,12 +994,21 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 draft = ids[r, plen:n]
                 # Raw logits in, no [g, V] log-softmax / fp64 temporaries.
                 tau, y, logp = block_verify_logits(p_logits, q_logits, draft, gen)
-                results.append((i, {"accepted": tau, "next": y, "logprobs": logp.tolist()}))
+                results.append(
+                    (i, {"accepted": tau, "next": y, "logprobs": logp.tolist()})
+                )
             del logits
         if os.environ.get("THUNDERSYNC_SPEC_PROF"):
-            pool = "gen" if getattr(self, "dynamic_inference_engine", None) is not None else "learner"
+            pool = (
+                "gen"
+                if getattr(self, "dynamic_inference_engine", None) is not None
+                else "learner"
+            )
             ntok = sum(rows[i].numel() for i in range(len(rows)))
-            print(f"[spec prof] verify_stashed pool={pool} rank={self.rank} rows={len(rows)} tok={ntok} total={time.perf_counter() - t_all:.3f} {self._prof}", flush=True)
+            print(
+                f"[spec prof] verify_stashed pool={pool} rank={self.rank} rows={len(rows)} tok={ntok} total={time.perf_counter() - t_all:.3f} {self._prof}",
+                flush=True,
+            )
         return results
 
     def _score(self, scorer, ids, pos, select=None):
@@ -894,7 +1027,10 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             full = self._score_full(scorer, ids, pos)[select[1], select[0]]
             lp_a = torch.log_softmax(logits[0].float(), -1)
             lp_b = torch.log_softmax(full.float(), -1)
-            print(f"[select check] n={full.shape[0]} max|dlogp|={(lp_a - lp_b).abs().max().item():.3e}", flush=True)
+            print(
+                f"[select check] n={full.shape[0]} max|dlogp|={(lp_a - lp_b).abs().max().item():.3e}",
+                flush=True,
+            )
         return logits[0] if native else logits[select[1], select[0]]
 
     def _score_full(self, scorer, ids, pos):
@@ -912,18 +1048,30 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 gather_kw["runtime_gather_output"] = True
         except ImportError:
             pass
-        if os.environ.get("THUNDERSYNC_SPEC_TORCHPROF") and not getattr(self, "_profiled", False):
+        if os.environ.get("THUNDERSYNC_SPEC_TORCHPROF") and not getattr(
+            self, "_profiled", False
+        ):
             self._profiled = True
             from torch.profiler import ProfilerActivity, profile
 
             with profile(
-                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                record_shapes=True,
             ) as prof:
-                scorer(input_ids=ids, position_ids=pos, attention_mask=None, **gather_kw)
+                scorer(
+                    input_ids=ids, position_ids=pos, attention_mask=None, **gather_kw
+                )
                 torch.cuda.synchronize()
-            print(f"[spec torchprof] ids={tuple(ids.shape)}\n" + prof.key_averages(
-                group_by_input_shape=True).table(sort_by="self_cuda_time_total", row_limit=25,
-                max_name_column_width=40, max_shapes_column_width=90), flush=True)
+            print(
+                f"[spec torchprof] ids={tuple(ids.shape)}\n"
+                + prof.key_averages(group_by_input_shape=True).table(
+                    sort_by="self_cuda_time_total",
+                    row_limit=25,
+                    max_name_column_width=40,
+                    max_shapes_column_width=90,
+                ),
+                flush=True,
+            )
         if ps.get_pipeline_model_parallel_world_size() == 1:
             logits = scorer(
                 input_ids=ids, position_ids=pos, attention_mask=None, **gather_kw
@@ -955,7 +1103,9 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             )
             if not ps.is_pipeline_last_stage(ignore_virtual=True):
                 torch.cuda.synchronize()
-                self._prof["forward"] = self._prof.get("forward", 0.0) + time.perf_counter() - t0
+                self._prof["forward"] = (
+                    self._prof.get("forward", 0.0) + time.perf_counter() - t0
+                )
                 return None
             logits = captured[0]
         tp = ps.get_tensor_model_parallel_world_size()
@@ -968,7 +1118,9 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             )
             logits = torch.cat(parts, dim=-1)
         torch.cuda.synchronize()
-        self._prof["forward"] = self._prof.get("forward", 0.0) + time.perf_counter() - t0
+        self._prof["forward"] = (
+            self._prof.get("forward", 0.0) + time.perf_counter() - t0
+        )
         return logits
 
     def _iter_row_id_batches(self, rows, batch_tokens, keys):
@@ -983,7 +1135,11 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
 
         dp, dp_rank = ps.get_data_parallel_world_size(), ps.get_data_parallel_rank()
         mine = sorted(
-            (i for i in range(len(rows)) if zlib.crc32(keys[i].encode()) % dp == dp_rank),
+            (
+                i
+                for i in range(len(rows))
+                if zlib.crc32(keys[i].encode()) % dp == dp_rank
+            ),
             key=lambda i: rows[i].numel(),
         )
         b = 0
@@ -1000,9 +1156,13 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             yield group, ids.cuda()
 
     @torch.no_grad()
-    def scorer_token_logprobs(self, rows: list[torch.Tensor]) -> list[torch.Tensor] | None:
-        """Debug/validation: next-token logprobs of ``rows`` under the fp32 scorer
-        (current weights), returned on last-pipeline-stage DP-rank-0 workers."""
+    def scorer_token_logprobs(
+        self, rows: list[torch.Tensor]
+    ) -> list[torch.Tensor] | None:
+        """Debug/validation: next-token logprobs of ``rows`` under the fp32 scorer.
+
+        Uses the current weights; returned on last-pipeline-stage DP-rank-0 workers.
+        """
         from megatron.core import parallel_state as ps
 
         self._prof = {}
@@ -1017,7 +1177,15 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             lp = torch.log_softmax(logits[0, :-1].float(), -1)
             out.append(lp.gather(-1, ids[0, 1:, None]).squeeze(-1).cpu())
         last = ps.is_pipeline_last_stage(ignore_virtual=True)
-        return out if (last and ps.get_data_parallel_rank() == 0 and ps.get_tensor_model_parallel_rank() == 0) else None
+        return (
+            out
+            if (
+                last
+                and ps.get_data_parallel_rank() == 0
+                and ps.get_tensor_model_parallel_rank() == 0
+            )
+            else None
+        )
 
     @torch.no_grad()
     def model_param_checksum(self) -> float:
@@ -1030,5 +1198,12 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         for name, t in self._iter_params_with_optional_kv_scales(kv_scales=None):
             names.append(name)
             total += float(t.detach().double().sum())
-        layers = sorted({int(n.split("layers.")[1].split(".")[0]) for n in names if "layers." in n})
-        return {"rank": self.rank, "n": len(names), "layers": (layers[:3], layers[-3:], len(layers)), "sum": total}
+        layers = sorted(
+            {int(n.split("layers.")[1].split(".")[0]) for n in names if "layers." in n}
+        )
+        return {
+            "rank": self.rank,
+            "n": len(names),
+            "layers": (layers[:3], layers[-3:], len(layers)),
+            "sum": total,
+        }

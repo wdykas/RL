@@ -255,9 +255,7 @@ def build_chunk_data(
 
 
 def _run_workers(policy: Policy, method: str, **kwargs) -> list[Any]:
-    return ray.get(
-        policy.worker_group.run_all_workers_single_data(method, **kwargs)
-    )
+    return ray.get(policy.worker_group.run_all_workers_single_data(method, **kwargs))
 
 
 def policy_drift_metrics(
@@ -304,7 +302,9 @@ def policy_drift_metrics(
     return {
         f"{prefix}/token_reject_rate": float(np.mean(out["reject"])),
         # Token-weighted: share of all generated tokens a draft would keep.
-        f"{prefix}/accepted_token_frac": float(np.sum(np.array(out["frac"]) * w) / w.sum()),
+        f"{prefix}/accepted_token_frac": float(
+            np.sum(np.array(out["frac"]) * w) / w.sum()
+        ),
         f"{prefix}/accepted_token_frac_longest25": float(
             np.sum((np.array(out["frac"]) * w)[long]) / w[long].sum()
         ),
@@ -440,11 +440,15 @@ async def _run_one_step(
             if rollouts_done and not planner.has_work():
                 return
 
-    verify_task = asyncio.create_task(pre_rollout()) if pre_rollout is not None else None
+    verify_task = (
+        asyncio.create_task(pre_rollout()) if pre_rollout is not None else None
+    )
     learner_task = asyncio.create_task(learner_loop())
     draft_task = None
     n_done = 0
-    after_verify = ts_cfg.draft_after_verify and verify_task is not None and drafter is not None
+    after_verify = (
+        ts_cfg.draft_after_verify and verify_task is not None and drafter is not None
+    )
     if after_verify:
         # Draft only once this iteration's verification is done, so verification
         # runs uncontended on the GPUs it shares with the drafting engine.
@@ -458,10 +462,15 @@ async def _run_one_step(
         for fut in asyncio.as_completed([rollout(i) for i in range(n)]):
             i, state, metrics = await fut
             n_done += 1
-            if drafter is not None and draft_task is None and not after_verify and (
-                n_done >= ts_cfg.draft_start_frac * n
-            ) and (
-                ts_cfg.draft_max_inflight is None or n - n_done <= ts_cfg.draft_max_inflight
+            if (
+                drafter is not None
+                and draft_task is None
+                and not after_verify
+                and (n_done >= ts_cfg.draft_start_frac * n)
+                and (
+                    ts_cfg.draft_max_inflight is None
+                    or n - n_done <= ts_cfg.draft_max_inflight
+                )
             ):
                 draft_task = asyncio.create_task(drafter())
             if learner_task.done():
@@ -546,7 +555,9 @@ async def _run_one_step(
             if step - m < 0:
                 continue
             _run_workers(
-                learner.policy, "load_master_combination", coeffs={f"hist{step - m}": 1.0}
+                learner.policy,
+                "load_master_combination",
+                coeffs={f"hist{step - m}": 1.0},
             )
             lag_lps[m] = learner.policy.get_logprobs(drift_data)["logprobs"]
         if lag_lps:
@@ -556,7 +567,9 @@ async def _run_one_step(
         lp_adam = None
         if step > 0:
             _run_workers(learner.policy, "save_adam_forecast", tag="adam")
-            _run_workers(learner.policy, "load_master_combination", coeffs={"adam": 1.0})
+            _run_workers(
+                learner.policy, "load_master_combination", coeffs={"adam": 1.0}
+            )
             lp_adam = learner.policy.get_logprobs(drift_data)["logprobs"]
             _run_workers(learner.policy, "load_master_combination", coeffs={"k": 1.0})
             assert torch.equal(
@@ -610,7 +623,9 @@ async def _run_one_step(
                 w.append(pos.numel())
             w_ = np.array(w, float)
             drift[f"{name}/token_reject_rate"] = float(differ.sum() / gen_mask.sum())
-            drift[f"{name}/accepted_token_frac"] = float(np.sum(np.array(fracs) * w_) / w_.sum())
+            drift[f"{name}/accepted_token_frac"] = float(
+                np.sum(np.array(fracs) * w_) / w_.sum()
+            )
             drift[f"{name}/full_accept"] = float(np.mean(np.array(fracs) == 1.0))
         # Forecast drafter: extrapolate the fp32 master weights along the last
         # update, theta_hat = theta_k + c (theta_k - theta_{k-1}), round to the
@@ -653,7 +668,9 @@ async def _run_one_step(
         mask_ = drift_data["token_mask"] * drift_data["sample_mask"].unsqueeze(-1)
         for m, lp_m in lag_lps.items():
             drift.update(policy_drift_metrics(lp_m, lp_old, mask_, f"lag{m}"))
-        _run_workers(learner.policy, "rename_master_weights", src="k", dst=f"hist{step}")
+        _run_workers(
+            learner.policy, "rename_master_weights", src="k", dst=f"hist{step}"
+        )
         _run_workers(learner.policy, "drop_master_weights", tag=f"hist{step - 5}")
         # Mismatch floor: theta_k on both, different engines.
         drift.update(policy_drift_metrics(gen, lp_old, mask, "mismatch"))
@@ -732,7 +749,10 @@ def thundersync_grpo_train(
     G = master_config.grpo.num_generations_per_prompt
     if spec is not None and os.environ.get("THUNDERSYNC_SPEC_SELFTEST"):
         first = next(iter(dataloader))
-        prompts = [torch.cat([m["token_ids"] for m in first["message_log"][i]]) for i in range(4)]
+        prompts = [
+            torch.cat([m["token_ids"] for m in first["message_log"][i]])
+            for i in range(4)
+        ]
         spec.draft_budget, budget = 256, spec.draft_budget
         print("[spec selftest]", asyncio.run(spec.self_test(prompts)), flush=True)
         spec.draft_budget = budget
@@ -741,7 +761,11 @@ def thundersync_grpo_train(
         b for b in itertools.islice(batches, max(1, ts_cfg.draft_lookahead) + 1)
     )
     drafts = None
-    cohort_mode = spec is not None and ts_cfg.verify_mode == "block" and ts_cfg.draft_lookahead > 1
+    cohort_mode = (
+        spec is not None
+        and ts_cfg.verify_mode == "block"
+        and ts_cfg.draft_lookahead > 1
+    )
     while upcoming:
         batch = upcoming.popleft()
         nb = next(batches, None)
@@ -770,10 +794,21 @@ def thundersync_grpo_train(
             cohort = spec.cohorts.pop(step, None)
             if cohort is not None:
                 cdrafts = [
-                    [(d["prompt"], -1, d["tokens"], d["finished"], d["key"], d["segments"])]
+                    [
+                        (
+                            d["prompt"],
+                            -1,
+                            d["tokens"],
+                            d["finished"],
+                            d["key"],
+                            d["segments"],
+                        )
+                    ]
                     for d in cohort
                 ]
-                pre_rollout = lambda c=cdrafts: spec.verify_chunked(c, ts_cfg.verify_chunks)  # noqa: E731
+                pre_rollout = lambda c=cdrafts: spec.verify_chunked(
+                    c, ts_cfg.verify_chunks
+                )  # noqa: E731
         elif chunked and drafts is not None:
             pre_rollout = lambda d=drafts: spec.verify_chunked(d, ts_cfg.verify_chunks)  # noqa: E731
         elif cohort_mode:
@@ -788,7 +823,10 @@ def thundersync_grpo_train(
 
         def _prompts(b):
             r = b.repeat_interleave(G)
-            return [torch.cat([m["token_ids"] for m in r["message_log"][i]]) for i in range(r.size)]
+            return [
+                torch.cat([m["token_ids"] for m in r["message_log"][i]])
+                for i in range(r.size)
+            ]
 
         if cohort_mode:
             # Ramp: start only the farthest cohort each step (plus the next one at

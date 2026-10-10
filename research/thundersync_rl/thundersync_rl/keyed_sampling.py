@@ -36,6 +36,7 @@ import torch
 import triton
 import triton.language as tl
 
+
 @triton.jit
 def _mix32(x):
     x = x ^ (x >> 16)
@@ -62,7 +63,14 @@ def _row_key(seed, pos, stream):
 
 @triton.jit
 def _keyed_gumbel_argmax_kernel(
-    logits_ptr, stride, seed_ptr, pos_ptr, variant_ptr, eps_ptr, out_ptr, vocab,
+    logits_ptr,
+    stride,
+    seed_ptr,
+    pos_ptr,
+    variant_ptr,
+    eps_ptr,
+    out_ptr,
+    vocab,
     BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -77,7 +85,9 @@ def _keyed_gumbel_argmax_kernel(
         cols = off + tl.arange(0, BLOCK)
         mask = cols < vocab
         lg = tl.load(
-            logits_ptr + row.to(tl.int64) * stride + cols, mask=mask, other=float("-inf")
+            logits_ptr + row.to(tl.int64) * stride + cols,
+            mask=mask,
+            other=float("-inf"),
         ).to(tl.float32)
         c = cols.to(tl.uint32)
         score = lg - tl.log(-tl.log(_uniform(c, key)))
@@ -123,7 +133,14 @@ def keyed_sample_logits(
     out = torch.empty(n, dtype=torch.int64, device=dev)
     if n:
         _keyed_gumbel_argmax_kernel[(n,)](
-            logits, logits.stride(0), seeds, positions, variants, eps, out, vocab,
+            logits,
+            logits.stride(0),
+            seeds,
+            positions,
+            variants,
+            eps,
+            out,
+            vocab,
             BLOCK=2048,
         )
     return out

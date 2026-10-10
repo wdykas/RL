@@ -264,7 +264,11 @@ def main():
     worst = {"grad": 0.0, "delta": 0.0}
     for step in range(args.steps):
         data, rewards = make_batch(
-            args.num_groups, G, args.seq_len, vocab, seed=step,
+            args.num_groups,
+            G,
+            args.seq_len,
+            vocab,
+            seed=step,
             uniform_groups=args.uniform_groups,
         )
         advs = []

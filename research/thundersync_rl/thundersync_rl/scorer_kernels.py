@@ -58,7 +58,11 @@ def use_fused_swiglu(model: torch.nn.Module) -> int:
     n = 0
     for mod in list(model.modules()):
         cfg = getattr(mod, "config", None)
-        if not (hasattr(mod, "linear_fc1") and hasattr(mod, "linear_fc2") and cfg is not None):
+        if not (
+            hasattr(mod, "linear_fc1")
+            and hasattr(mod, "linear_fc2")
+            and cfg is not None
+        ):
             continue
         if not (
             cfg.gated_linear_unit
@@ -99,8 +103,17 @@ class SDPACoreAttention(torch.nn.Module):
         # Optional lower-precision attention (e.g. bf16 flash) inside an fp32 model.
         self.attn_dtype = attn_dtype
 
-    def forward(self, query, key, value, attention_mask=None, attn_mask_type=None,
-                attention_bias=None, packed_seq_params=None, **kw):
+    def forward(
+        self,
+        query,
+        key,
+        value,
+        attention_mask=None,
+        attn_mask_type=None,
+        attention_bias=None,
+        packed_seq_params=None,
+        **kw,
+    ):
         assert packed_seq_params is None and attention_bias is None
         q, k, v = (t.permute(1, 2, 0, 3) for t in (query, key, value))  # [b, h, s, d]
         if k.shape[1] != q.shape[1]:
@@ -109,8 +122,14 @@ class SDPACoreAttention(torch.nn.Module):
             v = v.repeat_interleave(rep, dim=1)
         dtype = q.dtype
         if self.attn_dtype is not None:
-            q, k, v = q.to(self.attn_dtype), k.to(self.attn_dtype), v.to(self.attn_dtype)
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=self.softmax_scale)
+            q, k, v = (
+                q.to(self.attn_dtype),
+                k.to(self.attn_dtype),
+                v.to(self.attn_dtype),
+            )
+        out = F.scaled_dot_product_attention(
+            q, k, v, is_causal=True, scale=self.softmax_scale
+        )
         s, b = query.shape[0], query.shape[1]
         return out.to(dtype).permute(2, 0, 1, 3).reshape(s, b, -1)
 
@@ -146,7 +165,9 @@ def use_selective_output(model: torch.nn.Module) -> bool:
         sel = layer.ts_select
         if sel is not None:
             input_ = input_[sel[0], sel[1]].unsqueeze(1)  # [n, 1, h]
-        return orig_forward(input_, weight=weight, runtime_gather_output=runtime_gather_output, **kw)
+        return orig_forward(
+            input_, weight=weight, runtime_gather_output=runtime_gather_output, **kw
+        )
 
     layer.forward = forward
     return True
