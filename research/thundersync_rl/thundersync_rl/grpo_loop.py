@@ -99,55 +99,58 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # forward passes) and log how much of it cross-iteration speculative
     # rollouts would keep (see policy_drift_metrics).
     measure_policy_drift: bool = False
-    # Exact cross-iteration speculative rollouts (speculative.py): draft the next
-    # iteration's rollouts under the current weights once ``draft_start_frac`` of
-    # this iteration's rollouts have finished (up to ``draft_budget`` tokens
-    # each), verify them on the learner under the next weights, and decode only
-    # the rejected remainders.
+    # Exact cross-iteration speculative rollouts (speculative.py, DESIGN.md):
+    # while iteration k runs, the inference engine drafts the rollouts of the next
+    # ``draft_lookahead`` iterations; after the optimizer step every draft is
+    # block-verified against the new weights and only rejected or unfinished
+    # remainders are decoded. Defaults below are the validated configuration
+    # (Qwen2.5-Math-1.5B, 2 inference + 2 training GPUs); also set
+    # NVIDIA_TF32_OVERRIDE=1 for TF32 GEMMs in the fp32 scorer.
     speculate: bool = False
-    draft_budget: int = 1024
-    draft_start_frac: float = 0.5
+    # Max new tokens per draft (the rollout length cap is the natural value).
+    draft_budget: int = 4096
+    # Start drafting once this fraction of the iteration's rollouts finished
+    # (0: from the start of the iteration).
+    draft_start_frac: float = 0.0
+    # Keyed mode only: top-k of the head scored per position.
     spec_head_k: int = 64
-    # Drafts per trajectory sharing its keys; variants > 0 jitter the head
-    # log-probs by keyed logistic noise of scale ``variant_eps`` to explore races
-    # the target may flip. The longest verified prefix is kept (exact).
+    # Keyed mode only: drafts per trajectory sharing its keys; variants > 0
+    # jitter the head log-probs by keyed logistic noise of scale ``variant_eps``.
     draft_variants: int = 1
     variant_eps: float = 0.02
-    # "block": randomized block verification (Sun et al. 2024) on the learner with
-    # the drafts' q scored at theta_k before the optimizer step (highest
-    # acceptance). "keyed": shared-noise Gumbel verification (no q needed).
+    # "block": randomized block verification (Sun et al. 2024; ~99% of draft
+    # tokens kept). "keyed": position-keyed Gumbel sampling, exactly on-policy
+    # but token-level (~55% kept).
     verify_mode: Literal["block", "keyed"] = "block"
-    # Activations used to score p and q for block verification: "model" (the
-    # learner's own bf16 forward) or "fp32" (HF fp32 copy with the same weights,
-    # removing activation-rounding noise from the p/q ratio).
-    verify_precision: Literal["model", "fp32", "tf32"] = "model"
-    # Block mode: number of future iterations drafted concurrently. With > 1 a
-    # draft cut off at one deadline resumes (from its prefix, under the newer
-    # weights) in the next iteration, so drafts can cover whole rollouts.
-    draft_lookahead: int = 1
-    # Block mode q storage: "stash" recomputes q at verification from stashed
-    # weights (O(params) memory, scales); "full" stores full-vocab q per token.
+    # Scorer for p and q: "fp32" (a Megatron fp32 copy of the policy, which
+    # removes activation-rounding noise from p/q; 4 B/param per shard) or
+    # "model" (the training dtypes; half the memory, ~90% kept).
+    verify_precision: Literal["model", "fp32"] = "fp32"
+    # Iterations drafted concurrently. A draft cut off at one deadline resumes
+    # from its prefix, under the newer weights, in the next iteration.
+    draft_lookahead: int = 3
+    # q at verification: "stash" recomputes it from a bf16 copy of each drafting
+    # version's weights (memory O(params)); "full" stores full-vocab q per draft
+    # token (memory O(tokens x vocab); small runs only).
     q_storage: Literal["stash", "full"] = "stash"
-    # Stash mode: verify in this many chunks concurrently with the rollouts,
-    # publishing each chunk's plans as soon as it is verified.
-    verify_chunks: int = 1
-    # Tokens per scorer forward batch at verification (bounds logits memory).
+    # Stash mode: verification chunks, each publishing its plans when done.
+    verify_chunks: int = 4
+    # Tokens per scorer forward batch (bounds logits memory; lower it for large
+    # vocabularies or when verification shares the learner GPUs, e.g. 4096 at 4B).
     verify_batch_tokens: int = 16384
-    # Verify the longest drafts first (with verify_chunks > 1) so the likely
-    # stragglers' continuations start earliest.
-    verify_longest_first: bool = False
-    # Run the weight stash + block verification on the "learner" or on the
-    # "inference" (generation) workers. EXPERIMENTAL: "inference" currently hangs
-    # at the first verification (the stash call works; the awaited verify call
-    # never runs on the generation actors) - see RESUME.md.
-    verify_on: Literal["learner", "inference", "both"] = "learner"
-    # Run verification concurrently with the rollouts (awaited inside the step's
-    # event loop) even when verify_on != "learner".
-    verify_overlap: bool = False
+    # Verify the longest drafts first so likely stragglers continue earliest.
+    verify_longest_first: bool = True
+    # Worker groups that run weight stashes and verification: "learner",
+    # "inference" or "both" (chunks round-robin over both pools). With large
+    # models on few learner GPUs, "inference" keeps scorer memory off the learner.
+    verify_on: Literal["learner", "inference", "both"] = "both"
+    # Run verification concurrently with the rollouts (rollouts start as their
+    # plans are published) also when verify_on != "learner".
+    verify_overlap: bool = True
     # Chunks per pool in the round-robin, in verify_on order (learner, inference).
     verify_pool_weights: Optional[list[int]] = None
-    # Start drafting when this iteration's (overlapped) verification finishes,
-    # instead of at draft_start_frac of completed rollouts.
+    # Start drafting when this iteration's verification finishes, instead of at
+    # draft_start_frac of completed rollouts.
     draft_after_verify: bool = False
 
 

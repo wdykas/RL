@@ -81,9 +81,18 @@ def _spec(learner_handlers, base_handlers=None, gen_tail=(9, EOD), **kw):
         draft_budget=4096,
         max_new_tokens=16,
         pad_token_id=0,
-        verify_mode="block",
-        q_storage="stash",
-        **kw,
+        **{
+            "draft_variants": 1,
+            "variant_eps": 0.0,
+            "verify_mode": "block",
+            "verify_precision": "fp32",
+            "q_storage": "stash",
+            "verify_batch_tokens": 16384,
+            "longest_first": False,
+            "verify_on": "learner",
+            "pool_weights": None,
+            **kw,
+        },
     )
 
 

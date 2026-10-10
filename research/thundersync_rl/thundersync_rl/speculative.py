@@ -76,15 +76,15 @@ class SpeculativeGeneration:
         draft_budget: int,
         max_new_tokens: int,
         pad_token_id: int,
-        draft_variants: int = 1,
-        variant_eps: float = 0.0,
-        verify_mode: str = "keyed",
-        verify_precision: str = "model",
-        q_storage: str = "full",
-        verify_batch_tokens: int = 16384,
-        longest_first: bool = False,
-        verify_on: str = "learner",
-        pool_weights: tuple[int, ...] | None = None,
+        draft_variants: int,
+        variant_eps: float,
+        verify_mode: str,
+        verify_precision: str,
+        q_storage: str,
+        verify_batch_tokens: int,
+        longest_first: bool,
+        verify_on: str,
+        pool_weights: tuple[int, ...] | None,
     ):
         self.base = base
         self.learner_policy = learner_policy
@@ -207,6 +207,7 @@ class SpeculativeGeneration:
                     seeds=[s for _, s, _ in a],
                     vocab_limit=self.vocab_limit,
                     head_k=self.head_k,
+                    batch_tokens=self.verify_batch_tokens,
                     position_shift=shift,
                 )
             )
@@ -343,9 +344,7 @@ class SpeculativeGeneration:
                         "stash_weights",
                         version=self.current_step,
                         keep=sorted(keep),
-                        precision="fp32"
-                        if self.verify_precision in ("fp32", "tf32")
-                        else "model",
+                        precision=self.verify_precision,
                     )
                 ]
             )
@@ -364,6 +363,7 @@ class SpeculativeGeneration:
                     ],
                     prompt_lens=[d["prompt"].numel() for d in drafts.live],
                     vocab_limit=self.vocab_limit,
+                    batch_tokens=self.verify_batch_tokens,
                     precision=self.verify_precision,
                     keys=[d["key"] for d in drafts.live],
                     from_lens=drafts.prev_lens,
@@ -377,6 +377,7 @@ class SpeculativeGeneration:
                 rows=rows,
                 prompt_lens=[d[0].numel() for _, d in flat],
                 vocab_limit=self.vocab_limit,
+                batch_tokens=self.verify_batch_tokens,
                 precision=self.verify_precision,
             )
         )
@@ -401,9 +402,7 @@ class SpeculativeGeneration:
                             vocab_limit=self.vocab_limit,
                             seed=seed * 7 + a,
                             keys=[d[4] for _, d in flat[a:b]],
-                            precision="fp32"
-                            if self.verify_precision in ("fp32", "tf32")
-                            else "model",
+                            precision=self.verify_precision,
                             batch_tokens=self.verify_batch_tokens,
                         ),
                     )
@@ -421,6 +420,7 @@ class SpeculativeGeneration:
                     prompt_lens=[d[0].numel() for _, d in flat],
                     vocab_limit=self.vocab_limit,
                     seed=next(self._verify_seeds),
+                    batch_tokens=self.verify_batch_tokens,
                     precision=self.verify_precision,
                     keys=[d[4] for _, d in flat] if len(flat[0][1]) > 4 else None,
                 )
@@ -434,6 +434,7 @@ class SpeculativeGeneration:
                     seeds=[d[1] for _, d in flat],
                     vocab_limit=self.vocab_limit,
                     head_k=self.head_k,
+                    batch_tokens=self.verify_batch_tokens,
                 )
             )
         by_row = dict(x for rank_res in res for x in rank_res)
@@ -554,9 +555,7 @@ class SpeculativeGeneration:
                 seed=next(self._verify_seeds),
                 keys=[d[4] for _, d in flat[a:b]],
                 batch_tokens=self.verify_batch_tokens,
-                precision="fp32"
-                if self.verify_precision in ("fp32", "tf32")
-                else "model",
+                precision=self.verify_precision,
             )
             calls.append((a, refs))
         kept = total = full = 0

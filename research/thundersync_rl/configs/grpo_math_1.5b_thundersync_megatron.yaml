@@ -8,6 +8,21 @@ thundersync:
   max_buckets_per_group: 2  # distinct rewards per open group before collapsing to (G1, G2)
   max_open_groups: 4  # cap on groups holding gradient buckets (bounds accumulator memory)
   max_chunk_trajectories: 8
+  # Cross-iteration speculative rollouts (DESIGN.md). Off by default; the values below
+  # are the defaults that apply when it is on (validated at 1.5B on 2+2 GPUs). Also set
+  # NVIDIA_TF32_OVERRIDE=1 for TF32 GEMMs in the fp32 verification scorer.
+  speculate: false
+  draft_budget: 4096  # max new tokens per draft
+  draft_start_frac: 0.0  # start drafting at this fraction of finished rollouts
+  draft_lookahead: 3  # iterations drafted concurrently; cut drafts resume next iteration
+  verify_mode: block  # block (~99% tokens kept) | keyed (exactly on-policy, ~55% kept)
+  verify_precision: fp32  # fp32 Megatron scorer copy | model (training dtypes, ~90% kept)
+  q_storage: stash  # stash: q recomputed from bf16 weight copies (O(params) memory) | full
+  verify_on: both  # learner | inference | both: worker groups that verify
+  verify_chunks: 4  # verification chunks; plans publish as each finishes
+  verify_overlap: true  # verify concurrently with the rollouts
+  verify_longest_first: true  # longest drafts (likely stragglers) first
+  verify_batch_tokens: 16384  # tokens per scorer forward (bounds logits memory)
 
 grpo:
   num_prompts_per_step: 16
@@ -28,6 +43,9 @@ loss_fn:
   truncated_importance_sampling_ratio: null  # e.g. 2.0
   truncated_importance_sampling_type: null  # tis | icepop | seq-mask-tis
   token_level_loss: true
+  # Zero-advantage rows add no gradient; skip their forward/backward (they still count in
+  # the loss normalization). Exact, and the learner chunks them separately.
+  skip_zero_advantage_rows: true
 
 policy:
   model_name: Qwen/Qwen2.5-Math-1.5B-Instruct
@@ -36,6 +54,9 @@ policy:
   # Megatron micro-batches are CPU-launch bound at this size (~85 ms each), so
   # fewer, larger ones are much faster (16x1024 tokens: 426 ms at 4 vs 283 ms at 8).
   train_micro_batch_size: 8
+  # Round padded lengths so cuDNN fused attention reuses its plans instead of building a
+  # new one for every micro-batch (~120 ms CPU per micro-batch at 1.5B). Padding is masked.
+  make_sequence_length_divisible_by: 128
   logprob_batch_size: 4
   sequence_packing:
     enabled: false
