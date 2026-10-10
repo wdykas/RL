@@ -1,0 +1,409 @@
+<title>ThunderSyncRL Design</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Condensed:wght@500;600;700&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: single reading column (~68ch) with full-width tables/figures that scroll inside their own boxes; sticky contents rail on wide screens. */
+:root {
+  --bg: #f6f7f9;
+  --surface: #ffffff;
+  --fg: #171a21;
+  --muted: #586174;
+  --rule: #d9dde5;
+  --accent: #1d5bd0;      /* verified / kept */
+  --accent-soft: #e3ecfb;
+  --warn: #a8640f;        /* rejected / straggler */
+  --warn-soft: #f8ecd9;
+  --good: #1f7a4d;
+  --lane: #eef0f4;
+  --font-display: "IBM Plex Sans Condensed", "Arial Narrow", system-ui, sans-serif;
+  --font-body: "Source Serif 4", Georgia, "Times New Roman", serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #12151b; --surface: #191d25; --fg: #e4e7ee; --muted: #9aa3b5; --rule: #2c3240;
+    --accent: #6e9cf5; --accent-soft: #1d2a45; --warn: #e3a453; --warn-soft: #3a2b17;
+    --good: #5cc28d; --lane: #20252f; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #12151b; --surface: #191d25; --fg: #e4e7ee; --muted: #9aa3b5; --rule: #2c3240;
+  --accent: #6e9cf5; --accent-soft: #1d2a45; --warn: #e3a453; --warn-soft: #3a2b17;
+  --good: #5cc28d; --lane: #20252f; color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--fg); font-family: var(--font-body); font-size: 17px; line-height: 1.6; }
+.wrap { max-width: 1120px; margin: 0 auto; padding-inline: 20px; padding-block: 40px 80px; display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 48px; }
+@media (max-width: 900px) { .wrap { grid-template-columns: minmax(0, 1fr); gap: 24px; } nav.toc { position: static !important; } }
+nav.toc { position: sticky; top: calc(env(safe-area-inset-top, 0px) + 24px); align-self: start; font-family: var(--font-display); font-size: 14px; }
+nav.toc ol { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+nav.toc a { color: var(--muted); text-decoration: none; }
+nav.toc a:hover, nav.toc a:focus-visible { color: var(--accent); }
+nav.toc .label { text-transform: uppercase; letter-spacing: .08em; font-size: 12px; color: var(--muted); margin-bottom: 10px; }
+main { min-width: 0; }
+main > section { max-width: 68ch; }
+main > section.wide { max-width: none; }
+h1, h2, h3 { font-family: var(--font-display); line-height: 1.15; text-wrap: balance; }
+h1 { font-size: clamp(34px, 5vw, 48px); margin: 0 0 8px; letter-spacing: -.01em; }
+h2 { font-size: 28px; margin: 56px 0 12px; padding-top: 12px; border-top: 1px solid var(--rule); }
+h3 { font-size: 20px; margin: 28px 0 8px; }
+p { margin: 0 0 14px; }
+.lede { font-size: 20px; color: var(--muted); max-width: 60ch; }
+.meta { font-family: var(--font-display); font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin-bottom: 18px; }
+a { color: var(--accent); }
+code, .mono { font-family: var(--font-mono); font-size: .86em; }
+code { background: var(--lane); padding: 1px 5px; border-radius: 3px; }
+pre { font-family: var(--font-mono); font-size: 13.5px; line-height: 1.55; background: var(--surface); border: 1px solid var(--rule); border-radius: 6px; padding: 14px 16px; overflow-x: auto; margin: 0 0 18px; }
+pre code { background: none; padding: 0; font-size: inherit; }
+.math { font-family: var(--font-mono); font-size: 14.5px; background: var(--surface); border-left: 3px solid var(--accent); padding: 12px 16px; margin: 0 0 18px; overflow-x: auto; white-space: pre; line-height: 1.7; }
+ul, ol.steps { padding-left: 22px; margin: 0 0 16px; }
+li { margin-bottom: 6px; }
+.headline { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin: 28px 0 8px; max-width: none; }
+.stat { background: var(--surface); border: 1px solid var(--rule); border-radius: 6px; padding: 14px 16px; }
+.stat .v { font-family: var(--font-display); font-size: 30px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.stat .k { font-size: 14px; color: var(--muted); line-height: 1.35; }
+.stat.hl .v { color: var(--accent); }
+.tbl { overflow-x: auto; margin: 0 0 20px; border: 1px solid var(--rule); border-radius: 6px; background: var(--surface); }
+table { border-collapse: collapse; width: 100%; font-size: 15px; }
+th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--rule); vertical-align: top; }
+th { font-family: var(--font-display); font-weight: 600; font-size: 13px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); white-space: nowrap; }
+tr:last-child td { border-bottom: 0; }
+td.n { font-variant-numeric: tabular-nums; white-space: nowrap; }
+tr.best td { background: var(--accent-soft); font-weight: 600; }
+.note { font-size: 15px; color: var(--muted); }
+.callout { background: var(--surface); border: 1px solid var(--rule); border-left: 3px solid var(--warn); border-radius: 0 6px 6px 0; padding: 12px 16px; margin: 0 0 18px; font-size: 16px; }
+.callout.ok { border-left-color: var(--good); }
+.callout strong { font-family: var(--font-display); }
+/* timeline figure */
+figure { margin: 8px 0 24px; max-width: none; }
+figcaption { font-size: 14px; color: var(--muted); margin-top: 8px; max-width: 68ch; }
+.tl { background: var(--surface); border: 1px solid var(--rule); border-radius: 6px; padding: 16px; overflow-x: auto; }
+.tl-inner { min-width: 640px; display: grid; grid-template-columns: 120px 1fr; row-gap: 10px; column-gap: 12px; font-family: var(--font-display); font-size: 13px; }
+.lane-name { color: var(--muted); align-self: center; }
+.lane { position: relative; height: 30px; background: var(--lane); border-radius: 4px; }
+.bar { position: absolute; top: 3px; bottom: 3px; border-radius: 3px; display: flex; align-items: center; padding: 0 6px; white-space: nowrap; overflow: hidden; font-size: 12px; color: var(--fg); }
+.b-verify { background: var(--accent-soft); border: 1px solid var(--accent); }
+.b-train { background: var(--accent); color: var(--bg); }
+.b-draft { background: repeating-linear-gradient(135deg, var(--lane), var(--lane) 6px, var(--rule) 6px, var(--rule) 12px); border: 1px solid var(--rule); color: var(--muted); }
+.b-cont { background: var(--warn-soft); border: 1px solid var(--warn); }
+.b-misc { background: var(--rule); color: var(--fg); }
+.axis { grid-column: 2; position: relative; height: 18px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.axis span { position: absolute; transform: translateX(-50%); font-size: 11px; }
+.legend { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 12px; font-family: var(--font-display); font-size: 12px; color: var(--muted); }
+.legend i { display: inline-block; width: 14px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+.kv { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 16px; font-size: 15px; margin: 0 0 18px; }
+.kv dt { font-family: var(--font-mono); font-size: 13px; color: var(--accent); padding-top: 2px; }
+.kv dd { margin: 0; }
+@media (max-width: 560px) { .kv { grid-template-columns: minmax(0, 1fr); } .kv dd { margin-bottom: 8px; } }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+</style>
+
+<div class="wrap">
+<nav class="toc" aria-label="Contents">
+  <div class="label">Contents</div>
+  <ol>
+    <li><a href="#summary">Summary</a></li>
+    <li><a href="#problem">The problem</a></li>
+    <li><a href="#streaming">Gradient streaming</a></li>
+    <li><a href="#speculation">Cross-iteration speculation</a></li>
+    <li><a href="#verification">Block verification</a></li>
+    <li><a href="#scorer">The verification scorer</a></li>
+    <li><a href="#pipeline">Overlapped pipeline</a></li>
+    <li><a href="#exactness">Exactness</a></li>
+    <li><a href="#results">Results</a></li>
+    <li><a href="#time">Where the time goes</a></li>
+    <li><a href="#regime">When it pays</a></li>
+    <li><a href="#scaling">Scaling status</a></li>
+    <li><a href="#config">Configuration</a></li>
+    <li><a href="#code">Code map</a></li>
+    <li><a href="#open">Open work</a></li>
+  </ol>
+</nav>
+
+<main>
+<section id="summary" class="wide">
+  <div class="meta">NeMo-RL · branch thundersync-rl · Megatron training + Megatron inference</div>
+  <h1>ThunderSyncRL with cross-iteration speculation</h1>
+  <p class="lede">Zero-staleness GRPO that runs faster than an asynchronous pipeline. Every gradient is taken at the exact weights that generated its data, yet the generation engine never waits for the optimizer step.</p>
+  <div class="headline">
+    <div class="stat hl"><div class="v">3.02 s</div><div class="k">per iteration, zero staleness with speculation (100 steps)</div></div>
+    <div class="stat"><div class="v">6.13 s</div><div class="k">zero staleness without speculation</div></div>
+    <div class="stat"><div class="v">4.26 s</div><div class="k">async GRPO, lag 4, same settings</div></div>
+    <div class="stat"><div class="v">99.5%</div><div class="k">of drafted tokens kept after exact verification</div></div>
+  </div>
+  <p class="note">Qwen2.5-Math-1.5B-Instruct, 1 GB200 node: 2 Megatron inference GPUs + 2 Megatron training GPUs, 16 prompts × 8 samples, up to 4096 tokens. Reward matches the no-speculation baseline within run-to-run noise.</p>
+</section>
+
+<section id="problem">
+  <h2>The problem</h2>
+  <p>Synchronous on-policy GRPO alternates two phases. The engine samples a batch at weights θ<sub>k</sub>; the learner computes the update; the engine gets θ<sub>k+1</sub> and starts again. Each phase leaves the other's GPUs idle, and the rollout phase ends with a long tail where a few long trajectories decode alone on an almost empty engine.</p>
+  <p>Asynchronous RL removes the idle time by letting the engine run ahead on older weights. The price is staleness: the learner trains on trajectories sampled up to <em>L</em> versions ago and needs importance corrections or clipping to stay stable.</p>
+  <p>This work removes both kinds of idle time without giving up exactness, in two layers:</p>
+  <ul>
+    <li><strong>Gradient streaming</strong> (the ThunderSyncRL paper) moves the learner's work into the rollout tail: each trajectory is backpropagated as soon as it finishes, at θ<sub>k</sub>.</li>
+    <li><strong>Cross-iteration speculation</strong> (new here) moves the engine's work for iteration k+1 into iteration k: it drafts the next batch under the current weights and verifies those drafts exactly once θ<sub>k+1</sub> exists.</li>
+  </ul>
+</section>
+
+<section id="streaming">
+  <h2>Layer 1: Gradient streaming</h2>
+  <p>A GRPO advantage depends on the whole group, so a trajectory's gradient seemingly cannot be used before its group finishes. But the update is linear in the per-trajectory score gradients H<sub>i</sub> = ∇ log π<sub>θ<sub>k</sub></sub>(y<sub>i</sub>) (masked, summed over tokens):</p>
+  <div class="math">Δ = Σ_i a_i · H_i
+B[g, r] = Σ_{i ∈ group g, r_i = r} H_i        accumulated while group g is open
+Δ = Σ_g Σ_r a_g(r) · B[g, r]                  folded in when g closes</div>
+  <p>Every group-wise estimator gives trajectories with equal rewards in the same group the same advantage, so per-(group, reward) buckets are exact for any estimator. That includes NeMo-RL's default leave-one-out baseline with leave-one-out std, which is not affine in the reward. With binary rewards this is two buffers per open group. If a group exceeds <code>max_buckets_per_group</code> distinct rewards, it collapses to the paper's affine (Σ r<sub>i</sub>H<sub>i</sub>, Σ H<sub>i</sub>) form, and the accumulator raises an error if the estimator is not affine.</p>
+  <p>Normalization, the data-parallel reduction, clipping, the single optimizer step and the refit happen once per batch. Measured on Qwen2.5-0.5B in fp32: the streamed gradient differs from <code>Policy.train</code> by a relative 4.6–7.4 × 10<sup>−6</sup>, the same order as re-batching the synchronous update.</p>
+  <h3>Scheduling</h3>
+  <ul>
+    <li><strong>Final-first.</strong> Rows of closed groups (final advantages known) always go first. Idle learner time streams one open group's rows into buckets.</li>
+    <li><strong>Length-sorted chunks.</strong> Final rows from different groups share micro-batches, sorted by length to limit padding, and are balanced over data-parallel ranks by tokens.</li>
+    <li><strong>Zero-advantage chunks.</strong> With <code>loss_fn.skip_zero_advantage_rows</code>, zero-advantage rows go into chunks of their own. The worker counts their tokens for normalization and drops the whole chunk without a forward pass. Before this change they were spread across micro-batches that then ran part-empty. Learner time: 2.04 → 1.55 s per step.</li>
+  </ul>
+</section>
+
+<section id="speculation">
+  <h2>Layer 2: Cross-iteration speculation</h2>
+  <p>Zero staleness forces a drain at every update: iteration k+1 cannot sample until θ<sub>k+1</sub> exists. Speculation breaks that dependency without breaking exactness. While iteration k runs, the engine drafts the rollouts of the next iterations under the weights it has. After the step, each draft is verified against θ<sub>k+1</sub> with a rule whose output is distributed exactly as π<sub>θ<sub>k+1</sub></sub>. Only the rejected or unfinished remainders are decoded fresh.</p>
+  <h3>Why it can work</h3>
+  <p>One optimizer step moves the policy very little. The per-token rejection rate between π<sub>k</sub> and π<sub>k+1</sub> measured in bf16 is about 1.7 × 10<sup>−3</sup>, and it is the same for drafts made one to four versions earlier. That flatness shows bf16 activation rounding dominates it, not policy change. In fp32 the true one-step drift is about 3 × 10<sup>−4</sup> per token. Most drafted tokens are therefore acceptable, provided verification is precise enough to see the real drift through the numerical noise.</p>
+  <h3>Lifecycle of one iteration</h3>
+  <ol class="steps">
+    <li><strong>Draft.</strong> From the start of iteration k, the Megatron inference engine streams drafts for the prompts of iterations k+1 … k+<code>draft_lookahead</code> (<code>start_drafts</code>). Draft requests share the engine with iteration k's own rollouts and fill the capacity its tail leaves idle.</li>
+    <li><strong>Cut at the deadline.</strong> Just before the optimizer step, unfinished drafts are aborted and snapshotted (<code>collect_drafts</code>). Any prefix of a draft is a valid draft. A cut draft resumes from its prefix in the next iteration, under the newer weights.</li>
+    <li><strong>Record provenance.</strong> Each draft carries segments <code>(version, start, end)</code> saying which weights drafted which positions, because verification needs each token's true proposal distribution.</li>
+    <li><strong>Stash weights.</strong> Still at θ<sub>k</sub>, every verifier keeps a bf16 copy of the weights (<code>stash_weights</code>), one per version that drafted pending tokens. Older stashes are dropped.</li>
+    <li><strong>Verify.</strong> At iteration k+1, verifiers recompute q from the stashes and p from θ<sub>k+1</sub>, block-verify each draft, and publish a plan per trajectory: the kept prefix plus one bonus or residual token.</li>
+    <li><strong>Continue.</strong> The rollout code is unchanged. <code>SpeculativeGeneration</code> wraps the generation interface: a fully accepted, finished draft returns immediately, and anything else is sent to the engine to continue from its verified prefix.</li>
+  </ol>
+</section>
+
+<section id="verification">
+  <h2>Block verification</h2>
+  <p>Token-by-token speculative sampling rejects at the first position where the noise in p/q happens to fall low. Block verification (Sun et al. 2024) looks at the whole draft at once, so positive and negative noise in the ratio partly cancel along the block. For a draft x<sub>1..g</sub> from q, target p, and per-position distributions p<sub>i</sub>, q<sub>i</sub>:</p>
+  <div class="math">b_0 = 1,   b_i = min(1, b_{i-1} · p(x_i)/q(x_i))      →   log b_i = S_i − max_{j≤i} S_j,  S_i = Σ_{j≤i} log(p/q)(x_j)
+r_i = Σ_v max(b_i · p_i(v) − q_i(v), 0)                 (i &lt; g)
+h_i = r_i / (r_i + 1 − b_i)   (i &lt; g),     h_g = b_g
+τ   = max{ i : η_i ≤ h_i },   η_i ~ U(0,1) independent
+keep x_1..x_τ, then emit y ~ p_g                       if τ = g   (bonus token)
+                         y ~ norm(max(b_τ p_τ − q_τ, 0))  otherwise (residual)</div>
+  <p>The output (x<sub>1..τ</sub>, y) is distributed exactly as an autoregressive sample from p. <code>tests/unit/test_block_verification.py</code> checks this by exhaustive enumeration to a total-variation distance under 10<sup>−10</sup>.</p>
+  <table style="display:none"></table>
+  <div class="tbl"><table>
+    <thead><tr><th>Verification rule (bf16 unless stated)</th><th>Draft tokens kept</th></tr></thead>
+    <tbody>
+      <tr><td>Keyed Gumbel, token level (exactly on-policy alternative)</td><td class="n">51–60%</td></tr>
+      <tr><td>Block verification, bf16 scorer</td><td class="n">87–91%</td></tr>
+      <tr><td>Block verification, fp32 LM head</td><td class="n">91%</td></tr>
+      <tr class="best"><td>Block verification, fp32 Megatron scorer with TF32 GEMMs</td><td class="n">98–99.5%</td></tr>
+    </tbody>
+  </table></div>
+  <h3>Fused implementation</h3>
+  <p><code>block_verify_logits</code> works from raw logits: one <code>logsumexp</code> per row of p and q, the draft-token ratios and b on length-g vectors, and one Triton pass per position for the residual masses r<sub>i</sub>. Only the residual row actually sampled from is materialized. It is draw-for-draw identical to the reference (same τ, same y, log-probs within 2 × 10<sup>−6</sup>) and needs no [g, V] log-softmax or fp64 temporaries.</p>
+  <h3>Keyed sampling (alternative mode)</h3>
+  <p><code>verify_mode=keyed</code> makes every token a Gumbel-max sample whose noise is a hash of (seed, absolute position, token id), computed in a Triton kernel inside the engine's sampler. Two policies then emit the same token wherever their Gumbel races agree, so a draft can be checked position by position with no q at all. It is exactly on-policy but only keeps 51–60% of tokens, so block verification is the default.</p>
+</section>
+
+<section id="scorer">
+  <h2>The verification scorer</h2>
+  <p>Acceptance depends on log p − log q for weights one to three versions apart, and that difference is smaller than bf16 rounding noise. The verifier therefore scores with a second Megatron <code>GPTModel</code> built from a shallow copy of the training provider, with fp32 parameters and activations. Its parameters are refreshed by copying the training weights (about 7 ms at 1.5B). With <code>NVIDIA_TF32_OVERRIDE=1</code>, its GEMMs run on TF32 tensor cores. No Hugging Face model is used anywhere.</p>
+  <h3>Making the fp32 forward fast</h3>
+  <p>About 85% of verification time is scorer forward passes. Megatron and Transformer Engine are tuned for bf16 and fall back to slow paths in fp32. Three changes in <code>scorer_kernels.py</code> and <code>worker.py</code>:</p>
+  <ul>
+    <li><strong>Attention through torch SDPA.</strong> The unfused fp32 path builds the score matrix with TF32 GEMMs and applies mask and softmax as separate kernels. SDPA's fused fp32 kernel is about 2× faster per layer and about 1000× closer to exact (max error 1.7 × 10<sup>−6</sup> vs 2 × 10<sup>−3</sup>).</li>
+    <li><strong>Triton SwiGLU.</strong> One pass over the fc1 output replaces strided <code>silu</code>, <code>+ offset</code> and <code>mul</code> kernels on non-contiguous halves: 3.8× faster, relative error 4 × 10<sup>−7</sup>.</li>
+    <li><strong>Selective scoring.</strong> Each version's q forward stops at the last position that version drafted (causal attention makes the truncation exact), and the LM head runs only on positions whose logits verification needs. The p forward skips prompt positions. The logits are bitwise identical to the full forward (<code>THUNDERSYNC_SELECT_CHECK=1</code>).</li>
+  </ul>
+  <div class="callout"><strong>Attention needs fp32-level accuracy.</strong> Running only attention in bf16 inside the fp32 scorer drops tokens kept from 99.2% to 96.4% and fully accepted drafts from 98.5% to 94.7%, which slows iterations from 3.31 to 4.12 s. A Triton flash-attention kernel with <code>tf32x3</code> dots matched fp32 accuracy but was 2× slower than SDPA.</div>
+  <h3>q storage scales with parameters, not tokens</h3>
+  <p>The first version stored each draft's full-vocabulary q: O(draft tokens × vocabulary), about 150k floats per token. The default <code>q_storage=stash</code> keeps one bf16 weight copy per pending version (2 bytes per parameter per model-parallel shard) and recomputes q per batch at verification. Memory is O(parameters + one batch × vocabulary).</p>
+</section>
+
+<section id="pipeline" class="wide">
+  <h2>Overlapped verification pipeline</h2>
+  <div style="max-width:68ch">
+  <p>At the start of iteration k+1 every GPU is briefly free: the learner has just stepped and most rollouts are already drafted. Verification uses all of them and overlaps with the rollouts:</p>
+  <ul>
+    <li><strong>Both pools verify</strong> (<code>verify_on=both</code>). Rows are split into chunks (<code>verify_chunks=4</code>), assigned round-robin to the learner and inference worker groups. Rows are owned by data-parallel rank through a stable hash of the draft key. Sampling is seeded per data-parallel rank, so tensor-parallel partners make identical decisions.</li>
+    <li><strong>Plans publish per chunk</strong> (<code>verify_overlap</code>). Rollouts wait on a condition variable for their own plan, not for the whole batch. Verification errors wake every waiting rollout and surface instead of hanging it.</li>
+    <li><strong>Longest drafts first</strong> (<code>verify_longest_first</code>), so the continuations most likely to become stragglers start earliest.</li>
+    <li><strong>Training starts as soon as groups complete.</strong> The learner trains the first verified groups while later chunks are still verifying.</li>
+  </ul>
+  </div>
+  <figure>
+    <div class="tl" role="img" aria-label="Timeline of one 2.3 second iteration in which every draft is accepted. The learner verifies a chunk from 0 to 0.64 seconds, then trains until about 2.1 seconds, then steps and refits. The inference GPUs verify their chunks from 0 to about 0.7 seconds and draft future iterations the whole time.">
+      <div class="tl-inner">
+        <div class="lane-name">Learner GPUs</div>
+        <div class="lane">
+          <div class="bar b-verify" style="left:0%;width:27.8%">verify chunks 1, 3</div>
+          <div class="bar b-train" style="left:27.8%;width:60%">train complete groups at θ<sub>k+1</sub></div>
+          <div class="bar b-misc" style="left:87.8%;width:12.2%">step · refit</div>
+        </div>
+        <div class="lane-name">Inference GPUs</div>
+        <div class="lane">
+          <div class="bar b-verify" style="left:0%;width:30%">verify chunks 2, 4</div>
+          <div class="bar b-draft" style="left:30%;width:70%">draft iterations k+2 … k+4</div>
+        </div>
+        <div class="lane-name">Rollouts</div>
+        <div class="lane">
+          <div class="bar b-cont" style="left:18%;width:22%">remainders</div>
+          <div class="bar b-misc" style="left:40%;width:2%"></div>
+        </div>
+        <div class="axis"><span style="left:0%">0 s</span><span style="left:21.7%">0.5</span><span style="left:43.5%">1.0</span><span style="left:65.2%">1.5</span><span style="left:87%">2.0</span><span style="left:100%">2.3</span></div>
+      </div>
+      <div class="legend">
+        <span><i style="background:var(--accent-soft);border:1px solid var(--accent)"></i>verification</span>
+        <span><i style="background:var(--accent)"></i>training</span>
+        <span><i style="background:var(--warn-soft);border:1px solid var(--warn)"></i>decoding remainders</span>
+        <span><i style="background:var(--rule)"></i>step / refit</span>
+        <span><i style="background:var(--lane);border:1px solid var(--rule)"></i>drafting (continuous)</span>
+      </div>
+    </div>
+    <figcaption>A typical iteration where every draft is accepted (about 2.3 s, learner-bound). Approximate, from the measured averages: first training dispatch at 0.64 s, 1.48 s of learner work, 0.2 s step and refit. When one draft is rejected early, its remainder decodes serially and extends the rollout lane by 1–3 s.</figcaption>
+  </figure>
+</section>
+
+<section id="exactness">
+  <h2>Exactness</h2>
+  <p><strong>What is exact.</strong> Gradient streaming produces the synchronous update up to fp32 summation order. Block verification returns exact samples of p given each draft's true proposal distribution q. Every gradient is taken at the weights that define the sampling target, with no staleness and no importance weights.</p>
+  <p><strong>Where an approximation enters.</strong> Drafts are sampled by the bf16 inference engine, but q is recomputed by the fp32 scorer. The two differ by numerical noise at equal weights. This is the same kind of train/inference mismatch that every RL pipeline already has (measured per-token probability ratio about 1.0035 at equal weights). Batch-invariant kernels (NeMo-RL PR 3208) would make q bitwise the sampling distribution. Keyed mode avoids the issue entirely at lower acceptance.</p>
+  <div class="callout ok"><strong>Reward check over 100 steps.</strong> Speculation vs a second no-speculation baseline: reward difference −0.0016 ± 0.0037, paired by step. For scale, the two baselines differ from each other by −0.0080 ± 0.0036, so run-to-run noise is larger than any effect of speculation.</div>
+</section>
+
+<section id="results" class="wide">
+  <h2>Results</h2>
+  <div style="max-width:68ch"><p>Qwen2.5-Math-1.5B-Instruct, 2 inference + 2 training GPUs, 128 rollouts per step, group-granularity streaming. Mean seconds per iteration after warm-up; 30-step runs unless marked.</p></div>
+  <div class="tbl"><table>
+    <thead><tr><th>Configuration</th><th>Mean</th><th>Median</th><th>p90</th><th>Tokens kept</th><th>Drafts whole</th></tr></thead>
+    <tbody>
+      <tr><td>Zero staleness, no speculation (100 steps)</td><td class="n">6.13</td><td class="n">5.86</td><td class="n">7.88</td><td>–</td><td>–</td></tr>
+      <tr><td>Speculation, lookahead 3, overlapped verification on both pools (40 steps)</td><td class="n">3.97</td><td class="n">3.84</td><td class="n">4.59</td><td class="n">99.1%</td><td class="n">98.6%</td></tr>
+      <tr><td>+ fused scorer kernels (SDPA, Triton SwiGLU)</td><td class="n">3.55</td><td class="n">3.35</td><td class="n">4.42</td><td class="n">99.2%</td><td class="n">98.8%</td></tr>
+      <tr><td>+ selective scoring</td><td class="n">3.31</td><td class="n">3.07</td><td class="n">4.02</td><td class="n">99.2%</td><td class="n">98.5%</td></tr>
+      <tr><td>+ zero-advantage rows in their own chunks</td><td class="n">3.03</td><td class="n">2.79</td><td class="n">4.23</td><td class="n">99.4%</td><td class="n">98.5%</td></tr>
+      <tr class="best"><td>Same, 100 steps</td><td class="n">3.02</td><td class="n">2.70</td><td class="n">4.28</td><td class="n">99.5%</td><td class="n">98.4%</td></tr>
+      <tr><td>Async GRPO, lag 4, same settings (single controller)</td><td class="n">4.26</td><td class="n">2.40</td><td class="n">7.75</td><td>–</td><td>–</td></tr>
+    </tbody>
+  </table></div>
+  <div style="max-width:68ch">
+  <p>Async has a lower median but a much worse tail. With zero-advantage skip its learner is fast, so it becomes generation-bound and stalls for 2–13 s on some steps while generation catches up.</p>
+  <h3>Tried and not adopted</h3>
+  <div class="tbl"><table>
+    <thead><tr><th>Change</th><th>Result</th></tr></thead>
+    <tbody>
+      <tr><td>bf16 attention in the fp32 scorer</td><td>4.12 s; tokens kept 96.4%</td></tr>
+      <tr><td>Triton flash attention with tf32x3 dots</td><td>2× slower than fp32 SDPA</td></tr>
+      <tr><td>Verify only on inference GPUs</td><td>3.78 s; competes with drafting</td></tr>
+      <tr><td>Small first verification chunk; group-aligned chunks; 1:2 and 1:3 pool weights</td><td>3.2–3.9 s; neutral or worse</td></tr>
+      <tr><td>Delay drafting until few rollouts remain (<code>draft_max_inflight</code> 0 or 2)</td><td>6.30 s, 3.74 s; unfinished drafts</td></tr>
+      <tr><td>Pause drafts while continuations decode (always, or only in the tail)</td><td>5.73 s, 4.14 s; drafting time is worth more</td></tr>
+      <tr><td>Micro-batch 16, token-budgeted chunks, fused linear-logprob loss</td><td>No change in learner time</td></tr>
+    </tbody>
+  </table></div>
+  </div>
+</section>
+
+<section id="time">
+  <h2>Where the remaining time goes</h2>
+  <ul>
+    <li><strong>Steps where every draft is accepted take about 2.0–2.3 s.</strong> Those steps are learner-bound: about 0.6 s until the first verified groups, training, and a 0.2 s step and refit.</li>
+    <li><strong>About one draft per step (of 128) is rejected.</strong> Rejections occur at about 1.5 × 10<sup>−5</sup> per token, the same for tokens drafted one or three versions earlier, so lookahead costs no acceptance. The remaining rejections reflect the true one-step policy change.</li>
+    <li><strong>A rejection costs its remainder.</strong> The median remainder is about 450 tokens, decoded serially at about 3 ms per token. That straggler tail is most of the gap between the 2.3 s floor and the 3.0 s mean.</li>
+    <li><strong>Generation is now near saturation.</strong> The inference GPUs are about 83% busy keeping up with drafting (about 115k drafted tokens per step); the learner GPUs about 30%.</li>
+    <li><strong>The learner is CPU-bound.</strong> A training micro-batch takes about 130 ms of CPU for 70 ms of GPU work. Rounding padded lengths to multiples of 128 (<code>policy.make_sequence_length_divisible_by=128</code>) stopped cuDNN fused attention from building a new plan for every micro-batch: 270 → 130 ms CPU per micro-batch, learner 1.48 → 1.19 s per step. Iteration time did not move, because generation is the bottleneck.</li>
+  </ul>
+</section>
+
+<section id="regime">
+  <h2>When speculation pays</h2>
+  <p>Speculation converts idle generation capacity into next-iteration rollouts. It cannot create capacity. Its gain is bounded by the gap between the zero-staleness baseline and an asynchronous pipeline.</p>
+  <div class="tbl"><table>
+    <thead><tr><th>Setting</th><th>Zero staleness</th><th>Async lag 4</th><th>Speculative</th></tr></thead>
+    <tbody>
+      <tr><td>Qwen2.5-Math-1.5B, 2 + 2 GPUs (tail-bound)</td><td class="n">6.13 s</td><td class="n">4.26 s</td><td class="n"><strong>3.02 s</strong></td></tr>
+      <tr><td>Qwen3-4B, 2 + 2 GPUs (generation saturated)</td><td class="n">≈42.5 s</td><td>–</td><td class="n">≈43–47 s</td></tr>
+      <tr><td>Qwen3-4B, 3 inference + 1 training</td><td class="n">31.3 s</td><td class="n">31.3 s</td><td class="n">≈37 s</td></tr>
+    </tbody>
+  </table></div>
+  <p>At Qwen3-4B nearly every rollout runs to the 4096-token cap, so the engine is throughput-bound for the whole iteration and gradient streaming already hides the learner. Zero staleness equals async there, and speculation only adds verification work. Use speculation when the rollout phase ends in a latency-bound tail on mostly idle GPUs.</p>
+</section>
+
+<section id="scaling" class="wide">
+  <h2>Scaling status</h2>
+  <div class="tbl"><table>
+    <thead><tr><th>Piece</th><th>Status</th></tr></thead>
+    <tbody>
+      <tr><td>Drafting, streaming, abort</td><td>Megatron inference client and coordinator; inherits inference TP/PP/EP/DP</td></tr>
+      <tr><td>q storage</td><td>bf16 weight stash per pending version; memory O(parameters + batch × vocabulary)</td></tr>
+      <tr><td>Scorer memory</td><td>fp32 adds 4 bytes per parameter per shard; <code>verify_precision=model</code> keeps training dtypes (about 90% kept vs 99%)</td></tr>
+      <tr><td>Tensor parallelism</td><td>Vocab-parallel logits gathered per batch; validated at TP=2 (99.9% kept)</td></tr>
+      <tr><td>Pipeline parallelism</td><td>Forward-only pipeline schedule, last stage verifies; scorer log-probs at PP=2 bitwise equal PP=1. Inference must be pinned to PP=1 (<code>mcore_generation_config.pipeline_model_parallel_size=1</code>)</td></tr>
+      <tr><td>Context parallelism</td><td>Not implemented; the scorer raises. Needs packed (THD) scoring</td></tr>
+      <tr><td>MoE / expert parallelism</td><td>Provider copy carries the EP layout; untested</td></tr>
+      <tr><td>Large models on few learner GPUs</td><td>At 4B with one learner GPU: verify on the inference pool, or use <code>verify_batch_tokens=4096</code> and the bf16 scorer to fit</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="config">
+  <h2>Configuration</h2>
+  <p>The best 1.5B configuration, on top of the ThunderSync GRPO config:</p>
+<pre><code>NVIDIA_TF32_OVERRIDE=1
+++thundersync.speculate=true
+++thundersync.verify_mode=block
+++thundersync.q_storage=stash
+++thundersync.verify_precision=fp32
+++thundersync.draft_budget=4096
+++thundersync.draft_lookahead=3
+++thundersync.draft_start_frac=0.0
+++thundersync.verify_on=both
+++thundersync.verify_chunks=4
+++thundersync.verify_overlap=true
+++thundersync.verify_longest_first=true
+loss_fn.skip_zero_advantage_rows=true
+policy.megatron_cfg.fp32_lm_head=true
+policy.make_sequence_length_divisible_by=128</code></pre>
+  <dl class="kv">
+    <dt>draft_lookahead</dt><dd>Future iterations drafted concurrently. Unfinished drafts resume across iterations.</dd>
+    <dt>draft_start_frac</dt><dd>Fraction of this iteration's rollouts finished before drafting starts. 0 drafts from the start.</dd>
+    <dt>verify_precision</dt><dd><code>fp32</code> scorer (with TF32 GEMMs under the env flag) or <code>model</code> (training dtypes).</dd>
+    <dt>verify_on</dt><dd><code>learner</code>, <code>inference</code> or <code>both</code> worker groups run verification.</dd>
+    <dt>verify_chunks</dt><dd>Verification pieces; plans publish as each finishes.</dd>
+    <dt>verify_batch_tokens</dt><dd>Tokens per scorer forward batch (bounds logits memory). Default 16384.</dd>
+    <dt>draft_budget</dt><dd>Maximum new tokens per draft.</dd>
+  </dl>
+  <p class="note">Debug switches: <code>THUNDERSYNC_SPEC_PROF</code> (verification timing), <code>THUNDERSYNC_SPEC_CHECK</code> (cross-pool scorer check), <code>THUNDERSYNC_SELECT_CHECK</code> (selective vs full logits), <code>THUNDERSYNC_REJECT_LOG</code> (per-draft outcomes and continuation timing), <code>THUNDERSYNC_LEARNER_PROF</code> and <code>THUNDERSYNC_LEARNER_TORCHPROF</code> (training chunks).</p>
+</section>
+
+<section id="code" class="wide">
+  <h2>Code map</h2>
+  <div class="tbl"><table>
+    <thead><tr><th>File (research/thundersync_rl/)</th><th>Role</th></tr></thead>
+    <tbody>
+      <tr><td class="mono">thundersync_rl/grpo_loop.py</td><td>GRPO loop: per-sample rollouts, learner loop, drafter and verification tasks, config</td></tr>
+      <tr><td class="mono">thundersync_rl/streaming.py</td><td>StreamPlanner: arrivals to dispatches, bucket vs final chunks, zero-advantage chunks, DP balancing</td></tr>
+      <tr><td class="mono">thundersync_rl/speculative.py</td><td>SpeculativeGeneration: cohorts and segments, stash calls, chunked verification, plans, continuations</td></tr>
+      <tr><td class="mono">thundersync_rl/worker.py</td><td>Megatron worker extension: streaming train calls, scorer build and refresh, weight stashes, stashed block verification, draft streams</td></tr>
+      <tr><td class="mono">thundersync_rl/block_verification.py</td><td>Reference block verification and its exact output law (tested by enumeration)</td></tr>
+      <tr><td class="mono">thundersync_rl/block_verification_fused.py</td><td>Block verification from raw logits with a Triton residual-mass kernel</td></tr>
+      <tr><td class="mono">thundersync_rl/scorer_kernels.py</td><td>SDPA core attention, Triton SwiGLU, selective output layer</td></tr>
+      <tr><td class="mono">thundersync_rl/keyed_sampling.py</td><td>Position-keyed Gumbel-max sampling kernel (keyed mode)</td></tr>
+      <tr><td class="mono">nemo_rl/algorithms/grad_streaming.py</td><td>Core: per-(group, reward) gradient accumulators, final-first selection (shared with the single controller)</td></tr>
+    </tbody>
+  </table></div>
+  <p class="note" style="max-width:68ch">Tests: 55 research unit tests (block verification by enumeration, fused verification draw-for-draw, streaming equivalence, speculative driver plans, cohorts, chunked pools, error surfacing), 7 core zero-advantage tests, and GPU functional checks for scorer and refit parallelism.</p>
+</section>
+
+<section id="open">
+  <h2>Open work</h2>
+  <ul>
+    <li><strong>Stragglers.</strong> The remaining gap is about one rejected draft per step decoding its remainder at about 3 ms per token. Only faster single-sequence decoding helps, such as engine-level speculative decoding with an MTP or EAGLE head.</li>
+    <li><strong>Generation capacity.</strong> At 1.5B on 2 + 2 GPUs generation is near saturation, but moving a GPU to inference does not help: on 3 inference + 1 training GPUs speculation takes 3.32 s per 120 rollouts (no speculation: 5.53 s), because the single learner GPU becomes the bottleneck. Faster decoding in the engine is the remaining lever.</li>
+    <li><strong>Training CPU overhead.</strong> About 130 ms CPU vs 70 ms GPU per micro-batch; training CUDA graphs would need static or bucketed shapes.</li>
+    <li><strong>Batch invariance (PR 3208).</strong> Would make q bitwise the engine's sampling distribution. Needs Transformer Engine 2.18 or later and flash-attn 4.</li>
+    <li><strong>Scaling gaps.</strong> Context parallelism in the scorer, MoE validation, and zero-advantage skip with sequence packing.</li>
+    <li><strong>Upstream.</strong> Default <code>make_sequence_length_divisible_by</code> to 64–128 for Megatron training.</li>
+  </ul>
+</section>
+</main>
+</div>

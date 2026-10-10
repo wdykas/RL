@@ -3,6 +3,9 @@
 Implementation of [ThunderSyncRL: Lossless Acceleration of Agentic Reinforcement Learning](https://arxiv.org/abs/2610.05935)
 on NeMo RL with the **Megatron training backend** and the **non-colocated Megatron inference backend**.
 
+Full design write-up (algorithm, verification math, scorer, results): [`DESIGN.md`](DESIGN.md)
+(rendered page: [`docs/design.html`](docs/design.html)).
+
 ## Idea
 
 In synchronous GRPO, the learner idles until the slowest rollout of the batch
