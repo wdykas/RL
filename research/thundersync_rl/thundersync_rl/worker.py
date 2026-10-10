@@ -476,7 +476,10 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 # Megatron/TE fall back to unfused fp32 attention and GLU paths.
                 from thundersync_rl.scorer_kernels import use_fused_swiglu, use_sdpa_attention
 
-                use_sdpa_attention(self._mfp32, provider)
+                attn_bf16 = os.environ.get("THUNDERSYNC_SCORER_ATTN_BF16") == "1"
+                use_sdpa_attention(
+                    self._mfp32, provider, torch.bfloat16 if attn_bf16 else None
+                )
                 use_fused_swiglu(self._mfp32)
             from thundersync_rl.scorer_kernels import use_selective_output
 
@@ -763,7 +766,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         ``segments[i]``: [(version, start, end)] - draft tokens [start, end) of row
         i were drafted by stashed weights ``version``. p is the current weights.
         """
-        from thundersync_rl.block_verification import block_verify
+        from thundersync_rl.block_verification_fused import block_verify_logits
 
         self._prof = {}
         t_all = time.perf_counter()
@@ -810,9 +813,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                     continue
                 off = 0
                 for _, i, a, b in segs:
-                    lq_rows[i].append(
-                        (a, torch.log_softmax(logits[off : off + b - a, :vocab_limit].float(), -1))
-                    )
+                    lq_rows[i].append((a, logits[off : off + b - a, :vocab_limit]))
                     off += b - a
                 del logits
             self._load_scorer(None)
@@ -832,16 +833,15 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             for r, i in enumerate(group):
                 n, plen = rows[i].numel(), prompt_lens[i]
                 g = n - plen
-                lp = torch.log_softmax(logits[off : off + g + 1, :vocab_limit].float(), -1)
+                p_logits = logits[off : off + g + 1, :vocab_limit]
                 off += g + 1
                 parts = [t for _, t in sorted(lq_rows.pop(i), key=lambda x: x[0])]
-                lq = torch.cat(parts) if parts else lp[:0]
-                assert lq.shape[0] == g, (lq.shape, g)
+                q_logits = torch.cat(parts) if parts else p_logits[:0]
+                assert q_logits.shape[0] == g, (q_logits.shape, g)
                 draft = ids[r, plen:n]
-                tau, y = block_verify(lp, lq, draft, gen)
-                kept = torch.cat([draft[:tau], torch.tensor([y], device="cuda")])
-                lps = lp[torch.arange(tau + 1, device="cuda"), kept].tolist()
-                results.append((i, {"accepted": tau, "next": y, "logprobs": lps}))
+                # Raw logits in, no [g, V] log-softmax / fp64 temporaries.
+                tau, y, logp = block_verify_logits(p_logits, q_logits, draft, gen)
+                results.append((i, {"accepted": tau, "next": y, "logprobs": logp.tolist()}))
             del logits
         if os.environ.get("THUNDERSYNC_SPEC_PROF"):
             pool = "gen" if getattr(self, "dynamic_inference_engine", None) is not None else "learner"

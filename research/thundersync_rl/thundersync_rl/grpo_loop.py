@@ -136,6 +136,9 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # Verify the longest drafts first (with verify_chunks > 1) so the likely
     # stragglers' continuations start earliest.
     verify_longest_first: bool = False
+    # Put this many of the cheapest groups in a small first verification chunk
+    # (chunks then align to group boundaries) so the learner starts sooner.
+    verify_first_chunk_groups: int = 0
     # Run the weight stash + block verification on the "learner" or on the
     # "inference" (generation) workers. EXPERIMENTAL: "inference" currently hangs
     # at the first verification (the stash call works; the awaited verify call
@@ -718,6 +721,7 @@ def thundersync_grpo_train(
             q_storage=ts_cfg.q_storage,
             verify_batch_tokens=ts_cfg.verify_batch_tokens,
             longest_first=ts_cfg.verify_longest_first,
+            first_chunk_groups=ts_cfg.verify_first_chunk_groups,
             verify_on=ts_cfg.verify_on,
             pool_weights=ts_cfg.verify_pool_weights,
         )

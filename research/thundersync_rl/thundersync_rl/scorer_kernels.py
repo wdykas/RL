@@ -90,10 +90,14 @@ class SDPACoreAttention(torch.nn.Module):
     for the real tokens.
     """
 
-    def __init__(self, orig: torch.nn.Module, softmax_scale: float | None):
+    def __init__(
+        self, orig: torch.nn.Module, softmax_scale: float | None, attn_dtype=None
+    ):
         super().__init__()
         self.orig = orig
         self.softmax_scale = softmax_scale
+        # Optional lower-precision attention (e.g. bf16 flash) inside an fp32 model.
+        self.attn_dtype = attn_dtype
 
     def forward(self, query, key, value, attention_mask=None, attn_mask_type=None,
                 attention_bias=None, packed_seq_params=None, **kw):
@@ -103,18 +107,23 @@ class SDPACoreAttention(torch.nn.Module):
             rep = q.shape[1] // k.shape[1]
             k = k.repeat_interleave(rep, dim=1)
             v = v.repeat_interleave(rep, dim=1)
+        dtype = q.dtype
+        if self.attn_dtype is not None:
+            q, k, v = q.to(self.attn_dtype), k.to(self.attn_dtype), v.to(self.attn_dtype)
         out = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=self.softmax_scale)
         s, b = query.shape[0], query.shape[1]
-        return out.permute(2, 0, 1, 3).reshape(s, b, -1)
+        return out.to(dtype).permute(2, 0, 1, 3).reshape(s, b, -1)
 
 
-def use_sdpa_attention(model: torch.nn.Module, config) -> int:
+def use_sdpa_attention(model: torch.nn.Module, config, attn_dtype=None) -> int:
     """Replace every core_attention submodule of ``model`` with SDPA; return count."""
     n = 0
     for mod in list(model.modules()):
         ca = getattr(mod, "core_attention", None)
         if isinstance(ca, torch.nn.Module) and not isinstance(ca, SDPACoreAttention):
-            mod.core_attention = SDPACoreAttention(ca, getattr(config, "softmax_scale", None))
+            mod.core_attention = SDPACoreAttention(
+                ca, getattr(config, "softmax_scale", None), attn_dtype
+            )
             n += 1
     return n
 

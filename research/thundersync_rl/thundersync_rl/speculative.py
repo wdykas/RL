@@ -82,6 +82,7 @@ class SpeculativeGeneration:
         q_storage: str = "full",
         verify_batch_tokens: int = 16384,
         longest_first: bool = False,
+        first_chunk_groups: int = 0,
         verify_on: str = "learner",
         pool_weights: tuple[int, ...] | None = None,
     ):
@@ -103,6 +104,7 @@ class SpeculativeGeneration:
         self.q_storage = q_storage
         self.verify_batch_tokens = verify_batch_tokens
         self.longest_first = longest_first
+        self.first_chunk_groups = first_chunk_groups
         # Where stash + block verification run: "learner" or "inference" (the
         # generation workers hold theta_k until the refit and theta_{k+1} after
         # it, and sit idle while rollouts wait for verification).
@@ -467,6 +469,40 @@ class SpeculativeGeneration:
         diffs = [float((a - b).abs().max()) for a, b in zip(outs[0], outs[-1])]
         print(f"[spec check] pools={len(outs)} max|p diff| per row={[round(d, 6) for d in diffs]} param sums={sums}", flush=True)
 
+    def _group_chunks(self, flat, rows, chunks: int):
+        """Order rows group by group and cut chunks at group boundaries.
+
+        The learner trains on complete groups, so the first chunk holds the
+        ``first_chunk_groups`` cheapest fully drafted groups (fast to verify and
+        no decoding left, so training starts early); the other groups follow longest first (likely stragglers'
+        continuations start early), split into chunks of equal token counts.
+        """
+        groups: dict[tuple[int, ...], list[int]] = defaultdict(list)
+        for j, (_, d) in enumerate(flat):
+            groups[_key(d[0])].append(j)
+        cost = {k: sum(rows[j].numel() for j in js) for k, js in groups.items()}
+        # Groups whose drafts all finished complete as soon as they verify;
+        # unfinished (deadline-truncated) drafts still need decoding.
+        finished = {
+            k: all(len(flat[j][1]) <= 3 or flat[j][1][3] for j in js) for k, js in groups.items()
+        }
+        by_cost = sorted(groups, key=lambda k: (not finished[k], cost[k]))
+        first = by_cost[: self.first_chunk_groups]
+        rest = sorted(by_cost[self.first_chunk_groups :], key=lambda k: -max(
+            len(flat[j][1][2]) for j in groups[k]))
+        order = [j for k in first + rest for j in groups[k]]
+        bounds = [0, sum(len(groups[k]) for k in first)]
+        total = sum(cost[k] for k in rest)
+        acc, pos = 0, bounds[1]
+        for k in rest:
+            acc += cost[k]
+            pos += len(groups[k])
+            if len(bounds) < chunks and acc >= total * (len(bounds) - 1) / (chunks - 1):
+                bounds.append(pos)
+        if bounds[-1] != len(order):
+            bounds.append(len(order))
+        return [flat[j] for j in order], [rows[j] for j in order], bounds
+
     async def _verify_chunked(self, drafts, chunks: int) -> None:
         """Stash-mode verification in ``chunks`` pieces, publishing plans as each
         chunk finishes so rollouts start without waiting for the whole batch.
@@ -490,6 +526,8 @@ class SpeculativeGeneration:
         self._plan_cv = asyncio.Condition()
         n = len(flat)
         bounds = [round(c * n / chunks) for c in range(chunks + 1)]
+        if self.first_chunk_groups and chunks > 1:
+            flat, rows, bounds = self._group_chunks(flat, rows, chunks)
         calls = []
         for c, (a, b) in enumerate(zip(bounds, bounds[1:])):
             if b <= a:
