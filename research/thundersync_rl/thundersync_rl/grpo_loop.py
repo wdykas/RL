@@ -139,6 +139,9 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # Put this many of the cheapest groups in a small first verification chunk
     # (chunks then align to group boundaries) so the learner starts sooner.
     verify_first_chunk_groups: int = 0
+    # Cut verification chunks at group boundaries (groups longest first), so
+    # each finished chunk hands the learner complete groups.
+    verify_group_aligned: bool = False
     # Run the weight stash + block verification on the "learner" or on the
     # "inference" (generation) workers. EXPERIMENTAL: "inference" currently hangs
     # at the first verification (the stash call works; the awaited verify call
@@ -722,6 +725,7 @@ def thundersync_grpo_train(
             verify_batch_tokens=ts_cfg.verify_batch_tokens,
             longest_first=ts_cfg.verify_longest_first,
             first_chunk_groups=ts_cfg.verify_first_chunk_groups,
+            group_aligned=ts_cfg.verify_group_aligned,
             verify_on=ts_cfg.verify_on,
             pool_weights=ts_cfg.verify_pool_weights,
         )

@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 import itertools
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -83,6 +84,7 @@ class SpeculativeGeneration:
         verify_batch_tokens: int = 16384,
         longest_first: bool = False,
         first_chunk_groups: int = 0,
+        group_aligned: bool = False,
         verify_on: str = "learner",
         pool_weights: tuple[int, ...] | None = None,
     ):
@@ -105,6 +107,7 @@ class SpeculativeGeneration:
         self.verify_batch_tokens = verify_batch_tokens
         self.longest_first = longest_first
         self.first_chunk_groups = first_chunk_groups
+        self.group_aligned = group_aligned
         # Where stash + block verification run: "learner" or "inference" (the
         # generation workers hold theta_k until the refit and theta_{k+1} after
         # it, and sit idle while rollouts wait for verification).
@@ -472,10 +475,11 @@ class SpeculativeGeneration:
     def _group_chunks(self, flat, rows, chunks: int):
         """Order rows group by group and cut chunks at group boundaries.
 
-        The learner trains on complete groups, so the first chunk holds the
-        ``first_chunk_groups`` cheapest fully drafted groups (fast to verify and
-        no decoding left, so training starts early); the other groups follow longest first (likely stragglers'
-        continuations start early), split into chunks of equal token counts.
+        The learner trains on complete groups, so chunks never split a group.
+        An optional first chunk holds the ``first_chunk_groups`` cheapest fully
+        drafted groups (fast to verify, no decoding left); the other groups follow
+        longest first (likely stragglers' continuations start early), split into
+        chunks of equal token counts.
         """
         groups: dict[tuple[int, ...], list[int]] = defaultdict(list)
         for j, (_, d) in enumerate(flat):
@@ -491,13 +495,15 @@ class SpeculativeGeneration:
         rest = sorted(by_cost[self.first_chunk_groups :], key=lambda k: -max(
             len(flat[j][1][2]) for j in groups[k]))
         order = [j for k in first + rest for j in groups[k]]
-        bounds = [0, sum(len(groups[k]) for k in first)]
+        bounds = [0] + ([sum(len(groups[k]) for k in first)] if first else [])
+        rest_chunks = chunks - len(bounds) + 1
         total = sum(cost[k] for k in rest)
-        acc, pos = 0, bounds[1]
+        acc, pos = 0, bounds[-1]
         for k in rest:
             acc += cost[k]
             pos += len(groups[k])
-            if len(bounds) < chunks and acc >= total * (len(bounds) - 1) / (chunks - 1):
+            done = len(bounds) - (2 if first else 1)  # rest chunks closed so far
+            if done + 1 < rest_chunks and acc >= total * (done + 1) / rest_chunks:
                 bounds.append(pos)
         if bounds[-1] != len(order):
             bounds.append(len(order))
@@ -526,7 +532,7 @@ class SpeculativeGeneration:
         self._plan_cv = asyncio.Condition()
         n = len(flat)
         bounds = [round(c * n / chunks) for c in range(chunks + 1)]
-        if self.first_chunk_groups and chunks > 1:
+        if (self.group_aligned or self.first_chunk_groups) and chunks > 1:
             flat, rows, bounds = self._group_chunks(flat, rows, chunks)
         calls = []
         for c, (a, b) in enumerate(zip(bounds, bounds[1:])):
@@ -634,11 +640,22 @@ class SpeculativeGeneration:
                 cont["noise_seed"] = torch.tensor([plan.seed])
             if "stop_strings" in datum:
                 cont["stop_strings"] = datum["stop_strings"]
+            t0 = time.perf_counter()
             async for _, res in self.base.generate_async(cont):
                 glen = int(res["generation_lengths"][0])
                 c0 = ids.numel()
                 gen += res["output_ids"][0, c0 : c0 + glen].tolist()
                 lps += res["logprobs"][0, c0 : c0 + glen].tolist()
+            log_path = os.environ.get("THUNDERSYNC_REJECT_LOG")
+            if log_path:
+                import json
+
+                with open(log_path, "a") as f:
+                    f.write(json.dumps({
+                        "cont_step": self.current_step, "prefix": len(plan.prefix),
+                        "cont_tokens": len(gen) - len(plan.prefix),
+                        "t_start": t0, "secs": time.perf_counter() - t0,
+                    }) + "\n")
         n = plen + len(gen)
         out = BatchedDataDict(
             {

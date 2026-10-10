@@ -256,3 +256,13 @@ def test_group_chunked_verification_publishes_every_plan():
     asyncio.run(s.verify_chunked(_group_drafts([5, 1, 9, 3]), chunks=3))
     assert sorted(k[0] for k in s.plans) == [70, 71, 72, 73]
     assert all(len(v) == 2 for v in s.plans.values())
+
+
+def test_group_aligned_chunks_without_first_chunk():
+    s = _spec({})
+    s.group_aligned = True
+    flat, rows = s._flat_rows(_group_drafts([5, 1, 9, 3]))
+    flat, rows, bounds = s._group_chunks(flat, rows, chunks=2)
+    assert [int(d[0][0]) - 70 for _, d in flat] == [2, 2, 0, 0, 3, 3, 1, 1]
+    assert bounds[0] == 0 and bounds[-1] == 8 and len(bounds) == 3
+    assert all(b % 2 == 0 for b in bounds)
