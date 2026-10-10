@@ -497,7 +497,12 @@ def _validate_packages(out: ZeroTrainGenValidation) -> None:
 def validate_zero_train_gen_model_provider(
     config: PolicyConfig, model_cfg: Any
 ) -> None:
-    """Reject unsupported architectures using the resolved Bridge provider."""
+    """Reject unsupported architectures using the resolved Bridge provider.
+
+    Hybrid (Mamba) layer patterns are allowed: MCore's batch-invariant Mamba
+    decode (buffered chunk replay) is used with dynamic inference; measured with
+    THUNDERSYNC_MISMATCH_CHECK in the ThunderSync loop.
+    """
     if not config["megatron_cfg"].get("zero_train_gen_mismatch"):
         return
 
@@ -505,7 +510,6 @@ def validate_zero_train_gen_model_provider(
         field_name
         for field_name in (
             "multi_latent_attention",
-            "hybrid_layer_pattern",
             "experimental_attention_variant",
         )
         if getattr(model_cfg, field_name, None)
