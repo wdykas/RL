@@ -39,6 +39,7 @@ import collections
 import itertools
 import os
 import time
+from types import SimpleNamespace
 from typing import Any, Literal, Optional
 
 import numpy as np
@@ -259,6 +260,34 @@ def _run_workers(policy: Policy, method: str, **kwargs) -> list[Any]:
     return ray.get(policy.worker_group.run_all_workers_single_data(method, **kwargs))
 
 
+def train_gen_mismatch(trajectories, learner, tokenizer, master_config) -> dict:
+    """Debug (THUNDERSYNC_MISMATCH_CHECK): rollout log-probs vs the learner's.
+
+    Called before the optimizer step, so both sides use theta_k: any difference
+    is train/generation numerics (zero with batch-invariant kernels, NeMo-RL
+    PR 3208) plus, for speculative rollouts, the verification scorer's numerics.
+    """
+    data = build_chunk_data(
+        SimpleNamespace(
+            trajectories=trajectories, group=None, advantages=[0.0] * len(trajectories)
+        ),
+        tokenizer,
+        master_config,
+        learner.dp_size * master_config.policy["logprob_batch_size"],
+    )
+    train_lp = learner.policy.get_logprobs(data)["logprobs"]
+    mask = (data["token_mask"] * data["sample_mask"].unsqueeze(-1)).bool()
+    mask[:, 0] = False  # no prediction for the first token
+    diff = (train_lp - data["generation_logprobs"])[mask]
+    return {
+        "mismatch/max_abs_logprob_diff": float(diff.abs().max()),
+        "mismatch/mean_abs_logprob_diff": float(diff.abs().mean()),
+        "mismatch/exact_token_frac": float((diff == 0).float().mean()),
+        # k3 estimator of KL(gen || train), as gen_kl_error in the GRPO loss.
+        "mismatch/gen_kl": float((diff.exp() - 1 - diff).mean()),
+    }
+
+
 def _initial_sample_state(batch: BatchedDataDict, i: int) -> dict[str, Any]:
     return {
         "message_log": batch["message_log"][i],
@@ -461,6 +490,11 @@ async def _run_one_step(
         raise
     assert planner.all_done()
     t_rollout_end = last_rollout_t
+    mismatch = (
+        train_gen_mismatch(all_trajectories, learner, tokenizer, master_config)
+        if os.environ.get("THUNDERSYNC_MISMATCH_CHECK")
+        else {}
+    )
     t_finish = time.perf_counter()
     results = learner.finish()
     t_end = time.perf_counter()
@@ -490,6 +524,7 @@ async def _run_one_step(
         "time/draft_wait": draft_wait,
         "time/draft_score": draft_score,
         "_drafts": drafts,
+        **mismatch,
     }
     return out
 
