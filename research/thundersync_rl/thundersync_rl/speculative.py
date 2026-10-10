@@ -563,6 +563,18 @@ class SpeculativeGeneration:
                     f"verification returned {len(by_row)} of {chunk_rows} rows "
                     f"(per-rank counts {[len(x) for x in res]}): row ownership mismatch"
                 )
+            log_path = os.environ.get("THUNDERSYNC_REJECT_LOG")
+            if log_path:
+                import json
+
+                with open(log_path, "a") as f:
+                    for j, r in by_row.items():
+                        d = flat[a + j][1]
+                        f.write(json.dumps({
+                            "step": self.current_step, "accepted": r["accepted"],
+                            "draft_len": len(d[2]), "finished": bool(d[3]) if len(d) > 3 else True,
+                            "segments": d[5] if len(d) > 5 else None,
+                        }) + "\n")
             async with self._plan_cv:
                 for j, r in by_row.items():
                     d = flat[a + j][1]

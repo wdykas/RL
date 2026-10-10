@@ -189,8 +189,16 @@ class StreamPlanner:
                         advantages=None,
                     )
                 )
-        # Final trajectories from different groups can share a chunk.
-        final.sort(key=lambda t: t.num_tokens)
+        # Final trajectories from different groups can share a chunk. Zero-
+        # advantage rows go into chunks of their own: with
+        # loss_fn.skip_zero_advantage_rows the worker counts and drops such a
+        # chunk without a forward, instead of running part-empty micro-batches.
+        final.sort(
+            key=lambda t: (
+                self.groups[t.group].advantage_by_reward[t.reward] == 0.0,
+                t.num_tokens,
+            )
+        )
         for s in range(0, len(final), m):
             trajs = final[s : s + m]
             chunks.append(
