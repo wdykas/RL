@@ -30,6 +30,7 @@ unchanged: a request for a prompt that has a verified plan returns immediately
 from __future__ import annotations
 
 import asyncio
+import os
 import itertools
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -447,6 +448,21 @@ class SpeculativeGeneration:
                     cv.notify_all()
             raise
 
+    async def _debug_compare_pools(self, rows) -> None:
+        """THUNDERSYNC_SPEC_CHECK: score the same rows on every verifier pool,
+        concurrently with live rollouts, and report the largest difference."""
+        outs = []
+        for g in self.verifiers:
+            refs = g.run_all_workers_single_data("scorer_token_logprobs", rows=rows)
+            res = await asyncio.gather(*[asyncio.wrap_future(r.future()) for r in refs])
+            outs.append([x for x in res if x is not None][0])
+        sums = []
+        for g in self.verifiers:
+            refs = g.run_all_workers_single_data("model_param_checksum")
+            sums.append(await asyncio.gather(*[asyncio.wrap_future(r.future()) for r in refs]))
+        diffs = [float((a - b).abs().max()) for a, b in zip(outs[0], outs[-1])]
+        print(f"[spec check] pools={len(outs)} max|p diff| per row={[round(d, 6) for d in diffs]} param sums={sums}", flush=True)
+
     async def _verify_chunked(self, drafts, chunks: int) -> None:
         """Stash-mode verification in ``chunks`` pieces, publishing plans as each
         chunk finishes so rollouts start without waiting for the whole batch.
@@ -455,6 +471,8 @@ class SpeculativeGeneration:
         queued on the learner at once and processed in order.
         """
         flat, rows = self._flat_rows(drafts)
+        if os.environ.get("THUNDERSYNC_SPEC_CHECK") and len(self.verifiers) > 1:
+            await self._debug_compare_pools(rows[:4])
         if self.longest_first:
             # Longest drafts first: their continuations (the likely critical path)
             # start earliest. Verification order does not change any outcome.

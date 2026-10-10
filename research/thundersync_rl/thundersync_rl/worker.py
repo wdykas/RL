@@ -916,3 +916,8 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             out.append(lp.gather(-1, ids[0, 1:, None]).squeeze(-1).cpu())
         last = ps.is_pipeline_last_stage(ignore_virtual=True)
         return out if (last and ps.get_data_parallel_rank() == 0 and ps.get_tensor_model_parallel_rank() == 0) else None
+
+    @torch.no_grad()
+    def model_param_checksum(self) -> float:
+        """Debug: sum of the (refit target) model parameters, to compare pools."""
+        return float(sum(p.detach().double().sum() for p in self.model.parameters()))
