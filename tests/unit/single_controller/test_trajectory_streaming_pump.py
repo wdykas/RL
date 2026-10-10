@@ -78,9 +78,12 @@ def _patch_converter(monkeypatch):
 class _DataPlane(FakeDataPlaneClient):
     """Serves advantage inputs for sample ids from a test-owned reward table."""
 
-    def __init__(self, rewards: dict[str, float]):
+    def __init__(
+        self, rewards: dict[str, float], truncated: frozenset[str] = frozenset()
+    ):
         super().__init__()
         self.rewards = rewards
+        self.truncated = truncated
 
     def get_samples(self, sample_ids, partition_id, select_fields=None):
         n = len(sample_ids)
@@ -90,7 +93,7 @@ class _DataPlane(FakeDataPlaneClient):
             "token_mask": torch.ones(n, 4),
             "sample_mask": torch.ones(n),
             "mask_sample": torch.zeros(n, dtype=torch.bool),
-            "truncated": torch.zeros(n, dtype=torch.bool),
+            "truncated": torch.tensor([s in self.truncated for s in sample_ids]),
         }
         return TensorDict({k: cols[k] for k in select_fields}, batch_size=[n])
 
@@ -145,12 +148,16 @@ def _controller(buffer, dp_client, trainer, max_open_groups=100):
         trajectory_streaming=SimpleNamespace(max_open_groups=max_open_groups)
     )
     ctl._train_fields = ()
+    ctl._step_log_dict = {"masked_advantages": []}
     ctl._advantage_cfg = AdvantageConfig()
     ctl._advantage_estimator = GRPOAdvantageEstimator(
         SimpleNamespace(use_leave_one_out_baseline=True, normalize_rewards=True), None
     )
     ctl._algo_cfg = GRPOConfig.model_construct(
-        overlong_filtering=False, advantage_clip_low=None, advantage_clip_high=None
+        overlong_filtering=False,
+        advantage_clip_low=None,
+        advantage_clip_high=None,
+        num_generations_per_prompt=_G,
     )
     return ctl
 
@@ -312,3 +319,55 @@ def test_pump_final_first_with_all_groups_open_until_end(seed, dp):
     )
     for g, w in zip(got, want):
         torch.testing.assert_close(g, w, rtol=1e-6, atol=1e-6)
+
+
+def test_sealed_group_advantage_ignores_masked_rows_with_equal_reward():
+    # With overlong filtering the truncated row is left out of the leave-one-out
+    # baseline, so it gets a different advantage than the valid row sharing its
+    # reward. The bucket for that reward must use the valid row's advantage.
+    rewards = {"g_g0": 1.0, "g_g1": 1.0, "g_g2": 0.0, "g_g3": 0.0}
+    dp_client = _DataPlane(rewards, truncated=frozenset({"g_g1"}))
+    ctl = _controller(None, dp_client, trainer=None)
+    ctl._algo_cfg = GRPOConfig.model_construct(
+        overlong_filtering=True, advantage_clip_low=None, advantage_clip_high=None
+    )
+    meta = SimpleNamespace(sample_ids=list(rewards), partition_id="rollout_data")
+    by_reward = asyncio.run(ctl._group_advantage_by_reward(meta))
+
+    valid = torch.tensor([1.0, 0.0, 1.0, 1.0])
+    want = ctl._advantage_estimator.compute_advantage(
+        torch.zeros(4, 1, dtype=torch.long),
+        torch.tensor(list(rewards.values())),
+        torch.ones(4, 1),
+        valid_mask=valid,
+    )[:, 0]
+    assert want[0] != want[1]  # the masked row really differs
+    assert by_reward == {1.0: want[0].item(), 0.0: want[2].item()}
+    # The advantage metric gets the group's final, valid-token advantages
+    # (token mask is 4 wide), not chunk placeholders.
+    (logged,) = ctl._step_log_dict["masked_advantages"]
+    torch.testing.assert_close(logged, want[[0, 2, 3]].repeat_interleave(4))
+
+
+def test_group_size_not_divisible_by_dp_fails_loudly():
+    # With G=3 and DP=2 the last row of a step can never be claimed (chunks are
+    # trimmed to multiples of DP), so the pump would poll forever.
+    from nemo_rl.algorithms.grad_streaming import pick_final_first
+
+    rows = [("g", 1.0, i) for i in range(3)]
+    picked = pick_final_first(
+        rows, closed={"g"}, streaming=set(), max_open_groups=4, multiple_of=2
+    )
+    assert picked == [0, 1]
+    assert (
+        pick_final_first(
+            rows[2:], closed={"g"}, streaming=set(), max_open_groups=4, multiple_of=2
+        )
+        == []
+    )
+
+    ctl = _controller(None, _DataPlane({}), _Trainer({}, dp=2))
+    ctl._algo_cfg.num_generations_per_prompt = 3
+    ctl._buffer = SimpleNamespace(trajectory_step_groups=lambda version: [])
+    with pytest.raises(ValueError, match="multiple of the training data-parallel"):
+        asyncio.run(ctl._select_trajectory_chunk(_TrajectoryStepState()))

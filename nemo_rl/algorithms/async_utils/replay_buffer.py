@@ -1144,6 +1144,12 @@ class TQReplayBuffer:
         # ``ready_list`` stays False until ``seal_group``, so removal and
         # eviction clear partial groups like complete ones.
         self._trajectory_claims: dict[str, set[str]] = {}
+        # Claims of groups removed mid-step (rollout retry or eviction). The
+        # open train step still owns those rows: removal leaves them in TQ for
+        # the step's cleanup, and the group ID cannot be reserved again until
+        # :meth:`release_trajectory_claims` (a same-ID retry would rewrite the
+        # same sample IDs under the step).
+        self._retired_trajectory_claims: dict[str, set[str]] = {}
 
     def set_data_plane_checkpoint_barrier(
         self, barrier: DataPlaneCheckpointBarrier
@@ -1204,6 +1210,13 @@ class TQReplayBuffer:
             group_id = str(uuid.uuid4())
         if group_id in self._group_ids:
             raise ValueError(f"duplicate live group_id={group_id!r}")
+        if group_id in self._retired_trajectory_claims:
+            raise RuntimeError(
+                f"group_id={group_id!r} cannot be reserved again before the open "
+                "trajectory-streaming train step releases the rows it claimed "
+                "from the removed attempt (same-ID rollout retries are not "
+                "supported once a group's trajectories were trained)"
+            )
         self.meta_list.append(None)
         self.start_weight_list.append(weight_version)
         self.end_weight_list.append(-1)
@@ -1497,7 +1510,11 @@ class TQReplayBuffer:
         out: list[tuple[str, KVBatchMeta]] = []
         for i, group_id in enumerate(self._group_ids):
             meta = self.meta_list[i]
-            if meta is None or self.target_step_list[i] != target_step:
+            if (
+                meta is None
+                or self.target_step_list[i] != target_step
+                or group_id in self._retired_trajectory_claims
+            ):
                 continue
             claimed = self._trajectory_claims.get(group_id, set())
             out.extend(
@@ -1536,9 +1553,14 @@ class TQReplayBuffer:
         ]
 
     def release_trajectory_claims(self, group_ids: list[str]) -> None:
-        """Forget trajectory claims for groups whose step finished or aborted."""
+        """Forget trajectory claims for groups whose step finished or aborted.
+
+        Also releases claims retired by a mid-step removal; call this only
+        after the step cleared the claimed rows.
+        """
         for group_id in group_ids:
             self._trajectory_claims.pop(group_id, None)
+            self._retired_trajectory_claims.pop(group_id, None)
 
     async def remove_group(self, group_id: str, *, remove_in_dp: bool = False) -> int:
         """Remove the live slot identified by ``group_id``.
@@ -1820,13 +1842,25 @@ class TQReplayBuffer:
         ]
         if missing_group_ids:
             raise ValueError(f"unknown group_ids={missing_group_ids!r}")
+        # Rows already claimed by an open trajectory-streaming step stay in TQ:
+        # the step may still be fetching them and clears them at its end.
+        # Retire the claims before any await so the group's rows can no longer
+        # be claimed while it is being removed.
+        retiring_claims: dict[str, set[str]] = {}
+        for group_id in group_ids:
+            retired = self._retired_trajectory_claims.setdefault(group_id, set())
+            retired.update(self._trajectory_claims.pop(group_id, ()))
+            retiring_claims[group_id] = retired
         dropped_sample_ids: list[str] = []
         dropped_staging_keys: list[str] = []
         for group_id in group_ids:
             i = index_by_group_id[group_id]
             meta = self.meta_list[i]
             if meta is not None:
-                dropped_sample_ids.extend(meta.sample_ids)
+                claimed = retiring_claims[group_id]
+                dropped_sample_ids.extend(
+                    sid for sid in meta.sample_ids if sid not in claimed
+                )
             staging_keys = self._staging_keys_list[i]
             if staging_keys:
                 dropped_staging_keys.extend(staging_keys)
@@ -1899,6 +1933,10 @@ class TQReplayBuffer:
         self._training_claims.update(new_training_claims)
         for i in current_drop_idxs:
             self._delete_slot(i)
+        for group_id, claims in retiring_claims.items():
+            if not claims:
+                # Nothing is owned by a train step: the ID is free again.
+                self._retired_trajectory_claims.pop(group_id, None)
 
         return len(current_drop_idxs)
 

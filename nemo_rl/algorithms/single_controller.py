@@ -313,8 +313,8 @@ class _TrajectoryStepState:
     closed: set[str] = field(default_factory=set)  # groups folded into the batch
     counted: set[str] = field(default_factory=set)  # sealed + fully claimed
     claimed: set[str] = field(default_factory=set)  # groups with any claimed row
-    # Groups removed for a retry after some rows were claimed: the rollout
-    # manager already cleared their rows, so step cleanup must skip them.
+    # Groups removed for a retry after some rows were claimed. Their claimed
+    # rows stay in the data plane until the step's cleanup clears them.
     vanished: set[str] = field(default_factory=set)
     # Rollout metrics of groups completed since the last drain.
     rollout_metrics: list[dict[str, Any]] = field(default_factory=list)
@@ -2816,8 +2816,6 @@ class SingleControllerActor:
                                 consumed_group_count += num_groups
                                 continue
                         else:
-                            selected_group_ids: list[str] = []
-                            selected_training_claim_ids: list[str] = []
                             training_claim_ids_before = (
                                 self._buffer.training_owned_group_ids()
                             )
@@ -3241,24 +3239,16 @@ class SingleControllerActor:
                 async with self._data_plane_checkpoint_barrier.mutation(
                     "sample_clears"
                 ) as cut:
-                    if traj_cfg is not None and traj.vanished:
-                        consumed_metas = [
-                            m.subset(keep)
-                            for m in consumed_metas
-                            if (
-                                keep := [
-                                    i
-                                    for i, sid in enumerate(m.sample_ids)
-                                    if sid.rsplit("_g", 1)[0] not in traj.vanished
-                                ]
-                            )
-                        ]
                     await self._cleanup_consumed_metas_unlocked(cut, consumed_metas)
                     self._buffer.release_training_claims(consumed_training_claim_ids)
                 if traj_cfg is not None:
+                    # Every claimed row, including those of groups removed for a
+                    # retry mid-step, was just cleared with the consumed metas.
+                    self._buffer.release_trajectory_claims(
+                        sorted(traj.counted | traj.vanished)
+                    )
                     for group_id in traj.counted:
                         await self._buffer.remove_group(group_id)
-                    self._buffer.release_trajectory_claims(list(traj.counted))
                 for _ in range(consumed_group_count):
                     self._buffer_capacity.release()
                 step_metrics.update(
@@ -5426,9 +5416,12 @@ class SingleControllerActor:
                 self._algo_cfg,
             )
             response_advantages = torch.masked_select(advantages, mask.bool())
-        self._step_log_dict["masked_advantages"].append(
-            response_advantages.detach().cpu()
-        )
+        # Trajectory streaming logs each group's final advantages once, when
+        # it seals; rows of open groups carry a placeholder 1 here.
+        if row_advantages is None:
+            self._step_log_dict["masked_advantages"].append(
+                response_advantages.detach().cpu()
+            )
 
         fields_to_put = {adv_cfg.output_field: advantages}
         if not torch.equal(final_sample_mask, sample_mask):
@@ -5548,16 +5541,32 @@ class SingleControllerActor:
         prompt_ids, rewards, token_mask, _, _, final_sample_mask = (
             self._advantage_base_inputs(data)
         )
+        mask = token_mask * final_sample_mask.unsqueeze(-1)
         advantages = self._advantage_estimator.compute_advantage(
             prompt_ids=prompt_ids,
             rewards=rewards,
-            mask=token_mask * final_sample_mask.unsqueeze(-1),
+            mask=mask,
             repeated_batch=self._repeated_batch(data, rewards),
             valid_mask=final_sample_mask,
         )
         assert isinstance(self._algo_cfg, GRPOConfig)
         advantages = _clip_grpo_advantages(advantages, self._algo_cfg)
-        return dict(zip(rewards.tolist(), advantages[:, 0].tolist()))
+        # Same metric the batch path logs, once per group (chunks skip it).
+        self._step_log_dict["masked_advantages"].append(
+            torch.masked_select(advantages, mask.bool()).detach().cpu()
+        )
+        # Masked rows (overlong, env-flagged) are left out of the baseline, so
+        # their advantage differs from valid rows with the same reward; it is
+        # never trained on (zero sample mask), so valid rows take precedence.
+        by_reward: dict[float, float] = {}
+        valid_rows = final_sample_mask.bool().tolist()
+        for valid_pass in (True, False):
+            for reward, advantage, valid in zip(
+                rewards.tolist(), advantages[:, 0].tolist(), valid_rows
+            ):
+                if valid is valid_pass:
+                    by_reward.setdefault(reward, advantage)
+        return by_reward
 
     async def _drop_vanished_groups(
         self, traj: "_TrajectoryStepState", live: set[str]
@@ -5565,8 +5574,8 @@ class SingleControllerActor:
         """Forget groups removed from the buffer for a retry mid-step.
 
         Their streamed buckets are discarded on the workers (with their
-        normalization counts) and their rows, already cleared by the rollout
-        manager, are skipped at step cleanup.
+        normalization counts). The buffer keeps their claimed rows (and their
+        claims) until step cleanup clears them.
         """
         vanished = (traj.claimed | traj.bucketed) - live - traj.counted
         if not vanished:
@@ -5577,7 +5586,6 @@ class SingleControllerActor:
         traj.bucketed -= vanished
         traj.claimed -= vanished
         traj.vanished |= vanished
-        self._buffer.release_trajectory_claims(sorted(vanished))
 
     async def _select_trajectory_chunk(
         self, traj: "_TrajectoryStepState"
@@ -5604,15 +5612,23 @@ class SingleControllerActor:
                     meta
                 )
 
+        dp_size = self._trainer.sharding_annotations.get_axis_size("data_parallel")
+        # Chunks are trimmed to a multiple of the DP size, so a step can only
+        # drain completely if every group's row count is one too (a dropped
+        # prompt or an odd group size would leave rows that are never claimed).
+        if self._algo_cfg.num_generations_per_prompt % dp_size:
+            raise ValueError(
+                "async_rl.trajectory_streaming requires num_generations_per_prompt "
+                f"({self._algo_cfg.num_generations_per_prompt}) to be a multiple "
+                f"of the training data-parallel size ({dp_size})"
+            )
         peeked = self._buffer.peek_trajectory_rows(target_step=version)
         rows = pick_final_first(
             [(g, m.tags[0][STREAM_REWARD_TAG], (g, m)) for g, m in peeked],
             closed=traj.group_advantages.keys(),
             streaming=traj.bucketed - traj.closed,
             max_open_groups=self._async_cfg.trajectory_streaming.max_open_groups,
-            multiple_of=self._trainer.sharding_annotations.get_axis_size(
-                "data_parallel"
-            ),
+            multiple_of=dp_size,
         )
         for group_id, row_meta in rows:
             self._buffer.claim_trajectory_sample_ids(

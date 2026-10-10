@@ -48,6 +48,7 @@ def _worker():
 
     w = _make_worker(LossType.TOKEN_LEVEL)
     w.cfg["megatron_cfg"]["moe_router_load_balancing_type"] = "none"
+    w.cfg["megatron_cfg"]["expert_model_parallel_size"] = 1
     w.cfg["sequence_packing"] = {"enabled": False}
     w.cfg["dynamic_batching"] = {"enabled": False}
     return w
@@ -128,4 +129,13 @@ def test_worker_rejects_sequence_packing(mock_module_symbols):  # noqa: F811
     w = _worker()
     w.cfg["sequence_packing"] = {"enabled": True}
     with pytest.raises(ValueError, match="fixed-size"):
+        w.begin_train_step(loss_fn=_skip_loss())
+
+
+def test_worker_rejects_expert_parallelism(mock_module_symbols):  # noqa: F811
+    # Ranks skip different rows (or whole calls), so their forward counts
+    # differ; the EP all-to-all spans DP ranks and would hang.
+    w = _worker()
+    w.cfg["megatron_cfg"]["expert_model_parallel_size"] = 2
+    with pytest.raises(ValueError, match="expert_model_parallel_size=1"):
         w.begin_train_step(loss_fn=_skip_loss())

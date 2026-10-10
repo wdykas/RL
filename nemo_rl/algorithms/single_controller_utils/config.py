@@ -1329,6 +1329,14 @@ def _validate_trajectory_streaming(master_config: MasterConfig) -> None:
     mcfg = policy["megatron_cfg"]
     if mcfg["mtp_num_layers"]:
         raise ValueError("async_rl.trajectory_streaming does not support MTP losses")
+    if mcfg["expert_model_parallel_size"] > 1:
+        # Workers split each chunk per gradient bucket, so DP ranks run
+        # different numbers of forward passes; the EP all-to-all spans them.
+        raise ValueError(
+            "async_rl.trajectory_streaming requires expert_model_parallel_size=1: "
+            "data-parallel ranks run different numbers of forward passes per "
+            "chunk, which deadlocks the expert-parallel all-to-all"
+        )
     if mcfg["moe_router_load_balancing_type"] != "none":
         raise ValueError(
             "async_rl.trajectory_streaming requires "
@@ -1360,6 +1368,47 @@ def _validate_trajectory_streaming(master_config: MasterConfig) -> None:
             "async_rl.trajectory_streaming does not support "
             "grpo.seq_logprob_error_threshold: it changes the group baseline after "
             "rows were already backpropagated"
+        )
+    # A sealed group's advantages are recomputed from that group alone and
+    # must be a function of each trajectory's total_reward.
+    if algo.adv_estimator.name != "grpo":
+        raise ValueError(
+            "async_rl.trajectory_streaming requires grpo.adv_estimator.name='grpo' "
+            f"(got {algo.adv_estimator.name!r}): gdpo weights reward components, "
+            "reinforce_plus_plus normalizes across groups and opd is token-level, "
+            "so per-(group, reward) gradient buckets cannot represent them"
+        )
+    if master_config.loss_fn.positive_example_nll_weight != 0:
+        raise ValueError(
+            "async_rl.trajectory_streaming requires "
+            "loss_fn.positive_example_nll_weight=0: the NLL term carries no "
+            "advantage, so it cannot be bucketed and rescaled by the group advantage"
+        )
+    # Per-trajectory rows are built from the dataset sample, which matches the
+    # sealed group record only on the native rollout path: NeMo-Gym rebuilds
+    # the prompt and metadata, and token-capture groups are committed by the
+    # finalizer without the per-row reward tags the train pump buckets by.
+    if (
+        master_config.env.get("should_use_nemo_gym")
+        or master_config.token_capture.enabled
+    ):
+        raise ValueError(
+            "async_rl.trajectory_streaming supports the native rollout path only "
+            "(env.should_use_nemo_gym=false, token_capture.enabled=false)"
+        )
+    # Workers backpropagate each gradient bucket of a chunk separately, and a
+    # bucket can hold any number of rows: fixed-size microbatching needs mbs=1.
+    packing = "sequence_packing" in policy and policy["sequence_packing"]["enabled"]
+    if (
+        not packing
+        and not policy["dynamic_batching"]["enabled"]
+        and policy["train_micro_batch_size"] != 1
+    ):
+        raise ValueError(
+            "async_rl.trajectory_streaming splits chunks into per-bucket "
+            "microbatches of arbitrary size: enable policy.sequence_packing or "
+            "policy.dynamic_batching, or set policy.train_micro_batch_size=1 "
+            f"(got {policy['train_micro_batch_size']})"
         )
 
 
