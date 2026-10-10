@@ -345,3 +345,19 @@ speculation normally (98.7-99.8% draft tokens kept, rewards as usual). Without t
 the dedicated inference model inherits the training PP=2 and generates garbage (Megatron
 inference with PP>1 in this setup); the refit export itself is correct at PP=2
 (`tests/functional/check_refit_export_parallelism.py`: same 28 layers and checksum as PP=1).
+
+### When speculation pays
+
+Speculation converts idle generation capacity (the latency-bound tail and drain of a
+zero-staleness iteration) into next-iteration rollouts. It cannot create capacity:
+
+| setting | baseline | speculative (steady state) |
+|---|---|---|
+| Qwen2.5-Math-1.5B, 2+2 GPUs (tail-bound) | 6.47 s | 3.97 s (-39%) |
+| Qwen3-4B, 2+2 GPUs (generation saturated) | ~42.5 s | ~43-47 s |
+| Qwen3-4B, 3 gen + 1 train (generation throughput-bound, learner mostly idle) | ~31 s | ~37 s |
+
+Use it when the rollout phase is dominated by a few long stragglers on mostly idle GPUs;
+disable or limit it (late `draft_start_frac`) when the decode batch stays large for the
+whole iteration. An adaptive policy (draft only while the engine's active batch is small)
+is the natural next step.
