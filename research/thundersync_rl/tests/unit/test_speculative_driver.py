@@ -90,6 +90,8 @@ def _spec(learner_handlers, base_handlers=None, gen_tail=(9, EOD), **kw):
             "longest_first": False,
             "verify_on": "learner",
             "pool_weights": None,
+            "fused_verify_train": False,
+            "fused_max_retained_tokens": 16384,
             **kw,
         },
     )

@@ -22,6 +22,11 @@ thundersync:
   verify_overlap: true  # verify concurrently with the rollouts
   verify_longest_first: true  # longest drafts (likely stragglers) first
   verify_batch_tokens: 16384  # tokens per scorer forward (bounds logits memory)
+  # EXPERIMENTAL (untested on GPU): fused verification + training under
+  # policy.megatron_cfg.batch_invariant_mode. Needs verify_on=learner and
+  # verify_precision=model; see DESIGN.md section 14.
+  fused_verify_train: false
+  fused_max_retained_tokens: 16384  # retained verification graphs per learner rank
 
 grpo:
   num_prompts_per_step: 16

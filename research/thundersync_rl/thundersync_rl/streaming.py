@@ -25,6 +25,7 @@ from nemo_rl.algorithms.grad_streaming import pick_final_first
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.policy.lm_policy import Policy
+from thundersync_rl.fused_train import FusedRef
 
 GroupId = Hashable
 
@@ -44,6 +45,9 @@ class Trajectory:
     reward: float
     payload: Any  # whatever the data builder needs (e.g. the message log)
     num_tokens: int
+    # Fused verification + training: the retained verification forward this
+    # trajectory trains from (None: regular training forward).
+    fused: Optional[FusedRef] = None
 
 
 @dataclass
@@ -54,6 +58,9 @@ class Chunk:
     reward: Optional[float]
     trajectories: list[Trajectory]
     advantages: Optional[list[float]]  # final chunks only; None for bucket chunks
+    # Set for a single-row chunk trained from a retained verification forward;
+    # it must run on ``fused.dp_rank``, which holds the graph.
+    fused: Optional[FusedRef]
 
     @property
     def num_tokens(self) -> int:
@@ -169,15 +176,41 @@ class StreamPlanner:
         self.ready = [t for t in self.ready if id(t) not in taken]
         final: list[Trajectory] = []
         buckets: dict[tuple[GroupId, float], list[Trajectory]] = {}
+        chunks: list[Chunk] = []
+
+        def advantage(t: Trajectory) -> float:
+            return self.groups[t.group].advantage_by_reward[t.reward]
+
         for t in picked:
             g = self.groups[t.group]
             if g.advantage_by_reward is not None:
-                final.append(t)
+                if t.fused is not None:
+                    chunks.append(
+                        Chunk(
+                            group=None,
+                            reward=None,
+                            trajectories=[t],
+                            advantages=[advantage(t)],
+                            fused=t.fused,
+                        )
+                    )
+                else:
+                    final.append(t)
             else:
                 g.streaming = True
-                buckets.setdefault((t.group, float(t.reward)), []).append(t)
+                if t.fused is not None:
+                    chunks.append(
+                        Chunk(
+                            group=t.group,
+                            reward=float(t.reward),
+                            trajectories=[t],
+                            advantages=None,
+                            fused=t.fused,
+                        )
+                    )
+                else:
+                    buckets.setdefault((t.group, float(t.reward)), []).append(t)
 
-        chunks: list[Chunk] = []
         m = self.max_chunk_trajectories
         for (gid, r), trajs in buckets.items():
             for s in range(0, len(trajs), m):
@@ -187,6 +220,7 @@ class StreamPlanner:
                         reward=r,
                         trajectories=trajs[s : s + m],
                         advantages=None,
+                        fused=None,
                     )
                 )
 
@@ -194,9 +228,6 @@ class StreamPlanner:
         # sorted). Zero-advantage rows are chunked separately: with
         # loss_fn.skip_zero_advantage_rows the worker counts and drops an
         # all-zero chunk without a forward, and no chunk mixes the two kinds.
-        def advantage(t: Trajectory) -> float:
-            return self.groups[t.group].advantage_by_reward[t.reward]
-
         final.sort(key=lambda t: t.num_tokens)
         for rows in (
             [t for t in final if advantage(t) != 0.0],
@@ -210,13 +241,26 @@ class StreamPlanner:
                         reward=None,
                         trajectories=trajs,
                         advantages=[advantage(t) for t in trajs],
+                        fused=None,
                     )
                 )
 
-        # Greedy longest-first token balancing over DP ranks.
+        # Fused chunks run where their graph lives; the rest are balanced
+        # greedily, longest first, by tokens over the DP ranks.
         per_rank: list[list[Chunk]] = [[] for _ in range(self.dp_size)]
         load = [0] * self.dp_size
-        for c in sorted(chunks, key=lambda c: -c.num_tokens):
+        for c in chunks:
+            if c.fused is not None:
+                if not 0 <= c.fused.dp_rank < self.dp_size:
+                    raise ValueError(
+                        f"fused trajectory pinned to DP rank {c.fused.dp_rank} "
+                        f"of {self.dp_size}"
+                    )
+                per_rank[c.fused.dp_rank].append(c)
+                load[c.fused.dp_rank] += c.num_tokens
+        for c in sorted(
+            (c for c in chunks if c.fused is None), key=lambda c: -c.num_tokens
+        ):
             r = load.index(min(load))
             per_rank[r].append(c)
             load[r] += c.num_tokens
@@ -301,4 +345,4 @@ class StreamingLearner:
         return results[0]
 
     def abort(self) -> None:
-        ray.get(self.worker_group.run_all_workers_single_data("abort_train_step"))
+        ray.get(self.worker_group.run_all_workers_single_data("stream_abort_step"))

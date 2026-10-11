@@ -40,7 +40,7 @@ import itertools
 import os
 import time
 from types import SimpleNamespace
-from typing import Any, Literal, Optional
+from typing import Any, Callable, Literal, Optional
 
 import numpy as np
 import ray
@@ -60,8 +60,10 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.rollouts import run_sample_multi_turn_rollout
 from nemo_rl.models.generation.interfaces import GenerationInterface
+from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.logger import Logger
+from thundersync_rl.fused_train import FusedRef
 from thundersync_rl.speculative import SpeculativeGeneration
 from thundersync_rl.streaming import (
     Chunk,
@@ -144,6 +146,20 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # Start drafting when this iteration's verification finishes, instead of at
     # draft_start_frac of completed rollouts.
     draft_after_verify: bool = False
+    # EXPERIMENTAL, untested on GPU (DESIGN.md section 14, fused_train.py):
+    # fused verification + training under batch-invariant kernels. The learner
+    # computes p with the training model at theta_{k+1} (bitwise the training
+    # forward under BI) with autograd; drafts that verification turns into
+    # finished rollouts keep that graph and are trained from it, saving one
+    # forward per such trajectory. Requires speculate, verify_mode=block,
+    # verify_on=learner, verify_precision=model,
+    # policy.megatron_cfg.batch_invariant_mode, pipeline parallel size 1,
+    # generation temperature 1 and no fused linear log-probs. Off by default.
+    fused_verify_train: bool = False
+    # Fused mode: tokens of retained verification graphs per learner rank
+    # (bounds their activation memory, about one training micro-batch of this
+    # many tokens). Drafts over the budget are trained the regular way.
+    fused_max_retained_tokens: int = 16384
 
 
 def new_cohort_targets(
@@ -211,6 +227,61 @@ def validate_config(master_config: ThunderSyncMasterConfig) -> None:
         raise ValueError(
             "thundersync.speculate with batch_invariant_mode requires "
             f"thundersync.verify_on='learner' (got {ts_cfg.verify_on!r})."
+        )
+    validate_fused_verify_train(ts_cfg, master_config.policy)
+
+
+def validate_fused_verify_train(
+    ts_cfg: ThunderSyncConfig, policy_cfg: PolicyConfig
+) -> None:
+    """Reject settings under which fused verification + training is not exact.
+
+    The fused gradient equals the regular one only if the verification p
+    forward IS the training forward: the training model (learner, training
+    dtypes) under batch-invariant kernels, unscaled logits, logits for every
+    position, and a single pipeline stage holding the retained graph.
+    """
+    if not ts_cfg.fused_verify_train:
+        return
+    megatron_cfg = policy_cfg["megatron_cfg"]
+    problems = []
+    if not ts_cfg.speculate:
+        problems.append("thundersync.speculate must be true")
+    if ts_cfg.verify_mode != "block":
+        problems.append(
+            f"thundersync.verify_mode must be 'block' (got {ts_cfg.verify_mode!r})"
+        )
+    if ts_cfg.verify_on != "learner":
+        problems.append(
+            f"thundersync.verify_on must be 'learner' (got {ts_cfg.verify_on!r})"
+        )
+    if ts_cfg.verify_precision != "model":
+        problems.append(
+            "thundersync.verify_precision must be 'model' so p and q use the "
+            f"training numerics (got {ts_cfg.verify_precision!r})"
+        )
+    if ts_cfg.fused_max_retained_tokens <= 0:
+        problems.append("thundersync.fused_max_retained_tokens must be positive")
+    if not megatron_cfg.get("batch_invariant_mode"):
+        problems.append(
+            "policy.megatron_cfg.batch_invariant_mode must be true (the "
+            "verification forward must be bitwise the training forward)"
+        )
+    if megatron_cfg["pipeline_model_parallel_size"] != 1:
+        problems.append("policy.megatron_cfg.pipeline_model_parallel_size must be 1")
+    if megatron_cfg.get("use_fused_linear_logprobs"):
+        problems.append(
+            "policy.megatron_cfg.use_fused_linear_logprobs must be false "
+            "(verification needs full logits)"
+        )
+    if policy_cfg["generation"]["temperature"] != 1.0:
+        problems.append(
+            "policy.generation.temperature must be 1.0 (verification uses "
+            "unscaled logits)"
+        )
+    if problems:
+        raise ValueError(
+            "thundersync.fused_verify_train=true: " + "; ".join(problems) + "."
         )
 
 
@@ -327,6 +398,9 @@ async def _run_one_step(
     drafter=None,
     before_finish=None,
     pre_rollout=None,
+    claim_fused: Optional[
+        Callable[[torch.Tensor, torch.Tensor], Optional[FusedRef]]
+    ] = None,
 ) -> dict[str, Any]:
     G = master_config.grpo.num_generations_per_prompt
     repeated = batch.repeat_interleave(G)
@@ -369,6 +443,9 @@ async def _run_one_step(
     dispatches: list[tuple[float, float, int, int, int]] = []
     last_rollout_t = None
     all_trajectories: list[Trajectory] = []
+    # Fused verification + training: trajectories handed a retained forward,
+    # and what the learner did with them.
+    fused_counts = collections.Counter()
 
     async def rollout(i: int):
         state, metrics = await run_sample_multi_turn_rollout(
@@ -405,14 +482,18 @@ async def _run_one_step(
                             ),
                             "group": c.group,
                             "reward": c.reward,
+                            "fused_key": None if c.fused is None else c.fused.key,
                         }
                         for c in chunks
                     ]
                     for chunks in d.per_rank
                 ]
                 t0 = time.perf_counter()
-                await asyncio.gather(*learner.submit(per_rank, d.closes))
+                rank_results = await asyncio.gather(*learner.submit(per_rank, d.closes))
                 t1 = time.perf_counter()
+                for r in rank_results:
+                    for k in ("fused_trained", "fused_tokens", "fused_fallback"):
+                        fused_counts[k] += r[k]
                 learner_busy += t1 - t0
                 chunks = [c for cs in d.per_rank for c in cs]
                 dispatches.append(
@@ -469,6 +550,13 @@ async def _run_one_step(
                 loss_mult = 0.0
             ntok = sum(int(m["token_ids"].numel()) for m in state["message_log"])
             arrivals.append((last_rollout_t - t_start, i // G, ntok, reward))
+            fused = None
+            if claim_fused is not None:
+                fused = claim_fused(
+                    torch.cat([m["token_ids"] for m in repeated["message_log"][i]]),
+                    torch.cat([m["token_ids"] for m in state["message_log"]]),
+                )
+                fused_counts["claimed"] += fused is not None
             traj = Trajectory(
                 group=(step, i // G),
                 index=i,
@@ -478,6 +566,7 @@ async def _run_one_step(
                     "loss_multiplier": loss_mult,
                 },
                 num_tokens=ntok,
+                fused=fused,
             )
             all_trajectories.append(traj)
             planner.add(traj)
@@ -540,6 +629,14 @@ async def _run_one_step(
         "_drafts": drafts,
         **mismatch,
     }
+    if claim_fused is not None:
+        # Trajectories trained from their verification forward; each saved
+        # one training forward of its row (fused/forward_tokens_saved tokens).
+        out["fused/trajectories"] = fused_counts["fused_trained"]
+        out["fused/forward_tokens_saved"] = fused_counts["fused_tokens"]
+        out["fused/claimed"] = fused_counts["claimed"]
+        out["fused/fallbacks"] = fused_counts["fused_fallback"]
+        out["fused/unclaimed"] = results["stream_fused_unclaimed"]
     return out
 
 
@@ -580,6 +677,8 @@ def thundersync_grpo_train(
             longest_first=ts_cfg.verify_longest_first,
             verify_on=ts_cfg.verify_on,
             pool_weights=ts_cfg.verify_pool_weights,
+            fused_verify_train=ts_cfg.fused_verify_train,
+            fused_max_retained_tokens=ts_cfg.fused_max_retained_tokens,
         )
     G = master_config.grpo.num_generations_per_prompt
     if spec is not None and os.environ.get("THUNDERSYNC_SPEC_SELFTEST"):
@@ -696,6 +795,9 @@ def thundersync_grpo_train(
                 drafter=drafter,
                 before_finish=spec.score_prev if spec is not None else None,
                 pre_rollout=pre_rollout,
+                claim_fused=spec.claim_fused
+                if spec is not None and ts_cfg.fused_verify_train
+                else None,
             )
         )
         drafts = metrics.pop("_drafts")

@@ -35,12 +35,13 @@ import os
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, AsyncGenerator
+from typing import Any, AsyncGenerator, Optional
 
 import ray
 import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from thundersync_rl.fused_train import FusedRef
 
 
 @dataclass
@@ -51,6 +52,9 @@ class Plan:
     prefix: list[int] = field(default_factory=list)  # tokens already fixed
     prefix_logprobs: list[float] = field(default_factory=list)
     complete: bool = False
+    # Fused verification + training: the learner kept the verification
+    # forward of this (complete, fully accepted) draft for training.
+    fused: Optional[FusedRef] = None
 
 
 @dataclass
@@ -83,6 +87,8 @@ class SpeculativeGeneration:
         longest_first: bool,
         verify_on: str,
         pool_weights: tuple[int, ...] | None,
+        fused_verify_train: bool,
+        fused_max_retained_tokens: int,
     ):
         self.base = base
         self.learner_policy = learner_policy
@@ -98,6 +104,17 @@ class SpeculativeGeneration:
         self.verify_precision = verify_precision
         self.verify_batch_tokens = verify_batch_tokens
         self.longest_first = longest_first
+        # Fused verification + training (fused_train.py): p comes from the
+        # training model with autograd, and the forwards of drafts that become
+        # finished rollouts are kept (up to this many tokens per learner rank)
+        # for their training step.
+        self.fused_verify_train = fused_verify_train
+        self.fused_max_retained_tokens = fused_max_retained_tokens
+        # Complete plans with a retained forward, handed to the rollout that
+        # consumed them: prompt key -> [(generated tokens, ref)].
+        self._fused_claims: dict[
+            tuple[int, ...], list[tuple[tuple[int, ...], FusedRef]]
+        ] = defaultdict(list)
         # Where stash + block verification run: "learner" or "inference" (the
         # generation workers hold theta_k until the refit and theta_{k+1} after
         # it, and sit idle while rollouts wait for verification).
@@ -128,7 +145,9 @@ class SpeculativeGeneration:
         )
         self.eod = next(e for e in eods if e is not None)
         if os.environ.get("TMP_DEBUG_ENGINE_LP"):
-            ray.get(workers.run_all_workers_single_data("tmp_debug_patch_engine_logprobs"))
+            ray.get(
+                workers.run_all_workers_single_data("tmp_debug_patch_engine_logprobs")
+            )
         self._seeds = itertools.count(1)
         self._verify_seeds = itertools.count(1)
         self.plans: dict[tuple[int, ...], list[Plan]] = defaultdict(list)
@@ -346,6 +365,10 @@ class SpeculativeGeneration:
         )
 
     def verify(self, drafts: list[list[tuple[torch.Tensor, int, list[int]]]]) -> None:
+        if self.fused_verify_train:
+            raise NotImplementedError(
+                "fused_verify_train runs through chunked verification only"
+            )
         flat, rows = self._flat_rows(drafts)
         if self.verify_mode == "block":
             # Contiguous row slices per verifier pool, verified concurrently.
@@ -413,17 +436,42 @@ class SpeculativeGeneration:
             "spec/variant_wins": float(variant_wins),
         }
 
-    def _plan(self, d, r) -> Plan:
-        """Turn one draft and its verification result into a rollout plan."""
-        prompt, seed, draft = d[0], d[1], d[2]
-        n_acc = r["accepted"]
+    def _stopped(self, d) -> bool:
+        """Whether draft ``d``, if fully accepted, is a finished rollout."""
         # The draft terminated on its own (EOS/stop) rather than at the budget
         # or the deadline: a fully accepted draft is then a finished rollout.
         finished = d[3] if len(d) > 3 else True
         # Cohort/streamed drafts carry the full budget: finished = EOS or the cap.
-        stopped = finished and (len(d) > 4 or len(draft) < self.draft_budget)
-        if n_acc == len(draft) and stopped:
-            return Plan(seed, draft, r["logprobs"][:n_acc], complete=True)
+        return finished and (len(d) > 4 or len(d[2]) < self.draft_budget)
+
+    def _plan(self, d, r) -> Plan:
+        """Turn one draft and its verification result into a rollout plan."""
+        prompt, seed, draft = d[0], d[1], d[2]
+        n_acc = r["accepted"]
+        complete = n_acc == len(draft) and self._stopped(d)
+        fused = r.get("fused")
+        if fused is not None and not complete:
+            # The worker keeps a graph only for drafts flagged as finished and
+            # fully accepted; anything else means driver and worker disagree.
+            raise RuntimeError(
+                f"learner kept a fused forward for draft {fused['key']!r}, "
+                f"which is not a finished rollout ({n_acc} of {len(draft)} "
+                "tokens accepted)"
+            )
+        if complete:
+            return Plan(
+                seed,
+                draft,
+                r["logprobs"][:n_acc],
+                complete=True,
+                fused=None
+                if fused is None
+                else FusedRef(
+                    key=fused["key"],
+                    dp_rank=fused["dp_rank"],
+                    num_tokens=prompt.numel() + len(draft),
+                ),
+            )
         prefix = draft[:n_acc] + [r["next"]]
         done = r["next"] == self.eod or len(prefix) >= self.max_new_tokens
         return Plan(seed, prefix, r["logprobs"], complete=done)
@@ -484,6 +532,7 @@ class SpeculativeGeneration:
             flat = [flat[j] for j in order]
             rows = [rows[j] for j in order]
         self.plans.clear()
+        self._fused_claims.clear()
         self._pending = defaultdict(int)
         for _, d in flat:
             self._pending[_key(d[0])] += 1
@@ -496,8 +545,7 @@ class SpeculativeGeneration:
                 continue
             # Weighted round-robin of chunks over the verifier pools.
             group = self._chunk_pools[c % len(self._chunk_pools)]
-            refs = group.run_all_workers_single_data(
-                "verify_drafts_block_stashed",
+            kwargs = dict(
                 rows=rows[a:b],
                 prompt_lens=[d[0].numel() for _, d in flat[a:b]],
                 segments=[d[5] for _, d in flat[a:b]],
@@ -507,8 +555,19 @@ class SpeculativeGeneration:
                 batch_tokens=self.verify_batch_tokens,
                 precision=self.verify_precision,
             )
+            if self.fused_verify_train:
+                refs = group.run_all_workers_single_data(
+                    "verify_drafts_block_fused",
+                    **kwargs,
+                    retain=[self._stopped(d) for _, d in flat[a:b]],
+                    max_retained_tokens=self.fused_max_retained_tokens,
+                )
+            else:
+                refs = group.run_all_workers_single_data(
+                    "verify_drafts_block_stashed", **kwargs
+                )
             calls.append((a, refs))
-        kept = total = full = 0
+        kept = total = full = fused = 0
 
         async def fetch(a, refs):
             return (
@@ -551,6 +610,7 @@ class SpeculativeGeneration:
                     d = flat[a + j][1]
                     plan = self._plan(d, r)
                     full += plan.complete and r["accepted"] == len(d[2])
+                    fused += plan.fused is not None
                     kept += r["accepted"]
                     total += len(d[2])
                     self.plans[_key(d[0])].append(plan)
@@ -561,6 +621,8 @@ class SpeculativeGeneration:
             "spec/accepted_frac": kept / max(total, 1),
             "spec/full_accept": full / max(n, 1),
         }
+        if self.fused_verify_train:
+            self.stats["fused/retained"] = float(fused)
 
     # -- GenerationInterface used by the rollout ----------------------------------
 
@@ -597,6 +659,8 @@ class SpeculativeGeneration:
         )
         gen = list(plan.prefix)
         lps = list(plan.prefix_logprobs)
+        if plan.fused is not None:
+            self._fused_claims[key].append((tuple(gen), plan.fused))
         if not plan.complete:
             ids = torch.cat([prompt, torch.tensor(plan.prefix, dtype=torch.long)])
             cont = BatchedDataDict(
@@ -648,6 +712,29 @@ class SpeculativeGeneration:
             }
         )
         return index, out
+
+    def claim_fused(
+        self, prompt: torch.Tensor, token_ids: torch.Tensor
+    ) -> Optional[FusedRef]:
+        """The retained verification forward a finished rollout can train from.
+
+        ``prompt``: the rollout's generation prompt; ``token_ids``: its whole
+        trajectory (prompt, generated tokens, environment reply). Returns (and
+        removes) a ref whose verified row is a prefix of the trajectory, or
+        None. Equal trajectories may share a ref: their forwards are the same.
+        """
+        entries = self._fused_claims.get(_key(prompt))
+        if not entries:
+            return None
+        p = prompt.numel()
+        for j, (gen, ref) in enumerate(entries):
+            if (
+                token_ids.numel() >= p + len(gen)
+                and _key(token_ids[p : p + len(gen)]) == gen
+            ):
+                del entries[j]
+                return ref
+        return None
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.base, name)

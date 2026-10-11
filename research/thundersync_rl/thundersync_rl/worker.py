@@ -26,6 +26,7 @@ the grad buffers and the regular ``finish_train_step`` runs unchanged.
 
 import os
 import time
+from contextlib import nullcontext
 from typing import Any
 
 import ray
@@ -33,9 +34,20 @@ import torch
 
 from nemo_rl.algorithms.grad_streaming import GradStreamingSpec, StreamBucket
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.data.multimodal_utils import attach_media_token_validity_mask
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.megatron import train as megatron_train
+from nemo_rl.models.megatron.data import get_microbatch_iterator
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.megatron_policy_worker import (
     MegatronPolicyWorkerImpl,
+)
+from thundersync_rl.fused_train import (
+    FusedGraph,
+    FusedGraphStore,
+    FusedOutcome,
+    make_fused_model_forward,
+    substitute_model_forward,
 )
 
 WORKER_FQN = "thundersync_rl.worker.ThunderSyncMegatronPolicyWorker"
@@ -58,6 +70,8 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         max_open_groups: int,
     ) -> None:
         """Open an optimizer step whose gradient arrives in streamed chunks."""
+        # Retained verification forwards of this step (fused_verify_train).
+        self._fused_graphs = FusedGraphStore()
         self.begin_train_step(
             loss_fn=loss_fn,
             gbs=gbs,
@@ -88,9 +102,13 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         """Backprop streamed chunks, then fold any groups that closed.
 
         Each item is ``{"data": BatchedDataDict, "group": gid | None,
-        "reward": float | None}``; ``group=None`` items carry final advantages.
+        "reward": float | None, "fused_key": str | None}``; ``group=None`` items
+        carry final advantages. An item with a ``fused_key`` is one row whose
+        model forward is the retained verification forward of that key
+        (fused_train.py); everything else about its training is unchanged.
         """
         t0 = time.perf_counter()
+        fused_trained = fused_tokens = fused_fallback = 0
         for item in items:
             bucket = (
                 None
@@ -113,33 +131,38 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             adv0 = item["data"].get("advantages")
             if adv0 is None or bool((adv0 != 0).any()):
                 self._n_items = getattr(self, "_n_items", 0) + 1
+            fused_key = item.get("fused_key")
+            graph = None if fused_key is None else self._fused_graphs.pop(fused_key)
+            graph_tokens = 0 if graph is None else graph.num_tokens
+            # A key without a graph (over the budget, or dropped) trains normally.
+            outcome = FusedOutcome(
+                used=False, fallback=fused_key is not None and graph is None
+            )
+            substitute = (
+                nullcontext()
+                if graph is None
+                else substitute_model_forward(
+                    megatron_train,
+                    make_fused_model_forward(
+                        graph,
+                        megatron_train.model_forward,
+                        outcome,
+                        check=bool(os.environ.get("THUNDERSYNC_FUSED_CHECK")),
+                    ),
+                )
+            )
+            del graph  # only the substitute forward holds it now
             try:
-                if (
-                    tprof
-                    and getattr(self, "_n_items", 0) == int(tprof)
-                    and not getattr(self, "_tprof_done", False)
-                ):
-                    self._tprof_done = True
-                    from torch.profiler import ProfilerActivity, profile
-
-                    with profile(
-                        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]
-                    ) as tp:
-                        self.train_microbatch(item["data"], stream_bucket=bucket)
-                        torch.cuda.synchronize()
-                    print(
-                        f"[learner torchprof] shape={tuple(item['data']['input_ids'].shape)}\n"
-                        + tp.key_averages().table(
-                            sort_by="cpu_time_total",
-                            row_limit=30,
-                            max_name_column_width=60,
-                        ),
-                        flush=True,
-                    )
-                else:
-                    self.train_microbatch(item["data"], stream_bucket=bucket)
+                with substitute:
+                    self._stream_train_item(item, bucket, tprof)
             finally:
                 state["mbs"] = step_mbs
+                # Frees the graph's activations also when no forward ran (a
+                # zero-advantage row skipped by the worker).
+                del substitute
+            fused_trained += outcome.used
+            fused_tokens += graph_tokens if outcome.used else 0
+            fused_fallback += outcome.fallback
             if prof:
                 torch.cuda.synchronize()
                 d = item["data"]
@@ -156,15 +179,59 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         self._log_mem("stream_accumulate")
         self._stream_busy_s += time.perf_counter() - t0
         acc = self._train_step_state["grad_stream"]
-        return {"num_items": len(items), "open_buffers": acc.num_open_buffers()}
+        return {
+            "num_items": len(items),
+            "open_buffers": acc.num_open_buffers(),
+            "fused_trained": fused_trained,
+            "fused_tokens": fused_tokens,
+            "fused_fallback": fused_fallback,
+        }
+
+    def _stream_train_item(
+        self, item: dict[str, Any], bucket: StreamBucket | None, tprof: str | None
+    ) -> None:
+        """``train_microbatch`` on one streamed item (optionally under the profiler)."""
+        if (
+            tprof
+            and getattr(self, "_n_items", 0) == int(tprof)
+            and not getattr(self, "_tprof_done", False)
+        ):
+            self._tprof_done = True
+            from torch.profiler import ProfilerActivity, profile
+
+            with profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]
+            ) as tp:
+                self.train_microbatch(item["data"], stream_bucket=bucket)
+                torch.cuda.synchronize()
+            print(
+                f"[learner torchprof] shape={tuple(item['data']['input_ids'].shape)}\n"
+                + tp.key_averages().table(
+                    sort_by="cpu_time_total",
+                    row_limit=30,
+                    max_name_column_width=60,
+                ),
+                flush=True,
+            )
+        else:
+            self.train_microbatch(item["data"], stream_bucket=bucket)
 
     def stream_finish_step(self) -> dict[str, Any]:
         """Barrier: write back, normalize, DP-reduce, clip, step."""
         peak = self._train_step_state["grad_stream"].peak_open_buffers
+        # Retained verification graphs never outlive the weights they were
+        # taken at; any left (their rollout trained the regular way) go now.
+        unclaimed = self._fused_graphs.clear()
         results = self.finish_train_step()
         results["stream_peak_open_buffers"] = peak
         results["stream_learner_busy_s"] = self._stream_busy_s
+        results["stream_fused_unclaimed"] = unclaimed
         return results
+
+    def stream_abort_step(self) -> None:
+        """Abort the open streamed step and drop its retained verification graphs."""
+        self._fused_graphs = FusedGraphStore()
+        self.abort_train_step()
 
     def get_flat_grads(self) -> torch.Tensor:
         """Return this rank's gradient buffers on CPU (for equivalence tests).
@@ -700,45 +767,9 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         results = []
         for group, ids in self._iter_row_id_batches(rows, batch_tokens, keys):
             pos = torch.arange(ids.shape[1], device="cuda").expand(len(group), -1)
-            lq_rows: dict[int, list[tuple[int, torch.Tensor]]] = {i: [] for i in group}
-            versions = sorted({v for i in group for v, _, _ in segments[i]})
-            for v in versions:
-                # q of version v is needed only at its segments' positions; causal
-                # attention lets each row stop at its last such position.
-                segs = [
-                    (r, i, a, b)
-                    for r, i in enumerate(group)
-                    for sv, a, b in segments[i]
-                    if sv == v and b > a
-                ]
-                if not segs:
-                    continue
-                sub_rows = sorted({r for r, _, _, _ in segs})
-                local = {r: k for k, r in enumerate(sub_rows)}
-                width = max(prompt_lens[i] - 1 + b for _, i, _, b in segs)
-                s_idx = torch.cat(
-                    [
-                        torch.arange(prompt_lens[i] - 1 + a, prompt_lens[i] - 1 + b)
-                        for _, i, a, b in segs
-                    ]
-                )
-                b_idx = torch.cat(
-                    [torch.full((b - a,), local[r]) for r, _, a, b in segs]
-                )
-                self._load_scorer(v)
-                logits = self._score(
-                    scorer,
-                    ids[sub_rows, :width],
-                    pos[: len(sub_rows), :width],
-                    select=(s_idx.cuda(), b_idx.cuda()),
-                )
-                if logits is None:  # not the last pipeline stage
-                    continue
-                off = 0
-                for _, i, a, b in segs:
-                    lq_rows[i].append((a, logits[off : off + b - a, :vocab_limit]))
-                    off += b - a
-                del logits
+            lq_rows = self._stashed_q_logits(
+                scorer, group, ids, pos, prompt_lens, segments, vocab_limit
+            )
             self._load_scorer(None)
             spans = [(prompt_lens[i] - 1, rows[i].numel()) for i in group]
             logits = self._score(
@@ -787,6 +818,227 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             ntok = sum(rows[i].numel() for i in range(len(rows)))
             print(
                 f"[spec prof] verify_stashed pool={pool} rank={self.rank} rows={len(rows)} tok={ntok} total={time.perf_counter() - t_all:.3f} {self._prof}",
+                flush=True,
+            )
+        return results
+
+    @torch.no_grad()
+    def _stashed_q_logits(
+        self,
+        scorer,
+        group: list[int],
+        ids: torch.Tensor,
+        pos: torch.Tensor,
+        prompt_lens: list[int],
+        segments: list[list[tuple[int, int, int]]],
+        vocab_limit: int,
+    ) -> dict[int, list[tuple[int, torch.Tensor]]]:
+        """Q logits of a batch's draft positions, from the weights that drafted them.
+
+        Returns row -> [(segment start, [segment length, V] logits)]; empty off
+        the last pipeline stage.
+        """
+        lq_rows: dict[int, list[tuple[int, torch.Tensor]]] = {i: [] for i in group}
+        versions = sorted({v for i in group for v, _, _ in segments[i]})
+        for v in versions:
+            # q of version v is needed only at its segments' positions; causal
+            # attention lets each row stop at its last such position.
+            segs = [
+                (r, i, a, b)
+                for r, i in enumerate(group)
+                for sv, a, b in segments[i]
+                if sv == v and b > a
+            ]
+            if not segs:
+                continue
+            sub_rows = sorted({r for r, _, _, _ in segs})
+            local = {r: k for k, r in enumerate(sub_rows)}
+            width = max(prompt_lens[i] - 1 + b for _, i, _, b in segs)
+            s_idx = torch.cat(
+                [
+                    torch.arange(prompt_lens[i] - 1 + a, prompt_lens[i] - 1 + b)
+                    for _, i, a, b in segs
+                ]
+            )
+            b_idx = torch.cat([torch.full((b - a,), local[r]) for r, _, a, b in segs])
+            self._load_scorer(v)
+            logits = self._score(
+                scorer,
+                ids[sub_rows, :width],
+                pos[: len(sub_rows), :width],
+                select=(s_idx.cuda(), b_idx.cuda()),
+            )
+            if logits is None:  # not the last pipeline stage
+                continue
+            off = 0
+            for _, i, a, b in segs:
+                lq_rows[i].append((a, logits[off : off + b - a, :vocab_limit]))
+                off += b - a
+            del logits
+        return lq_rows
+
+    # ---- Fused verification + training (batch-invariant kernels; fused_train.py) ----
+
+    def _check_fused_verify_supported(self, state: dict[str, Any]) -> None:
+        """Raise unless the verification forward can stand in for training's."""
+        from megatron.core import parallel_state as ps
+
+        problems = []
+        if state["grad_stream"] is None:
+            problems.append("the train step was opened without gradient streaming")
+        if not self.cfg["megatron_cfg"].get("batch_invariant_mode"):
+            problems.append("batch_invariant_mode is off")
+        if state["mtp_enabled"]:
+            problems.append("multi-token prediction needs the loss mask in the forward")
+        if self.draft_model is not None:
+            problems.append(
+                "draft-model training captures hidden states in the forward"
+            )
+        if self.cfg["megatron_cfg"].get("use_fused_linear_logprobs"):
+            problems.append("fused linear log-probs produce no logits")
+        if ps.get_pipeline_model_parallel_world_size() != 1:
+            problems.append("pipeline parallelism (the graph spans stages)")
+        if ps.get_context_parallel_world_size() != 1:
+            problems.append("context parallelism")
+        if problems:
+            raise RuntimeError(
+                "fused verification + training unsupported: " + "; ".join(problems)
+            )
+
+    def _training_forward(self, row: torch.Tensor) -> torch.Tensor:
+        """Logits [1, S, V] of one row, computed exactly as a training forward.
+
+        Same padding (``make_sequence_length_divisible_by``), micro-batch
+        processing and ``model_forward`` call as ``train_microbatch``; autograd
+        follows the caller's grad mode.
+        """
+        m = self.cfg["make_sequence_length_divisible_by"]
+        n = row.numel()
+        ids = torch.zeros((1, -(-n // m) * m), dtype=torch.long)
+        ids[0, :n] = row
+        data = BatchedDataDict({"input_ids": ids, "input_lengths": torch.tensor([n])})
+        attach_media_token_validity_mask(data, self.media_placeholder_token_id)
+        iterator, *_ = get_microbatch_iterator(
+            data,
+            self.cfg,
+            1,
+            straggler_timer=self.mcore_state.straggler_timer,
+            delegate_pack_to_model=self.delegate_pack_to_model,
+            delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
+            model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
+            mtp_enabled=self.mtp_enabled,
+        )
+        mb = next(iterator)
+        return megatron_train.model_forward(
+            model=self.model,
+            data_dict=mb.data_dict,
+            input_ids_cp_sharded=mb.input_ids_cp_sharded,
+            position_ids=mb.position_ids,
+            attention_mask=mb.attention_mask,
+            packed_seq_params=mb.packed_seq_params,
+            defer_fp32_logits=self.defer_fp32_logits,
+            mtp_loss_mask=mb.mtp_loss_mask,
+            padding_mask=mb.padding_mask,
+            straggler_timer=self.mcore_state.straggler_timer,
+            use_fused_linear_logprobs=False,
+            media_token_validity_mask=mb.media_token_validity_mask,
+            model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
+        )
+
+    def verify_drafts_block_fused(
+        self,
+        rows: list[torch.Tensor],
+        prompt_lens: list[int],
+        segments: list[list[tuple[int, int, int]]],
+        vocab_limit: int,
+        seed: int,
+        keys: list[str],
+        batch_tokens: int,
+        precision: str,
+        retain: list[bool],
+        max_retained_tokens: int,
+    ) -> list[tuple[int, dict[str, Any]]]:
+        """Block verification with p from the training model; keep training forwards.
+
+        As ``verify_drafts_block_stashed`` (q from the stashed weights), but p
+        is the training model's forward of each row at the current weights,
+        run like a training forward inside the open train step. For a row with
+        ``retain[i]`` (the driver would turn its full acceptance into a
+        finished rollout) the forward runs with autograd; if verification
+        accepts the whole draft and the rank's retained graphs stay within
+        ``max_retained_tokens``, the graph is kept for the row's training call
+        and the result carries ``"fused": {"key", "dp_rank"}``. Other graphs
+        are freed right away.
+        """
+        from megatron.core import parallel_state as ps
+
+        # Triton kernel: imported where it runs (GPU workers only).
+        from thundersync_rl.block_verification_fused import block_verify_logits
+
+        state = self._assert_step_open()
+        self._check_fused_verify_supported(state)
+        self._prof = {}
+        t_all = time.perf_counter()
+        self._scorer_precision = precision
+        scorer = self._fp32_scorer()
+        self.model.train()  # the mode training runs in (the step is open)
+        dp_rank = ps.get_data_parallel_rank()
+        gen = torch.Generator(device="cuda").manual_seed(seed * 1_000_003 + dp_rank)
+        results = []
+        for group, ids in self._iter_row_id_batches(rows, batch_tokens, keys):
+            pos = torch.arange(ids.shape[1], device="cuda").expand(len(group), -1)
+            lq_rows = self._stashed_q_logits(
+                scorer, group, ids, pos, prompt_lens, segments, vocab_limit
+            )
+            for r, i in enumerate(group):
+                n, plen = rows[i].numel(), prompt_lens[i]
+                g = n - plen
+                keep = retain[i] and self._fused_graphs.can_retain(
+                    n, max_retained_tokens
+                )
+                t0 = time.perf_counter()
+                with torch.set_grad_enabled(keep):
+                    logits = self._training_forward(rows[i])
+                self._prof["forward"] = (
+                    self._prof.get("forward", 0.0) + time.perf_counter() - t0
+                )
+                with torch.no_grad():
+                    p_logits = logits[0, plen - 1 : n, :vocab_limit].detach().float()
+                    parts = [t for _, t in sorted(lq_rows.pop(i), key=lambda x: x[0])]
+                    q_logits = torch.cat(parts) if parts else p_logits[:0]
+                    assert q_logits.shape[0] == g, (q_logits.shape, g)
+                    draft = ids[r, plen:n]
+                    tau, y, _ = block_verify_logits(p_logits, q_logits, draft, gen)
+                    # Log-probs exactly as training computes them (fp32
+                    # log-softmax + gather): generation log-probs of the plan
+                    # equal the trainer's bitwise.
+                    kept = torch.cat([draft[:tau], torch.tensor([y], device="cuda")])
+                    logp = torch.log_softmax(p_logits[: tau + 1], -1).gather(
+                        -1, kept.unsqueeze(-1)
+                    )[:, 0]
+                res: dict[str, Any] = {
+                    "accepted": tau,
+                    "next": y,
+                    "logprobs": logp.tolist(),
+                }
+                if keep and tau == g:
+                    self._fused_graphs.put(
+                        keys[i],
+                        FusedGraph(
+                            ids=rows[i].detach().cpu().clone(), logits=logits[:, :n]
+                        ),
+                    )
+                    res["fused"] = {"key": keys[i], "dp_rank": dp_rank}
+                del logits, p_logits, q_logits
+                results.append((i, res))
+        self._log_mem("verify_drafts_block_fused")
+        if os.environ.get("THUNDERSYNC_SPEC_PROF"):
+            ntok = sum(rows[i].numel() for i in range(len(rows)))
+            print(
+                f"[spec prof] verify_fused rank={self.rank} rows={len(rows)} tok={ntok} "
+                f"retained={len(self._fused_graphs)} "
+                f"retained_tok={self._fused_graphs.retained_tokens} "
+                f"total={time.perf_counter() - t_all:.3f} {self._prof}",
                 flush=True,
             )
         return results
