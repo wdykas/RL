@@ -127,8 +127,6 @@ class SpeculativeGeneration:
             else workers.run_all_workers_single_data("termination_id")
         )
         self.eod = next(e for e in eods if e is not None)
-        if os.environ.get("TMP_DEBUG_ENGINE_LP"):
-            ray.get(workers.run_all_workers_single_data("tmp_debug_patch_engine_logprobs"))
         self._seeds = itertools.count(1)
         self._verify_seeds = itertools.count(1)
         self.plans: dict[tuple[int, ...], list[Plan]] = defaultdict(list)
