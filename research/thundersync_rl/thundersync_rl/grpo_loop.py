@@ -60,6 +60,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.rollouts import run_sample_multi_turn_rollout
 from nemo_rl.models.generation.interfaces import GenerationInterface
+from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.logger import Logger
 from thundersync_rl.speculative import SpeculativeGeneration
@@ -198,6 +199,30 @@ def validate_config(master_config: ThunderSyncMasterConfig) -> None:
     assert ddp["grad_reduce_in_fp32"], (
         "per-trajectory gradients are moved out of the grad buffer; keep it fp32"
     )
+    validate_expert_parallel(master_config.thundersync, master_config.policy)
+
+
+def validate_expert_parallel(
+    ts_cfg: ThunderSyncConfig, policy_cfg: PolicyConfig
+) -> None:
+    """Reject open-group gradient buckets under expert parallelism.
+
+    An open-group bucket is scaled by its group's advantage after the fact,
+    which assumes a rank's gradient comes only from its own rows. Expert weights
+    also receive gradient from tokens other EP ranks route to them (rows of
+    other groups), so their buckets would be mis-scaled. Final chunks carry
+    their advantages in the loss and stay exact.
+    """
+    if (
+        policy_cfg["megatron_cfg"]["expert_model_parallel_size"] > 1
+        and ts_cfg.granularity == "trajectory"
+        and ts_cfg.max_open_groups > 0
+    ):
+        raise ValueError(
+            "expert_model_parallel_size > 1 requires thundersync.granularity="
+            "'group' (or max_open_groups=0): open-group gradient buckets are not "
+            "exact under expert parallelism"
+        )
 
 
 def make_group_advantage_fn(master_config: MasterConfig):

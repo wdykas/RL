@@ -177,6 +177,11 @@ def main():
     adv_fn = make_group_advantage_fn(cfg)
     ts = cfg.thundersync
     compare_grads = learner.dp_size == 1
+    expert_parallel = pcfg["megatron_cfg"]["expert_model_parallel_size"] > 1
+    if expert_parallel and ts.max_open_groups > 0:
+        # Mirrors grpo_loop.validate_config: open-group buckets are not exact
+        # under expert parallelism (expert grads mix rows of other EP ranks).
+        raise SystemExit("expert parallelism: pass thundersync.max_open_groups=0")
 
     def run_streamed(data, rewards, rng):
         planner = StreamPlanner(
@@ -185,9 +190,7 @@ def main():
             max_chunk_trajectories=ts.max_chunk_trajectories,
             max_open_groups=ts.max_open_groups,
             micro_batch_size=mbs,
-            equal_rank_microbatches=(
-                pcfg["megatron_cfg"]["expert_model_parallel_size"] > 1
-            ),
+            equal_rank_microbatches=expert_parallel,
         )
         for gi in range(args.num_groups):
             planner.register_group(gi, G)
@@ -313,8 +316,9 @@ def main():
         )
     passed = worst["grad"] <= args.tol if compare_grads else worst["delta"] <= args.tol
     status = "PASS" if passed else "FAIL"
+    grad_msg = f"{worst['grad']:.3e}" if compare_grads else "n/a (multi-GPU)"
     print(
-        f"EQUIVALENCE {status} ({args.mode}): max grad rel err = {worst['grad']:.3e}, "
+        f"EQUIVALENCE {status} ({args.mode}): max grad rel err = {grad_msg}, "
         f"max Delta_k = {worst['delta']:.3e} (tol {args.tol})",
         flush=True,
     )

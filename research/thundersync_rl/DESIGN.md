@@ -74,6 +74,14 @@ Scheduling:
   run the same number of micro-batches per dispatch. The planner then pads short ranks
   with one-row padding chunks (fully masked: no gradient, no normalization count), and the
   worker ignores `skip_zero_advantage_rows` (zero-advantage rows run a forward).
+  Open-group buckets are not exact under EP: a bucket is scaled by its group's advantage
+  afterwards, assuming the rank's gradient came only from its own rows, but expert weights
+  also get gradient from tokens other EP ranks route to them. `validate_config` therefore
+  requires `granularity=group` (or `max_open_groups=0`) with EP; final chunks carry their
+  advantages in the loss and are exact. GPU check (random 4-layer, 8-expert Qwen3-MoE,
+  EP=2 x DP=2 per policy, fp32, uneven per-rank chunk counts): streamed and synchronous
+  updates match (Delta_k <= 6.6e-5 over 3 steps, same as a row-permuted synchronous control);
+  with open-group buckets the expert weights diverged (Delta_k 0.24).
 
 ## 3. Layer 2: cross-iteration speculation
 
@@ -310,7 +318,7 @@ speculation when the rollout phase ends in a latency-bound tail on mostly idle G
 | Tensor parallelism | Vocab-parallel logits gathered per batch; validated at TP=2 (99.9% kept) |
 | Pipeline parallelism | Forward-only pipeline schedule, last stage verifies; scorer log-probs at PP=2 bitwise equal PP=1. Inference must be pinned to PP=1 (`mcore_generation_config.pipeline_model_parallel_size=1`) |
 | Context parallelism | Not implemented; the scorer raises. Needs packed (THD) scoring |
-| MoE / expert parallelism | Provider copy carries the EP layout; fused kernels skip MoE modules; untested end to end |
+| MoE / expert parallelism | Streaming exact on GPU with EP=2 (group granularity; tiny random MoE); scorer copy carries the EP layout, fused kernels skip MoE modules; no real-model run yet |
 | Large models on few learner GPUs | At 4B with one learner GPU: verify on the inference pool, or `verify_batch_tokens=4096` and the bf16 scorer to fit |
 
 ## 12. Configuration
