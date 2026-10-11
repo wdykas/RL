@@ -446,7 +446,7 @@ Bitwise train/generation parity removes work that exists only to bridge numerics
 of these are off by default.
 
 **Fused verification + training** (`thundersync.fused_verify_train`, `fused_train.py`).
-*Experimental: implemented and unit-tested on CPU, not yet run on GPU.* With BI, the
+*Experimental, opt-in; exact on GPU, not faster yet (A/B below).* With BI, the
 learner's bf16 training forward is the engine's numerics, so p for verification can come
 from the training model itself at θ_{k+1}, and that p forward is exactly the forward that
 training of iteration k+1 needs for the same trajectory. Fused mode keeps it:
@@ -487,6 +487,18 @@ enforced by `validate_fused_verify_train` and on the worker: `speculate`,
 linear log-probs, no MTP or draft-model training. `THUNDERSYNC_FUSED_CHECK=1` also runs the
 real forward for each fused row and prints the largest logit difference over the verified
 positions (expected 0).
+
+GPU A/B (Qwen3-1.7B, BI, 2 + 2 GPUs, 2k-token cap, learner bf16 block verification, same
+seed, 6 steps, `thundersync_work/fused_ab.sh`): every fused forward matched a fresh forward
+bitwise (`THUNDERSYNC_FUSED_CHECK`: max |logit diff| 0), and the train/generation mismatch
+check read 0 on every token in every step, whereas unfused bf16 verification left 1-4% of
+accepted tokens inexact (its scorer copy is not the training forward). 5-13 trajectories per
+step were fused (10-27k forward tokens saved, no fallbacks), but steady-state steps took
+13.4-14.4 s against 10.5-11.0 s unfused: rollouts wait about 3 s longer for verification
+forwards that run with autograd, which costs more than the training forwards they save at
+this size. Acceptance was the same either way (41-52% of draft tokens) and well below the
+fp32 scorer's 92-99%, so fused mode is a net loss here. It is worth retesting where
+training forwards are expensive relative to verification (large models, learner-bound runs).
 
 **Keyed verification under BI** (`verify_mode=keyed`). With bitwise parity the learner's
 logits for a draft are the ones the engine sampled from, so keyed verification needs no
