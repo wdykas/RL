@@ -76,6 +76,8 @@ def _simulate_fused(seed, dp_size, max_open_groups, chunk=3):
         dp_size=dp_size,
         max_chunk_trajectories=chunk,
         max_open_groups=max_open_groups,
+        micro_batch_size=1,
+        equal_rank_microbatches=False,
     )
     for g in range(groups):
         planner.register_group(g, G)
@@ -159,7 +161,12 @@ def test_fused_trajectories_trained_once_with_exact_update(
 
 def test_fused_chunk_pinned_to_missing_rank_raises():
     planner = StreamPlanner(
-        _loo_adv, dp_size=2, max_chunk_trajectories=4, max_open_groups=0
+        _loo_adv,
+        dp_size=2,
+        max_chunk_trajectories=4,
+        max_open_groups=0,
+        micro_batch_size=1,
+        equal_rank_microbatches=False,
     )
     planner.register_group(0, 2)
     for i in range(2):

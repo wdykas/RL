@@ -24,6 +24,7 @@ group closes. At the barrier, the folded batch gradient is written back into
 the grad buffers and the regular ``finish_train_step`` runs unchanged.
 """
 
+import functools
 import os
 import time
 from contextlib import nullcontext
@@ -51,6 +52,25 @@ from thundersync_rl.fused_train import (
 )
 
 WORKER_FQN = "thundersync_rl.worker.ThunderSyncMegatronPolicyWorker"
+
+
+def _model_in_eval(method):
+    """Run ``method`` with ``self.model`` in eval mode, then restore its mode.
+
+    Learner-side verification runs while a streamed train step is open; leaving
+    the model in eval mode would silently disable dropout for the rest of the step.
+    """
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            self.model.train(was_training)
+
+    return wrapper
 
 
 @ray.remote(
@@ -390,6 +410,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         return eod
 
     @torch.no_grad()
+    @_model_in_eval
     def verify_drafts(
         self,
         rows: list[torch.Tensor],
@@ -411,7 +432,6 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         """
         from thundersync_rl.keyed_sampling import keyed_sample_logits
 
-        self.model.eval()
         world = torch.distributed.get_world_size()
         mine = sorted(
             (i for i in range(len(rows)) if i % world == self.rank),
@@ -535,6 +555,14 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 provider.bias_activation_fusion = False
             provider.finalize()
             self._mfp32 = provider.provide().cuda().eval()
+            # RotaryEmbedding.forward is a process-wide lru_cache(32). In an
+            # inference process the engine's CUDA graphs read tables from that
+            # cache, so the scorer's own RoPE calls must not evict them.
+            rope = getattr(self._mfp32, "rotary_pos_emb", None)
+            if rope is not None and hasattr(rope.forward, "cache_parameters"):
+                import types
+
+                rope.forward = types.MethodType(type(rope).forward.__wrapped__, rope)
             if provider.params_dtype == torch.float32:
                 # Megatron/TE fall back to unfused fp32 attention and GLU paths.
                 from thundersync_rl.scorer_kernels import (
@@ -572,48 +600,6 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         torch.cuda.synchronize()
         self._prof["export"] = self._prof.get("export", 0.0) + time.perf_counter() - t0
         return self._mfp32
-
-    def tmp_debug_patch_engine_logprobs(self) -> bool:
-        """TEMPORARY debug: host-side shape checks before engine log-prob indexing."""
-        from megatron.core.inference.contexts.dynamic_context import (
-            DynamicInferenceContext,
-        )
-
-        orig = DynamicInferenceContext.calculate_log_probs_tensors
-        if getattr(orig, "_ts_dbg", False):
-            return True
-
-        def wrapped(
-            ctx,
-            logits,
-            new_tokens,
-            only_last_token_logits=False,
-            sampling=None,
-            row_to_request=None,
-        ):
-            rows = logits.squeeze(0).shape[0]
-            vocab = logits.shape[-1]
-            n_new = len(new_tokens)
-            mx = int(new_tokens.max()) if n_new else -1
-            decode = only_last_token_logits or ctx.is_decode_only()
-            if (decode and n_new > rows) or mx >= vocab:
-                raise RuntimeError(
-                    f"[engine logprob dbg] rows={rows} vocab={vocab} n_new={n_new} max_tok={mx} "
-                    f"decode={decode} only_last={only_last_token_logits} total={ctx.total_request_count} "
-                    f"paused={ctx.paused_request_count} row_to_request={None if row_to_request is None else tuple(row_to_request.shape)}"
-                )
-            return orig(
-                ctx,
-                logits,
-                new_tokens,
-                only_last_token_logits,
-                sampling,
-                row_to_request,
-            )
-
-        wrapped._ts_dbg = True
-        DynamicInferenceContext.calculate_log_probs_tensors = wrapped
-        return True
 
     def termination_id(self) -> int | None:
         tok = getattr(self, "megatron_tokenizer", None)
@@ -735,6 +721,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         self._prof["load"] = self._prof.get("load", 0.0) + time.perf_counter() - t0
 
     @torch.no_grad()
+    @_model_in_eval
     def verify_drafts_block_stashed(
         self,
         rows: list[torch.Tensor],
@@ -755,7 +742,6 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
 
         self._prof = {}
         t_all = time.perf_counter()
-        self.model.eval()
         self._scorer_precision = precision
         scorer = self._fp32_scorer()
         from megatron.core import parallel_state as ps

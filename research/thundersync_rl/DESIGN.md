@@ -69,6 +69,11 @@ Scheduling:
 - **Zero-advantage chunks.** With `loss_fn.skip_zero_advantage_rows`, zero-advantage rows
   are chunked separately; the worker counts their tokens for normalization and drops the
   whole chunk without a forward pass. Learner time 2.04 → 1.55 s per step.
+- **Expert parallelism.** With `expert_model_parallel_size > 1` every forward/backward
+  runs an all-to-all over the EP group, which spans data-parallel ranks, so all ranks must
+  run the same number of micro-batches per dispatch. The planner then pads short ranks
+  with one-row padding chunks (fully masked: no gradient, no normalization count), and the
+  worker ignores `skip_zero_advantage_rows` (zero-advantage rows run a forward).
 
 ## 3. Layer 2: cross-iteration speculation
 
@@ -406,16 +411,30 @@ batch-invariant Mamba decode (buffered chunk replay) already makes them exact.
   policy, so exact verification against it rejects long drafts: 33-44% of draft tokens kept on
   Qwen3-1.7B's ~3k-token outputs versus 94-98% with the fp32 scorer. The fp32 scorer is the
   default; rollouts then follow the fp32 approximation of the policy, as without BI.
-- *Where the scorer runs.* With the fp32 scorer on the learner, BI speculation is stable
-  (Qwen3-1.7B: 94-98% of draft tokens kept, 7 steps), but it does not scale: BI requires TP=1,
-  so each learner GPU holds the full fp32 copy (4 B/param) plus a bf16 stash per pending
-  version on top of training state; Qwen3-8B ran out of memory on 2 and 3 learner GPUs.
-  The scorer belongs on the inference GPUs, but there it currently breaks the BI engine:
-  acceptance decays step by step (97% -> ~40% over 6 steps) and the engine eventually
-  produces NaN logits (sampled token id 155647, out of the 151936 vocab). Not the cause:
-  concurrent execution (pausing the engine during verification did not help), CUDA graphs on
-  the scorer, inference-optimized layers on the scorer. Under investigation.
-- Until fixed, `validate_config` rejects speculation with BI unless `verify_on=learner`.
+- *Where the scorer runs.* On the learner it is stable but does not scale under BI: BI
+  requires TP=1, so each learner GPU holds the full fp32 copy (4 B/param) plus a bf16 stash
+  per pending version on top of training state (Qwen3-8B ran out of memory on 2 and 3 learner
+  GPUs). On the inference GPUs (`verify_on=inference`, the recommended BI setting) it first
+  broke the engine: acceptance decayed step by step (97% -> ~40%) and the engine eventually
+  sampled from NaN logits (token id 155647 outside the 151936 vocab).
+- *Root cause and fix.* Under BI, NeMo-RL turns flashinfer RoPE off, so the engine reads its
+  RoPE table from `RotaryEmbedding.forward`, an `lru_cache(maxsize=32)` shared by every
+  instance in the process, and the engine's inference CUDA graphs capture that table's
+  address. The scorer's own RoPE calls evicted the engine's entry, and the generation
+  worker's `cache_clear()` (prepare/finish generation) freed it; the scorer's activations
+  and weight stashes then reused the memory the graphs kept reading. Fixes:
+  `megatron_worker._pin_rotary_tables` memoizes the engine's RoPE tables per module with no
+  eviction (BI path; unit-tested in `tests/unit/models/generation/test_megatron_rope_pin.py`),
+  and the scorer's RoPE forward bypasses the shared cache. The scorer copy also builds
+  standard Transformer Engine layers without CUDA graphs, so both verifier pools compute
+  identical p and the scorer never joins the engine's graph state. Result (Qwen3-1.7B, BI,
+  verification on inference GPUs, 10 steps): 92-99% of draft tokens kept with no decay; the
+  train/generation log-prob gap stays at the fp32-scorer level (mean 0.011) on accepted
+  tokens and is zero on engine-decoded ones.
+- The same eviction hazard applies to any process that captures inference CUDA graphs with
+  the non-flashinfer RoPE path and creates other RoPE models or calls `cache_clear()`
+  (upstream: MCore could keep the dynamic-inference table in `rotary_pos_emb_cache`, as its
+  flashinfer path does).
 
 ### BI-enabled optimizations (opt-in)
 
@@ -486,8 +505,8 @@ holds for fully accepted speculative tokens too.
   3 + 1 split makes the learner the bottleneck; faster engine decoding is the lever.
 - **Training CPU overhead.** About 130 ms CPU vs 70 ms GPU per micro-batch; training CUDA
   graphs would need static or bucketed shapes.
-- **Batch invariance with inference-side verification.** Find why the scorer in the BI
-  inference process degrades the engine (section 14); then verify on inference GPUs under BI.
+- **Batch invariance at scale.** Run the BI speculation presets (inference-side verification)
+  on 8B+ models on the cluster; validate the opt-in BI optimizations on GPU.
 - **Scaling gaps.** Context parallelism in the scorer, MoE validation, zero-advantage
   skip with sequence packing.
 - **Upstream.** Default `make_sequence_length_divisible_by` to 64–128 for Megatron

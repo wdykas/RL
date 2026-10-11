@@ -130,6 +130,35 @@ def _inference_optimized_transformer_layer_spec(config: Any) -> Any:
     )
 
 
+def _pin_rotary_tables(lang_module: Any) -> None:
+    """Memoize ``lang_module.rotary_pos_emb.forward`` per module, without eviction.
+
+    ``RotaryEmbedding.forward`` is an ``lru_cache(maxsize=32)`` shared by every
+    instance in the process. Inference CUDA graphs bake in the address of the
+    cached RoPE table, so an eviction (any other model's RoPE calls) or a
+    ``cache_clear()`` frees memory the graphs keep reading, and later
+    allocations overwrite it (wrong logits, eventually NaN). The per-instance
+    memo keeps every table alive as long as the module; it has no
+    ``cache_parameters``, so the ``cache_clear()`` sites below skip it.
+    """
+    import types
+
+    rope = getattr(lang_module, "rotary_pos_emb", None)
+    forward = getattr(rope, "forward", None)
+    if rope is None or not hasattr(forward, "cache_parameters"):
+        return
+    compute = type(rope).forward.__wrapped__
+    tables: dict[tuple, Any] = {}
+
+    def pinned_forward(self, max_seq_len, offset=0, packed_seq=False, cp_group=None):
+        key = (max_seq_len, offset, packed_seq, cp_group)
+        if key not in tables:
+            tables[key] = compute(self, max_seq_len, offset, packed_seq, cp_group)
+        return tables[key]
+
+    rope.forward = types.MethodType(pinned_forward, rope)
+
+
 def _configure_inference_optimized_layer_spec(model_provider: Any) -> None:
     """Select MCore inference linears for a Bridge generic-GPT provider.
 
@@ -565,6 +594,10 @@ class MegatronGenerationMixin:
         if getattr(model_config, "batch_invariant_mode", False):
             use_flashinfer_fused_rope = False
             allow_installed_flash_attn_4()
+            # Without flashinfer RoPE the engine reads its RoPE table from
+            # RotaryEmbedding.forward's process-wide lru_cache; CUDA graphs
+            # capture that tensor's address, so it must never be evicted/freed.
+            _pin_rotary_tables(unwrap_model(self._gen_model()))
 
         image_preprocessing_config = self._build_image_preprocessing_config(
             mcore_generation_config

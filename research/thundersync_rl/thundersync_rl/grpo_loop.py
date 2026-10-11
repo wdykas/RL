@@ -214,21 +214,7 @@ def validate_config(master_config: ThunderSyncMasterConfig) -> None:
     assert ddp["grad_reduce_in_fp32"], (
         "per-trajectory gradients are moved out of the grad buffer; keep it fp32"
     )
-    ts_cfg = master_config.thundersync
-    if (
-        ts_cfg.speculate
-        and master_config.policy["megatron_cfg"].get("batch_invariant_mode")
-        and ts_cfg.verify_on != "learner"
-        and not os.environ.get("TMP_DEBUG_ALLOW_BI_INFER_VERIFY")
-    ):
-        # The fp32 verification scorer inside a batch-invariant inference process
-        # (CUDA-graph engine running concurrently) hits an out-of-bounds index in
-        # the engine after a few steps; on the learner it is stable.
-        raise ValueError(
-            "thundersync.speculate with batch_invariant_mode requires "
-            f"thundersync.verify_on='learner' (got {ts_cfg.verify_on!r})."
-        )
-    validate_fused_verify_train(ts_cfg, master_config.policy)
+    validate_fused_verify_train(master_config.thundersync, master_config.policy)
 
 
 def validate_fused_verify_train(
@@ -309,7 +295,12 @@ def build_chunk_data(
     master_config: ThunderSyncMasterConfig,
     pad_to_multiple: int,
 ) -> BatchedDataDict:
-    """Flatten a chunk's message logs into a ClippedPG training batch."""
+    """Flatten a chunk's message logs into a ClippedPG training batch.
+
+    A padding chunk keeps its template's tokens but is fully masked out
+    (``sample_mask = token_mask = advantages = 0``): it runs a forward/backward
+    that adds neither gradient nor normalization count.
+    """
     message_logs = [t.payload["message_log"] for t in chunk.trajectories]
     add_grpo_token_loss_masks_and_generation_logprobs(message_logs)
     flat, input_lengths = batched_message_log_to_flat_message(
@@ -338,6 +329,9 @@ def build_chunk_data(
             "advantages": adv.unsqueeze(-1).expand(n, s).clone(),
         }
     )
+    if chunk.padding:
+        for k in ("sample_mask", "token_mask", "advantages"):
+            data[k] = torch.zeros_like(data[k])
     return pad_batch_to_multiple(data, pad_to_multiple)
 
 
@@ -354,7 +348,10 @@ def train_gen_mismatch(trajectories, learner, tokenizer, master_config) -> dict:
     """
     data = build_chunk_data(
         SimpleNamespace(
-            trajectories=trajectories, group=None, advantages=[0.0] * len(trajectories)
+            trajectories=trajectories,
+            group=None,
+            advantages=[0.0] * len(trajectories),
+            padding=False,
         ),
         tokenizer,
         master_config,
@@ -412,11 +409,17 @@ async def _run_one_step(
     max_open_groups = (
         ts_cfg.max_open_groups if ts_cfg.granularity == "trajectory" else 0
     )
+    # Expert parallelism runs a token all-to-all across DP ranks in every
+    # forward/backward, so all ranks must run the same number per dispatch.
     planner = StreamPlanner(
         adv_fn,
         dp_size=learner.dp_size,
         max_chunk_trajectories=ts_cfg.max_chunk_trajectories,
         max_open_groups=max_open_groups,
+        micro_batch_size=mbs,
+        equal_rank_microbatches=(
+            master_config.policy["megatron_cfg"]["expert_model_parallel_size"] > 1
+        ),
     )
     for p in range(n // G):
         planner.register_group((step, p), G)
@@ -495,12 +498,12 @@ async def _run_one_step(
                     for k in ("fused_trained", "fused_tokens", "fused_fallback"):
                         fused_counts[k] += r[k]
                 learner_busy += t1 - t0
-                chunks = [c for cs in d.per_rank for c in cs]
+                chunks = [c for cs in d.per_rank for c in cs if not c.padding]
                 dispatches.append(
                     (
                         t0 - t_start,
                         t1 - t_start,
-                        sum(len(c.trajectories) for c in chunks),
+                        d.num_trajectories,
                         sum(c.num_tokens for c in chunks),
                         sum(1 for c in chunks if c.group is not None),
                     )
