@@ -376,3 +376,29 @@ def test_expert_parallel_rejects_open_group_buckets(ep, granularity, open_groups
     else:
         with pytest.raises(ValueError, match="expert parallelism"):
             validate_expert_parallel(ts, policy)
+
+
+@pytest.mark.parametrize(
+    "verify_on,gen_ep,ok",
+    [
+        ("learner", 2, True),
+        ("both", 2, False),
+        ("inference", 2, False),
+        ("both", 1, True),
+    ],
+)
+def test_expert_parallel_speculation_verifies_on_learner(verify_on, gen_ep, ok):
+    from thundersync_rl.grpo_loop import ThunderSyncConfig, validate_expert_parallel
+
+    ts = ThunderSyncConfig(granularity="group", speculate=True, verify_on=verify_on)
+    policy = {
+        "megatron_cfg": {"expert_model_parallel_size": 2},
+        "generation": {
+            "mcore_generation_config": {"expert_model_parallel_size": gen_ep}
+        },
+    }
+    if ok:
+        validate_expert_parallel(ts, policy)
+    else:
+        with pytest.raises(ValueError, match="verify_on='learner'"):
+            validate_expert_parallel(ts, policy)

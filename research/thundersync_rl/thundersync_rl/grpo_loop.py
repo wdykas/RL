@@ -205,7 +205,7 @@ def validate_config(master_config: ThunderSyncMasterConfig) -> None:
 def validate_expert_parallel(
     ts_cfg: ThunderSyncConfig, policy_cfg: PolicyConfig
 ) -> None:
-    """Reject open-group gradient buckets under expert parallelism.
+    """Reject settings that are inexact or deadlock under expert parallelism.
 
     An open-group bucket is scaled by its group's advantage after the fact,
     which assumes a rank's gradient comes only from its own rows. Expert weights
@@ -222,6 +222,20 @@ def validate_expert_parallel(
             "expert_model_parallel_size > 1 requires thundersync.granularity="
             "'group' (or max_open_groups=0): open-group gradient buckets are not "
             "exact under expert parallelism"
+        )
+    from nemo_rl.models.generation.megatron.config import merged_inference_megatron_cfg
+
+    if (
+        ts_cfg.speculate
+        and ts_cfg.verify_on != "learner"
+        and merged_inference_megatron_cfg(policy_cfg)["expert_model_parallel_size"] > 1
+    ):
+        # The inference engine steps its EP ranks together; a generation worker
+        # blocked in a verification forward leaves its peers' engine all-to-all
+        # unmatched while its own scorer all-to-all waits (deadlock).
+        raise ValueError(
+            "speculation with inference expert parallelism requires "
+            f"thundersync.verify_on='learner' (got {ts_cfg.verify_on!r})"
         )
 
 

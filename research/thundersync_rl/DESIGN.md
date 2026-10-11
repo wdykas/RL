@@ -82,6 +82,15 @@ Scheduling:
   EP=2 x DP=2 per policy, fp32, uneven per-rank chunk counts): streamed and synchronous
   updates match (Delta_k <= 6.6e-5 over 3 steps, same as a row-permuted synchronous control);
   with open-group buckets the expert weights diverged (Delta_k 0.24).
+  Verification under EP: every scorer forward is an all-to-all over the EP group and each
+  rank holds only its own experts, so the learner's verifiers run in lockstep
+  (`_expert_parallel_lockstep`): the ranks exchange their per-batch stash versions once,
+  each batch slot scores the union of versions in the same order, and a rank without rows
+  for a slot or version runs a one-row dummy forward; keyed verification pads its batch
+  count the same way. Inference-side verification is rejected under inference EP: the engine
+  steps its EP ranks together, so a worker blocked in a scorer forward deadlocks against its
+  peers' engine all-to-all (observed). End to end on the tiny MoE (EP=2 learner and
+  inference, `verify_on=learner`): block and keyed speculation run without hangs.
 
 ## 3. Layer 2: cross-iteration speculation
 
@@ -318,7 +327,7 @@ speculation when the rollout phase ends in a latency-bound tail on mostly idle G
 | Tensor parallelism | Vocab-parallel logits gathered per batch; validated at TP=2 (99.9% kept) |
 | Pipeline parallelism | Forward-only pipeline schedule, last stage verifies; scorer log-probs at PP=2 bitwise equal PP=1. Inference must be pinned to PP=1 (`mcore_generation_config.pipeline_model_parallel_size=1`) |
 | Context parallelism | Not implemented; the scorer raises. Needs packed (THD) scoring |
-| MoE / expert parallelism | Streaming exact on GPU with EP=2 (group granularity; tiny random MoE); scorer copy carries the EP layout, fused kernels skip MoE modules; no real-model run yet |
+| MoE / expert parallelism | Streaming exact on GPU with EP=2 (group granularity; tiny random MoE); verification on the learner in EP lockstep (inference-side verification rejected under EP); no real-model run yet |
 | Large models on few learner GPUs | At 4B with one learner GPU: verify on the inference pool, or `verify_batch_tokens=4096` and the bf16 scorer to fit |
 
 ## 12. Configuration
@@ -391,7 +400,9 @@ functional checks for scorer and refit parallelism.
   graphs would need static or bucketed shapes.
 - **Batch invariance (PR 3208).** Would make q bitwise the engine's sampling
   distribution. Needs Transformer Engine 2.18 or later and flash-attn 4.
-- **Scaling gaps.** Context parallelism in the scorer, MoE validation, zero-advantage
+- **MoE.** A real-model run; inference-side verification under EP (needs the engine paused
+  or stepped in lockstep with the scorer); open-group buckets under EP.
+- **Scaling gaps.** Context parallelism in the scorer, zero-advantage
   skip with sequence packing.
 - **Upstream.** Default `make_sequence_length_divisible_by` to 64–128 for Megatron
   training.
