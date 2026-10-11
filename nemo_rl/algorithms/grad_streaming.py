@@ -47,6 +47,12 @@ the list of flat gradient tensors that one backward pass writes into (for
 Megatron, the DDP ``grad_data`` buffers), and calls ``capture`` after each
 backward. ``capture`` moves the fresh gradient into storage and zeroes the
 gradient tensors, so they act as scratch space between captures.
+
+With ``buckets=False`` (group granularity, ``max_open_groups=0``) there is
+nothing to keep apart: every chunk carries final advantages, so its gradient
+stays in the gradient tensors and accumulates there exactly as in
+non-streamed training. The accumulator then allocates nothing and ``capture``
+and ``finalize`` are no-ops.
 """
 
 from __future__ import annotations
@@ -79,6 +85,38 @@ class GradStreamingSpec:
     # 0 when the caller never streams open groups); used to check accumulator
     # memory up front.
     max_open_groups: int
+
+
+@dataclass(frozen=True)
+class GradStreamMemory:
+    """Accumulator memory for one rank (see :func:`grad_stream_memory`)."""
+
+    buckets: bool  # False: in-place mode, nothing allocated
+    copy_bytes: int  # one fp32 copy of the rank's gradient buffers
+    device_bytes: int  # on the gradients' device
+    host_bytes: int  # pinned host memory (storage_device="cpu")
+
+
+def grad_stream_memory(spec: GradStreamingSpec, grad_numel: int) -> GradStreamMemory:
+    """Memory a :class:`StreamingGroupAccumulator` built for ``spec`` needs.
+
+    With buckets (``max_open_groups > 0``): the device-side batch accumulator
+    (one fp32 gradient copy) plus up to ``max_buckets_per_group *
+    max_open_groups`` bucket copies on ``storage_device``. Without buckets
+    final chunks accumulate in place in the grad buffers: zero bytes.
+    """
+    copy_bytes = grad_numel * 4
+    buckets = spec.max_open_groups > 0
+    if not buckets:
+        return GradStreamMemory(False, copy_bytes, 0, 0)
+    bucket_bytes = copy_bytes * spec.max_buckets_per_group * spec.max_open_groups
+    on_cuda = spec.storage_device == "cuda"
+    return GradStreamMemory(
+        True,
+        copy_bytes,
+        copy_bytes + (bucket_bytes if on_cuda else 0),
+        0 if on_cuda else bucket_bytes,
+    )
 
 
 @dataclass
@@ -114,6 +152,10 @@ class StreamingGroupAccumulator:
         max_buckets_per_group: distinct reward values kept per group before
             collapsing to the affine (G1, G2) representation.
         affine_rtol: relative tolerance for the affine-advantage check.
+        buckets: whether open-group bucket chunks may be captured. ``False``
+            (``max_open_groups=0``) selects the in-place mode: final chunks
+            accumulate directly in ``grad_tensors``, no batch accumulator is
+            allocated, and a bucket capture raises.
     """
 
     def __init__(
@@ -124,6 +166,7 @@ class StreamingGroupAccumulator:
         max_buckets_per_group: int,
         storage_dtype: torch.dtype = torch.float32,
         affine_rtol: float = 1e-4,
+        buckets: bool = True,
     ):
         assert max_buckets_per_group >= 2, "need >= 2 buckets to collapse to affine"
         self.grad_tensors = grad_tensors
@@ -136,13 +179,19 @@ class StreamingGroupAccumulator:
         cpus = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else 1
         gpus = max(1, torch.cuda.device_count()) if torch.cuda.is_available() else 1
         self._num_cpu_threads = max(1, min(32, cpus // gpus))
-        # The batch accumulator always lives next to the gradients: final-chunk
+        self.buckets_enabled = buckets
+        # The batch accumulator lives next to the gradients: final-chunk
         # captures (the bulk of the work) are then a device-side add, and only
-        # the per-group buckets use ``storage_device``.
-        self.batch_acc = [
-            torch.zeros(g.numel(), dtype=storage_dtype, device=g.device)
-            for g in grad_tensors
-        ]
+        # the per-group buckets use ``storage_device``. Without buckets the
+        # gradient tensors themselves are the batch accumulator.
+        self.batch_acc = (
+            [
+                torch.zeros(g.numel(), dtype=storage_dtype, device=g.device)
+                for g in grad_tensors
+            ]
+            if buckets
+            else []
+        )
         self.peak_open_buffers = 0
 
     # ── storage helpers ──
@@ -256,7 +305,14 @@ class StreamingGroupAccumulator:
         is added straight into the batch accumulator. Otherwise the backward
         must have used advantage 1 for every trajectory, and all of them must
         belong to ``group`` and share ``reward``.
+
+        Without buckets a final chunk's gradient is left where backward put
+        it, and a bucket capture raises (callers should reject it before the
+        backward; see :meth:`check_capture`).
         """
+        self.check_capture(group)
+        if not self.buckets_enabled:
+            return
         if group is None:
             self._add_grad_into(self.batch_acc)
             self._zero_grads()
@@ -280,6 +336,14 @@ class StreamingGroupAccumulator:
             self._add_grad_into(g2)
         self._zero_grads()
         self.peak_open_buffers = max(self.peak_open_buffers, self.num_open_buffers())
+
+    def check_capture(self, group: Optional[GroupId]) -> None:
+        """Raise if a chunk for ``group`` cannot be captured in this mode."""
+        if group is not None and not self.buckets_enabled:
+            raise ValueError(
+                f"bucket chunk for open group {group!r} in a step opened with "
+                "max_open_groups=0 (no gradient buckets)"
+            )
 
     def _collapse_to_affine(self, st: _GroupState) -> None:
         g1 = self._new_buffers()
@@ -343,6 +407,8 @@ class StreamingGroupAccumulator:
     def finalize(self) -> None:
         """Write the batch accumulator back into the gradient tensors."""
         assert not self.groups, f"groups still open at barrier: {list(self.groups)}"
+        if not self.buckets_enabled:
+            return  # already accumulated in place
         for g, a in zip(self.grad_tensors, self.batch_acc):
             g.view(-1).copy_(a)
         self.batch_acc = []

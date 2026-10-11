@@ -61,12 +61,16 @@ def block_verify_logits(
     q_logits: torch.Tensor,
     draft: torch.Tensor,
     generator: torch.Generator | None = None,
-) -> tuple[int, int, torch.Tensor]:
+    *,
+    with_logq: bool = False,
+) -> tuple[int, int, torch.Tensor] | tuple[int, int, torch.Tensor, torch.Tensor]:
     """Sample (tau, y) from raw logits; also return log p of the kept tokens.
 
     ``p_logits``: [g+1, V] target logits, ``q_logits``: [g, V] draft logits (any
     float dtype; last dim contiguous), ``draft``: [g] token ids.
-    Returns (tau, y, logp) with logp = log p(kept[i]) for kept = draft[:tau] + [y].
+    Returns (tau, y, logp) with logp = log p(kept[i]) for kept = draft[:tau] + [y];
+    with ``with_logq`` also logq = log q(draft[i]) for i < tau ([tau], fp32, the
+    values the acceptance ratios used).
     """
     g = draft.numel()
     dev = p_logits.device
@@ -106,4 +110,6 @@ def block_verify_logits(
     y = int(torch.multinomial((dist / dist.sum()).float(), 1, generator=generator))
     kept = torch.cat([draft[:tau], torch.tensor([y], device=dev)])
     logp = p_logits[torch.arange(tau + 1, device=dev), kept].float() - lse_p[: tau + 1]
+    if with_logq:
+        return tau, y, logp, lqx[:tau]
     return tau, y, logp

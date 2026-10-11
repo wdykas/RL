@@ -64,7 +64,7 @@ from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.logger import Logger
 from thundersync_rl.fused_train import FusedRef
-from thundersync_rl.speculative import SpeculativeGeneration
+from thundersync_rl.speculative import SpeculativeGeneration, cohort_draft
 from thundersync_rl.streaming import (
     Chunk,
     StreamingLearner,
@@ -108,7 +108,9 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # Max new tokens per draft (the rollout length cap is the natural value).
     draft_budget: int = 4096
     # Start drafting once this fraction of the iteration's rollouts finished
-    # (0: from the start of the iteration).
+    # (0: at the first finished rollout). Starting before any rollout finishes
+    # is slower: drafts then compete with the iteration's own rollouts (1.5B,
+    # 100 steps: 3.17 vs 3.01 s mean, 3.10 vs 2.55 s median).
     draft_start_frac: float = 0.0
     # Keyed mode only: top-k of the head scored per position.
     spec_head_k: int = 64
@@ -535,15 +537,21 @@ async def _run_one_step(
         ts_cfg.max_open_groups if ts_cfg.granularity == "trajectory" else 0
     )
     # Expert parallelism runs a token all-to-all across DP ranks in every
-    # forward/backward, so all ranks must run the same number per dispatch.
+    # forward/backward, so all ranks must run the same number per dispatch;
+    # the worker then also trains zero-advantage rows (no skipping).
+    expert_parallel = (
+        master_config.policy["megatron_cfg"]["expert_model_parallel_size"] > 1
+    )
     planner = StreamPlanner(
         adv_fn,
         dp_size=learner.dp_size,
         max_chunk_trajectories=ts_cfg.max_chunk_trajectories,
         max_open_groups=max_open_groups,
         micro_batch_size=mbs,
-        equal_rank_microbatches=(
-            master_config.policy["megatron_cfg"]["expert_model_parallel_size"] > 1
+        equal_rank_microbatches=expert_parallel,
+        skip_zero_advantage_chunks=(
+            bool(getattr(loss_fn, "skip_zero_advantage_rows", False))
+            and not expert_parallel
         ),
     )
     for p in range(n // G):
@@ -854,19 +862,7 @@ def thundersync_grpo_train(
         if cohort_mode and chunked:
             cohort = spec.cohorts.pop(step, None)
             if cohort is not None:
-                cdrafts = [
-                    [
-                        (
-                            d["prompt"],
-                            -1,
-                            d["tokens"],
-                            d["finished"],
-                            d["key"],
-                            d["segments"],
-                        )
-                    ]
-                    for d in cohort
-                ]
+                cdrafts = [[cohort_draft(d)] for d in cohort]
                 pre_rollout = lambda c=cdrafts: spec.verify_chunked(
                     c, ts_cfg.verify_chunks
                 )  # noqa: E731

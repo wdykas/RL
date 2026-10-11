@@ -71,6 +71,11 @@ class Chunk:
     def num_tokens(self) -> int:
         return sum(t.num_tokens for t in self.trajectories)
 
+    @property
+    def zero_advantage(self) -> bool:
+        """A final chunk whose every row has advantage 0 (no gradient)."""
+        return self.advantages is not None and all(a == 0.0 for a in self.advantages)
+
     def num_microbatches(self, micro_batch_size: int) -> int:
         """Forward/backward calls the worker runs for this chunk.
 
@@ -125,6 +130,11 @@ class StreamPlanner:
             all-masked padding chunks to the short ranks. Required with expert
             parallelism, whose token all-to-all spans DP ranks and hangs if
             their forward counts differ.
+        skip_zero_advantage_chunks: the learner drops all-zero-advantage
+            chunks without a forward (``loss_fn.skip_zero_advantage_rows``
+            without expert parallelism). Ranks are then balanced by the tokens
+            of live chunks only, since a skipped chunk costs ~nothing; total
+            tokens break ties so skipped chunks still spread over ranks.
     """
 
     def __init__(
@@ -136,8 +146,10 @@ class StreamPlanner:
         max_open_groups: int,
         micro_batch_size: int,
         equal_rank_microbatches: bool,
+        skip_zero_advantage_chunks: bool = False,
     ):
         self.compute_group_advantages = compute_group_advantages
+        self.skip_zero_advantage_chunks = skip_zero_advantage_chunks
         self.max_open_groups = max_open_groups
         self.dp_size = dp_size
         self.max_chunk_trajectories = max_chunk_trajectories
@@ -275,24 +287,20 @@ class StreamPlanner:
                 )
 
         # Fused chunks run where their graph lives; the rest are balanced
-        # greedily, longest first, by tokens over the DP ranks.
-        per_rank: list[list[Chunk]] = [[] for _ in range(self.dp_size)]
-        load = [0] * self.dp_size
+        # greedily, longest first, by (live tokens, total tokens): a chunk the
+        # worker skips costs no forward when skipping is on.
         for c in chunks:
-            if c.fused is not None:
-                if not 0 <= c.fused.dp_rank < self.dp_size:
-                    raise ValueError(
-                        f"fused trajectory pinned to DP rank {c.fused.dp_rank} "
-                        f"of {self.dp_size}"
-                    )
-                per_rank[c.fused.dp_rank].append(c)
-                load[c.fused.dp_rank] += c.num_tokens
-        for c in sorted(
-            (c for c in chunks if c.fused is None), key=lambda c: -c.num_tokens
-        ):
-            r = load.index(min(load))
-            per_rank[r].append(c)
-            load[r] += c.num_tokens
+            if c.fused is not None and not 0 <= c.fused.dp_rank < self.dp_size:
+                raise ValueError(
+                    f"fused trajectory pinned to DP rank {c.fused.dp_rank} "
+                    f"of {self.dp_size}"
+                )
+        per_rank = balance_chunks(
+            chunks,
+            self.dp_size,
+            skip_zero_advantage=self.skip_zero_advantage_chunks,
+            pinned_rank=lambda c: None if c.fused is None else c.fused.dp_rank,
+        )
         if self.equal_rank_microbatches and chunks:
             self._pad_to_equal_microbatches(per_rank, chunks)
 
@@ -326,6 +334,47 @@ class StreamPlanner:
                 )
                 for _ in range(target - count)
             )
+
+
+def balance_chunks(
+    chunks: list[Chunk],
+    dp_size: int,
+    *,
+    skip_zero_advantage: bool,
+    pinned_rank: Optional[Callable[[Chunk], Optional[int]]] = None,
+) -> list[list[Chunk]]:
+    """Greedy longest-processing-time assignment of chunks to DP ranks.
+
+    A chunk's cost is ``(live tokens, tokens)``, compared lexicographically,
+    where live tokens are its tokens unless the worker skips it (an
+    all-zero-advantage chunk with ``skip_zero_advantage``). Without skipping
+    this is the plain token balance. ``pinned_rank`` places some chunks on a
+    fixed rank before the rest are balanced. Only which rank backpropagates a chunk
+    changes, so the step's gradient is the same up to fp32 summation order.
+    """
+
+    def cost(c: Chunk) -> tuple[int, int]:
+        skipped = skip_zero_advantage and c.zero_advantage
+        return (0 if skipped else c.num_tokens, c.num_tokens)
+
+    per_rank: list[list[Chunk]] = [[] for _ in range(dp_size)]
+    load = [(0, 0)] * dp_size
+    free = []
+    for c in chunks:
+        # Chunks pinned to a rank (fused: the rank holding their graph) first.
+        r = None if pinned_rank is None else pinned_rank(c)
+        if r is None:
+            free.append(c)
+            continue
+        per_rank[r].append(c)
+        live, total = cost(c)
+        load[r] = (load[r][0] + live, load[r][1] + total)
+    for c in sorted(free, key=cost, reverse=True):
+        r = load.index(min(load))
+        per_rank[r].append(c)
+        live, total = cost(c)
+        load[r] = (load[r][0] + live, load[r][1] + total)
+    return per_rank
 
 
 def pad_batch_to_multiple(data: BatchedDataDict, multiple: int) -> BatchedDataDict:

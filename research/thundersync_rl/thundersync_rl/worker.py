@@ -78,6 +78,68 @@ def _model_in_eval(method):
     return wrapper
 
 
+def _plain_floats(x: Any) -> list[float] | None:
+    """Engine log-probs (list, tensor or a serialized ("tensor", data) pair) as floats."""
+    if x is None:
+        return None
+    if isinstance(x, torch.Tensor):
+        return x.float().tolist()
+    if isinstance(x, (list, tuple)) and len(x) == 2 and x[0] == "tensor":
+        from megatron.core.inference.inference_request import deserialize_tensor
+
+        return deserialize_tensor(x[1]).float().tolist()
+    return [float(v) for v in x]
+
+
+def apply_draft_frame(
+    frame: dict[str, Any],
+    tokens: list[int],
+    logprobs: list[list[float] | None],
+    i: int,
+) -> bool:
+    """Apply one streaming frame of draft ``i``; return True on the final frame.
+
+    ``tokens`` is draft i's token list (updated in place). ``logprobs[i]`` holds
+    the engine's log-prob of each token, or None once a frame did not carry one
+    per new token (the driver then reports the scorer's log p, see
+    ``SpeculativeGeneration._plan``).
+    """
+    if "partial" in frame:
+        part = frame["partial"]
+        new = list(part["new_tokens"])
+        tokens.extend(new)
+        lps = _plain_floats(part.get("new_log_probs"))
+        if logprobs[i] is not None:
+            if lps is not None and len(lps) == len(new):
+                logprobs[i].extend(lps)
+            else:
+                logprobs[i] = None
+        return False
+    if "final" in frame:
+        final = frame["final"]
+        get = (
+            final.get if isinstance(final, dict) else lambda k: getattr(final, k, None)
+        )
+        tokens[:] = list(get("generated_tokens"))
+        lps = _plain_floats(get("generated_log_probs"))
+        logprobs[i] = lps if lps is not None and len(lps) == len(tokens) else None
+        return True
+    return False
+
+
+def snapshot_drafts(
+    tokens: list[list[int]],
+    logprobs: list[list[float] | None],
+    done: list[bool],
+) -> list[tuple[list[int], bool, list[float] | None]]:
+    """(tokens, finished, engine logprobs or None) per draft, copied."""
+    out = []
+    for t, lp, d in zip(tokens, logprobs, done):
+        ok = lp is not None and len(lp) == len(t)
+        out.append((list(t), d, list(lp) if ok else None))
+    return out
+
+
 @ray.remote(
     runtime_env=get_runtime_env_for_policy_worker("megatron_policy_worker")
 )  # pragma: no cover
@@ -627,9 +689,10 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
     ) -> bool:
         """Submit draft requests as streams and return immediately.
 
-        Tokens accumulate in ``self._draft_tokens`` as partial frames arrive;
-        ``collect_drafts`` aborts whatever is unfinished at the deadline. Any
-        prefix of a draft is a valid draft, so truncation is harmless.
+        Tokens and the engine's log-probs of them accumulate in
+        ``self._draft_tokens`` / ``self._draft_logprobs`` as partial frames
+        arrive; ``collect_drafts`` aborts whatever is unfinished at the deadline.
+        Any prefix of a draft is a valid draft, so truncation is harmless.
         """
         import asyncio
 
@@ -638,16 +701,21 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         # Fresh buffers per call, captured by the coroutines below: streams aborted
         # at an earlier deadline may still deliver late frames, which must not
         # land in this round's drafts.
-        tokens = [[] for _ in prompts]
+        tokens: list[list[int]] = [[] for _ in prompts]
+        logprobs: list[list[float] | None] = [[] for _ in prompts]
         done = [False] * len(prompts)
         streams = {}
-        self._draft_tokens, self._draft_done, self._draft_streams = (
-            tokens,
-            done,
-            streams,
-        )
+        (
+            self._draft_tokens,
+            self._draft_logprobs,
+            self._draft_done,
+            self._draft_streams,
+        ) = (tokens, logprobs, done, streams)
 
         async def run_one(i, prompt):
+            # return_log_probs=True: the engine reports log q'(x) of each sampled
+            # token (temperature 1, no top-k/top-p under speculation, so raw and
+            # processed log-probs coincide).
             sp = self._build_sampling_params(greedy=False, stop_words=None)
             sp.num_tokens_to_generate = (
                 max_new_tokens[i]
@@ -658,28 +726,22 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             stream = self.inference_client.add_request_streaming(prompt, sp)
             streams[i] = stream
             async for frame in stream:
-                if "partial" in frame:
-                    tokens[i].extend(frame["partial"]["new_tokens"])
-                elif "final" in frame:
-                    final = frame["final"]
-                    toks = (
-                        final["generated_tokens"]
-                        if isinstance(final, dict)
-                        else final.generated_tokens
-                    )
-                    tokens[i][:] = list(toks)
-                    done[i] = True
+                done[i] = apply_draft_frame(frame, tokens[i], logprobs, i) or done[i]
 
         for i, p in enumerate(prompts):
             asyncio.run_coroutine_threadsafe(run_one(i, list(p)), self._inference_loop)
         return True
 
-    def collect_drafts(self) -> list[tuple[list[int], bool]]:
-        """Abort unfinished drafts; return (tokens, finished) per draft."""
+    def collect_drafts(self) -> list[tuple[list[int], bool, list[float] | None]]:
+        """Abort unfinished drafts; return (tokens, finished, engine logprobs) per draft.
+
+        The log-probs are None when the engine did not report one per token.
+        """
         import asyncio
 
-        tokens, done, streams = (
+        tokens, logprobs, done, streams = (
             self._draft_tokens,
+            self._draft_logprobs,
             self._draft_done,
             self._draft_streams,
         )
@@ -689,7 +751,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             for i, stream in list(streams.items()):
                 if not done[i]:
                     self.inference_client.abort_request(stream.request_id)
-            return [(list(t), d) for t, d in zip(tokens, done)]
+            return snapshot_drafts(tokens, logprobs, done)
 
         return asyncio.run_coroutine_threadsafe(
             abort_and_snapshot(), self._inference_loop
@@ -749,6 +811,9 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
 
         ``segments[i]``: [(version, start, end)] - draft tokens [start, end) of row
         i were drafted by stashed weights ``version``. p is the current weights.
+        Returns [(row_index, {"accepted", "next", "logprobs", "draft_logq"})]:
+        "logprobs" = log p of the kept tokens (accepted prefix + next),
+        "draft_logq" = log q of the accepted prefix.
         """
         from thundersync_rl.block_verification_fused import block_verify_logits
 
@@ -816,7 +881,9 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 assert q_logits.shape[0] == g, (q_logits.shape, g)
                 draft = ids[r, plen:n]
                 # Raw logits in, no [g, V] log-softmax / fp64 temporaries.
-                tau, y, logp = block_verify_logits(p_logits, q_logits, draft, gen)
+                tau, y, logp, logq = block_verify_logits(
+                    p_logits, q_logits, draft, gen, with_logq=True
+                )
                 if self._batch_invariant:
                     # Report log-probs exactly as training computes them (fp32
                     # log-softmax + gather), so they match the trainer bitwise.
@@ -825,7 +892,18 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                         -1, kept.unsqueeze(-1)
                     )[:, 0]
                 results.append(
-                    (i, {"accepted": tau, "next": y, "logprobs": logp.tolist()})
+                    (
+                        i,
+                        {
+                            "accepted": tau,
+                            "next": y,
+                            "logprobs": logp.tolist(),
+                            # log q of the accepted draft tokens (same vocab
+                            # slice as verification), for the behavior
+                            # log-probs log p + log q' - log q (speculative._plan).
+                            "draft_logq": logq.tolist(),
+                        },
+                    )
                 )
             del logits
         self._log_mem("verify_drafts_block_stashed")

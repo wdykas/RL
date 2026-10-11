@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import math
 import os
 import time
 from collections import defaultdict
@@ -66,6 +67,64 @@ class CohortDrafts:
 
 def _key(ids: torch.Tensor) -> tuple[int, ...]:
     return tuple(int(t) for t in ids.tolist())
+
+
+def _drafted(res) -> tuple[list[int], bool, list[float] | None]:
+    """(tokens, finished, engine log-probs or None) of one ``collect_drafts`` entry."""
+    toks, done, *rest = res
+    lps = rest[0] if rest else None
+    return toks, done, (lps if lps is not None and len(lps) == len(toks) else None)
+
+
+def cohort_draft(d: dict[str, Any]) -> tuple:
+    """Draft tuple of a cohort draft, as ``verify``/``verify_chunked`` take them.
+
+    (prompt, seed, tokens, finished, key, segments, engine log-probs or None)
+    """
+    return (
+        d["prompt"],
+        -1,
+        d["tokens"],
+        d["finished"],
+        d["key"],
+        d["segments"],
+        d.get("logprobs"),
+    )
+
+
+def behavior_logprobs(
+    logp: list[float],
+    n_acc: int,
+    engine_logq: list[float] | None,
+    draft_logq: list[float] | None,
+) -> list[float]:
+    """Generation log-probs reported for a verified draft's kept tokens.
+
+    ``logp``: log p (verifier, theta_{k+1}) of the kept tokens; the first
+    ``n_acc`` are accepted draft tokens, any further one the verifier's own
+    bonus/residual token. An accepted draft token was sampled by the engine from
+    q' (bf16 engine law) and accepted against q (the scorer's recompute of the
+    drafting weights): its output law is p + K^T (q' - q) ~= p * q'/q, so its
+    behavior log-prob is log p + log q' - log q. The verifier's own token keeps
+    log p: it is drawn by the verifier (bonus: exactly from p; residual: from
+    norm(max(b p - q, 0)), which involves q, never q'), so there is no q'/q factor
+    to attribute to it. Without the engine's or the verifier's log q (keyed mode,
+    non-streamed drafts, or an engine that did not report log-probs) log p is
+    reported unchanged.
+    """
+    if (
+        engine_logq is None
+        or draft_logq is None
+        or len(draft_logq) < n_acc
+        or len(engine_logq) < n_acc
+    ):
+        return list(logp)
+    out = list(logp)
+    for j in range(n_acc):
+        v = logp[j] + engine_logq[j] - draft_logq[j]
+        if math.isfinite(v):
+            out[j] = v
+    return out
 
 
 class SpeculativeGeneration:
@@ -248,7 +307,7 @@ class SpeculativeGeneration:
         step = self.current_step
 
         def collect():
-            res = ray.get(rank0.collect_drafts.remote())
+            res = [_drafted(x) for x in ray.get(rank0.collect_drafts.remote())]
             return [
                 [
                     (
@@ -265,9 +324,10 @@ class SpeculativeGeneration:
                         ),
                         f"{step + 1}:{i}",
                         [(step, 0, len(toks))],
+                        lps,
                     )
                 ]
-                for i, (toks, done) in enumerate(res)
+                for i, (toks, done, lps) in enumerate(res)
             ]
 
         return collect
@@ -287,6 +347,9 @@ class SpeculativeGeneration:
                         "finished": False,
                         "key": f"{target}:{j}",
                         "segments": [],
+                        # Engine log-probs of "tokens" (None once a segment
+                        # came without them).
+                        "logprobs": [],
                     }
                     for j, p in enumerate(prompts)
                 ]
@@ -314,9 +377,14 @@ class SpeculativeGeneration:
 
         def collect():
             res = ray.get(rank0.collect_drafts.remote()) if live else []
-            for d, (toks, done) in zip(live, res):
+            for d, x in zip(live, res):
+                toks, done, lps = _drafted(x)
                 start = len(d["tokens"])
                 d["tokens"].extend(toks)
+                if d.get("logprobs") is not None and lps is not None:
+                    d["logprobs"].extend(lps)
+                else:
+                    d["logprobs"] = None
                 d["finished"] = done
                 d["segments"].append((step, start, len(d["tokens"])))
             return CohortDrafts(live)
@@ -328,11 +396,7 @@ class SpeculativeGeneration:
         cohort = self.cohorts.pop(step, None)
         if cohort is None:
             return False
-        drafts = [
-            [(d["prompt"], -1, d["tokens"], d["finished"], d["key"], d["segments"])]
-            for d in cohort
-        ]
-        self.verify(drafts)
+        self.verify([[cohort_draft(d)] for d in cohort])
         return True
 
     # -- verification (start of iteration k+1, learner holds theta_{k+1}) -------
@@ -456,6 +520,12 @@ class SpeculativeGeneration:
         """Turn one draft and its verification result into a rollout plan."""
         prompt, seed, draft = d[0], d[1], d[2]
         n_acc = r["accepted"]
+        lps = behavior_logprobs(
+            r["logprobs"],
+            n_acc,
+            d[6] if len(d) > 6 else None,
+            r.get("draft_logq"),
+        )
         complete = n_acc == len(draft) and self._stopped(d)
         fused = r.get("fused")
         if fused is not None and not complete:
@@ -470,7 +540,7 @@ class SpeculativeGeneration:
             return Plan(
                 seed,
                 draft,
-                r["logprobs"][:n_acc],
+                lps[:n_acc],
                 complete=True,
                 fused=None
                 if fused is None
@@ -482,7 +552,7 @@ class SpeculativeGeneration:
             )
         prefix = draft[:n_acc] + [r["next"]]
         done = r["next"] == self.eod or len(prefix) >= self.max_new_tokens
-        return Plan(seed, prefix, r["logprobs"], complete=done)
+        return Plan(seed, prefix, lps, complete=done)
 
     async def verify_chunked(self, drafts, chunks: int) -> None:
         """Run ``_verify_chunked``; on failure, wake every waiting rollout.

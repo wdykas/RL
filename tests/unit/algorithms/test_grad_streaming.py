@@ -193,3 +193,112 @@ def test_pick_final_first_respects_open_group_cap():
         )
         == []
     )
+
+
+def _final_chunks(seed, sizes, num_chunks, max_microbatches):
+    """Random fp32 per-microbatch gradients, grouped into final chunks."""
+    gen = torch.Generator().manual_seed(seed)
+    rng = random.Random(seed)
+    return [
+        [
+            [
+                torch.randn(p, generator=gen, dtype=torch.float32) * 10.0**k
+                for p in sizes
+            ]
+            for k in range(rng.randint(1, max_microbatches))
+        ]
+        for _ in range(num_chunks)
+    ]
+
+
+def _run_final_chunks(chunks, sizes, buckets):
+    """Backward = add each micro-batch gradient into the grad buffers."""
+    grads = [torch.zeros(p, dtype=torch.float32) for p in sizes]
+    acc = StreamingGroupAccumulator(
+        grads, storage_device="cpu", max_buckets_per_group=2, buckets=buckets
+    )
+    for chunk in chunks:
+        for mb in chunk:
+            for buf, h in zip(grads, mb):
+                buf.add_(h)
+        acc.capture(None, None)
+        acc.close_group("never-streamed", {0.0: 0.0})  # unknown group: no-op
+    acc.finalize()
+    return grads, acc
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_in_place_mode_bitwise_equal_for_single_microbatch_chunks(seed):
+    # One micro-batch per chunk: batch_acc mode computes acc + (0 + g) and the
+    # in-place mode acc + g, the same fp32 additions in the same order.
+    sizes = [37, 5]
+    chunks = _final_chunks(seed, sizes, num_chunks=9, max_microbatches=1)
+    ref, _ = _run_final_chunks(chunks, sizes, buckets=True)
+    got, acc = _run_final_chunks(chunks, sizes, buckets=False)
+    assert acc.batch_acc == [] and acc.peak_open_buffers == 0
+    assert acc.num_open_buffers() == 0
+    for g, r in zip(got, ref):
+        assert torch.equal(g, r)
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_in_place_mode_multi_microbatch_chunks_is_sequential_sum(seed):
+    # With several micro-batches per chunk, batch_acc mode adds each chunk's
+    # partial sum (acc + (g1 + g2)); the in-place mode adds micro-batch by
+    # micro-batch ((acc + g1) + g2), exactly like non-streamed training. The
+    # two agree up to fp32 summation order, not necessarily bitwise.
+    sizes = [64, 3]
+    chunks = _final_chunks(seed, sizes, num_chunks=7, max_microbatches=3)
+    got, _ = _run_final_chunks(chunks, sizes, buckets=False)
+    sequential = [torch.zeros(p, dtype=torch.float32) for p in sizes]
+    for chunk in chunks:
+        for mb in chunk:
+            for s, h in zip(sequential, mb):
+                s.add_(h)
+    for g, s in zip(got, sequential):
+        assert torch.equal(g, s)
+    ref, _ = _run_final_chunks(chunks, sizes, buckets=True)
+    for g, r in zip(got, ref):
+        torch.testing.assert_close(g, r, rtol=1e-5, atol=1e-3)
+
+
+def test_in_place_mode_rejects_bucket_chunks():
+    grads = [torch.zeros(3)]
+    acc = StreamingGroupAccumulator(
+        grads, storage_device="cpu", max_buckets_per_group=2, buckets=False
+    )
+    acc.check_capture(None)
+    with pytest.raises(ValueError, match="max_open_groups=0"):
+        acc.check_capture("g")
+    grads[0].add_(1.0)
+    with pytest.raises(ValueError, match="max_open_groups=0"):
+        acc.capture("g", 1.0)
+    acc.finalize()
+    torch.testing.assert_close(grads[0], torch.ones(3))
+
+
+def test_grad_stream_memory():
+    from nemo_rl.algorithms.grad_streaming import GradStreamingSpec, grad_stream_memory
+
+    n = 1000
+    group = grad_stream_memory(GradStreamingSpec("cuda", 2, 0), n)
+    assert (group.buckets, group.device_bytes, group.host_bytes) == (False, 0, 0)
+    cuda = grad_stream_memory(GradStreamingSpec("cuda", 2, 4), n)
+    assert cuda.buckets and cuda.copy_bytes == 4 * n
+    assert (cuda.device_bytes, cuda.host_bytes) == (4 * n * 9, 0)
+    cpu = grad_stream_memory(GradStreamingSpec("cpu", 2, 4), n)
+    assert (cpu.device_bytes, cpu.host_bytes) == (4 * n, 4 * n * 8)
+
+
+def test_empty_mb_metrics_match_all_masked_microbatch():
+    from nemo_rl.algorithms.loss.wrapper import empty_mb_metrics
+
+    m = empty_mb_metrics(
+        ["loss", "probs_ratio", "probs_ratio_min", "probs_ratio_clamped_max"]
+    )
+    assert m == {
+        "loss": 0.0,
+        "probs_ratio": 0.0,
+        "probs_ratio_min": float("inf"),
+        "probs_ratio_clamped_max": float("-inf"),
+    }

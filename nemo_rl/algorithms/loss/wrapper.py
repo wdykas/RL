@@ -45,6 +45,23 @@ _SEQ_METRIC_MAX: frozenset[str] = frozenset(
 )
 
 
+def empty_mb_metrics(keys: Any) -> dict[str, float]:
+    """Per-microbatch metrics of a microbatch with no valid token.
+
+    Matches what the losses report when every token is masked: zero for summed
+    metrics (and the loss), ``+inf`` for minima and ``-inf`` for maxima, which
+    every metric reducer filters out.
+    """
+    return {
+        k: math.inf
+        if k in _SEQ_METRIC_MIN
+        else -math.inf
+        if k in _SEQ_METRIC_MAX
+        else 0.0
+        for k in keys
+    }
+
+
 class SequencePackingLossWrapper:
     def __init__(
         self,

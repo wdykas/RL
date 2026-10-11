@@ -55,11 +55,13 @@ from nemo_rl.algorithms.grad_streaming import (
     GradStreamingSpec,
     StreamBucket,
     StreamingGroupAccumulator,
+    grad_stream_memory,
 )
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.loss.loss_functions import ClippedPGLossFn
 from nemo_rl.algorithms.loss.utils import rescale_loss_metrics
+from nemo_rl.algorithms.loss.wrapper import empty_mb_metrics
 from nemo_rl.algorithms.metric_utils import LEARNING_RATE_KEY
 from nemo_rl.data.multimodal_utils import (
     attach_media_token_validity_mask,
@@ -1803,7 +1805,9 @@ class MegatronPolicyWorkerImpl(
         is moved out of the grad buffers right after backward: into the
         ``stream_bucket`` accumulator when given (chunk trained with
         advantage 1, group still open), else straight into the batch
-        accumulator (chunk trained with final advantages).
+        accumulator (chunk trained with final advantages). A step opened with
+        ``max_open_groups=0`` has no buckets, and final chunks simply
+        accumulate in the grad buffers as in a non-streamed step.
 
         Multimodal validity-mask and model-owned packing/CP behavior match the
         regular ``train`` path.
@@ -1814,6 +1818,12 @@ class MegatronPolicyWorkerImpl(
             raise ValueError(
                 "train_microbatch got a stream_bucket but the step was opened "
                 "without grad_streaming"
+            )
+        if grad_stream is not None:
+            # Reject before backward: in the in-place mode (max_open_groups=0)
+            # a bucket chunk's gradient would land in the batch gradient.
+            grad_stream.check_capture(
+                None if stream_bucket is None else stream_bucket.group
             )
         try:
             if stream_bucket is not None:
@@ -1863,17 +1873,28 @@ class MegatronPolicyWorkerImpl(
         a multiple of the microbatch size: fixed-size microbatching would
         otherwise discard the remainder, and a zero-advantage row adds exactly
         zero gradient.
+
+        Only reached with expert parallelism off (``skip_zero_advantage_rows``
+        is forced off under EP), so ranks may run different forward counts.
         """
         sample_mask = data["sample_mask"]
         token_mask = data["token_mask"][:, 1:] * sample_mask.unsqueeze(-1)
         live = (data["advantages"][:, 1:] * token_mask).ne(0).any(dim=-1)
         keep = torch.nonzero(live).flatten().tolist()
         state = self._train_step_state
-        # Still run one microbatch per step when nothing is live yet, so every
-        # rank reports the same metric schema at finish.
-        if not keep and state["all_mb_metrics"]:
-            zero = torch.zeros((), dtype=torch.float64, device="cuda")
-            return None, zero, zero
+        if not keep:
+            # Every rank reports at least one per-microbatch metric entry per
+            # step, so the step's metric schema does not depend on how chunks
+            # were scheduled. Once a microbatch has run on this worker the
+            # schema is known and that entry is synthesized as an all-masked
+            # microbatch would report it; only the very first chunk on a
+            # worker still runs a forward/backward (gradient exactly zero).
+            filler = self._empty_mb_metrics(state["loss_fn"])
+            if state["all_mb_metrics"] or filler is not None:
+                if not state["all_mb_metrics"]:
+                    state["all_mb_metrics"].append(filler)
+                zero = torch.zeros((), dtype=torch.float64, device="cuda")
+                return None, zero, zero
         mbs = state["mbs"]
         pad = -len(keep) % mbs if keep else min(mbs, data.size)
         if pad:
@@ -1884,6 +1905,19 @@ class MegatronPolicyWorkerImpl(
         if len(keep) < data.size:
             data = data.select_indices(keep)
         return data, kept_seqs, kept_toks
+
+    def _empty_mb_metrics(self, loss_fn: LossFunction) -> Optional[dict[str, Any]]:
+        """Metrics of a microbatch with no valid token, without running it.
+
+        Uses the metric keys this loss reported on an earlier microbatch of
+        this worker (``None`` if there was none yet). Values are what the loss
+        reports for an all-masked microbatch: zero sums (and zero loss),
+        ``+inf`` minima and ``-inf`` maxima, which every metric reducer skips.
+        """
+        keys = getattr(self, "_mb_metric_keys", {}).get(type(loss_fn))
+        if keys is None:
+            return None
+        return empty_mb_metrics(keys)
 
     def _train_microbatch_body(
         self,
@@ -2048,6 +2082,13 @@ class MegatronPolicyWorkerImpl(
         mb_metrics_collected = broadcast_loss_metrics_from_last_stage(
             mb_metrics_collected
         )
+        if state["skip_zero_advantage_rows"] and mb_metrics_collected:
+            # Metric schema for _empty_mb_metrics (later all-zero chunks).
+            if not hasattr(self, "_mb_metric_keys"):
+                self._mb_metric_keys = {}
+            self._mb_metric_keys[type(loss_fn)] = tuple(
+                k for k in mb_metrics_collected[0] if k != DRAFT_STEP_PAYLOAD_KEY
+            )
 
         for m in mb_metrics_collected:
             draft_payload = m.get(DRAFT_STEP_PAYLOAD_KEY)
@@ -2475,35 +2516,39 @@ class MegatronPolicyWorkerImpl(
                 "is incompatible with reusing them for MXFP8 param all-gather"
             )
         grads = [buf.grad_data for buf in buffers]
-        # Memory: one fp32 copy of this rank's gradients for the batch
+        # max_open_groups=0 (group granularity): every chunk carries final
+        # advantages, so gradients accumulate in place in the grad buffers and
+        # the accumulator allocates nothing (0 bytes on device and host).
+        # Otherwise: one fp32 copy of this rank's gradients for the batch
         # accumulator (always on device) plus up to max_buckets_per_group
         # copies per streaming group (on storage_device).
-        copy_bytes = sum(g.numel() for g in grads) * 4
-        bucket_bytes = copy_bytes * spec.max_buckets_per_group * spec.max_open_groups
-        free, _ = torch.cuda.mem_get_info()
-        free += torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
-        on_device = copy_bytes + (bucket_bytes if spec.storage_device == "cuda" else 0)
+        mem = grad_stream_memory(spec, sum(g.numel() for g in grads))
         copies = (
-            f"{copy_bytes / 2**30:.1f} GiB per gradient copy, "
+            f"{mem.copy_bytes / 2**30:.1f} GiB per gradient copy, "
             f"{spec.max_buckets_per_group} x {spec.max_open_groups} bucket copies"
         )
-        # The batch accumulator is always on device; it must fit outright. The
-        # streamed chunks' activations and logits need the rest, so warn when
-        # the copies take more than half of what is free (fits with activation
-        # checkpointing or small micro-batches, may OOM otherwise).
-        if on_device > free:
-            raise ValueError(
-                f"gradient streaming needs {on_device / 2**30:.1f} GiB of GPU memory "
-                f"({copies}) but only {free / 2**30:.1f} GiB is free; lower "
-                "max_open_groups, use storage_device=cpu, or add training GPUs"
-            )
-        if on_device > 0.5 * free:
-            warnings.warn(
-                f"gradient streaming takes {on_device / 2**30:.1f} of "
-                f"{free / 2**30:.1f} GiB free GPU memory ({copies}); the streamed "
-                "chunks' activations must fit in the rest"
-            )
-        if spec.storage_device != "cuda":
+        if mem.device_bytes > 0:
+            free, _ = torch.cuda.mem_get_info()
+            free += torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+            # The batch accumulator is always on device; it must fit outright.
+            # The streamed chunks' activations and logits need the rest, so
+            # warn when the copies take more than half of what is free (fits
+            # with activation checkpointing or small micro-batches, may OOM
+            # otherwise).
+            if mem.device_bytes > free:
+                raise ValueError(
+                    f"gradient streaming needs {mem.device_bytes / 2**30:.1f} GiB "
+                    f"of GPU memory ({copies}) but only {free / 2**30:.1f} GiB is "
+                    "free; lower max_open_groups (0 needs no extra memory), use "
+                    "storage_device=cpu, or add training GPUs"
+                )
+            if mem.device_bytes > 0.5 * free:
+                warnings.warn(
+                    f"gradient streaming takes {mem.device_bytes / 2**30:.1f} of "
+                    f"{free / 2**30:.1f} GiB free GPU memory ({copies}); the "
+                    "streamed chunks' activations must fit in the rest"
+                )
+        if mem.host_bytes > 0:
             with open("/proc/meminfo") as f:
                 meminfo = dict(line.split(":", 1) for line in f)
             available = int(meminfo["MemAvailable"].split()[0]) * 1024
@@ -2513,9 +2558,9 @@ class MegatronPolicyWorkerImpl(
                 if torch.distributed.is_initialized()
                 else 1
             )
-            if bucket_bytes > 0.8 * available / ranks:
+            if mem.host_bytes > 0.8 * available / ranks:
                 raise ValueError(
-                    f"gradient streaming needs {bucket_bytes / 2**30:.1f} GiB of "
+                    f"gradient streaming needs {mem.host_bytes / 2**30:.1f} GiB of "
                     f"pinned host memory ({copies}) but its budget is "
                     f"{0.8 * available / ranks / 2**30:.1f} GiB; lower max_open_groups"
                 )
@@ -2523,6 +2568,7 @@ class MegatronPolicyWorkerImpl(
             grads,
             storage_device=spec.storage_device,
             max_buckets_per_group=spec.max_buckets_per_group,
+            buckets=mem.buckets,
         )
 
     def close_stream_groups(

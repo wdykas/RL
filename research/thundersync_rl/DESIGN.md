@@ -60,15 +60,35 @@ refit happen once per batch. On Qwen2.5-0.5B in fp32 the streamed gradient diffe
 `Policy.train` by a relative 4.6–7.4e-6, the same order as re-batching the synchronous
 update.
 
+Accumulator memory. With buckets (`max_open_groups > 0`) the accumulator keeps a batch
+accumulator `batch_acc` (one fp32 copy of the rank's grad buffers, always on the GPU)
+plus the open buckets, and the grad buffers are scratch space between chunks. Group
+granularity (`max_open_groups=0`) has no buckets: every chunk carries final advantages,
+so its gradient stays in the grad buffers and accumulates there as in non-streamed
+training. No `batch_acc`, no per-chunk copy, `finalize` is a no-op, and the memory check
+needs 0 bytes (−30.5 GiB/GPU for Qwen3-8B on 2 GPUs). It is bitwise equal to the
+`batch_acc` form when every chunk runs one micro-batch (`acc + (0 + g)` = `acc + g`).
+A chunk of several micro-batches is now summed micro-batch by micro-batch
+(`(acc + g1) + g2`, the order of non-streamed training) instead of chunk-sum first
+(`acc + (g1 + g2)`), so the two forms differ only in fp32 summation order.
+
 Scheduling:
 
 - **Final-first.** Rows of closed groups (final advantages known) always go first. Idle
   learner time streams one open group's rows into buckets.
 - **Length-sorted chunks.** Final rows from different groups share micro-batches, sorted
-  by length to limit padding, balanced over data-parallel ranks by tokens.
+  by length to limit padding, balanced over data-parallel ranks by tokens. With
+  zero-advantage skipping (and no EP) the balance counts only live (nonzero-advantage)
+  chunks' tokens, total tokens breaking ties: a skipped chunk costs no forward. This
+  changes only which rank runs a chunk (fp32 order).
 - **Zero-advantage chunks.** With `loss_fn.skip_zero_advantage_rows`, zero-advantage rows
   are chunked separately; the worker counts their tokens for normalization and drops the
-  whole chunk without a forward pass. Learner time 2.04 → 1.55 s per step.
+  whole chunk without a forward pass. Learner time 2.04 → 1.55 s per step. A rank whose
+  first chunk of a step is all zero-advantage no longer runs a forced forward/backward
+  to report metrics: it reports one synthesized all-masked metric entry (zero sums, ±inf
+  extrema) from the metric keys seen earlier on that worker. Only the worker's very first
+  such chunk still runs. Gradients are unchanged (the forced pass added exact zeros);
+  diagnostic metrics now average over the rows that actually ran.
 - **Expert parallelism.** With `expert_model_parallel_size > 1` every forward/backward
   runs an all-to-all over the EP group, which spans data-parallel ranks, so all ranks must
   run the same number of micro-batches per dispatch. The planner then pads short ranks
@@ -244,9 +264,37 @@ no staleness, no importance weights.
 **Approximation.** Drafts are sampled by the bf16 inference engine, but q is recomputed
 by the fp32 scorer. The two differ by numerical noise at equal weights, the same kind of
 train/inference mismatch every RL pipeline has (per-token probability ratio about 1.0035
-at equal weights). Accepted tokens then follow the fp32 scorer's policy up to
-O(TV(q_bf16, q_fp32)), and their reported log-probs are the fp32 scorer's, so the train/
-generation gap on them is the fp32-vs-training gap. Batch-invariant kernels with
+at equal weights). The output law is linear in the engine's q': out = p + Kᵀ(q' − q),
+and with ~98% acceptance K ≈ I, so an accepted draft token x is distributed as about
+p(x)·q'(x)/q(x), not p(x).
+
+**Behavior log-probs.** Generation log-probs feed the importance-sampling correction
+(`loss_fn.use_importance_sampling_correction`, TIS), so they must describe that law.
+Every draft carries the engine's own log q'(x) of each sampled token (`start_drafts`
+reads `new_log_probs` from the partial frames and `generated_log_probs` from the final
+one; cohort drafts append each resumed segment's log-probs). Block verification returns
+log q(x) of each accepted token (`draft_logq`: the scorer's recomputed q from the
+stashed weights, same vocabulary slice as the acceptance ratios), and `_plan` reports
+(`behavior_logprobs`):
+
+| Token | Reported generation log-prob |
+|---|---|
+| accepted draft token | log p + log q' − log q |
+| verifier's bonus token (whole draft accepted) | log p: sampled exactly from p |
+| verifier's residual token (after a rejection) | log p: sampled from norm(max(b·p − q, 0)), which never involves q'; the q'-dependence of the BV output law has no per-token closed form there, and these tokens are ~1–2% of drafts |
+| engine continuation | the engine's log-prob, as in normal generation |
+
+If a draft has no engine log-probs (keyed mode, non-streamed `draft`, or a segment whose
+frames lacked them; one missing segment disables it for the whole cohort draft) or the
+verifier returned no `draft_logq`, log p is reported as before. The engine's log-probs
+are of the sampling distribution itself: speculation requires temperature 1 and no
+top-k/top-p, so raw and processed log-probs coincide. With this, TIS sees the full
+train-vs-behavior gap instead of only its train-vs-p_fp32 half (G2 in
+`thundersync_work/research/estimator_theory.md`). GPU check (1.5B, 30 steps,
+`THUNDERSYNC_MISMATCH_CHECK`): the corrected log-probs are applied (tokens bitwise equal
+to training's log-probs 18% → 35%), while the mean distance to training's log-probs is
+unchanged within noise (3.0e-3 vs 3.5e-3; KL 7.6e-5 vs 8.1e-5) — expected, since the check
+measures train-vs-reported, not reported-vs-true-law. Batch-invariant kernels with
 training-precision verification (`verify_precision=model`) make q bitwise the sampling
 distribution at lower acceptance (section 14); keyed mode avoids the issue too.
 
@@ -254,7 +302,8 @@ distribution at lower acceptance (section 14); keyed mode avoids the issue too.
 strings, so `validate_config` rejects speculation with temperature ≠ 1, top-p < 1, top-k,
 or stop strings. Streaming computes advantages per group as each group closes, so it
 requires `grpo.adv_estimator.name=grpo` and no `seq_logprob_error_in_loss`. A streamed
-draft stopped by `draft_budget` below `max_new_tokens` is not a finished rollout. Inference-side verification
+draft stopped by `draft_budget` below `max_new_tokens` is not a finished rollout.
+Inference-side verification
 requires inference TP = PP = 1 (the scorer and the running engine would share
 communicators); keyed verification requires learner TP = PP = 1. Streaming rejects reward
 penalties and per-sample advantage overrides, and MoE settings that are not
@@ -279,6 +328,9 @@ streaming. Mean seconds per iteration after warm-up; 30-step runs unless marked.
 | + selective scoring | 3.31 | 3.07 | 4.02 | 99.2% | 98.5% |
 | + zero-advantage rows in their own chunks | 3.03 | 2.79 | 4.23 | 99.4% | 98.5% |
 | **Same, 100 steps** | **3.02** | **2.70** | **4.28** | **99.5%** | **98.4%** |
+| Same, rerun in the lookahead session (100 steps) | 3.01 | 2.55 | 5.19 | 99.4% | 97.4% |
+| **Lookahead 4 (100 steps)** | **2.86** | **2.54** | **4.18** | **99.4%** | **98.5%** |
+| Lookahead 5 (100 steps) | 2.98 | 2.53 | 4.35 | 99.2% | 98.7% |
 | Async GRPO, lag 4, same settings (single controller) | 4.26 | 2.40 | 7.75 | – | – |
 
 Async has a lower median but a much worse tail: with zero-advantage skip its learner is
@@ -293,6 +345,7 @@ Tried and not adopted:
 | Verify only on inference GPUs | 3.78 s; competes with drafting |
 | Small first verification chunk; group-aligned chunks; 1:2 and 1:3 pool weights | 3.2–3.9 s; neutral or worse |
 | Delay drafting until few rollouts remain in flight (0 or 2) | 6.30 s, 3.74 s; unfinished drafts |
+| Start drafting at the start of the iteration instead of at the first finished rollout | 3.17 vs 3.01 s (100 steps); drafts compete with the iteration's own rollouts |
 | Pause drafts while continuations decode (always, or only in the tail) | 5.73 s, 4.14 s; drafting time is worth more |
 | Micro-batch 16, token-budgeted chunks, fused linear-logprob loss | No change in learner time |
 | 3 inference + 1 training GPUs | 3.32 s per 120 rollouts (no speculation 5.53 s): single learner GPU becomes the bottleneck |
