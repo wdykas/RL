@@ -24,6 +24,7 @@ group closes. At the barrier, the folded batch gradient is written back into
 the grad buffers and the regular ``finish_train_step`` runs unchanged.
 """
 
+import functools
 import os
 import time
 from typing import Any
@@ -39,6 +40,25 @@ from nemo_rl.models.policy.workers.megatron_policy_worker import (
 )
 
 WORKER_FQN = "thundersync_rl.worker.ThunderSyncMegatronPolicyWorker"
+
+
+def _model_in_eval(method):
+    """Run ``method`` with ``self.model`` in eval mode, then restore its mode.
+
+    Learner-side verification runs while a streamed train step is open; leaving
+    the model in eval mode would silently disable dropout for the rest of the step.
+    """
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            self.model.train(was_training)
+
+    return wrapper
 
 
 @ray.remote(
@@ -312,6 +332,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         return eod
 
     @torch.no_grad()
+    @_model_in_eval
     def verify_drafts(
         self,
         rows: list[torch.Tensor],
@@ -333,7 +354,6 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         """
         from thundersync_rl.keyed_sampling import keyed_sample_logits
 
-        self.model.eval()
         world = torch.distributed.get_world_size()
         mine = sorted(
             (i for i in range(len(rows)) if i % world == self.rank),
@@ -582,6 +602,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         self._prof["load"] = self._prof.get("load", 0.0) + time.perf_counter() - t0
 
     @torch.no_grad()
+    @_model_in_eval
     def verify_drafts_block_stashed(
         self,
         rows: list[torch.Tensor],
@@ -602,7 +623,6 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
 
         self._prof = {}
         t_all = time.perf_counter()
-        self.model.eval()
         self._scorer_precision = precision
         scorer = self._fp32_scorer()
         from megatron.core import parallel_state as ps
