@@ -56,6 +56,7 @@ def _simulate(
     max_open_groups=100,
     mbs=2,
     equal_rank_microbatches=False,
+    skip_zero_advantage_chunks=False,
 ):
     """Drive planner + one accumulator per DP rank with random arrivals."""
     rng = random.Random(seed)
@@ -71,6 +72,8 @@ def _simulate(
             storage_device="cpu",
             storage_dtype=torch.float64,
             max_buckets_per_group=max_buckets,
+            # Group granularity: final chunks accumulate in place.
+            buckets=not group_only and max_open_groups > 0,
         )
         for r in range(dp_size)
     ]
@@ -81,6 +84,7 @@ def _simulate(
         max_open_groups=0 if group_only else max_open_groups,
         micro_batch_size=mbs,
         equal_rank_microbatches=equal_rank_microbatches,
+        skip_zero_advantage_chunks=skip_zero_advantage_chunks,
     )
     for g in range(len(rewards_per_group)):
         planner.register_group(g, G)
@@ -181,14 +185,25 @@ def test_non_affine_estimator_raises():
             _simulate(rewards, _adv_fn(True), 1, 2, seed, chunk=1)
 
 
+@pytest.mark.parametrize("skip_zero", [False, True])
 @pytest.mark.parametrize("seed", range(3))
-def test_group_granularity_exact_and_never_buckets(seed):
+def test_group_granularity_exact_and_never_buckets(seed, skip_zero):
     rng = random.Random(seed)
     rewards = [[float(rng.random() < 0.5) for _ in range(8)] for _ in range(4)]
-    got, want, accs, _ = _simulate(rewards, _adv_fn(True), 2, 2, seed, group_only=True)
+    got, want, accs, _ = _simulate(
+        rewards,
+        _adv_fn(True),
+        2,
+        2,
+        seed,
+        group_only=True,
+        skip_zero_advantage_chunks=skip_zero,
+    )
     for g, w in zip(got, want):
         torch.testing.assert_close(g, w, rtol=1e-12, atol=1e-12)
     assert all(a.peak_open_buffers == 0 for a in accs)
+    # In-place mode: no batch accumulator was allocated.
+    assert all(a.batch_acc == [] and not a.buckets_enabled for a in accs)
 
 
 @pytest.mark.parametrize("cap", [1, 2])
@@ -467,3 +482,73 @@ def test_speculation_parallel_layout_guards(ts_kw, train_tp, gen_tp, ok):
     else:
         with pytest.raises(ValueError, match="speculate"):
             validate_speculation(ts, policy)
+
+
+def _chunk(tokens, advantages):
+    trajs = [
+        Trajectory(group=0, index=i, reward=0.0, payload=None, num_tokens=t)
+        for i, t in enumerate(tokens)
+    ]
+    return Chunk(
+        group=None,
+        reward=None,
+        trajectories=trajs,
+        advantages=advantages,
+        padding=False,
+    )
+
+
+def _old_token_balance(chunks, dp_size):
+    """The planner's previous greedy longest-first balance on total tokens."""
+    per_rank = [[] for _ in range(dp_size)]
+    load = [0] * dp_size
+    for c in sorted(chunks, key=lambda c: -c.num_tokens):
+        r = load.index(min(load))
+        per_rank[r].append(c)
+        load[r] += c.num_tokens
+    return per_rank
+
+
+@pytest.mark.parametrize("seed", range(5))
+def test_balance_without_skipping_matches_token_balance(seed):
+    from thundersync_rl.streaming import balance_chunks
+
+    rng = random.Random(seed)
+    chunks = [_chunk([rng.randint(1, 50)], [rng.choice([0.0, 0.5])]) for _ in range(20)]
+    got = balance_chunks(chunks, 3, skip_zero_advantage=False)
+    want = _old_token_balance(chunks, 3)
+    assert [[id(c) for c in cs] for cs in got] == [[id(c) for c in cs] for cs in want]
+
+
+def test_balance_by_live_tokens_when_zero_advantage_chunks_are_skipped():
+    from thundersync_rl.streaming import balance_chunks
+
+    live = [_chunk([100], [1.0]), _chunk([60], [-1.0]), _chunk([40], [0.5])]
+    dead = [_chunk([90], [0.0]), _chunk([80], [0.0, 0.0])]
+    chunks = live + dead
+
+    def live_load(cs):
+        return sum(c.num_tokens for c in cs if not c.zero_advantage)
+
+    # Total-token balance puts both long dead chunks on one rank and all live
+    # work (200 tokens) on the other; live-token balance gives 100 / 100.
+    per_rank = balance_chunks(chunks, 2, skip_zero_advantage=True)
+    assert sorted(live_load(cs) for cs in per_rank) == [100, 100]
+    # Skipped chunks still spread over ranks (ties broken by total tokens).
+    assert all(any(c.zero_advantage for c in cs) for cs in per_rank)
+    old = _old_token_balance(chunks, 2)
+    assert sorted(live_load(cs) for cs in old) != [100, 100]
+    assert sorted(id(c) for cs in per_rank for c in cs) == sorted(map(id, chunks))
+
+
+def test_zero_advantage_property():
+    assert _chunk([3, 4], [0.0, 0.0]).zero_advantage
+    assert not _chunk([3, 4], [0.0, 0.2]).zero_advantage
+    bucket = Chunk(
+        group=1,
+        reward=1.0,
+        trajectories=_chunk([3], [0.0]).trajectories,
+        advantages=None,
+        padding=False,
+    )
+    assert not bucket.zero_advantage  # bucket chunks train with advantage 1
