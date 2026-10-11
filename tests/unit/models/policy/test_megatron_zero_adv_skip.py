@@ -132,10 +132,17 @@ def test_worker_rejects_sequence_packing(mock_module_symbols):  # noqa: F811
         w.begin_train_step(loss_fn=_skip_loss())
 
 
-def test_worker_rejects_expert_parallelism(mock_module_symbols):  # noqa: F811
-    # Ranks skip different rows (or whole calls), so their forward counts
-    # differ; the EP all-to-all spans DP ranks and would hang.
+def test_expert_parallelism_trains_every_row(mock_module_symbols):  # noqa: F811
+    # Ranks would skip different rows (or whole calls), so their forward
+    # counts would differ; the EP all-to-all spans DP ranks and would hang.
+    # With EP every row runs, including all-zero chunks after the first.
     w = _worker()
     w.cfg["megatron_cfg"]["expert_model_parallel_size"] = 2
-    with pytest.raises(ValueError, match="expert_model_parallel_size=1"):
+    with pytest.warns(UserWarning, match="skip_zero_advantage_rows is ignored"):
         w.begin_train_step(loss_fn=_skip_loss())
+    w.train_microbatch(_batch([0, 2]))
+    w.train_microbatch(_batch([]))
+    assert _trained_rows(mock_module_symbols) == [list(range(8)), list(range(8))]
+    state = w._train_step_state
+    assert not state["skip_zero_advantage_rows"]
+    assert float(state["local_valid_toks"]) == pytest.approx(16 * 256)
