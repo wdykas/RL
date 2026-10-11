@@ -19,6 +19,11 @@ acceptance math (``acceptance_weights``, ``stop_probabilities``,
 computed as: one logsumexp per row of p and q, the draft-token ratios and b on
 [g] vectors, and one Triton pass per row for r_i = sum_v max(b_i p_i - q_i, 0).
 Only the residual row that is actually sampled from is materialized.
+
+``block_verify_stats_lazy`` is the lazy variant (see
+``block_verification.lazy_stop_index``): it needs only per-position statistics
+(log p(x_i), log q(x_i), logsumexps) plus full rows at the few positions the
+backward scan visits, and is pathwise identical to ``block_verify_logits``.
 """
 
 from __future__ import annotations
@@ -30,6 +35,8 @@ import triton.language as tl
 from thundersync_rl.block_verification import (
     acceptance_weights,
     emit_distribution,
+    lazy_slack,
+    lazy_stop_index,
     stop_probabilities,
 )
 
@@ -56,6 +63,51 @@ def _residual_mass_kernel(
     tl.store(out + row, tl.sum(acc, 0))
 
 
+def residual_masses(
+    p_logits: torch.Tensor,
+    q_logits: torch.Tensor,
+    lse_p: torch.Tensor,
+    lse_q: torch.Tensor,
+    b: torch.Tensor,
+) -> torch.Tensor:
+    """r_k = sum_v max(b_k p_k(v) - q_k(v), 0) for rows k (fp64 [k]).
+
+    One Triton program per row with a fixed reduction order, so a row's r does
+    not depend on which other rows are in the call.
+    """
+    k = b.numel()  # rows 0..k-1 (p_logits may carry the extra bonus row)
+    r = torch.empty(k, dtype=torch.float64, device=p_logits.device)
+    if k:
+        if p_logits.stride(-1) != 1:
+            p_logits = p_logits.contiguous()
+        if q_logits.stride(-1) != 1:
+            q_logits = q_logits.contiguous()
+        _residual_mass_kernel[(k,)](
+            p_logits,
+            q_logits,
+            lse_p.contiguous(),
+            lse_q.contiguous(),
+            b.contiguous(),
+            r,
+            p_logits.stride(0),
+            q_logits.stride(0),
+            p_logits.shape[-1],
+            BLOCK=2048,
+        )
+    return r
+
+
+def _probs(row: torch.Tensor, lse: torch.Tensor) -> torch.Tensor:
+    return (row.float() - lse).double().exp()
+
+
+def _emit(p_row, q_row, lse_p_tau, lse_q_tau, b_tau, generator):
+    """Sample the emitted token (bonus if ``q_row`` is None, else the residual)."""
+    q = None if q_row is None else _probs(q_row, lse_q_tau)
+    dist = emit_distribution(_probs(p_row, lse_p_tau), q, b_tau)
+    return int(torch.multinomial((dist / dist.sum()).float(), 1, generator=generator))
+
+
 def block_verify_logits(
     p_logits: torch.Tensor,
     q_logits: torch.Tensor,
@@ -80,30 +132,87 @@ def block_verify_logits(
     lpx = p_logits[ar, draft].float() - lse_p[:g]
     lqx = q_logits[ar, draft].float() - lse_q
     b = acceptance_weights(lpx - lqx)  # [g+1]
-    r = torch.empty(g, dtype=torch.float64, device=dev)
-    if g:
-        _residual_mass_kernel[(g,)](
-            p_logits,
-            q_logits,
-            lse_p.contiguous(),
-            lse_q.contiguous(),
-            b[:g].contiguous(),
-            r,
-            p_logits.stride(0),
-            q_logits.stride(0),
-            p_logits.shape[-1],
-            BLOCK=2048,
-        )
+    r = residual_masses(p_logits, q_logits, lse_p[:g], lse_q, b[:g])
     h = stop_probabilities(r, b)
     eta = torch.rand(g + 1, generator=generator, dtype=torch.float64, device=dev)
     tau = int(torch.nonzero(eta <= h).flatten().max())
-
-    def probs(logits, lse, i):
-        return (logits[i].float() - lse[i]).double().exp()
-
-    q_row = None if tau == g else probs(q_logits, lse_q, tau)
-    dist = emit_distribution(probs(p_logits, lse_p, tau), q_row, b[tau])
-    y = int(torch.multinomial((dist / dist.sum()).float(), 1, generator=generator))
+    q_row = None if tau == g else q_logits[tau]
+    lse_q_tau = None if tau == g else lse_q[tau]
+    y = _emit(p_logits[tau], q_row, lse_p[tau], lse_q_tau, b[tau], generator)
     kept = torch.cat([draft[:tau], torch.tensor([y], device=dev)])
     logp = p_logits[torch.arange(tau + 1, device=dev), kept].float() - lse_p[: tau + 1]
+    return tau, y, logp
+
+
+def block_verify_stats_lazy(
+    lpx: torch.Tensor,
+    lqx: torch.Tensor,
+    lse_p: torch.Tensor,
+    lse_q: torch.Tensor,
+    p_rows,
+    q_rows,
+    generator: torch.Generator | None = None,
+) -> tuple[int, int, torch.Tensor, int]:
+    """Lazy block verification from per-position statistics and on-demand rows.
+
+    ``lpx``/``lqx``: [g] fp32 log p(x_i) / log q(x_i) (draft-token logit minus
+    logsumexp); ``lse_p``: [g+1], ``lse_q``: [g] fp32 logsumexps.
+    ``p_rows(idx)`` / ``q_rows(idx)``: raw logits rows [k, V] at positions ``idx``
+    (LongTensor), bitwise the rows the statistics were computed from.
+
+    Given the same inputs and generator state, (tau, y, logp) and the generator
+    state afterwards equal ``block_verify_logits`` on the full logits: the same
+    ``rand(g+1)`` and ``multinomial`` calls, the same b, and r_i (same Triton
+    program per row) and h_i (same formula) wherever ``lazy_stop_index`` needs
+    them. Full rows are read only at positions where eta_i <= b_i (1 + slack)
+    above tau, and at tau itself. Returns (tau, y, logp, rows evaluated).
+    """
+    g = lpx.numel()
+    dev = lse_p.device
+    b = acceptance_weights(lpx - lqx)
+
+    def residual_mass(idx):
+        return residual_masses(p_rows(idx), q_rows(idx), lse_p[idx], lse_q[idx], b[idx])
+
+    eta = torch.rand(g + 1, generator=generator, dtype=torch.float64, device=dev)
+    tau, n_eval = lazy_stop_index(b, eta, residual_mass, lazy_slack(lse_p[:g]))
+    at = torch.tensor([tau], device=dev)
+    p_row = p_rows(at)[0]
+    q_row = None if tau == g else q_rows(at)[0]
+    lse_q_tau = None if tau == g else lse_q[tau]
+    y = _emit(p_row, q_row, lse_p[tau], lse_q_tau, b[tau], generator)
+    logp = torch.cat([lpx[:tau], (p_row[y].float() - lse_p[tau]).view(1)])
+    return tau, y, logp, n_eval
+
+
+def block_verify_logits_lazy(
+    p_logits: torch.Tensor,
+    q_logits: torch.Tensor,
+    draft: torch.Tensor,
+    generator: torch.Generator | None = None,
+) -> tuple[int, int, torch.Tensor]:
+    """``block_verify_logits`` with the lazy scan (pathwise identical results).
+
+    Skips the residual pass entirely on whole-accepted drafts (eta_g <= b_g).
+    """
+    g = draft.numel()
+    dev = p_logits.device
+    if p_logits.stride(-1) != 1:
+        p_logits = p_logits.contiguous()
+    if q_logits.stride(-1) != 1:
+        q_logits = q_logits.contiguous()
+    lse_p = torch.logsumexp(p_logits.float(), -1)
+    lse_q = torch.logsumexp(q_logits.float(), -1) if g else lse_p[:0]
+    ar = torch.arange(g, device=dev)
+    lpx = p_logits[ar, draft].float() - lse_p[:g]
+    lqx = q_logits[ar, draft].float() - lse_q
+    tau, y, logp, _ = block_verify_stats_lazy(
+        lpx,
+        lqx,
+        lse_p,
+        lse_q,
+        lambda idx: p_logits[idx],
+        lambda idx: q_logits[idx],
+        generator,
+    )
     return tau, y, logp
