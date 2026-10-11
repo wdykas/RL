@@ -265,3 +265,106 @@ def test_every_iteration_after_the_first_gets_a_cohort():
     assert new_cohort_targets(0, 3, max_steps=12, existing=set()) == [1, 2]
     assert new_cohort_targets(1, 3, max_steps=12, existing={2}) == [3, 4]
     assert new_cohort_targets(10, 3, max_steps=12, existing=set()) == [11]
+
+
+# -- G2: behavior log-probs of accepted draft tokens --------------------------
+
+
+def test_behavior_logprobs_correct_accepted_tokens_only():
+    from thundersync_rl.speculative import behavior_logprobs
+
+    logp = [-1.0, -2.0, -3.0]  # 2 accepted draft tokens + the verifier's token
+    out = behavior_logprobs(logp, 2, engine_logq=[-1.5, -2.5], draft_logq=[-1.25, -2.0])
+    assert out == pytest.approx([-1.0 - 1.5 + 1.25, -2.0 - 2.5 + 2.0, -3.0])
+    # Missing engine or verifier log q: log p unchanged (keyed / non-streamed).
+    assert behavior_logprobs(logp, 2, None, [-1.0, -2.0]) == logp
+    assert behavior_logprobs(logp, 2, [-1.0, -2.0], None) == logp
+    # Non-finite correction (q underflow) falls back to log p for that token.
+    out = behavior_logprobs(logp, 2, [-1.5, -2.5], [float("-inf"), -2.0])
+    assert out == pytest.approx([-1.0, -2.5, -3.0])
+
+
+def test_plans_report_p_times_engine_q_over_scorer_q():
+    # row -> (accepted, next); verifier log p = -0.1 per kept token, log q = -0.3.
+    results = {0: (3, 0), 1: (1, 7), 2: (2, 9)}
+
+    def verify(rows, prompt_lens, segments, keys, **_):
+        return [
+            (
+                i,
+                {
+                    "accepted": a,
+                    "next": y,
+                    "logprobs": [-0.1] * (a + 1),
+                    "draft_logq": [-0.3] * a,
+                },
+            )
+            for i, (a, y) in results.items()
+        ]
+
+    s = _spec({"verify_drafts_block_stashed": verify})
+    p = [torch.tensor([10 + i, 20 + i]) for i in range(3)]
+    eng = [-0.2, -0.4, -0.6]
+    drafts = [
+        [(p[0], -1, [4, 5, EOD], True, "1:0", [(0, 0, 3)], eng)],
+        [(p[1], -1, [4, 5, 6], False, "1:1", [(0, 0, 3)], eng)],
+        # No engine log-probs: the scorer's log p is kept.
+        [(p[2], -1, [4, 5, 6], False, "1:2", [(0, 0, 3)], None)],
+    ]
+    s.verify(drafts)
+    plans = {k: v[0] for k, v in s.plans.items()}
+    full = plans[(10, 20)]
+    assert full.complete and full.prefix == [4, 5, EOD]
+    assert full.prefix_logprobs == pytest.approx([-0.1 + e + 0.3 for e in eng])
+    cont = plans[(11, 21)]
+    assert cont.prefix == [4, 7] and not cont.complete
+    # Accepted token corrected; the verifier's residual token keeps log p.
+    assert cont.prefix_logprobs == pytest.approx([-0.1 - 0.2 + 0.3, -0.1])
+    assert plans[(12, 22)].prefix_logprobs == pytest.approx([-0.1] * 3)
+
+
+def test_streamed_drafts_carry_engine_logprobs():
+    s = _spec(
+        {},
+        base_handlers={
+            "start_drafts": lambda prompts, budget, interval: None,
+            "collect_drafts": lambda: [
+                ([4, EOD], True, [-0.5, -0.25]),
+                ([4, 5], False, [-0.5]),  # misaligned: dropped
+                ([6], False),  # engine without log-probs
+            ],
+        },
+    )
+    prompts = [torch.tensor([1 + i]) for i in range(3)]
+    collect = asyncio.run(s.draft_streaming(prompts))
+    (a,), (b,), (c,) = collect()
+    assert a[2] == [4, EOD] and a[3] and a[6] == [-0.5, -0.25]
+    assert b[6] is None and c[6] is None and c[2] == [6]
+
+
+def test_cohort_drafts_keep_engine_logprobs_across_resumptions():
+    from thundersync_rl.speculative import cohort_draft
+
+    collected = [
+        [([5, 6], False, [-0.1, -0.2]), ([7], False, [-0.3])],
+        [([8], True, [-0.4]), ([9], False)],  # second draft: segment without lps
+        [([10], True, [-0.5])],
+    ]
+    s = _spec(
+        {},
+        base_handlers={
+            "start_drafts": lambda prompts, budgets, interval: None,
+            "collect_drafts": lambda: collected.pop(0),
+        },
+    )
+    p0, p1 = torch.tensor([1, 1]), torch.tensor([3, 3])
+    asyncio.run(s.draft_cohorts(0, {3: [p0, p1]}))()
+    asyncio.run(s.draft_cohorts(1, {}))()
+    d0, d1 = s.cohorts[3]
+    assert d0["tokens"] == [5, 6, 8] and d0["logprobs"] == [-0.1, -0.2, -0.4]
+    assert d0["segments"] == [(0, 0, 2), (1, 2, 3)]
+    # Once a segment lacks log-probs the draft falls back to log p for good.
+    asyncio.run(s.draft_cohorts(2, {}))()
+    assert d1["tokens"] == [7, 9, 10] and d1["logprobs"] is None
+    assert cohort_draft(d0)[6] == [-0.1, -0.2, -0.4]
+    assert cohort_draft(d0)[:6] == (p0, -1, d0["tokens"], True, "3:0", d0["segments"])

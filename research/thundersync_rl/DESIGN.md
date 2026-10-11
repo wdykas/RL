@@ -244,9 +244,33 @@ no staleness, no importance weights.
 **Approximation.** Drafts are sampled by the bf16 inference engine, but q is recomputed
 by the fp32 scorer. The two differ by numerical noise at equal weights, the same kind of
 train/inference mismatch every RL pipeline has (per-token probability ratio about 1.0035
-at equal weights). Accepted tokens then follow the fp32 scorer's policy up to
-O(TV(q_bf16, q_fp32)), and their reported log-probs are the fp32 scorer's, so the train/
-generation gap on them is the fp32-vs-training gap. Batch-invariant kernels with
+at equal weights). The output law is linear in the engine's q': out = p + Kᵀ(q' − q),
+and with ~98% acceptance K ≈ I, so an accepted draft token x is distributed as about
+p(x)·q'(x)/q(x), not p(x).
+
+**Behavior log-probs.** Generation log-probs feed the importance-sampling correction
+(`loss_fn.use_importance_sampling_correction`, TIS), so they must describe that law.
+Every draft carries the engine's own log q'(x) of each sampled token (`start_drafts`
+reads `new_log_probs` from the partial frames and `generated_log_probs` from the final
+one; cohort drafts append each resumed segment's log-probs). Block verification returns
+log q(x) of each accepted token (`draft_logq`: the scorer's recomputed q from the
+stashed weights, same vocabulary slice as the acceptance ratios), and `_plan` reports
+(`behavior_logprobs`):
+
+| Token | Reported generation log-prob |
+|---|---|
+| accepted draft token | log p + log q' − log q |
+| verifier's bonus token (whole draft accepted) | log p: sampled exactly from p |
+| verifier's residual token (after a rejection) | log p: sampled from norm(max(b·p − q, 0)), which never involves q'; the q'-dependence of the BV output law has no per-token closed form there, and these tokens are ~1–2% of drafts |
+| engine continuation | the engine's log-prob, as in normal generation |
+
+If a draft has no engine log-probs (keyed mode, non-streamed `draft`, or a segment whose
+frames lacked them; one missing segment disables it for the whole cohort draft) or the
+verifier returned no `draft_logq`, log p is reported as before. The engine's log-probs
+are of the sampling distribution itself: speculation requires temperature 1 and no
+top-k/top-p, so raw and processed log-probs coincide. With this, TIS sees the full
+train-vs-behavior gap instead of only its train-vs-p_fp32 half (G2 in
+`thundersync_work/research/estimator_theory.md`). Batch-invariant kernels with
 training-precision verification (`verify_precision=model`) make q bitwise the sampling
 distribution at lower acceptance (section 14); keyed mode avoids the issue too.
 
