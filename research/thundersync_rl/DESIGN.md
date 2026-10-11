@@ -244,8 +244,17 @@ no staleness, no importance weights.
 **Approximation.** Drafts are sampled by the bf16 inference engine, but q is recomputed
 by the fp32 scorer. The two differ by numerical noise at equal weights, the same kind of
 train/inference mismatch every RL pipeline has (per-token probability ratio about 1.0035
-at equal weights). Batch-invariant kernels (NeMo-RL PR 3208) would make q bitwise the
-sampling distribution; keyed mode avoids the issue at lower acceptance.
+at equal weights). Accepted tokens then follow the fp32 scorer's policy up to
+O(TV(q_bf16, q_fp32)), and their reported log-probs are the fp32 scorer's, so the train/
+generation gap on them is the fp32-vs-training gap. Batch-invariant kernels with
+training-precision verification (`verify_precision=model`) make q bitwise the sampling
+distribution at lower acceptance (section 14); keyed mode avoids the issue too.
+
+**Configuration guards.** Verification compares raw logits and drafts ignore stop
+strings, so `validate_config` rejects speculation with temperature ≠ 1, top-p < 1, top-k,
+or stop strings. Streaming computes advantages per group as each group closes, so it
+requires `grpo.adv_estimator.name=grpo` and no `seq_logprob_error_in_loss`. A streamed
+draft stopped by `draft_budget` below `max_new_tokens` is not a finished rollout.
 
 **Reward check over 100 steps.** Speculation vs a second no-speculation baseline: reward
 difference −0.0016 ± 0.0037 (paired by step). The two baselines differ from each other by
