@@ -63,7 +63,7 @@ from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.logger import Logger
-from thundersync_rl.speculative import SpeculativeGeneration
+from thundersync_rl.speculative import SpeculativeGeneration, cohort_draft
 from thundersync_rl.streaming import (
     Chunk,
     StreamingLearner,
@@ -759,19 +759,7 @@ def thundersync_grpo_train(
         if cohort_mode and chunked:
             cohort = spec.cohorts.pop(step, None)
             if cohort is not None:
-                cdrafts = [
-                    [
-                        (
-                            d["prompt"],
-                            -1,
-                            d["tokens"],
-                            d["finished"],
-                            d["key"],
-                            d["segments"],
-                        )
-                    ]
-                    for d in cohort
-                ]
+                cdrafts = [[cohort_draft(d)] for d in cohort]
                 pre_rollout = lambda c=cdrafts: spec.verify_chunked(
                     c, ts_cfg.verify_chunks
                 )  # noqa: E731

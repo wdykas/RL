@@ -38,3 +38,20 @@ def test_fused_matches_reference_draw_for_draw(noise):
         assert (tau, y) == ref
         kept = torch.cat([draft[:tau], torch.tensor([y], device="cuda")])
         torch.testing.assert_close(logp, lp[torch.arange(tau + 1, device="cuda"), kept])
+
+
+def test_fused_returns_logq_of_accepted_tokens():
+    from thundersync_rl.block_verification_fused import block_verify_logits
+
+    torch.manual_seed(1)
+    vocab, g = 3000, 24
+    p = torch.randn(g + 1, vocab, device="cuda") * 2
+    q = p[:g] + torch.randn(g, vocab, device="cuda") * 0.05
+    draft = torch.multinomial(torch.softmax(q, -1), 1).flatten()
+    g1 = torch.Generator(device="cuda").manual_seed(0)
+    g2 = torch.Generator(device="cuda").manual_seed(0)
+    tau, y, logp = block_verify_logits(p, q, draft, g1)
+    tau2, y2, logp2, logq = block_verify_logits(p, q, draft, g2, with_logq=True)
+    assert (tau, y) == (tau2, y2) and torch.equal(logp, logp2)
+    lq = torch.log_softmax(q, -1)[torch.arange(tau, device="cuda"), draft[:tau]]
+    torch.testing.assert_close(logq, lq)
