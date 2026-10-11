@@ -418,19 +418,33 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         """
         from thundersync_rl.keyed_sampling import keyed_sample_logits
 
-        world = torch.distributed.get_world_size()
+        from megatron.core import parallel_state as ps
+
+        # By data-parallel rank: the tensor-parallel ranks of a replica share rows.
+        dp, dp_rank = ps.get_data_parallel_world_size(), ps.get_data_parallel_rank()
         mine = sorted(
-            (i for i in range(len(rows)) if i % world == self.rank),
+            (i for i in range(len(rows)) if i % dp == dp_rank),
             key=lambda i: rows[i].numel(),
         )
-        results = []
+        groups = []
         b = 0
         while b < len(mine):
             e = b + 1
             while e < len(mine) and rows[mine[e]].numel() * (e + 1 - b) <= batch_tokens:
                 e += 1
-            group = mine[b:e]
+            groups.append(mine[b:e])
             b = e
+        # Expert parallelism: every forward is an all-to-all over the EP group.
+        lockstep = self._expert_parallel_lockstep([[] for _ in groups])
+        for _ in range(len(groups), len(groups) if lockstep is None else len(lockstep)):
+            n = self.cfg["make_sequence_length_divisible_by"]
+            self.model(
+                input_ids=torch.zeros((1, n), dtype=torch.long, device="cuda"),
+                position_ids=torch.arange(n, device="cuda")[None],
+                attention_mask=None,
+            )
+        results = []
+        for group in groups:
             s = max(rows[i].numel() for i in group)
             # Pad like training (make_sequence_length_divisible_by): batch-invariant
             # kernels are invariant within a token-count shape class only.
@@ -744,10 +758,32 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             seed * 1_000_003 + ps.get_data_parallel_rank()
         )
         results = []
-        for group, ids in self._iter_row_id_batches(rows, batch_tokens, keys):
+        batches = list(self._iter_row_id_batches(rows, batch_tokens, keys))
+        plans = [
+            sorted({v for i in group for v, a, b in segments[i] if b > a})
+            for group, _ in batches
+        ]
+        lockstep = self._expert_parallel_lockstep(plans)
+        for j in range(len(batches) if lockstep is None else len(lockstep)):
+            if j >= len(batches):
+                # Expert parallelism: out of rows, join the other ranks' forwards.
+                for v in lockstep[j]:
+                    self._load_scorer(v)
+                    self._dummy_score(scorer)
+                self._load_scorer(None)
+                self._dummy_score(scorer)
+                continue
+            group, ids = batches[j]
             pos = torch.arange(ids.shape[1], device="cuda").expand(len(group), -1)
             lq_rows = self._stashed_q_logits(
-                scorer, group, ids, pos, prompt_lens, segments, vocab_limit
+                scorer,
+                group,
+                ids,
+                pos,
+                prompt_lens,
+                segments,
+                vocab_limit,
+                lockstep_versions=None if lockstep is None else lockstep[j],
             )
             self._load_scorer(None)
             spans = [(prompt_lens[i] - 1, rows[i].numel()) for i in group]
@@ -811,14 +847,20 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         prompt_lens: list[int],
         segments: list[list[tuple[int, int, int]]],
         vocab_limit: int,
+        lockstep_versions: list[int] | None = None,
     ) -> dict[int, list[tuple[int, torch.Tensor]]]:
         """Q logits of a batch's draft positions, from the weights that drafted them.
 
         Returns row -> [(segment start, [segment length, V] logits)]; empty off
-        the last pipeline stage.
+        the last pipeline stage. ``lockstep_versions``: the expert-parallel
+        group's common versions for this batch slot (see
+        ``_expert_parallel_lockstep``); versions this rank has no rows for run a
+        dummy forward.
         """
         lq_rows: dict[int, list[tuple[int, torch.Tensor]]] = {i: [] for i in group}
-        versions = sorted({v for i in group for v, _, _ in segments[i]})
+        versions = lockstep_versions
+        if versions is None:
+            versions = sorted({v for i in group for v, _, _ in segments[i]})
         for v in versions:
             # q of version v is needed only at its segments' positions; causal
             # attention lets each row stop at its last such position.
@@ -829,6 +871,10 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 if sv == v and b > a
             ]
             if not segs:
+                if lockstep_versions is not None:
+                    # Expert parallelism: another rank needs version v here.
+                    self._load_scorer(v)
+                    self._dummy_score(scorer)
                 continue
             sub_rows = sorted({r for r, _, _, _ in segs})
             local = {r: k for k, r in enumerate(sub_rows)}
@@ -1157,6 +1203,38 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             self._prof.get("forward", 0.0) + time.perf_counter() - t0
         )
         return logits
+
+    def _expert_parallel_lockstep(
+        self, plans: list[list[int]]
+    ) -> list[list[int]] | None:
+        """Common forward schedule of the expert-parallel group, or None without EP.
+
+        ``plans[j]``: stash versions batch j of this rank scores q with (p follows).
+        Every scorer forward runs an all-to-all over the EP group, and each rank
+        holds only its own experts, so all EP ranks must run the same number of
+        forwards with the same weights loaded: batch j scores, in order, the union
+        of the ranks' versions for j, and ranks without rows there run a dummy.
+        """
+        from megatron.core import parallel_state as ps
+
+        if ps.get_expert_model_parallel_world_size() <= 1:
+            return None
+        gathered: list[Any] = [None] * ps.get_expert_model_parallel_world_size()
+        torch.distributed.all_gather_object(
+            gathered, plans, group=ps.get_expert_model_parallel_group()
+        )
+        n = max(len(p) for p in gathered)
+        return [
+            sorted({v for p in gathered if j < len(p) for v in p[j]}) for j in range(n)
+        ]
+
+    def _dummy_score(self, scorer) -> None:
+        """One-row scorer forward whose output is discarded (EP lockstep filler)."""
+        n = self.cfg["make_sequence_length_divisible_by"]
+        ids = torch.zeros((1, n), dtype=torch.long, device="cuda")
+        pos = torch.arange(n, device="cuda")[None]
+        zero = torch.zeros(1, dtype=torch.long, device="cuda")
+        self._score(scorer, ids, pos, select=(zero, zero))
 
     def _iter_row_id_batches(self, rows, batch_tokens, keys):
         """This rank's rows, length-sorted, as padded token-id batches.
