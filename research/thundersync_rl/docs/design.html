@@ -117,6 +117,7 @@ figcaption { font-size: 14px; color: var(--muted); margin-top: 8px; max-width: 6
     <li><a href="#scaling">Scaling status</a></li>
     <li><a href="#config">Configuration</a></li>
     <li><a href="#code">Code map</a></li>
+    <li><a href="#bi">Batch invariance</a></li>
     <li><a href="#open">Open work</a></li>
   </ol>
 </nav>
@@ -158,7 +159,8 @@ B[g, r] = Σ_{i ∈ group g, r_i = r} H_i        accumulated while group g is op
   <ul>
     <li><strong>Final-first.</strong> Rows of closed groups (final advantages known) always go first. Idle learner time streams one open group's rows into buckets.</li>
     <li><strong>Length-sorted chunks.</strong> Final rows from different groups share micro-batches, sorted by length to limit padding, and are balanced over data-parallel ranks by tokens.</li>
-    <li><strong>Zero-advantage chunks.</strong> With <code>loss_fn.skip_zero_advantage_rows</code>, zero-advantage rows go into chunks of their own. The worker counts their tokens for normalization and drops the whole chunk without a forward pass. Before this change they were spread across micro-batches that then ran part-empty. Learner time: 2.04 → 1.55 s per step.</li>
+    <li><strong>Zero-advantage chunks.</strong> With <code>loss_fn.skip_zero_advantage_rows</code>, zero-advantage rows go into chunks of their own. The worker counts their tokens for normalization and drops the whole chunk without a forward pass. Learner time: 2.04 → 1.55 s per step.</li>
+    <li><strong>Expert parallelism.</strong> With <code>expert_model_parallel_size &gt; 1</code> every forward/backward runs an all-to-all over the EP group, which spans data-parallel ranks, so all ranks must run the same number of micro-batches per dispatch. The planner then pads short ranks with one-row padding chunks (fully masked: no gradient, no normalization count), and the worker ignores <code>skip_zero_advantage_rows</code> (zero-advantage rows run a forward).</li>
   </ul>
 </section>
 
@@ -169,10 +171,10 @@ B[g, r] = Σ_{i ∈ group g, r_i = r} H_i        accumulated while group g is op
   <p>One optimizer step moves the policy very little. The per-token rejection rate between π<sub>k</sub> and π<sub>k+1</sub> measured in bf16 is about 1.7 × 10<sup>−3</sup>, and it is the same for drafts made one to four versions earlier. That flatness shows bf16 activation rounding dominates it, not policy change. In fp32 the true one-step drift is about 3 × 10<sup>−4</sup> per token. Most drafted tokens are therefore acceptable, provided verification is precise enough to see the real drift through the numerical noise.</p>
   <h3>Lifecycle of one iteration</h3>
   <ol class="steps">
-    <li><strong>Draft.</strong> From the start of iteration k, the Megatron inference engine streams drafts for the prompts of iterations k+1 … k+<code>draft_lookahead</code> (<code>start_drafts</code>). Draft requests share the engine with iteration k's own rollouts and fill the capacity its tail leaves idle.</li>
+    <li><strong>Draft.</strong> From the start of iteration k, the Megatron inference engine streams drafts for the prompts of iterations k+1 … k+<code>draft_lookahead</code> (<code>start_drafts</code>). Draft requests share the engine with iteration k's own rollouts and fill the capacity its tail leaves idle. New cohorts ramp in at most two per step (<code>new_cohort_targets</code>).</li>
     <li><strong>Cut at the deadline.</strong> Just before the optimizer step, unfinished drafts are aborted and snapshotted (<code>collect_drafts</code>). Any prefix of a draft is a valid draft. A cut draft resumes from its prefix in the next iteration, under the newer weights.</li>
     <li><strong>Record provenance.</strong> Each draft carries segments <code>(version, start, end)</code> saying which weights drafted which positions, because verification needs each token's true proposal distribution.</li>
-    <li><strong>Stash weights.</strong> Still at θ<sub>k</sub>, every verifier keeps a bf16 copy of the weights (<code>stash_weights</code>), one per version that drafted pending tokens. Older stashes are dropped.</li>
+    <li><strong>Stash weights.</strong> Still at θ<sub>k</sub>, every verifier keeps a bf16 copy of the weights (<code>stash_weights</code>), one per version that drafted pending tokens.</li>
     <li><strong>Verify.</strong> At iteration k+1, verifiers recompute q from the stashes and p from θ<sub>k+1</sub>, block-verify each draft, and publish a plan per trajectory: the kept prefix plus one bonus or residual token.</li>
     <li><strong>Continue.</strong> The rollout code is unchanged. <code>SpeculativeGeneration</code> wraps the generation interface: a fully accepted, finished draft returns immediately, and anything else is sent to the engine to continue from its verified prefix.</li>
   </ol>
@@ -188,7 +190,6 @@ h_i = r_i / (r_i + 1 − b_i)   (i &lt; g),     h_g = b_g
 keep x_1..x_τ, then emit y ~ p_g                       if τ = g   (bonus token)
                          y ~ norm(max(b_τ p_τ − q_τ, 0))  otherwise (residual)</div>
   <p>The output (x<sub>1..τ</sub>, y) is distributed exactly as an autoregressive sample from p. <code>tests/unit/test_block_verification.py</code> checks this by exhaustive enumeration to a total-variation distance under 10<sup>−10</sup>.</p>
-  <table style="display:none"></table>
   <div class="tbl"><table>
     <thead><tr><th>Verification rule (bf16 unless stated)</th><th>Draft tokens kept</th></tr></thead>
     <tbody>
@@ -199,7 +200,7 @@ keep x_1..x_τ, then emit y ~ p_g                       if τ = g   (bonus token
     </tbody>
   </table></div>
   <h3>Fused implementation</h3>
-  <p><code>block_verify_logits</code> works from raw logits: one <code>logsumexp</code> per row of p and q, the draft-token ratios and b on length-g vectors, and one Triton pass per position for the residual masses r<sub>i</sub>. Only the residual row actually sampled from is materialized. It is draw-for-draw identical to the reference (same τ, same y, log-probs within 2 × 10<sup>−6</sup>) and needs no [g, V] log-softmax or fp64 temporaries.</p>
+  <p><code>block_verify_logits</code> works from raw logits: one <code>logsumexp</code> per row of p and q, the draft-token ratios and b on length-g vectors, and one Triton pass per position for the residual masses r<sub>i</sub>. Only the residual row actually sampled from is materialized. It shares <code>acceptance_weights</code>, <code>stop_probabilities</code> and <code>emit_distribution</code> with the reference and rounds the same way (fp32 log-probs, exponentiated in fp64); it is draw-for-draw identical to the reference in tests.</p>
   <h3>Keyed sampling (alternative mode)</h3>
   <p><code>verify_mode=keyed</code> makes every token a Gumbel-max sample whose noise is a hash of (seed, absolute position, token id), computed in a Triton kernel inside the engine's sampler. Two policies then emit the same token wherever their Gumbel races agree, so a draft can be checked position by position with no q at all. It is exactly on-policy but only keeps 51–60% of tokens, so block verification is the default.</p>
 </section>
@@ -210,9 +211,9 @@ keep x_1..x_τ, then emit y ~ p_g                       if τ = g   (bonus token
   <h3>Making the fp32 forward fast</h3>
   <p>About 85% of verification time is scorer forward passes. Megatron and Transformer Engine are tuned for bf16 and fall back to slow paths in fp32. Three changes in <code>scorer_kernels.py</code> and <code>worker.py</code>:</p>
   <ul>
-    <li><strong>Attention through torch SDPA.</strong> The unfused fp32 path builds the score matrix with TF32 GEMMs and applies mask and softmax as separate kernels. SDPA's fused fp32 kernel is about 2× faster per layer and about 1000× closer to exact (max error 1.7 × 10<sup>−6</sup> vs 2 × 10<sup>−3</sup>).</li>
-    <li><strong>Triton SwiGLU.</strong> One pass over the fc1 output replaces strided <code>silu</code>, <code>+ offset</code> and <code>mul</code> kernels on non-contiguous halves: 3.8× faster, relative error 4 × 10<sup>−7</sup>.</li>
-    <li><strong>Selective scoring.</strong> Each version's q forward stops at the last position that version drafted (causal attention makes the truncation exact), and the LM head runs only on positions whose logits verification needs. The p forward skips prompt positions. The logits are bitwise identical to the full forward (<code>THUNDERSYNC_SELECT_CHECK=1</code>).</li>
+    <li><strong>Attention through torch SDPA.</strong> Replaces plain causal softmax attention only (no sliding window, no attention sinks), using each module's own softmax scale. About 2× faster per layer than the unfused fp32 path and about 1000× closer to exact (max error 1.7 × 10<sup>−6</sup> vs 2 × 10<sup>−3</sup> with TF32 score GEMMs).</li>
+    <li><strong>Triton SwiGLU</strong> for dense <code>MLP</code> modules only (MoE experts keep their own forward). One pass over the fc1 output replaces strided <code>silu</code>, <code>+ offset</code> and <code>mul</code>: 3.8× faster, relative error 4 × 10<sup>−7</sup>.</li>
+    <li><strong>Selective scoring</strong> (<code>select_positions</code>). Each version's q forward stops at the last position that version drafted (causal attention makes the truncation exact), and the LM head runs only on positions whose logits verification needs. The p forward skips prompt positions. The logits are bitwise identical to the full forward (<code>THUNDERSYNC_SELECT_CHECK=1</code>).</li>
   </ul>
   <div class="callout"><strong>Attention needs fp32-level accuracy.</strong> Running only attention in bf16 inside the fp32 scorer drops tokens kept from 99.2% to 96.4% and fully accepted drafts from 98.5% to 94.7%, which slows iterations from 3.31 to 4.12 s. A Triton flash-attention kernel with <code>tf32x3</code> dots matched fp32 accuracy but was 2× slower than SDPA.</div>
   <h3>q storage scales with parameters, not tokens</h3>
@@ -222,9 +223,9 @@ keep x_1..x_τ, then emit y ~ p_g                       if τ = g   (bonus token
 <section id="pipeline" class="wide">
   <h2>Overlapped verification pipeline</h2>
   <div style="max-width:68ch">
-  <p>At the start of iteration k+1 every GPU is briefly free: the learner has just stepped and most rollouts are already drafted. Verification uses all of them and overlaps with the rollouts:</p>
+  <p>At the start of iteration k+1 every GPU is briefly free. Verification uses all of them and overlaps with the rollouts:</p>
   <ul>
-    <li><strong>Both pools verify</strong> (<code>verify_on=both</code>). Rows are split into chunks (<code>verify_chunks=4</code>), assigned round-robin to the learner and inference worker groups. Rows are owned by data-parallel rank through a stable hash of the draft key. Sampling is seeded per data-parallel rank, so tensor-parallel partners make identical decisions.</li>
+    <li><strong>Both pools verify</strong> (<code>verify_on=both</code>). Rows are split into <code>verify_chunks</code> chunks, assigned round-robin to the learner and inference worker groups. Rows are owned by data-parallel rank through a stable hash of the draft key. Sampling is seeded per data-parallel rank, so tensor-parallel partners make identical decisions.</li>
     <li><strong>Plans publish per chunk</strong> (<code>verify_overlap</code>). Rollouts wait on a condition variable for their own plan, not for the whole batch. Verification errors wake every waiting rollout and surface instead of hanging it.</li>
     <li><strong>Longest drafts first</strong> (<code>verify_longest_first</code>), so the continuations most likely to become stragglers start earliest.</li>
     <li><strong>Training starts as soon as groups complete.</strong> The learner trains the first verified groups while later chunks are still verifying.</li>
@@ -259,7 +260,7 @@ keep x_1..x_τ, then emit y ~ p_g                       if τ = g   (bonus token
         <span><i style="background:var(--lane);border:1px solid var(--rule)"></i>drafting (continuous)</span>
       </div>
     </div>
-    <figcaption>A typical iteration where every draft is accepted (about 2.3 s, learner-bound). Approximate, from the measured averages: first training dispatch at 0.64 s, 1.48 s of learner work, 0.2 s step and refit. When one draft is rejected early, its remainder decodes serially and extends the rollout lane by 1–3 s.</figcaption>
+    <figcaption>A typical iteration where every draft is accepted (about 2.3 s, learner-bound). Approximate: about 0.6 s until the first verified groups, then training, then a 0.2 s step and refit. When one draft is rejected early, its remainder decodes serially and extends the rollout lane by 1–3 s.</figcaption>
   </figure>
 </section>
 
@@ -295,9 +296,10 @@ keep x_1..x_τ, then emit y ~ p_g                       if τ = g   (bonus token
       <tr><td>Triton flash attention with tf32x3 dots</td><td>2× slower than fp32 SDPA</td></tr>
       <tr><td>Verify only on inference GPUs</td><td>3.78 s; competes with drafting</td></tr>
       <tr><td>Small first verification chunk; group-aligned chunks; 1:2 and 1:3 pool weights</td><td>3.2–3.9 s; neutral or worse</td></tr>
-      <tr><td>Delay drafting until few rollouts remain (<code>draft_max_inflight</code> 0 or 2)</td><td>6.30 s, 3.74 s; unfinished drafts</td></tr>
+      <tr><td>Delay drafting until few rollouts remain in flight (0 or 2)</td><td>6.30 s, 3.74 s; unfinished drafts</td></tr>
       <tr><td>Pause drafts while continuations decode (always, or only in the tail)</td><td>5.73 s, 4.14 s; drafting time is worth more</td></tr>
       <tr><td>Micro-batch 16, token-budgeted chunks, fused linear-logprob loss</td><td>No change in learner time</td></tr>
+      <tr><td>3 inference + 1 training GPUs</td><td>3.32 s per 120 rollouts (no speculation 5.53 s): single learner GPU becomes the bottleneck</td></tr>
     </tbody>
   </table></div>
   </div>
@@ -339,7 +341,7 @@ keep x_1..x_τ, then emit y ~ p_g                       if τ = g   (bonus token
       <tr><td>Tensor parallelism</td><td>Vocab-parallel logits gathered per batch; validated at TP=2 (99.9% kept)</td></tr>
       <tr><td>Pipeline parallelism</td><td>Forward-only pipeline schedule, last stage verifies; scorer log-probs at PP=2 bitwise equal PP=1. Inference must be pinned to PP=1 (<code>mcore_generation_config.pipeline_model_parallel_size=1</code>)</td></tr>
       <tr><td>Context parallelism</td><td>Not implemented; the scorer raises. Needs packed (THD) scoring</td></tr>
-      <tr><td>MoE / expert parallelism</td><td>Provider copy carries the EP layout; untested</td></tr>
+      <tr><td>MoE / expert parallelism</td><td>Provider copy carries the EP layout; fused kernels skip MoE modules; untested end to end</td></tr>
       <tr><td>Large models on few learner GPUs</td><td>At 4B with one learner GPU: verify on the inference pool, or use <code>verify_batch_tokens=4096</code> and the bf16 scorer to fit</td></tr>
     </tbody>
   </table></div>
@@ -371,7 +373,7 @@ policy.make_sequence_length_divisible_by=128</code></pre>
     <dt>verify_batch_tokens</dt><dd>Tokens per scorer forward batch (bounds logits memory). Default 16384.</dd>
     <dt>draft_budget</dt><dd>Maximum new tokens per draft.</dd>
   </dl>
-  <p class="note">Debug switches: <code>THUNDERSYNC_SPEC_PROF</code> (verification timing), <code>THUNDERSYNC_SPEC_CHECK</code> (cross-pool scorer check), <code>THUNDERSYNC_SELECT_CHECK</code> (selective vs full logits), <code>THUNDERSYNC_REJECT_LOG</code> (per-draft outcomes and continuation timing), <code>THUNDERSYNC_LEARNER_PROF</code> and <code>THUNDERSYNC_LEARNER_TORCHPROF</code> (training chunks).</p>
+  <p class="note">Debug switches: <code>THUNDERSYNC_SPEC_PROF</code> (verification timing), <code>THUNDERSYNC_SPEC_CHECK</code> (cross-pool scorer check), <code>THUNDERSYNC_SELECT_CHECK</code> (selective vs full logits, PP=1), <code>THUNDERSYNC_SPEC_TORCHPROF</code> (scorer profile, PP=1), <code>THUNDERSYNC_REJECT_LOG</code> (per-draft outcomes and continuation timing), <code>THUNDERSYNC_LEARNER_PROF</code> and <code>THUNDERSYNC_LEARNER_TORCHPROF</code> (training chunks), <code>THUNDERSYNC_SCORER_ATTN_BF16</code> (experiment: bf16 attention in the scorer), <code>THUNDERSYNC_SPEC_SELFTEST</code> (keyed mode: re-draft with the same seeds and verify on unchanged weights before training), <code>THUNDERSYNC_MISMATCH_CHECK</code> (rollout vs learner log-probs before each optimizer step).</p>
 </section>
 
 <section id="code" class="wide">
@@ -379,29 +381,69 @@ policy.make_sequence_length_divisible_by=128</code></pre>
   <div class="tbl"><table>
     <thead><tr><th>File (research/thundersync_rl/)</th><th>Role</th></tr></thead>
     <tbody>
-      <tr><td class="mono">thundersync_rl/grpo_loop.py</td><td>GRPO loop: per-sample rollouts, learner loop, drafter and verification tasks, config</td></tr>
+      <tr><td class="mono">thundersync_rl/grpo_loop.py</td><td>GRPO loop: per-sample rollouts, learner loop, drafter and verification tasks, config, cohort ramp</td></tr>
       <tr><td class="mono">thundersync_rl/streaming.py</td><td>StreamPlanner: arrivals to dispatches, bucket vs final chunks, zero-advantage chunks, DP balancing</td></tr>
       <tr><td class="mono">thundersync_rl/speculative.py</td><td>SpeculativeGeneration: cohorts and segments, stash calls, chunked verification, plans, continuations</td></tr>
       <tr><td class="mono">thundersync_rl/worker.py</td><td>Megatron worker extension: streaming train calls, scorer build and refresh, weight stashes, stashed block verification, draft streams</td></tr>
-      <tr><td class="mono">thundersync_rl/block_verification.py</td><td>Reference block verification and its exact output law (tested by enumeration)</td></tr>
+      <tr><td class="mono">thundersync_rl/block_verification.py</td><td>Reference block verification, shared acceptance helpers, exact output law</td></tr>
       <tr><td class="mono">thundersync_rl/block_verification_fused.py</td><td>Block verification from raw logits with a Triton residual-mass kernel</td></tr>
-      <tr><td class="mono">thundersync_rl/scorer_kernels.py</td><td>SDPA core attention, Triton SwiGLU, selective output layer</td></tr>
+      <tr><td class="mono">thundersync_rl/scorer_kernels.py</td><td>SDPA core attention, Triton SwiGLU, selective LM head</td></tr>
       <tr><td class="mono">thundersync_rl/keyed_sampling.py</td><td>Position-keyed Gumbel-max sampling kernel (keyed mode)</td></tr>
+      <tr><td class="mono">thundersync_rl/fused_train.py</td><td>Fused verification + training (BI, experimental): retained graphs, logit stitching, forward substitution</td></tr>
       <tr><td class="mono">nemo_rl/algorithms/grad_streaming.py</td><td>Core: per-(group, reward) gradient accumulators, final-first selection (shared with the single controller)</td></tr>
     </tbody>
   </table></div>
-  <p class="note" style="max-width:68ch">Tests: 55 research unit tests (block verification by enumeration, fused verification draw-for-draw, streaming equivalence, speculative driver plans, cohorts, chunked pools, error surfacing), 7 core zero-advantage tests, and GPU functional checks for scorer and refit parallelism.</p>
+  <p class="note" style="max-width:68ch">Tests: 119 research unit tests (block verification by enumeration, fused verification draw-for-draw, scorer kernels on GPU, streaming equivalence, speculative driver plans, cohorts and ramp, chunked pools, error surfacing, fused verification + training: routing, claims, config checks and gradient equality on a tiny causal model), 7 core zero-advantage tests, and GPU functional checks for scorer and refit parallelism.</p>
+</section>
+
+<section id="bi">
+  <h2>Batch invariance (NeMo-RL PR 3208)</h2>
+  <p>Branch <code>thundersync-rl-bi</code> applies PR 3208 (<code>policy.megatron_cfg.zero_train_gen_mismatch</code>): Megatron training and Megatron inference run the same batch-invariant kernel stack, so generation log-probs and training log-probs of the same tokens are bitwise equal.</p>
+  <p><strong>How the kernels get batch invariance</strong> (<code>te_native</code> backend): native cuBLASLt GEMMs with a starved workspace (no split-K, so a fixed K-reduction order at every row count), batch-invariant <code>aten::_log_softmax</code> / <code>mean</code>, TE RMSNorm kept native under 64-multiple token alignment, FlashAttention 4 with <code>num_splits=1</code>. Requirements enforced by the PR's validator: BF16, TP=1, CP=1, no packing, generation <code>transformer_impl=inference_optimized</code> (so no QKV-bias models such as Qwen2.5), <code>make_sequence_length_divisible_by</code> a multiple of 64.</p>
+  <p><strong>Environment.</strong> TE 2.18 (built from source against torch 2.11), flash-attn-4 4.0.0b19, CuTe DSL 4.6.2 (including <code>nvidia-cutlass-dsl-libs-core</code>, the Python frontend), quack-kernels 0.6.4 and apache-tvm-ffi 0.1.11, as a PYTHONPATH overlay (<code>thundersync_work/build_bi_overlay.sh</code>).</p>
+  <p><strong>Measured with ThunderSync</strong> (<code>THUNDERSYNC_MISMATCH_CHECK=1</code>: before the optimizer step the learner recomputes the batch's log-probs and compares them with the rollout log-probs):</p>
+  <div class="tbl"><table>
+    <thead><tr><th>Model</th><th>Mismatch</th></tr></thead>
+    <tbody>
+      <tr><td>Qwen3-1.7B, BI</td><td>0 on every token (4 steps)</td></tr>
+      <tr><td>Nemotron-Nano-9B-v2 (hybrid Mamba), BI, validator's hybrid exclusion relaxed</td><td>0 on every token (3 steps)</td></tr>
+    </tbody>
+  </table></div>
+  <p>The PR's exclusion of hybrid Mamba models is an untested-scope limit: MCore's batch-invariant Mamba decode (buffered chunk replay) already makes them exact.</p>
+  <h3>Speculation under BI</h3>
+  <ul>
+    <li><strong>Scorer precision.</strong> BI kernels are BF16-only (<code>TransformerConfig</code> asserts it), so an fp32 scorer is built with <code>batch_invariant_mode=False</code> on its own copy, keeping the process-wide TE attention settings (its attention is replaced by SDPA anyway). A bf16 scorer would match the policy bitwise once it scores like training (training op sequence, rows padded to the training multiple, full-row LM head, training's fp32 log-softmax: 92–97% of tokens bitwise equal so far), but its rounding jitter between consecutive weight versions is part of the policy, so exact verification against it rejects long drafts: 33–44% of draft tokens kept on Qwen3-1.7B's ~3k-token outputs versus 94–98% with the fp32 scorer. The fp32 scorer is the default; rollouts then follow the fp32 approximation of the policy, as without BI.</li>
+    <li><strong>Where the scorer runs.</strong> On the learner it is stable but does not scale under BI: BI requires TP=1, so each learner GPU holds the full fp32 copy (4 B/param) plus a bf16 stash per pending version on top of training state (Qwen3-8B ran out of memory on 2 and 3 learner GPUs). On the inference GPUs (<code>verify_on=inference</code>, the recommended BI setting) it first broke the engine: acceptance decayed step by step (97% → ~40%) and the engine eventually sampled from NaN logits (token id 155647 outside the 151936 vocab).</li>
+    <li><strong>Root cause and fix.</strong> Under BI, NeMo-RL turns flashinfer RoPE off, so the engine reads its RoPE table from <code>RotaryEmbedding.forward</code>, an <code>lru_cache(maxsize=32)</code> shared by every instance in the process, and the engine's inference CUDA graphs capture that table's address. The scorer's own RoPE calls evicted the engine's entry, and the generation worker's <code>cache_clear()</code> (prepare/finish generation) freed it; the scorer's activations and weight stashes then reused the memory the graphs kept reading. Fixes: <code>megatron_worker._pin_rotary_tables</code> memoizes the engine's RoPE tables per module with no eviction (BI path; unit-tested in <code>tests/unit/models/generation/test_megatron_rope_pin.py</code>), and the scorer's RoPE forward bypasses the shared cache. The scorer copy also builds standard Transformer Engine layers without CUDA graphs, so both verifier pools compute identical p and the scorer never joins the engine's graph state. Result (Qwen3-1.7B, BI, verification on inference GPUs, 10 steps): 92–99% of draft tokens kept with no decay; the train/generation log-prob gap stays at the fp32-scorer level (mean 0.011) on accepted tokens and is zero on engine-decoded ones. Qwen3-8B, BI, 1 node (2 inference + 2 training GPUs, verification on inference, 4 steps): 93–99% kept, 91–95% of drafts fully accepted, about 50 s per step at ~3.5k mean generated tokens.</li>
+    <li>The same eviction hazard applies to any process that captures inference CUDA graphs with the non-flashinfer RoPE path and creates other RoPE models or calls <code>cache_clear()</code> (upstream: MCore could keep the dynamic-inference table in <code>rotary_pos_emb_cache</code>, as its flashinfer path does).</li>
+  </ul>
+
+  <h3>BI-enabled optimizations (opt-in)</h3>
+  <p>Bitwise train/generation parity removes work that exists only to bridge numerics. All of these are off by default.</p>
+  <p><strong>Fused verification + training</strong> (<code>thundersync.fused_verify_train</code>, <code>fused_train.py</code>). <em>Experimental, opt-in; exact on GPU, not faster yet (A/B below).</em> With BI, the learner's bf16 training forward is the engine's numerics, so p for verification can come from the training model itself at θ<sub>k+1</sub>, and that p forward is exactly the forward that training of iteration k+1 needs for the same trajectory. Fused mode keeps it:</p>
+  <ol class="steps">
+    <li>q is recomputed from the weight stashes as before (bf16 scorer, no grad).</li>
+    <li>p is a forward of the training model, inside the already open train step, shaped like a training micro-batch (one row, padded to <code>make_sequence_length_divisible_by</code>, same <code>model_forward</code> call). Rows whose full acceptance would make a finished rollout (EOS or length cap) run with autograd; the others without.</li>
+    <li>A draft that is fully accepted and finished keeps its graph on the verifying data-parallel rank, up to <code>fused_max_retained_tokens</code> per rank (<code>FusedGraphStore</code>); every other graph is freed at once. Its plan is complete, so the rollout returns immediately and the environment rewards it through the normal rollout path; no extra reward hook is needed.</li>
+    <li>The driver matches the finished trajectory to its retained forward (<code>claim_fused</code>), and the planner sends it as a one-row chunk pinned to that rank, into its (group, reward) bucket while the group is open or as a final row once it closed, exactly as any other trajectory. The worker runs the regular <code>train_microbatch</code>, with only <code>model_forward</code> replaced by the retained logits: same loss, token and sequence counts, bucket capture and finalization. The training row is the verified row plus the environment's reply; causal attention makes the verified logits its prefix, and the reply positions, masked out of the loss, are filled with constants that carry no gradient. Any mismatch (other tokens, an unmasked token after the verified row, a missing graph) falls back to the real forward.</li>
+    <li>Retained graphs never outlive the step: the barrier drops unclaimed ones before the optimizer step.</li>
+  </ol>
+  <p>The gradient equals the unfused path's up to fp32 summation order (per-row losses are additive, and BI makes a row's forward independent of its micro-batch). Each fused trajectory saves one full training forward of its row (<code>fused/trajectories</code>, <code>fused/forward_tokens_saved</code>; <code>fused/retained</code>, <code>fused/claimed</code>, <code>fused/fallbacks</code>, <code>fused/unclaimed</code> track the rest). It pays where bf16 verification keeps most drafts whole: short outputs, where block verification against the training-dtype policy keeps about 87–91% of tokens. On long outputs bf16 acceptance is low (33–44% of draft tokens on Qwen3-1.7B's ~3k-token outputs), few drafts finish whole, and the fp32 scorer (not fusable: its p is not the training forward) is the better choice. Requirements, enforced by <code>validate_fused_verify_train</code> and on the worker: <code>speculate</code>, <code>verify_mode=block</code>, <code>verify_on=learner</code>, <code>verify_precision=model</code>, <code>batch_invariant_mode</code>, PP=1 (and BI's TP=1, CP=1), generation temperature 1, no fused linear log-probs, no MTP or draft-model training. <code>THUNDERSYNC_FUSED_CHECK=1</code> also runs the real forward for each fused row and prints the largest logit difference over the verified positions (expected 0).</p>
+  <div class="callout"><strong>GPU A/B.</strong> Qwen3-1.7B, BI, 2 + 2 GPUs, 2k-token cap, learner bf16 block verification, same seed, 6 steps (<code>thundersync_work/fused_ab.sh</code>): every fused forward matched a fresh forward bitwise (<code>THUNDERSYNC_FUSED_CHECK</code>: max |logit diff| 0), and the train/generation mismatch check read 0 on every token in every step, whereas unfused bf16 verification left 1–4% of accepted tokens inexact (its scorer copy is not the training forward). 5–13 trajectories per step were fused (10–27k forward tokens saved, no fallbacks), but steady-state steps took 13.4–14.4 s against 10.5–11.0 s unfused: rollouts wait about 3 s longer for verification forwards that run with autograd, which costs more than the training forwards they save at this size. Acceptance was the same either way (41–52% of draft tokens) and well below the fp32 scorer's 92–99%, so fused mode is a net loss here. It is worth retesting where training forwards are expensive relative to verification (large models, learner-bound runs). On Qwen3-8B (1 node, 2 + 2 GPUs) the default settings run out of memory on the learner (weight stashes, retained graphs and training state on TP=1 GPUs); it fits with <code>draft_lookahead=1 verify_batch_tokens=4096 fused_max_retained_tokens=8192</code>, keeping 66–68% of draft tokens, but only about one trajectory per step finishes whole and gets fused.</div>
+  <p><strong>Keyed verification under BI</strong> (<code>verify_mode=keyed</code>). With bitwise parity the learner's logits for a draft are the ones the engine sampled from, so keyed verification needs no scorer copy and no weight stashes: p from the current training weights is all it reads, and the check is token-level (keep the agreeing prefix, then the learner's own token). It stays exactly on-policy, at the lower token-level acceptance of <a href="#verification">block verification</a>. GPU check (Qwen3-1.7B, BI, 2 + 2 GPUs, <code>thundersync_work/keyed_bi.sh</code>): the self-test re-drafts with the same seeds and keeps 100% of every draft on unchanged weights, and the train/generation mismatch check reads 0 on every token of every step once the plan reports full-vocabulary log-probs (sampling keeps the <code>vocab_limit</code> slice the engine's keyed sampler uses). Acceptance across a weight update is 10–13% of draft tokens, against 92–99% for block verification with the fp32 scorer, so keyed mode trades nearly all of the speculation gain for removing the scorer and the stashes; it is the memory-light option, not the fast one. On Qwen3-8B (1 node, 2 + 2 GPUs) it fits on the learner, keeps 7–10% of draft tokens and takes 66–100 s per step against about 50 s for block verification on the inference GPUs.</p>
+  <p><strong>No importance-sampling correction.</strong> Generation and training log-probs are bitwise equal under BI, so the importance weights are exactly 1 and <code>loss_fn.use_importance_sampling_correction</code> can be disabled. In fused mode the plan's log-probs are computed with training's own log-softmax from the training forward, so this holds for fully accepted speculative tokens too.</p>
 </section>
 
 <section id="open">
   <h2>Open work</h2>
   <ul>
-    <li><strong>Stragglers.</strong> The remaining gap is about one rejected draft per step decoding its remainder at about 3 ms per token. Only faster single-sequence decoding helps, such as engine-level speculative decoding with an MTP or EAGLE head.</li>
-    <li><strong>Generation capacity.</strong> At 1.5B on 2 + 2 GPUs generation is near saturation, but moving a GPU to inference does not help: on 3 inference + 1 training GPUs speculation takes 3.32 s per 120 rollouts (no speculation: 5.53 s), because the single learner GPU becomes the bottleneck. Faster decoding in the engine is the remaining lever.</li>
+    <li><strong>Stragglers.</strong> About one rejected draft per step decodes its remainder at about 3 ms per token. Only faster single-sequence decoding helps, such as engine-level speculative decoding with an MTP or EAGLE head.</li>
+    <li><strong>Generation capacity.</strong> At 1.5B generation is near saturation on 2 + 2 GPUs, and a 3 + 1 split makes the learner the bottleneck; faster engine decoding is the lever.</li>
     <li><strong>Training CPU overhead.</strong> About 130 ms CPU vs 70 ms GPU per micro-batch; training CUDA graphs would need static or bucketed shapes.</li>
-    <li><strong>Batch invariance (PR 3208).</strong> Would make q bitwise the engine's sampling distribution. Needs Transformer Engine 2.18 or later and flash-attn 4.</li>
-    <li><strong>Scaling gaps.</strong> Context parallelism in the scorer, MoE validation, and zero-advantage skip with sequence packing.</li>
+    <li><strong>Batch invariance at scale.</strong> Run the BI speculation presets (inference-side verification) on 2-node 8B/14B and Nemotron-Nano on the cluster (1-node 8B passes); validate the opt-in BI optimizations on GPU.</li>
+    <li><strong>Scaling gaps.</strong> Context parallelism in the scorer, MoE validation, zero-advantage skip with sequence packing.</li>
     <li><strong>Upstream.</strong> Default <code>make_sequence_length_divisible_by</code> to 64–128 for Megatron training.</li>
+    <li><strong>Fused verification + training on GPU.</strong> Validate <code>fused_verify_train</code> end to end (<code>THUNDERSYNC_FUSED_CHECK=1</code>, gradient against the unfused path) and measure the saved learner time on short-output tasks (see <a href="#bi">Batch invariance</a>).</li>
   </ul>
 </section>
 </main>
