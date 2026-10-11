@@ -219,9 +219,10 @@ class SpeculativeGeneration:
         prefix of a draft is a valid draft for verification.
         """
         rank0 = self.base._policy.worker_group.workers[0]
+        budget = min(self.draft_budget, self.max_new_tokens)
         ray.get(
             rank0.start_drafts.remote(
-                [p.tolist() for p in prompts], self.draft_budget, self.stream_interval
+                [p.tolist() for p in prompts], budget, self.stream_interval
             )
         )
 
@@ -235,7 +236,14 @@ class SpeculativeGeneration:
                         prompts[i],
                         -1,
                         toks,
-                        done,
+                        # Stopping at a draft budget below max_new_tokens is not
+                        # the end of the rollout (EOS exactly at the budget is).
+                        done
+                        and (
+                            len(toks) < budget
+                            or budget == self.max_new_tokens
+                            or (bool(toks) and toks[-1] == self.eod)
+                        ),
                         f"{step + 1}:{i}",
                         [(step, 0, len(toks))],
                     )

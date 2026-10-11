@@ -402,3 +402,34 @@ def test_expert_parallel_speculation_verifies_on_learner(verify_on, gen_ep, ok):
     else:
         with pytest.raises(ValueError, match="verify_on='learner'"):
             validate_expert_parallel(ts, policy)
+
+
+@pytest.mark.parametrize(
+    "gen,ok",
+    [
+        ({"temperature": 1.0, "top_p": 1.0, "top_k": None, "stop_strings": None}, True),
+        (
+            {"temperature": 0.7, "top_p": 1.0, "top_k": None, "stop_strings": None},
+            False,
+        ),
+        (
+            {"temperature": 1.0, "top_p": 0.9, "top_k": None, "stop_strings": None},
+            False,
+        ),
+        ({"temperature": 1.0, "top_p": 1.0, "top_k": 50, "stop_strings": None}, False),
+        (
+            {"temperature": 1.0, "top_p": 1.0, "top_k": None, "stop_strings": ["</a>"]},
+            False,
+        ),
+    ],
+)
+def test_speculation_rejects_unreproduced_sampling(gen, ok):
+    from thundersync_rl.grpo_loop import ThunderSyncConfig, validate_speculation
+
+    policy = {"generation": gen}
+    validate_speculation(ThunderSyncConfig(speculate=False), policy)
+    if ok:
+        validate_speculation(ThunderSyncConfig(speculate=True), policy)
+    else:
+        with pytest.raises(ValueError, match="speculate"):
+            validate_speculation(ThunderSyncConfig(speculate=True), policy)

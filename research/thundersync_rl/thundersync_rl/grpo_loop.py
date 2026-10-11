@@ -199,7 +199,45 @@ def validate_config(master_config: ThunderSyncMasterConfig) -> None:
     assert ddp["grad_reduce_in_fp32"], (
         "per-trajectory gradients are moved out of the grad buffer; keep it fp32"
     )
+    # Per-group advantages are computed as each group closes; estimators with
+    # batch-global statistics would silently become per-group.
+    assert master_config.grpo.adv_estimator.name == "grpo", (
+        "gradient streaming supports grpo.adv_estimator.name='grpo' (per-group "
+        f"advantages), got {master_config.grpo.adv_estimator.name!r}"
+    )
+    assert not getattr(loss_cfg, "seq_logprob_error_in_loss", False), (
+        "loss_fn.seq_logprob_error_in_loss renormalizes over surviving sequences, "
+        "which the streamed per-chunk loss does not see"
+    )
+    validate_speculation(master_config.thundersync, master_config.policy)
     validate_expert_parallel(master_config.thundersync, master_config.policy)
+
+
+def validate_speculation(ts_cfg: ThunderSyncConfig, policy_cfg: PolicyConfig) -> None:
+    """Reject sampling settings speculative verification does not reproduce.
+
+    Verification compares raw (temperature 1, untruncated) logits of the
+    drafting and current weights, and drafts run without stop strings, so the
+    rollout law matches the configured sampler only for plain sampling.
+    """
+    if not ts_cfg.speculate:
+        return
+    gen = policy_cfg["generation"]
+    problems = []
+    if gen["temperature"] != 1.0:
+        problems.append(
+            f"policy.generation.temperature must be 1.0 (got {gen['temperature']})"
+        )
+    if gen.get("top_p", 1.0) != 1.0:
+        problems.append(f"policy.generation.top_p must be 1.0 (got {gen['top_p']})")
+    if gen.get("top_k") not in (None, -1, 0):
+        problems.append(f"policy.generation.top_k must be unset (got {gen['top_k']})")
+    if gen.get("stop_strings"):
+        problems.append(
+            "policy.generation.stop_strings must be unset (drafts ignore them)"
+        )
+    if problems:
+        raise ValueError("thundersync.speculate=true: " + "; ".join(problems) + ".")
 
 
 def validate_expert_parallel(

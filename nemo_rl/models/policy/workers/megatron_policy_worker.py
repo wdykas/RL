@@ -2462,16 +2462,30 @@ class MegatronPolicyWorkerImpl(
         # copies per streaming group (on storage_device).
         copy_bytes = sum(g.numel() for g in grads) * 4
         bucket_bytes = copy_bytes * spec.max_buckets_per_group * spec.max_open_groups
-        if spec.storage_device == "cuda":
-            free, _ = torch.cuda.mem_get_info()
-            free += torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
-            # Keep at least half for the streamed chunks' activations/logits.
-            needed, budget = copy_bytes + bucket_bytes, 0.5 * free
-            where, hint = (
-                "GPU memory",
-                "lower max_open_groups or use storage_device=cpu",
+        free, _ = torch.cuda.mem_get_info()
+        free += torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+        on_device = copy_bytes + (bucket_bytes if spec.storage_device == "cuda" else 0)
+        copies = (
+            f"{copy_bytes / 2**30:.1f} GiB per gradient copy, "
+            f"{spec.max_buckets_per_group} x {spec.max_open_groups} bucket copies"
+        )
+        # The batch accumulator is always on device; it must fit outright. The
+        # streamed chunks' activations and logits need the rest, so warn when
+        # the copies take more than half of what is free (fits with activation
+        # checkpointing or small micro-batches, may OOM otherwise).
+        if on_device > free:
+            raise ValueError(
+                f"gradient streaming needs {on_device / 2**30:.1f} GiB of GPU memory "
+                f"({copies}) but only {free / 2**30:.1f} GiB is free; lower "
+                "max_open_groups, use storage_device=cpu, or add training GPUs"
             )
-        else:
+        if on_device > 0.5 * free:
+            warnings.warn(
+                f"gradient streaming takes {on_device / 2**30:.1f} of "
+                f"{free / 2**30:.1f} GiB free GPU memory ({copies}); the streamed "
+                "chunks' activations must fit in the rest"
+            )
+        if spec.storage_device != "cuda":
             with open("/proc/meminfo") as f:
                 meminfo = dict(line.split(":", 1) for line in f)
             available = int(meminfo["MemAvailable"].split()[0]) * 1024
@@ -2481,15 +2495,12 @@ class MegatronPolicyWorkerImpl(
                 if torch.distributed.is_initialized()
                 else 1
             )
-            needed, budget = bucket_bytes, 0.8 * available / ranks
-            where, hint = "pinned host memory", "lower max_open_groups"
-        if needed > budget:
-            raise ValueError(
-                f"gradient streaming needs {needed / 2**30:.1f} GiB of {where} "
-                f"({copy_bytes / 2**30:.1f} GiB per gradient copy, "
-                f"{spec.max_buckets_per_group} x {spec.max_open_groups} bucket "
-                f"copies) but its budget is {budget / 2**30:.1f} GiB; {hint}"
-            )
+            if bucket_bytes > 0.8 * available / ranks:
+                raise ValueError(
+                    f"gradient streaming needs {bucket_bytes / 2**30:.1f} GiB of "
+                    f"pinned host memory ({copies}) but its budget is "
+                    f"{0.8 * available / ranks / 2**30:.1f} GiB; lower max_open_groups"
+                )
         return StreamingGroupAccumulator(
             grads,
             storage_device=spec.storage_device,
