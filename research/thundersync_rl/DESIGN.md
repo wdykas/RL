@@ -349,7 +349,9 @@ Debug switches: `THUNDERSYNC_SPEC_PROF` (verification timing), `THUNDERSYNC_SPEC
 `THUNDERSYNC_SPEC_TORCHPROF` (scorer profile, PP=1), `THUNDERSYNC_REJECT_LOG` (per-draft
 outcomes and continuation timing), `THUNDERSYNC_LEARNER_PROF` and
 `THUNDERSYNC_LEARNER_TORCHPROF` (training chunks), `THUNDERSYNC_SCORER_ATTN_BF16`
-(experiment: bf16 attention in the scorer).
+(experiment: bf16 attention in the scorer), `THUNDERSYNC_SPEC_SELFTEST` (keyed mode:
+re-draft with the same seeds and verify on unchanged weights before training),
+`THUNDERSYNC_MISMATCH_CHECK` (rollout vs learner log-probs before each optimizer step).
 
 ## 13. Code map
 
