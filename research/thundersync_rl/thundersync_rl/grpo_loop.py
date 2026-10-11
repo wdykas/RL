@@ -209,6 +209,30 @@ def validate_config(master_config: ThunderSyncMasterConfig) -> None:
         "loss_fn.seq_logprob_error_in_loss renormalizes over surviving sequences, "
         "which the streamed per-chunk loss does not see"
     )
+    # Per-sample advantage overrides and reward penalties of the synchronous
+    # trainer are not applied by the streaming path.
+    grpo_cfg = master_config.grpo
+    for key in ("invalid_tool_call_advantage", "malformed_thinking_advantage"):
+        assert getattr(grpo_cfg, key, None) is None, (
+            f"grpo.{key} is not supported with gradient streaming"
+        )
+    penalty_cfg = getattr(grpo_cfg, "reward_penalties", None) or {}
+    if not isinstance(penalty_cfg, dict):
+        penalty_cfg = penalty_cfg.model_dump()
+    penalties = [k for k, v in penalty_cfg.items() if k.startswith("penalize_") and v]
+    assert not penalties, f"grpo.reward_penalties not supported: {penalties}"
+    # The router's load-balancing loss and expert-bias update depend on which
+    # rows share a micro-batch, which streaming changes.
+    megatron_cfg = master_config.policy["megatron_cfg"]
+    assert megatron_cfg.get("moe_router_load_balancing_type", "none") in (
+        "none",
+        ["none"],
+    ), (
+        "gradient streaming needs policy.megatron_cfg.moe_router_load_balancing_type='none'"
+    )
+    assert not megatron_cfg.get("moe_router_bias_update_rate", 0.0), (
+        "gradient streaming needs policy.megatron_cfg.moe_router_bias_update_rate=0"
+    )
     validate_speculation(master_config.thundersync, master_config.policy)
     validate_expert_parallel(master_config.thundersync, master_config.policy)
 
