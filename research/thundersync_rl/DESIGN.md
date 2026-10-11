@@ -290,7 +290,11 @@ verifier returned no `draft_logq`, log p is reported as before. The engine's log
 are of the sampling distribution itself: speculation requires temperature 1 and no
 top-k/top-p, so raw and processed log-probs coincide. With this, TIS sees the full
 train-vs-behavior gap instead of only its train-vs-p_fp32 half (G2 in
-`thundersync_work/research/estimator_theory.md`). Batch-invariant kernels with
+`thundersync_work/research/estimator_theory.md`). GPU check (1.5B, 30 steps,
+`THUNDERSYNC_MISMATCH_CHECK`): the corrected log-probs are applied (tokens bitwise equal
+to training's log-probs 18% → 35%), while the mean distance to training's log-probs is
+unchanged within noise (3.0e-3 vs 3.5e-3; KL 7.6e-5 vs 8.1e-5) — expected, since the check
+measures train-vs-reported, not reported-vs-true-law. Batch-invariant kernels with
 training-precision verification (`verify_precision=model`) make q bitwise the sampling
 distribution at lower acceptance (section 14); keyed mode avoids the issue too.
 
@@ -298,7 +302,8 @@ distribution at lower acceptance (section 14); keyed mode avoids the issue too.
 strings, so `validate_config` rejects speculation with temperature ≠ 1, top-p < 1, top-k,
 or stop strings. Streaming computes advantages per group as each group closes, so it
 requires `grpo.adv_estimator.name=grpo` and no `seq_logprob_error_in_loss`. A streamed
-draft stopped by `draft_budget` below `max_new_tokens` is not a finished rollout. Inference-side verification
+draft stopped by `draft_budget` below `max_new_tokens` is not a finished rollout.
+Inference-side verification
 requires inference TP = PP = 1 (the scorer and the running engine would share
 communicators); keyed verification requires learner TP = PP = 1. Streaming rejects reward
 penalties and per-sample advantage overrides, and MoE settings that are not
