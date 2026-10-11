@@ -238,7 +238,7 @@ def validate_config(master_config: ThunderSyncMasterConfig) -> None:
 
 
 def validate_speculation(ts_cfg: ThunderSyncConfig, policy_cfg: PolicyConfig) -> None:
-    """Reject sampling settings speculative verification does not reproduce.
+    """Reject settings speculative verification does not reproduce or support.
 
     Verification compares raw (temperature 1, untruncated) logits of the
     drafting and current weights, and drafts run without stop strings, so the
@@ -252,7 +252,7 @@ def validate_speculation(ts_cfg: ThunderSyncConfig, policy_cfg: PolicyConfig) ->
         problems.append(
             f"policy.generation.temperature must be 1.0 (got {gen['temperature']})"
         )
-    if gen.get("top_p", 1.0) != 1.0:
+    if gen.get("top_p") not in (None, 1.0):
         problems.append(f"policy.generation.top_p must be 1.0 (got {gen['top_p']})")
     if gen.get("top_k") not in (None, -1, 0):
         problems.append(f"policy.generation.top_k must be unset (got {gen['top_k']})")
@@ -260,6 +260,26 @@ def validate_speculation(ts_cfg: ThunderSyncConfig, policy_cfg: PolicyConfig) ->
         problems.append(
             "policy.generation.stop_strings must be unset (drafts ignore them)"
         )
+    from nemo_rl.models.generation.megatron.config import merged_inference_megatron_cfg
+
+    inference = merged_inference_megatron_cfg(policy_cfg)
+    if ts_cfg.verify_on != "learner" and (
+        inference["tensor_model_parallel_size"] > 1
+        or inference["pipeline_model_parallel_size"] > 1
+    ):
+        # The scorer's collectives would share the engine's TP/PP communicators
+        # with the running engine, which nothing pauses (as under EP).
+        problems.append(
+            "thundersync.verify_on must be 'learner' with inference TP or PP > 1"
+        )
+    megatron_cfg = policy_cfg["megatron_cfg"]
+    if ts_cfg.verify_mode == "keyed" and (
+        megatron_cfg["tensor_model_parallel_size"] > 1
+        or megatron_cfg["pipeline_model_parallel_size"] > 1
+    ):
+        # Keyed verification calls the training model directly: vocab-sharded
+        # logits under TP, no pipeline schedule under PP.
+        problems.append("thundersync.verify_mode='keyed' requires learner TP=PP=1")
     if problems:
         raise ValueError("thundersync.speculate=true: " + "; ".join(problems) + ".")
 

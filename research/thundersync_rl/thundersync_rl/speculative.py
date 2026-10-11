@@ -159,7 +159,9 @@ class SpeculativeGeneration:
         fields = {
             "input_ids": ids,
             "input_lengths": torch.tensor([prompts[i].numel() for i, _ in rows]),
-            "max_new_tokens": torch.full((len(rows),), self.draft_budget),
+            "max_new_tokens": torch.full(
+                (len(rows),), min(self.draft_budget, self.max_new_tokens)
+            ),
         }
         if self.verify_mode == "keyed":
             fields["noise_seed"] = torch.tensor([seeds[i] for i, _ in rows])
@@ -428,7 +430,8 @@ class SpeculativeGeneration:
         finished = d[3] if len(d) > 3 else True
         # Cohort/streamed drafts carry the full budget: finished = EOS or the cap.
         stopped = finished and (len(d) > 4 or len(draft) < self.draft_budget)
-        if n_acc == len(draft) and stopped:
+        # A draft at the length cap is a finished rollout: nothing follows it.
+        if n_acc == len(draft) and (stopped or len(draft) >= self.max_new_tokens):
             return Plan(seed, draft, r["logprobs"][:n_acc], complete=True)
         prefix = draft[:n_acc] + [r["next"]]
         done = r["next"] == self.eod or len(prefix) >= self.max_new_tokens

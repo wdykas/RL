@@ -426,10 +426,44 @@ def test_expert_parallel_speculation_verifies_on_learner(verify_on, gen_ep, ok):
 def test_speculation_rejects_unreproduced_sampling(gen, ok):
     from thundersync_rl.grpo_loop import ThunderSyncConfig, validate_speculation
 
-    policy = {"generation": gen}
+    par = {"tensor_model_parallel_size": 1, "pipeline_model_parallel_size": 1}
+    policy = {"generation": gen, "megatron_cfg": dict(par)}
     validate_speculation(ThunderSyncConfig(speculate=False), policy)
     if ok:
         validate_speculation(ThunderSyncConfig(speculate=True), policy)
     else:
         with pytest.raises(ValueError, match="speculate"):
             validate_speculation(ThunderSyncConfig(speculate=True), policy)
+
+
+@pytest.mark.parametrize(
+    "ts_kw,train_tp,gen_tp,ok",
+    [
+        ({"verify_on": "both"}, 1, 1, True),
+        ({"verify_on": "both"}, 1, 2, False),
+        ({"verify_on": "learner"}, 2, 2, True),
+        ({"verify_on": "learner", "verify_mode": "keyed"}, 2, 2, False),
+    ],
+)
+def test_speculation_parallel_layout_guards(ts_kw, train_tp, gen_tp, ok):
+    from thundersync_rl.grpo_loop import ThunderSyncConfig, validate_speculation
+
+    policy = {
+        "generation": {
+            "temperature": 1.0,
+            "top_p": None,
+            "top_k": None,
+            "stop_strings": None,
+            "mcore_generation_config": {"tensor_model_parallel_size": gen_tp},
+        },
+        "megatron_cfg": {
+            "tensor_model_parallel_size": train_tp,
+            "pipeline_model_parallel_size": 1,
+        },
+    }
+    ts = ThunderSyncConfig(speculate=True, **ts_kw)
+    if ok:
+        validate_speculation(ts, policy)
+    else:
+        with pytest.raises(ValueError, match="speculate"):
+            validate_speculation(ts, policy)
