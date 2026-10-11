@@ -184,6 +184,10 @@ def main():
             dp_size=learner.dp_size,
             max_chunk_trajectories=ts.max_chunk_trajectories,
             max_open_groups=ts.max_open_groups,
+            micro_batch_size=mbs,
+            equal_rank_microbatches=(
+                pcfg["megatron_cfg"]["expert_model_parallel_size"] > 1
+            ),
         )
         for gi in range(args.num_groups):
             planner.register_group(gi, G)
@@ -211,6 +215,9 @@ def main():
                         .expand_as(cd["token_mask"])
                         .clone()
                     )
+                    if c.padding:
+                        for k in ("sample_mask", "token_mask", "advantages"):
+                            cd[k] = torch.zeros_like(cd[k])
                     items.append(
                         {
                             "data": pad_batch_to_multiple(cd, mbs),

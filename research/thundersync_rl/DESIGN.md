@@ -69,6 +69,11 @@ Scheduling:
 - **Zero-advantage chunks.** With `loss_fn.skip_zero_advantage_rows`, zero-advantage rows
   are chunked separately; the worker counts their tokens for normalization and drops the
   whole chunk without a forward pass. Learner time 2.04 → 1.55 s per step.
+- **Expert parallelism.** With `expert_model_parallel_size > 1` every forward/backward
+  runs an all-to-all over the EP group, which spans data-parallel ranks, so all ranks must
+  run the same number of micro-batches per dispatch. The planner then pads short ranks
+  with one-row padding chunks (fully masked: no gradient, no normalization count), and the
+  worker ignores `skip_zero_advantage_rows` (zero-advantage rows run a forward).
 
 ## 3. Layer 2: cross-iteration speculation
 

@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Callable, Hashable, Optional
 
@@ -54,10 +55,22 @@ class Chunk:
     reward: Optional[float]
     trajectories: list[Trajectory]
     advantages: Optional[list[float]]  # final chunks only; None for bucket chunks
+    # All-masked filler that only keeps per-rank forward counts equal: built
+    # with sample_mask = token_mask = advantages = 0, so it adds no gradient
+    # and no normalization count. Its trajectories are templates, not work.
+    padding: bool
 
     @property
     def num_tokens(self) -> int:
         return sum(t.num_tokens for t in self.trajectories)
+
+    def num_microbatches(self, micro_batch_size: int) -> int:
+        """Forward/backward calls the worker runs for this chunk.
+
+        A chunk of at most ``micro_batch_size`` rows runs as one micro-batch;
+        a larger one is padded to a multiple of ``micro_batch_size``.
+        """
+        return max(1, math.ceil(len(self.trajectories) / micro_batch_size))
 
 
 @dataclass
@@ -67,7 +80,9 @@ class Dispatch:
 
     @property
     def num_trajectories(self) -> int:
-        return sum(len(c.trajectories) for cs in self.per_rank for c in cs)
+        return sum(
+            len(c.trajectories) for cs in self.per_rank for c in cs if not c.padding
+        )
 
 
 @dataclass
@@ -97,6 +112,12 @@ class StreamPlanner:
         dp_size: number of data-parallel ranks to balance chunks over.
         max_chunk_trajectories: split chunks larger than this.
         max_open_groups: cap on groups holding buckets (0 = group granularity).
+        micro_batch_size: the learner's training micro-batch size.
+        equal_rank_microbatches: give every DP rank the same number of
+            micro-batch forward/backward calls per dispatch by appending
+            all-masked padding chunks to the short ranks. Required with expert
+            parallelism, whose token all-to-all spans DP ranks and hangs if
+            their forward counts differ.
     """
 
     def __init__(
@@ -106,11 +127,15 @@ class StreamPlanner:
         dp_size: int,
         max_chunk_trajectories: int,
         max_open_groups: int,
+        micro_batch_size: int,
+        equal_rank_microbatches: bool,
     ):
         self.compute_group_advantages = compute_group_advantages
         self.max_open_groups = max_open_groups
         self.dp_size = dp_size
         self.max_chunk_trajectories = max_chunk_trajectories
+        self.micro_batch_size = micro_batch_size
+        self.equal_rank_microbatches = equal_rank_microbatches
         self.groups: dict[GroupId, _Group] = {}
         self.ready: list[Trajectory] = []
         self.num_dispatched = 0
@@ -187,6 +212,7 @@ class StreamPlanner:
                         reward=r,
                         trajectories=trajs[s : s + m],
                         advantages=None,
+                        padding=False,
                     )
                 )
 
@@ -210,6 +236,7 @@ class StreamPlanner:
                         reward=None,
                         trajectories=trajs,
                         advantages=[advantage(t) for t in trajs],
+                        padding=False,
                     )
                 )
 
@@ -220,10 +247,38 @@ class StreamPlanner:
             r = load.index(min(load))
             per_rank[r].append(c)
             load[r] += c.num_tokens
+        if self.equal_rank_microbatches and chunks:
+            self._pad_to_equal_microbatches(per_rank, chunks)
 
         self.num_dispatched += sum(len(c.trajectories) for c in chunks)
         # Closes go after this dispatch's chunks (workers apply them last).
         return Dispatch(per_rank=per_rank, closes=self._pending_closes())
+
+    def _pad_to_equal_microbatches(
+        self, per_rank: list[list[Chunk]], chunks: list[Chunk]
+    ) -> None:
+        """Append one-row padding chunks until every rank runs as many micro-batches.
+
+        Each padding chunk is a single micro-batch built from the dispatch's
+        shortest trajectory (cheapest forward) and fully masked out.
+        """
+        mbs = self.micro_batch_size
+        counts = [sum(c.num_microbatches(mbs) for c in cs) for cs in per_rank]
+        target = max(counts)
+        template = min(
+            (t for c in chunks for t in c.trajectories), key=lambda t: t.num_tokens
+        )
+        for cs, count in zip(per_rank, counts):
+            cs.extend(
+                Chunk(
+                    group=None,
+                    reward=None,
+                    trajectories=[template],
+                    advantages=[0.0],
+                    padding=True,
+                )
+                for _ in range(target - count)
+            )
 
 
 def pad_batch_to_multiple(data: BatchedDataDict, multiple: int) -> BatchedDataDict:
