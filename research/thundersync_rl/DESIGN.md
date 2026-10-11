@@ -279,6 +279,9 @@ streaming. Mean seconds per iteration after warm-up; 30-step runs unless marked.
 | + selective scoring | 3.31 | 3.07 | 4.02 | 99.2% | 98.5% |
 | + zero-advantage rows in their own chunks | 3.03 | 2.79 | 4.23 | 99.4% | 98.5% |
 | **Same, 100 steps** | **3.02** | **2.70** | **4.28** | **99.5%** | **98.4%** |
+| Same, rerun in the lookahead session (100 steps) | 3.01 | 2.55 | 5.19 | 99.4% | 97.4% |
+| **Lookahead 4 (100 steps)** | **2.86** | **2.54** | **4.18** | **99.4%** | **98.5%** |
+| Lookahead 5 (100 steps) | 2.98 | 2.53 | 4.35 | 99.2% | 98.7% |
 | Async GRPO, lag 4, same settings (single controller) | 4.26 | 2.40 | 7.75 | – | – |
 
 Async has a lower median but a much worse tail: with zero-advantage skip its learner is
@@ -293,6 +296,7 @@ Tried and not adopted:
 | Verify only on inference GPUs | 3.78 s; competes with drafting |
 | Small first verification chunk; group-aligned chunks; 1:2 and 1:3 pool weights | 3.2–3.9 s; neutral or worse |
 | Delay drafting until few rollouts remain in flight (0 or 2) | 6.30 s, 3.74 s; unfinished drafts |
+| Start drafting at the start of the iteration instead of at the first finished rollout | 3.17 vs 3.01 s (100 steps); drafts compete with the iteration's own rollouts |
 | Pause drafts while continuations decode (always, or only in the tail) | 5.73 s, 4.14 s; drafting time is worth more |
 | Micro-batch 16, token-budgeted chunks, fused linear-logprob loss | No change in learner time |
 | 3 inference + 1 training GPUs | 3.32 s per 120 rollouts (no speculation 5.53 s): single learner GPU becomes the bottleneck |
