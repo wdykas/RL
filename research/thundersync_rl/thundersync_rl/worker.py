@@ -327,20 +327,6 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                         float(getattr(sp, "variant_eps", 0.0)),
                     )
                 )
-            if os.environ.get("THUNDERSYNC_SPEC_DEBUG"):
-                ctx_len = context.get_active_sequence_lengths()[:n].tolist()
-                pre = context.request_in_prefill_status_tensor[lo:hi].tolist()[:n]
-                for j, rid in enumerate(context.request_ids[lo:hi].tolist()[:n]):
-                    if (
-                        seeds[j] == 1
-                        and positions[j] - len(engine.get_request(rid).prompt_tokens)
-                        < 8
-                    ):
-                        print(
-                            f"[keyed dbg] call ctx_len={ctx_len[j]} prefill={pre[j]} "
-                            f"req_pos={positions[j]} prompt={len(engine.get_request(rid).prompt_tokens)}",
-                            flush=True,
-                        )
             if all(s < 0 for s in seeds):
                 return orig_kernel(
                     logits,

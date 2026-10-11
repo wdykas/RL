@@ -349,7 +349,9 @@ Debug switches: `THUNDERSYNC_SPEC_PROF` (verification timing), `THUNDERSYNC_SPEC
 `THUNDERSYNC_SPEC_TORCHPROF` (scorer profile, PP=1), `THUNDERSYNC_REJECT_LOG` (per-draft
 outcomes and continuation timing), `THUNDERSYNC_LEARNER_PROF` and
 `THUNDERSYNC_LEARNER_TORCHPROF` (training chunks), `THUNDERSYNC_SCORER_ATTN_BF16`
-(experiment: bf16 attention in the scorer).
+(experiment: bf16 attention in the scorer), `THUNDERSYNC_SPEC_SELFTEST` (keyed mode:
+re-draft with the same seeds and verify on unchanged weights before training),
+`THUNDERSYNC_MISMATCH_CHECK` (rollout vs learner log-probs before each optimizer step).
 
 ## 13. Code map
 
@@ -430,7 +432,9 @@ batch-invariant Mamba decode (buffered chunk replay) already makes them exact.
   identical p and the scorer never joins the engine's graph state. Result (Qwen3-1.7B, BI,
   verification on inference GPUs, 10 steps): 92-99% of draft tokens kept with no decay; the
   train/generation log-prob gap stays at the fp32-scorer level (mean 0.011) on accepted
-  tokens and is zero on engine-decoded ones.
+  tokens and is zero on engine-decoded ones. Qwen3-8B, BI, 1 node (2 inference + 2 training
+  GPUs, verification on inference, 4 steps): 93-99% kept, 91-95% of drafts fully accepted,
+  about 50 s per step at ~3.5k mean generated tokens.
 - The same eviction hazard applies to any process that captures inference CUDA graphs with
   the non-flashinfer RoPE path and creates other RoPE models or calls `cache_clear()`
   (upstream: MCore could keep the dynamic-inference table in `rotary_pos_emb_cache`, as its
@@ -506,7 +510,8 @@ holds for fully accepted speculative tokens too.
 - **Training CPU overhead.** About 130 ms CPU vs 70 ms GPU per micro-batch; training CUDA
   graphs would need static or bucketed shapes.
 - **Batch invariance at scale.** Run the BI speculation presets (inference-side verification)
-  on 8B+ models on the cluster; validate the opt-in BI optimizations on GPU.
+  on 2-node 8B/14B and Nemotron-Nano on the cluster (1-node 8B passes); validate the opt-in
+  BI optimizations on GPU.
 - **Scaling gaps.** Context parallelism in the scorer, MoE validation, zero-advantage
   skip with sequence packing.
 - **Upstream.** Default `make_sequence_length_divisible_by` to 64–128 for Megatron
