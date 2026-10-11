@@ -78,6 +78,13 @@ def _model_in_eval(method):
     return wrapper
 
 
+def _unwrap(model: torch.nn.Module) -> torch.nn.Module:
+    """The innermost module under DDP / Float16Module wrappers."""
+    while hasattr(model, "module"):
+        model = model.module
+    return model
+
+
 def _plain_floats(x: Any) -> list[float] | None:
     """Engine log-probs (list, tensor or a serialized ("tensor", data) pair) as floats."""
     if x is None:
@@ -686,6 +693,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         prompts: list[list[int]],
         max_new_tokens: int | list[int],
         stream_interval: int,
+        hidden_keys: list[str] | None = None,
     ) -> bool:
         """Submit draft requests as streams and return immediately.
 
@@ -693,8 +701,14 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         ``self._draft_tokens`` / ``self._draft_logprobs`` as partial frames
         arrive; ``collect_drafts`` aborts whatever is unfinished at the deadline.
         Any prefix of a draft is a valid draft, so truncation is harmless.
+
+        ``hidden_keys[i]`` (engine-sourced q): tag draft i so the engine logs
+        its final hidden states under that key (``install_draft_hidden_log``,
+        fetched with ``pop_draft_hidden``).
         """
         import asyncio
+
+        from thundersync_rl.engine_q import HIDDEN_KEY_ATTR
 
         if self.inference_client is None or self._inference_loop is None:
             return False
@@ -723,6 +737,9 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 else max_new_tokens
             )
             sp.streaming_interval = stream_interval
+            if hidden_keys is not None:
+                # Travels with the serialized sampling params to the engine.
+                sp.add_attributes({HIDDEN_KEY_ATTR: hidden_keys[i]})
             stream = self.inference_client.add_request_streaming(prompt, sp)
             streams[i] = stream
             async for frame in stream:
@@ -1262,6 +1279,277 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
 
         return hidden, logits_fn, w_live
 
+    # ---- Engine-sourced q under batch invariance (verify_source="engine") ----
+    # q of a drafted token is the engine's own log-prob; full q rows come from
+    # the engine's logged final hidden states and an LM-head-only stash per
+    # pending version (engine_q.py). p is the training model's own forward.
+
+    def install_draft_hidden_log(self) -> bool | None:
+        """Log the engine's LM-head input for tagged draft requests.
+
+        Generation workers. A forward pre-hook on the engine model's output
+        layer copies, per forward, the row of each tagged request's last input
+        token (the hidden state its next token is sampled from) to host memory,
+        keyed by (draft key, generated index). Returns True when installed,
+        None on ranks that hold no rows to log (not the last pipeline stage,
+        tensor-parallel rank > 0), False when unsupported (no engine, MTP
+        speculative decoding inside the engine, sequence-parallel head input).
+        """
+        from megatron.core import parallel_state as ps
+        from thundersync_rl.engine_q import HIDDEN_KEY_ATTR, HiddenLog, step_rows
+
+        engine = getattr(self, "dynamic_inference_engine", None)
+        ctx = getattr(self, "inference_context", None)
+        if engine is None or ctx is None:
+            return False
+        if getattr(self, "_hidden_log", None) is not None:
+            return True
+        if not ps.is_pipeline_last_stage(ignore_virtual=True):
+            return None
+        if ps.get_tensor_model_parallel_rank() != 0:
+            return None
+        if getattr(ctx, "num_speculative_tokens", 0):
+            return False
+        materialized = bool(ctx.config.materialize_only_last_token_logits)
+        layer = _unwrap(self._gen_model()).output_layer
+        if getattr(layer, "sequence_parallel", False) and not materialized:
+            return False
+        try:
+            from megatron.core.inference.utils import InferenceMode
+        except ImportError:  # pragma: no cover
+            InferenceMode = None
+        log = HiddenLog()
+        cache: dict[int, tuple[str, int] | None] = {}
+        owner: list[Any] = [None]
+
+        def lookup(rid, engine):
+            if owner[0] is not engine or len(cache) > 1_000_000:
+                # Request ids are per engine: a rebuilt engine starts over.
+                cache.clear()
+                owner[0] = engine
+            if rid not in cache:
+                entry = engine.requests.get(rid)
+                info = None
+                if entry is not None:
+                    req = entry.record[-1]
+                    key = getattr(req.sampling_params, HIDDEN_KEY_ATTR, None)
+                    if key is not None:
+                        info = (key, len(req.prompt_tokens))
+                cache[rid] = info
+            return cache[rid]
+
+        def hook(module, args, kwargs):
+            if InferenceMode is not None and not InferenceMode.is_active():
+                return  # not an engine forward
+            if torch.cuda.is_current_stream_capturing():
+                return  # a captured graph would replay without the hook
+            h = args[0] if args else kwargs["input_"]
+            # Looked up per call: the worker may rebuild its engine and context.
+            engine, ctx = self.dynamic_inference_engine, self.inference_context
+            if engine is None or ctx is None:
+                return
+            a, e = ctx.paused_request_count, ctx.total_request_count
+            if e <= a:
+                return
+            entries = step_rows(
+                ctx.request_ids[a:e].tolist(),
+                ctx.request_kv_length_offsets[a:e].tolist(),
+                ctx.request_query_lengths[a:e].tolist(),
+                lambda rid: lookup(rid, engine),
+            )
+            if not entries:
+                return
+            rows = h.reshape(-1, h.shape[-1])
+            if not materialized:
+                # One row per input token: keep each request's last one.
+                rows = ctx.last_token_logits(rows.unsqueeze(0))
+            log.record(entries, rows)
+
+        layer.register_forward_pre_hook(hook, with_kwargs=True)
+        self._hidden_log = log
+        return True
+
+    def pop_draft_hidden(
+        self, keys: list[str], lengths: list[int]
+    ) -> dict[str, torch.Tensor]:
+        """Logged hidden states [n, d] (CPU) of the drafts this engine ran.
+
+        Drafts another engine ran, or with a missing row, are left out. Every
+        key is closed: rows of later engine steps (an aborted stream finishing
+        its step) are discarded.
+        """
+        log = getattr(self, "_hidden_log", None)
+        if log is None:
+            return {}
+        out = {}
+        for k, n in zip(keys, lengths):
+            h = log.pop(k, n)
+            if h is not None and n > 0:
+                out[k] = h
+        return out
+
+    def _lm_head(self):
+        """(output layer, live head weight, logit scaling or None) of the training model."""
+        gpt = _unwrap(self.model)
+        layer = gpt.output_layer
+        weight = (
+            gpt.shared_embedding_or_output_weight()
+            if getattr(gpt, "share_embeddings_and_output_weights", False)
+            else layer.weight
+        )
+        return layer, weight, getattr(gpt, "_scale_logits", None)
+
+    @torch.no_grad()
+    def stash_head(self, version: int, keep: list[int]) -> int:
+        """Stash only the LM-head weight as ``version`` (V x d per version)."""
+        _, weight, _ = self._lm_head()
+        if not hasattr(self, "_head_stash"):
+            self._head_stash: dict[int, torch.Tensor] = {}
+        self._head_stash[version] = weight.detach().clone()
+        for v in list(self._head_stash):
+            if v not in keep and v != version:
+                del self._head_stash[v]
+        self._log_mem(f"stash_head v={version} n={len(self._head_stash)}")
+        return len(self._head_stash)
+
+    def _head_logprobs(
+        self, hidden: torch.Tensor, version: int, vocab_limit: int
+    ) -> torch.Tensor:
+        """Q log-prob rows [n, V] (fp32) of ``hidden`` [n, d] under head ``version``.
+
+        The training model's own output layer with the stashed weight. Under
+        batch invariance its GEMM gives each row's logits independently of the
+        row count, so a row equals the engine's row for the same hidden state.
+        """
+        layer, _, scale = self._lm_head()
+        w = self._head_stash[version]
+        h = hidden.to(device="cuda", dtype=w.dtype)
+        z, _ = layer(h.unsqueeze(1), weight=w, runtime_gather_output=True)
+        if scale is not None:
+            z = scale(z)
+        return torch.log_softmax(z[:, 0, :vocab_limit].float(), -1)
+
+    @torch.no_grad()
+    @_model_in_eval
+    def verify_drafts_block_engine(
+        self,
+        rows: list[torch.Tensor],
+        prompt_lens: list[int],
+        segments: list[list[tuple[int, int, int]]],
+        engine_logq: list[list[float]],
+        hidden: list[torch.Tensor],
+        vocab_limit: int,
+        seed: int,
+        keys: list[str],
+        **_: Any,
+    ) -> list[tuple[int, dict[str, Any]]]:
+        """Block verification with q from the engine and p from the training model.
+
+        Requires batch-invariant kernels (the engine's decode is the training
+        forward). Per draft i: p = log-softmax of the training model's forward
+        of ``rows[i]`` at the current weights (a training-shaped forward, as
+        ``verify_drafts_block_fused`` runs it, without autograd); log q(x_j) =
+        ``engine_logq[i][j]``; q rows only where the lazy scan needs them, from
+        ``hidden[i]`` [g, d] (the engine's final hidden states) and the
+        LM-head stash of the version that drafted position j (``segments``).
+        No scorer copy and no whole-model stash. Returns the same per-row dicts
+        as ``verify_drafts_block_stashed``: "logprobs" are training's own
+        log-probs of the kept tokens and "draft_logq" the engine's, so the
+        behavior-log-prob correction is exactly zero.
+
+        ``THUNDERSYNC_ENGINE_Q_CHECK=1``: also rebuild every q row of each draft
+        and print how many drafted tokens' log q match the engine bitwise and
+        the largest difference (expected: all, 0).
+        """
+        from megatron.core import parallel_state as ps
+        from thundersync_rl.engine_q import verify_engine_q
+
+        if not self.cfg["megatron_cfg"].get("batch_invariant_mode"):
+            raise RuntimeError(
+                "verify_source='engine' requires policy.megatron_cfg.batch_invariant_mode"
+            )
+        if ps.get_tensor_model_parallel_world_size() != 1:
+            raise RuntimeError("verify_source='engine' requires tensor parallel size 1")
+        self._prof = {}
+        t_all = time.perf_counter()
+        gen = torch.Generator(device="cuda").manual_seed(
+            seed * 1_000_003 + ps.get_data_parallel_rank()
+        )
+        check = os.environ.get("THUNDERSYNC_ENGINE_Q_CHECK") == "1"
+        chk_max, chk_tok, chk_exact = 0.0, 0, 0
+        results = []
+        n_rows = 0
+        for i in self._my_rows(rows, keys):
+            n, plen = rows[i].numel(), prompt_lens[i]
+            g = n - plen
+            t0 = time.perf_counter()
+            logits = self._training_forward(rows[i])
+            # Log-probs exactly as training computes them (fp32 log-softmax).
+            p_lp = torch.log_softmax(logits[0, plen - 1 : n, :vocab_limit].float(), -1)
+            del logits
+            self._prof["forward"] = (
+                self._prof.get("forward", 0.0) + time.perf_counter() - t0
+            )
+            draft = rows[i][plen:].cuda()
+            lq = torch.tensor(engine_logq[i], dtype=torch.float32, device="cuda")
+            assert lq.numel() == g, (lq.numel(), g)
+            h = hidden[i]
+            assert h.shape[0] == g, (tuple(h.shape), g)
+            version = [0] * g
+            for v, a, b in segments[i]:
+                version[a:b] = [v] * (b - a)
+
+            def q_rows(idx, h=h, version=version):
+                idx_l = idx.tolist()
+                out: list[Any] = [None] * len(idx_l)
+                by_v: dict[int, list[int]] = {}
+                for j, t in enumerate(idx_l):
+                    by_v.setdefault(version[t], []).append(j)
+                for v, js in by_v.items():
+                    lp = self._head_logprobs(h[[idx_l[j] for j in js]], v, vocab_limit)
+                    for k, j in enumerate(js):
+                        out[j] = lp[k]
+                return torch.stack(out)
+
+            tau, y, logp, n_eval = verify_engine_q(p_lp, draft, lq, q_rows, gen)
+            n_rows += n_eval + (tau < g)
+            if check:
+                for a in range(0, g, 512):
+                    idx = torch.arange(a, min(g, a + 512))
+                    rec = q_rows(idx).gather(-1, draft[idx.cuda()].view(-1, 1))[:, 0]
+                    d = (rec - lq[a : a + idx.numel()]).abs()
+                    chk_max = max(chk_max, float(d.max()))
+                    chk_exact += int((d == 0).sum())
+                    chk_tok += idx.numel()
+            results.append(
+                (
+                    i,
+                    {
+                        "accepted": tau,
+                        "next": y,
+                        "logprobs": logp.tolist(),
+                        "draft_logq": lq[:tau].tolist(),
+                    },
+                )
+            )
+            del p_lp
+        self._prof["q_rows"] = n_rows
+        self._log_mem("verify_drafts_block_engine")
+        if check:
+            print(
+                f"[engine q check] rank={self.rank} rows={len(results)} tok={chk_tok} "
+                f"exact={chk_exact} max|dlogq|={chk_max:.3e}",
+                flush=True,
+            )
+        if os.environ.get("THUNDERSYNC_SPEC_PROF"):
+            ntok = sum(rows[i].numel() for i, _ in results)
+            print(
+                f"[spec prof] verify_engine rank={self.rank} rows={len(results)} "
+                f"tok={ntok} total={time.perf_counter() - t_all:.3f} {self._prof}",
+                flush=True,
+            )
+        return results
+
     # ---- Fused verification + training (batch-invariant kernels; fused_train.py) ----
 
     def _check_fused_verify_supported(self, state: dict[str, Any]) -> None:
@@ -1604,18 +1892,18 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         zero = torch.zeros(1, dtype=torch.long, device="cuda")
         self._score(scorer, ids, pos, select=(zero, zero))
 
-    def _iter_row_id_batches(self, rows, batch_tokens, keys):
-        """This rank's rows, length-sorted, as padded token-id batches.
+    def _my_rows(self, rows, keys) -> list[int]:
+        """Indices of the rows this data-parallel rank owns, shortest first.
 
-        Rows are owned by data-parallel rank (stable hash of the key), so the
-        tensor-parallel ranks of one replica process the same rows together.
+        Ownership is a stable hash of the draft key, so the tensor-parallel
+        ranks of one replica process the same rows together.
         """
         import zlib
 
         from megatron.core import parallel_state as ps
 
         dp, dp_rank = ps.get_data_parallel_world_size(), ps.get_data_parallel_rank()
-        mine = sorted(
+        return sorted(
             (
                 i
                 for i in range(len(rows))
@@ -1623,6 +1911,14 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             ),
             key=lambda i: rows[i].numel(),
         )
+
+    def _iter_row_id_batches(self, rows, batch_tokens, keys):
+        """This rank's rows, length-sorted, as padded token-id batches.
+
+        Rows are owned by data-parallel rank (stable hash of the key), so the
+        tensor-parallel ranks of one replica process the same rows together.
+        """
+        mine = self._my_rows(rows, keys)
         b = 0
         while b < len(mine):
             e = b + 1

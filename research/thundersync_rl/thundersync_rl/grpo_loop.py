@@ -131,6 +131,18 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # [T, V] logits (rows recomputed on demand). Same decisions as the eager
     # rule given the same logits; off until validated on GPU.
     verify_lazy: bool = False
+    # Where q (the drafts' sampling law) and p come from (DESIGN.md section 14,
+    # engine_q.py). "scorer": a scorer copy of the policy (verify_precision)
+    # and a whole-model weight stash per pending version. "engine" (batch
+    # invariance only): log q of each drafted token is the engine's own
+    # log-prob, full q rows are rebuilt on demand from the engine's logged
+    # final hidden states and an LM-head-only stash per pending version, and p
+    # is the training model's forward. No scorer, no whole-model stash; exact.
+    # Requires speculate, verify_mode=block, verify_on=learner,
+    # batch_invariant_mode, PP=EP=1, no fused_verify_train and no MTP
+    # speculative decoding in the engine. Falls back to "scorer" when the
+    # engine cannot log hidden states.
+    verify_source: Literal["scorer", "engine"] = "scorer"
     # Iterations drafted concurrently. A draft cut off at one deadline resumes
     # from its prefix, under the newer weights, in the next iteration.
     draft_lookahead: int = 3
@@ -258,6 +270,64 @@ def validate_config(master_config: ThunderSyncMasterConfig) -> None:
     validate_speculation(master_config.thundersync, master_config.policy)
     validate_expert_parallel(master_config.thundersync, master_config.policy)
     validate_fused_verify_train(master_config.thundersync, master_config.policy)
+    validate_engine_verify_source(master_config.thundersync, master_config.policy)
+
+
+def validate_engine_verify_source(
+    ts_cfg: ThunderSyncConfig, policy_cfg: PolicyConfig
+) -> None:
+    """Reject settings under which engine-sourced q is not the drafts' law.
+
+    q is taken from the engine (its log-probs, and rows rebuilt from its
+    hidden states with the training model's LM head) and p from the training
+    model, so both must run the same numerics (batch-invariant kernels) and p
+    must be a single-stage, single-replica forward on the learner.
+    """
+    if ts_cfg.verify_source != "engine":
+        return
+    megatron_cfg = policy_cfg["megatron_cfg"]
+    gen_cfg = policy_cfg["generation"]
+    mcore_gen = gen_cfg.get("mcore_generation_config") or {}
+    problems = []
+    if not ts_cfg.speculate:
+        problems.append("thundersync.speculate must be true")
+    if ts_cfg.verify_mode != "block":
+        problems.append(
+            f"thundersync.verify_mode must be 'block' (got {ts_cfg.verify_mode!r})"
+        )
+    if ts_cfg.verify_on != "learner":
+        problems.append(
+            "thundersync.verify_on must be 'learner' (p is the training model's "
+            f"forward; got {ts_cfg.verify_on!r})"
+        )
+    if ts_cfg.fused_verify_train:
+        problems.append("thundersync.fused_verify_train must be false")
+    if not megatron_cfg.get("batch_invariant_mode"):
+        problems.append(
+            "policy.megatron_cfg.batch_invariant_mode must be true (the engine's "
+            "log-probs and hidden states are the training forward's only under "
+            "batch invariance)"
+        )
+    if megatron_cfg.get("pipeline_model_parallel_size", 1) != 1:
+        problems.append("policy.megatron_cfg.pipeline_model_parallel_size must be 1")
+    if megatron_cfg.get("expert_model_parallel_size", 1) != 1:
+        problems.append("policy.megatron_cfg.expert_model_parallel_size must be 1")
+    if gen_cfg.get("backend") not in (None, "megatron"):
+        problems.append("policy.generation.backend must be 'megatron'")
+    if mcore_gen.get("num_speculative_tokens"):
+        problems.append(
+            "policy.generation.mcore_generation_config.num_speculative_tokens must "
+            "be 0 (one sampled token per engine forward)"
+        )
+    if mcore_gen.get("logprobs_mode", "raw_logprobs") != "raw_logprobs":
+        problems.append(
+            "policy.generation.mcore_generation_config.logprobs_mode must be "
+            "'raw_logprobs' (log q of the sampling distribution)"
+        )
+    if problems:
+        raise ValueError(
+            "thundersync.verify_source='engine': " + "; ".join(problems) + "."
+        )
 
 
 def validate_fused_verify_train(
@@ -821,6 +891,7 @@ def thundersync_grpo_train(
             pool_weights=ts_cfg.verify_pool_weights,
             fused_verify_train=ts_cfg.fused_verify_train,
             fused_max_retained_tokens=ts_cfg.fused_max_retained_tokens,
+            verify_source=ts_cfg.verify_source,
         )
     G = master_config.grpo.num_generations_per_prompt
     if spec is not None and os.environ.get("THUNDERSYNC_SPEC_SELFTEST"):

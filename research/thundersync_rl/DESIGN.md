@@ -441,7 +441,7 @@ speculation when the rollout phase ends in a latency-bound tail on mostly idle G
 |---|---|
 | Drafting, streaming, abort | Megatron inference client and coordinator; inherits inference TP/PP/EP/DP |
 | q storage | bf16 weight stash per pending version; memory O(parameters + batch x vocabulary) |
-| Scorer memory | fp32 adds 4 bytes per parameter per shard; `verify_precision=model` keeps training dtypes (about 90% kept vs 99%) |
+| Scorer memory | fp32 adds 4 bytes per parameter per shard; `verify_precision=model` keeps training dtypes (about 90% kept vs 99%); under BI, `verify_source=engine` needs no scorer and only an LM-head stash per version (section 14) |
 | Tensor parallelism | Vocab-parallel logits gathered per batch; validated at TP=2 (99.9% kept) |
 | Pipeline parallelism | Forward-only pipeline schedule, last stage verifies; scorer log-probs at PP=2 bitwise equal PP=1. Inference must be pinned to PP=1 (`mcore_generation_config.pipeline_model_parallel_size=1`) |
 | Context parallelism | Not implemented; the scorer raises. Needs packed (THD) scoring |
@@ -475,6 +475,7 @@ policy.make_sequence_length_divisible_by=128
 | `draft_start_frac` | Fraction of this iteration's rollouts finished before drafting starts (0: from the start) |
 | `verify_precision` | `fp32` scorer (TF32 GEMMs under the env flag) or `model` (training dtypes) |
 | `verify_lazy` | Lazy, logit-free block verification (section 4); default `false` until GPU-validated |
+| `verify_source` | `scorer` (default) or `engine`: under BI, q from the engine's log-probs and logged hidden states with an LM-head stash, p from the training model (section 14) |
 | `verify_on` | `learner`, `inference` or `both` worker groups run verification |
 | `verify_chunks` | Verification pieces; plans publish as each finishes |
 | `verify_batch_tokens` | Tokens per scorer forward batch (bounds logits memory), default 16384 |
@@ -490,7 +491,9 @@ re-draft with the same seeds and verify on unchanged weights before training),
 `THUNDERSYNC_MISMATCH_CHECK` (rollout vs learner log-probs before each optimizer step),
 `THUNDERSYNC_LAZY_LOGITS` (with `verify_lazy`: keep logits, lazy scan only),
 `THUNDERSYNC_LAZY_CHUNK` (logit-free row chunk, default 512), `THUNDERSYNC_LAZY_CHECK` (with
-`verify_lazy`: rerun the eager logits path on the same seed and print decision mismatches).
+`verify_lazy`: rerun the eager logits path on the same seed and print decision mismatches),
+`THUNDERSYNC_ENGINE_Q_CHECK` (with `verify_source=engine`: rebuild every q row from the logged
+hidden states and print how many drafted tokens' log q match the engine bitwise).
 
 ## 13. Code map
 
@@ -502,16 +505,19 @@ re-draft with the same seeds and verify on unchanged weights before training),
 | `thundersync_rl/worker.py` | Megatron worker extension: streaming train calls, scorer build and refresh, weight stashes, stashed block verification, draft streams |
 | `thundersync_rl/block_verification.py` | Reference block verification, shared acceptance helpers, exact output law |
 | `thundersync_rl/block_verification_fused.py` | Block verification from raw logits with a Triton residual-mass kernel; lazy variant from per-position statistics |
+| `thundersync_rl/engine_q.py` | Engine-sourced q under BI: engine hidden-state log, per-step row mapping, verification from engine log q + rows on demand |
 | `thundersync_rl/logit_free.py` | `ChunkedHead`: LM-head statistics from hidden states in fixed row chunks, rows recomputed on demand |
 | `thundersync_rl/scorer_kernels.py` | SDPA core attention, Triton SwiGLU, selective LM head |
 | `thundersync_rl/keyed_sampling.py` | Position-keyed Gumbel-max sampling kernel (keyed mode) |
 | `thundersync_rl/fused_train.py` | Fused verification + training (BI, experimental): retained graphs, logit stitching, forward substitution |
 | `nemo_rl/algorithms/grad_streaming.py` | Core: per-(group, reward) gradient accumulators, final-first selection (shared with the single controller) |
 
-Tests: 119 research unit tests (block verification by enumeration, fused verification
+Tests: 252 research unit tests (block verification by enumeration, fused verification
 draw-for-draw, scorer kernels on GPU, streaming equivalence, speculative driver plans,
 cohorts and ramp, chunked pools, error surfacing, fused verification + training: routing,
-claims, config checks and gradient equality on a tiny causal model), 7 core zero-advantage tests, and GPU
+claims, config checks and gradient equality on a tiny causal model; engine-sourced q: hidden
+log and engine hook on fakes, rule vs the eager rule, worker path on GPU with bitwise log q
+reconstruction, head-GEMM row invariance at Qwen3 shapes, driver plumbing and config checks), 7 core zero-advantage tests, and GPU
 functional checks for scorer and refit parallelism.
 
 ## 14. Batch invariance (NeMo-RL PR 3208)
@@ -644,6 +650,93 @@ stashes, retained graphs and training state on TP=1 GPUs); it fits with
 `draft_lookahead=1 verify_batch_tokens=4096 fused_max_retained_tokens=8192`, keeping 66-68%
 of draft tokens, but only about one trajectory per step finishes whole and gets fused.
 
+**Engine-sourced q** (`thundersync.verify_source=engine`, `engine_q.py`). *Opt-in; CPU and
+short GPU unit tests pass, not yet run end to end.* The default verifier needs an fp32 copy
+of the model (4 B/param, unsharded under BI since BI needs TP=1) plus a bf16 whole-model
+stash per pending version (2 B/param each): about 82 GB on each learner GPU at 8B with
+three pending versions, impossible at 70B. Under BI neither is needed. The engine's decode
+is bitwise the training forward, so the drafts' true law q is the engine's own
+distribution, and p can be the training model's forward at θ_{k+1}:
+
+- **log q(x_i)** of every drafted token is the engine's own log-prob, already streamed with
+  the draft (G2, draft tuple index 6).
+- **p** is the training model's bf16 forward of the row, run like a training micro-batch
+  (`_training_forward`, no autograd, eval mode), turned into log-probs with training's fp32
+  log-softmax.
+- **Lazy scan.** Block verification needs only b_i = min(1, b_{i−1}·p(x_i)/q(x_i)), which
+  uses only log p(x_i) and log q(x_i), plus full q rows where the lazy scan computes r_i
+  (η_i ≤ b_i(1 + slack), visited from the top) and the residual row at τ. Whole-accepted
+  drafts (η_g ≤ b_g) need no q row at all.
+- **Rows on demand from hidden states.** Every engine forward runs a pre-hook on the
+  engine model's output layer (`install_draft_hidden_log`). For each draft request (tagged
+  through a sampling-params attribute) it copies the row of its last input token to pinned
+  host memory: the final hidden state after the final norm, from which that token was
+  sampled (`HiddenLog`, d × 2 B per drafted token). Rows are keyed by (draft, generated
+  index t = last position + 1 − prompt length), so an intermediate prefill chunk records
+  nothing and an engine eviction's re-prefill overwrites the same t. At the deadline the
+  driver collects each draft's rows from the engine that ran it (`pop_draft_hidden`) and
+  ships them with the draft (tuple index 7; cohort drafts concatenate per segment). The
+  learner keeps only the LM-head weight per pending version (`stash_head`, V × d × 2 B) and
+  rebuilds a q row as `log_softmax(output_layer(h, weight=W_head^(v)))`. It uses the
+  training model's own output layer and logit scaling, and the version v that drafted that
+  position (segments).
+- **Why the rows are exact.** The hidden states are bitwise the training forward's under
+  BI. The head GEMM under BI's cuBLAS settings (no split-K) gives a row the same logits at
+  any row count. `test_head_rows_are_batch_invariant_under_bi_cublas_settings` checks this
+  for the Qwen3-1.7B and Qwen3-8B head shapes at 1-600 rows (bitwise). In a run,
+  `THUNDERSYNC_ENGINE_Q_CHECK=1` rebuilds every q row and prints how many drafted tokens'
+  log q equal the engine's bitwise (expected: all, max |dlogq| = 0). If they ever differ,
+  b and the rows would come from slightly different q's: an ulp-level inconsistency of the
+  same kind as the scorer's today. The fallback would then be to rebuild log q(x_i) from
+  the rows too, at one head GEMM per drafted token.
+- **Decisions.** `verify_engine_q` feeds log-prob rows (logsumexp 0) to
+  `block_verify_stats_lazy`. It makes the same `rand(g+1)` and `multinomial` calls as
+  `block_verify_logits`, and unit tests check the same decisions and generator state as the
+  eager rule on the same rows.
+- **Reported log-probs.** The plan reports training's own log p of the kept tokens (entries
+  of the training log-softmax rows) and `draft_logq` = the engine's log q. G2's correction
+  log q' − log q is therefore exactly zero; `behavior_logprobs` skips equal pairs, so log p
+  is reported bitwise. With BI's 0-mismatch engine log-probs, `THUNDERSYNC_MISMATCH_CHECK`
+  should read 0 on every token. Importance-sampling correction is unnecessary in this mode.
+- **Exactness.** q is the drafts' true sampling law, p is the training policy at θ_{k+1},
+  and the rule is block verification. The rollouts are therefore exact samples of the
+  policy being trained, with no fp32 approximation. Acceptance is that of exact bf16
+  speculation, the same as `verify_precision=model` with a training-exact scorer (about 50%
+  on long outputs; see the offline measurement below).
+- **Fallbacks.** If the engine cannot log hidden states, `SpeculativeGeneration` reverts to
+  `verify_source=scorer` with a printed warning. That happens with no engine, MTP
+  speculative decoding inside the engine, or a sequence-parallel head input. A single draft
+  without full engine log-probs or hidden rows is dropped before verification and its
+  rollout decodes from scratch (`spec/engine_q_dropped`). Dropping is exact because
+  whether a draft was logged does not depend on its tokens. A hook that never fires (for
+  example under a whole-model CUDA graph, which replays without Python) shows up as every
+  draft dropped. No path re-runs a forward of a stashed version.
+
+Memory, per learner GPU, three pending versions, ~1.5M drafted tokens per step (128 rollouts
+x 3 cohorts x 4k):
+
+| | scorer mode (fp32 scorer + bf16 stashes) | engine mode |
+|---|---|---|
+| Qwen3-8B (d = 4096, V = 151,936) | 33 GB + 3 x 16 GB = 82 GB | 3 x 1.24 GB = 3.7 GB LM-head stashes |
+| 70B (Llama-3, d = 8192, V = 128,256) | 282 GB + 3 x 141 GB (does not fit at TP=1) | 3 x 2.1 GB = 6.3 GB |
+| Hidden states (host memory, not GPU) | none | 8 KB/token at 8B (12.6 GB per 1.5M tokens), 16 KB/token at 70B (25 GB) |
+
+Transient GPU memory per verified row is the training forward's logits plus fp32 log-probs,
+(g+1) x V x 4 B each (about 2.5 GB each for a 4k-token draft at V = 152k), and a few q rows.
+Hidden states move engine → driver → learner through Ray (CPU) once per draft, and only
+the rows the scan visits go to the GPU.
+
+Requirements, enforced by `validate_engine_verify_source` and on the worker: `speculate`,
+`verify_mode=block`, `verify_on=learner`, `batch_invariant_mode`, PP = EP = 1 (and BI's
+TP=1, checked on the worker), no `fused_verify_train`, Megatron generation with
+`num_speculative_tokens=0` and `logprobs_mode=raw_logprobs`. Possible extensions: BI with
+TP > 1 (vocab-parallel head rows gathered, stash V/TP x d), and combining with fused mode,
+whose p forward is the same training forward.
+
+GPU validation to run (Qwen3-1.7B, BI flags from `thundersync_work/bi_flags.txt`, A/B against
+`verify_precision=model`): expect the same kept fraction, `[engine q check]` with
+`max|dlogq|=0`, `spec/engine_q_dropped` near 0, and the mismatch check at 0 on every token.
+
 **Keyed verification under BI** (`verify_mode=keyed`). With bitwise parity the learner's
 logits for a draft are the ones the engine sampled from, so keyed verification needs no
 scorer copy and no weight stashes: p from the current training weights is all it reads, and
@@ -693,6 +786,9 @@ versions is the policy's own, so exact bf16 speculation is inherently ~50%; an f
   skip with sequence packing.
 - **Upstream.** Default `make_sequence_length_divisible_by` to 64–128 for Megatron
   training.
+- **Engine-sourced q on GPU.** Run the `verify_source=engine` A/B against
+  `verify_precision=model` on Qwen3-1.7B under BI (same kept fraction, engine q check 0,
+  mismatch 0, few dropped drafts), then Qwen3-8B where scorer mode runs out of memory.
 - **Fused verification + training on GPU.** Validate `fused_verify_train` end to end
   (`THUNDERSYNC_FUSED_CHECK=1`, gradient against the unfused path) and measure the saved
   learner time on short-output tasks (section 14).

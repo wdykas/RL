@@ -79,8 +79,10 @@ def _drafted(res) -> tuple[list[int], bool, list[float] | None]:
 def cohort_draft(d: dict[str, Any]) -> tuple:
     """Draft tuple of a cohort draft, as ``verify``/``verify_chunked`` take them.
 
-    (prompt, seed, tokens, finished, key, segments, engine log-probs or None)
+    (prompt, seed, tokens, finished, key, segments, engine log-probs or None,
+    engine hidden states [len(tokens), d] or None)
     """
+    hidden = d.get("hidden")
     return (
         d["prompt"],
         -1,
@@ -89,6 +91,32 @@ def cohort_draft(d: dict[str, Any]) -> tuple:
         d["key"],
         d["segments"],
         d.get("logprobs"),
+        None if hidden is None else cat_hidden(hidden),
+    )
+
+
+def cat_hidden(parts: list[torch.Tensor]) -> torch.Tensor:
+    """Concatenate per-segment hidden states, skipping empty segments."""
+    parts = [h for h in parts if h.numel()]
+    return torch.cat(parts) if parts else torch.empty(0, 0)
+
+
+def engine_q_ready(d: tuple) -> bool:
+    """Whether a draft carries what engine-sourced verification needs.
+
+    The engine's log-prob of every token (index 6) and its hidden state at
+    every position (index 7). Drafts without them are dropped before
+    verification (their rollouts decode from scratch): exact, since whether
+    the engine logged a draft does not depend on its tokens.
+    """
+    n = len(d[2])
+    lps = d[6] if len(d) > 6 else None
+    hid = d[7] if len(d) > 7 else None
+    return (
+        lps is not None
+        and len(lps) == n
+        and hid is not None
+        and (n == 0 or hid.shape[0] == n)
     )
 
 
@@ -121,6 +149,10 @@ def behavior_logprobs(
         return list(logp)
     out = list(logp)
     for j in range(n_acc):
+        if engine_logq[j] == draft_logq[j]:
+            # q is the engine's law (engine-sourced verification): no
+            # correction, and log p is reported bitwise.
+            continue
         v = logp[j] + engine_logq[j] - draft_logq[j]
         if math.isfinite(v):
             out[j] = v
@@ -149,6 +181,7 @@ class SpeculativeGeneration:
         fused_verify_train: bool,
         fused_max_retained_tokens: int,
         verify_lazy: bool = False,
+        verify_source: str = "scorer",
     ):
         self.base = base
         self.learner_policy = learner_policy
@@ -163,6 +196,12 @@ class SpeculativeGeneration:
         self.verify_mode = verify_mode
         self.verify_precision = verify_precision
         self.verify_lazy = verify_lazy
+        # "scorer": p and q from the scorer copy and whole-model weight stashes.
+        # "engine" (batch invariance): q from the engine's own log-probs and
+        # logged hidden states with an LM-head-only stash, p from the training
+        # model (engine_q.py).
+        self.verify_source = verify_source
+        self._hidden_nonce = itertools.count()
         self.verify_batch_tokens = verify_batch_tokens
         self.longest_first = longest_first
         # Fused verification + training (fused_train.py): p comes from the
@@ -205,6 +244,17 @@ class SpeculativeGeneration:
             else workers.run_all_workers_single_data("termination_id")
         )
         self.eod = next(e for e in eods if e is not None)
+        if verify_source == "engine":
+            ok = ray.get(
+                workers.run_all_workers_single_data("install_draft_hidden_log")
+            )
+            if not any(x is True for x in ok) or any(x is False for x in ok):
+                print(
+                    "[thundersync] verify_source=engine: the engine cannot log "
+                    f"hidden states ({ok}); falling back to verify_source=scorer",
+                    flush=True,
+                )
+                self.verify_source = "scorer"
         self._seeds = itertools.count(1)
         self._verify_seeds = itertools.count(1)
         self.plans: dict[tuple[int, ...], list[Plan]] = defaultdict(list)
@@ -300,16 +350,20 @@ class SpeculativeGeneration:
         """
         rank0 = self.base._policy.worker_group.workers[0]
         budget = min(self.draft_budget, self.max_new_tokens)
+        step = self.current_step
+        hkeys = self._hidden_keys([f"{step + 1}:{i}" for i in range(len(prompts))])
         ray.get(
             rank0.start_drafts.remote(
-                [p.tolist() for p in prompts], budget, self.stream_interval
+                [p.tolist() for p in prompts],
+                budget,
+                self.stream_interval,
+                **({} if hkeys is None else {"hidden_keys": hkeys}),
             )
         )
 
-        step = self.current_step
-
         def collect():
             res = [_drafted(x) for x in ray.get(rank0.collect_drafts.remote())]
+            hid = self._pop_hidden(hkeys, [len(x[0]) for x in res])
             return [
                 [
                     (
@@ -327,12 +381,38 @@ class SpeculativeGeneration:
                         f"{step + 1}:{i}",
                         [(step, 0, len(toks))],
                         lps,
+                        hid[i],
                     )
                 ]
                 for i, (toks, done, lps) in enumerate(res)
             ]
 
         return collect
+
+    def _hidden_keys(self, keys: list[str]) -> list[str] | None:
+        """Engine hidden-log keys of one drafting round (None: not logging)."""
+        if self.verify_source != "engine":
+            return None
+        nonce = next(self._hidden_nonce)
+        return [f"{nonce}|{k}" for k in keys]
+
+    def _pop_hidden(
+        self, hkeys: list[str] | None, lengths: list[int]
+    ) -> list[torch.Tensor | None]:
+        """Each draft's logged engine hidden states, or None where missing."""
+        if hkeys is None:
+            return [None] * len(lengths)
+        merged: dict[str, torch.Tensor] = {}
+        for r in ray.get(
+            self.base._policy.worker_group.run_all_workers_single_data(
+                "pop_draft_hidden", keys=hkeys, lengths=lengths
+            )
+        ):
+            merged.update(r)
+        return [
+            torch.empty(0, 0) if n == 0 else merged.get(k)
+            for k, n in zip(hkeys, lengths)
+        ]
 
     async def draft_cohorts(self, step: int, new: dict[int, list[torch.Tensor]]):
         """Resume unfinished drafts of future steps and start new cohorts.
@@ -352,6 +432,9 @@ class SpeculativeGeneration:
                         # Engine log-probs of "tokens" (None once a segment
                         # came without them).
                         "logprobs": [],
+                        # Engine hidden states per segment (engine-sourced
+                        # q; None once a segment came without them).
+                        "hidden": [],
                     }
                     for j, p in enumerate(prompts)
                 ]
@@ -363,6 +446,7 @@ class SpeculativeGeneration:
             if not d["finished"]
         ]
         rank0 = self.base._policy.worker_group.workers[0]
+        hkeys = self._hidden_keys([d["key"] for d in live]) if live else None
         if live:
             ray.get(
                 rank0.start_drafts.remote(
@@ -374,13 +458,19 @@ class SpeculativeGeneration:
                     ],
                     [self.max_new_tokens - len(d["tokens"]) for d in live],
                     self.stream_interval,
+                    **({} if hkeys is None else {"hidden_keys": hkeys}),
                 )
             )
 
         def collect():
             res = ray.get(rank0.collect_drafts.remote()) if live else []
-            for d, x in zip(live, res):
+            hid = self._pop_hidden(hkeys, [len(_drafted(x)[0]) for x in res])
+            for d, x, h in zip(live, res, hid):
                 toks, done, lps = _drafted(x)
+                if d.get("hidden") is not None and h is not None:
+                    d["hidden"].append(h)
+                else:
+                    d["hidden"] = None
                 start = len(d["tokens"])
                 d["tokens"].extend(toks)
                 if d.get("logprobs") is not None and lps is not None:
@@ -423,24 +513,45 @@ class SpeculativeGeneration:
         for cohort in self.cohorts.values():
             for d in cohort:
                 keep.update(v for v, _, _ in d["segments"])
+        if self.verify_source == "engine":
+            # Only the LM head: full q rows are rebuilt from the engine's
+            # hidden states, never by a forward of the stashed version.
+            method, kw = "stash_head", {}
+        else:
+            method, kw = "stash_weights", {"precision": self.verify_precision}
         ray.get(
             [
                 ref
                 for g in self.verifiers
                 for ref in g.run_all_workers_single_data(
-                    "stash_weights",
-                    version=self.current_step,
-                    keep=sorted(keep),
-                    precision=self.verify_precision,
+                    method, version=self.current_step, keep=sorted(keep), **kw
                 )
             ]
         )
+
+    def _engine_q_filter(self, drafts):
+        """Engine-sourced q: drop drafts the engine did not fully log (counted)."""
+        if self.verify_source != "engine":
+            return drafts, 0
+        kept = [[d for d in variants if engine_q_ready(d)] for variants in drafts]
+        dropped = sum(len(v) for v in drafts) - sum(len(v) for v in kept)
+        return [v for v in kept if v], dropped
+
+    def _verify_method(self, flat) -> tuple[str, dict[str, Any]]:
+        """Worker method and its extra arguments for block verification."""
+        if self.verify_source == "engine":
+            return "verify_drafts_block_engine", {
+                "engine_logq": [d[6] for _, d in flat],
+                "hidden": [d[7] for _, d in flat],
+            }
+        return "verify_drafts_block_stashed", {}
 
     def verify(self, drafts: list[list[tuple[torch.Tensor, int, list[int]]]]) -> None:
         if self.fused_verify_train:
             raise NotImplementedError(
                 "fused_verify_train runs through chunked verification only"
             )
+        drafts, dropped = self._engine_q_filter(drafts)
         flat, rows = self._flat_rows(drafts)
         if self.verify_mode == "block":
             # Contiguous row slices per verifier pool, verified concurrently.
@@ -449,11 +560,13 @@ class SpeculativeGeneration:
             seed = next(self._verify_seeds)
             futs = []
             for g, a, b in zip(self.verifiers, cuts, cuts[1:]):
+                method, extra = self._verify_method(flat[a:b])
                 futs.append(
                     (
                         a,
                         g.run_all_workers_single_data(
-                            "verify_drafts_block_stashed",
+                            method,
+                            **extra,
                             rows=rows[a:b],
                             prompt_lens=[d[0].numel() for _, d in flat[a:b]],
                             segments=[d[5] for _, d in flat[a:b]],
@@ -508,6 +621,8 @@ class SpeculativeGeneration:
             "spec/full_accept": full / max(len(drafts), 1),
             "spec/variant_wins": float(variant_wins),
         }
+        if self.verify_source == "engine":
+            self.stats["spec/engine_q_dropped"] = float(dropped)
 
     def _stopped(self, d) -> bool:
         """Whether draft ``d``, if fully accepted, is a finished rollout."""
@@ -603,6 +718,7 @@ class SpeculativeGeneration:
         ``longest_first``; chunks go round-robin over the verifier pools, and
         every chunk call is queued at once (each pool runs its calls in order).
         """
+        drafts, dropped = self._engine_q_filter(drafts)
         flat, rows = self._flat_rows(drafts)
         if os.environ.get("THUNDERSYNC_SPEC_CHECK") and len(self.verifiers) > 1:
             await self._debug_compare_pools(rows[:4])
@@ -645,9 +761,8 @@ class SpeculativeGeneration:
                     max_retained_tokens=self.fused_max_retained_tokens,
                 )
             else:
-                refs = group.run_all_workers_single_data(
-                    "verify_drafts_block_stashed", **kwargs
-                )
+                method, extra = self._verify_method(flat[a:b])
+                refs = group.run_all_workers_single_data(method, **kwargs, **extra)
             calls.append((a, refs))
         kept = total = full = fused = 0
 
@@ -705,6 +820,8 @@ class SpeculativeGeneration:
         }
         if self.fused_verify_train:
             self.stats["fused/retained"] = float(fused)
+        if self.verify_source == "engine":
+            self.stats["spec/engine_q_dropped"] = float(dropped)
 
     # -- GenerationInterface used by the rollout ----------------------------------
 

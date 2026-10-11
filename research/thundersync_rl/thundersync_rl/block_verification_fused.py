@@ -76,6 +76,11 @@ def residual_masses(
     not depend on which other rows are in the call.
     """
     k = b.numel()  # rows 0..k-1 (p_logits may carry the extra bonus row)
+    if not p_logits.is_cuda:
+        # CPU reference (tests): same rounding, fp32 log-probs exponentiated in fp64.
+        p = (p_logits[:k].float() - lse_p[:k, None]).double().exp()
+        q = (q_logits[:k].float() - lse_q[:k, None]).double().exp()
+        return (b[:, None] * p - q).clamp_min(0).sum(-1)
     r = torch.empty(k, dtype=torch.float64, device=p_logits.device)
     if k:
         if p_logits.stride(-1) != 1:
