@@ -17,6 +17,7 @@ thundersync:
   draft_lookahead: 3  # iterations drafted concurrently; cut drafts resume next iteration
   verify_mode: block  # block (~99% tokens kept) | keyed (exactly on-policy, ~55% kept)
   verify_precision: fp32  # fp32 Megatron scorer copy | model (training dtypes, ~90% kept)
+  verify_lazy: false  # lazy, logit-free block verification (same decisions; A/B pending)
   verify_on: both  # learner | inference | both: worker groups that verify
   verify_chunks: 4  # verification chunks; plans publish as each finishes
   verify_overlap: true  # verify concurrently with the rollouts
