@@ -1006,6 +1006,8 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             problems.append("fused linear log-probs produce no logits")
         if ps.get_pipeline_model_parallel_world_size() != 1:
             problems.append("pipeline parallelism (the graph spans stages)")
+        if ps.get_tensor_model_parallel_world_size() != 1:
+            problems.append("tensor parallelism (training logits are vocab-sharded)")
         if ps.get_context_parallel_world_size() != 1:
             problems.append("context parallelism")
         if problems:
@@ -1199,6 +1201,20 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
 
         torch.cuda.synchronize()
         t0 = time.perf_counter()
+        seq_len = ids.shape[1]
+        m = self.cfg["make_sequence_length_divisible_by"]
+        if (
+            self._batch_invariant
+            and ps.get_tensor_model_parallel_world_size() > 1
+            and seq_len % m
+        ):
+            # Batch-invariant scorer at TP>1: sequence parallelism splits the
+            # sequence over TP ranks, and each rank's norm row count must stay
+            # in training's shape class, so pad like training. Causal attention
+            # leaves the logits of the real positions unchanged (sliced below).
+            padded = -(-seq_len // m) * m
+            ids = torch.nn.functional.pad(ids, (0, padded - seq_len))
+            pos = torch.arange(padded, device=ids.device).expand(ids.shape[0], -1)
         # On generation workers Megatron's global InferenceMode is active while the
         # engine runs; it requires gathered TP logits from any forward.
         gather_kw = {}
@@ -1281,6 +1297,8 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 parts, logits.contiguous(), group=ps.get_tensor_model_parallel_group()
             )
             logits = torch.cat(parts, dim=-1)
+        if logits.shape[1] != seq_len:
+            logits = logits[:, :seq_len]
         torch.cuda.synchronize()
         self._prof["forward"] = (
             self._prof.get("forward", 0.0) + time.perf_counter() - t0

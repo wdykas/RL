@@ -469,8 +469,59 @@ generation log-probs and training log-probs of the same tokens are bitwise equal
 a starved workspace (no split-K, so a fixed K-reduction order at every row count),
 batch-invariant `aten::_log_softmax` / `mean`, TE RMSNorm kept native under 64-multiple
 token alignment, FlashAttention 4 with `num_splits=1`. Requirements enforced by the PR's
-validator: BF16, TP=1, CP=1, no packing, generation `transformer_impl=inference_optimized`
-(so no QKV-bias models such as Qwen2.5), `make_sequence_length_divisible_by` a multiple of 64.
+validator: BF16, CP=1, no packing, generation `transformer_impl=inference_optimized`
+(so no QKV-bias models such as Qwen2.5), `make_sequence_length_divisible_by` a multiple of 64,
+and **identical parallelism in training and inference** (next paragraph). The PR shipped with
+a TP=1 gate; branch `thundersync-bi-tp2` replaces it.
+
+**Parallelism under BI: any TP, same layout on both sides** (`zero_train_gen_mismatch.py`;
+design notes in `thundersync_work/research/bi_tensor_parallel.md`). Rules, checked by
+`validate_batch_invariant_mode`:
+
+- training TP, PP, EP and expert TP equal the merged generation config's (an unset expert TP
+  resolves to TP; generation pins expert TP to 1, so training needs 1 too). A different TP
+  changes the K split of the row-parallel GEMMs, which no kernel choice undoes;
+- at TP>1, `sequence_parallel=true` on both sides (`inference_optimized` layers require it;
+  training must run the same reduce-scatter / all-gather and the same per-rank norm row
+  counts), and `make_sequence_length_divisible_by` (and the dynamic-batching round) a
+  multiple of lcm(64, 32*TP), so each rank's tokens/TP norm rows stay a multiple of 32
+  (64 at TP=2, 128 at TP=4, 256 at TP=8);
+- `inference_fuse_tp_communication=false` and `tp_comm_overlap=false` (at any TP; the
+  generation worker also refuses fused TP communication at build time). Under BI the fused
+  reduce-scatter falls back to NCCL, but the next layer would still skip its norm + all-gather
+  and read a stale symmetric buffer.
+
+Log-probs at TP>1: training's `DistributedLogprob` normalized with MAX/SUM all-reduces of
+partial statistics, while inference all-gathers the logits and runs one full-vocabulary
+`log_softmax`. Under BI, `DistributedLogprob` / `ChunkedDistributedLogprob` are replaced by
+`_BatchInvariantLogprob`: TP=1 keeps the local path; TP>1 runs `_GatheredVocabLogprob`, which
+all-gathers the vocab shards per sequence chunk (at most 4096 tokens per chunk unless
+`logprob_chunk_size` is set), runs the TP=1 path on them (bitwise inference's), saves only the
+local shard, and in backward re-gathers per chunk and returns g * (onehot - softmax) on the
+local vocab slice. Unit tests (CPU, TP ranks as threads): forward bitwise equal to the
+full-vocabulary log-softmax at TP 2/3/4; backward equal to the full-vocabulary gradient on each
+shard (to 1 ulp; only the forward must be bitwise).
+
+Collectives: a 2-rank reduction is one commutative IEEE addition, so TP=2 reduce-scatter and
+all-reduce give a token the same bits at every batch size whatever NCCL algorithm runs. At
+TP>=3 the order of a token's partial sums may depend on which rank owns the token, i.e. on
+the token count. `scripts/bi_tp/nccl_tp_invariance.py` measures it (TP 2/3/4, reduce-scatter
+and all-reduce, plus an ordered all-to-all + fixed-rank-order fp32 sum as the reference fix).
+If TP>=3 shows a dependence, the follow-up is an ordered TP reduce-scatter behind a flag
+(patching TE's and MCore's `reduce_scatter_along_first_dim` and the inference layer's), plus
+MCore's inference `TOKEN_ROUNDER` raised to lcm(64, 32*TP) at TP>=4; it is not a validator
+rejection. End-to-end check: `scripts/bi_tp/tp_parity.sh` (TP=1/2 on 2 + 2 GPUs of one node;
+TP=4 on 2 nodes via `tp_parity_submit.sh`), pass = mismatch 0 and exact fraction 1 every step.
+Status: unit-tested only, GPU parity not yet run.
+
+ThunderSync under BI at TP>1: the learner's bf16 (`verify_precision=model`) scorer
+all-gathers its vocab-parallel logits before the log-softmax (same bits as training's
+gathered path) and pads its rows to `make_sequence_length_divisible_by` (sequence
+parallelism needs a multiple of TP; the norm row class needs training's multiple); fused
+verification + training still requires TP=1 (it reads p from the training forward's logits,
+which are vocab-sharded at TP>1); keyed verification still requires learner TP=PP=1 (it calls
+the training model directly); scorers on the inference workers still require
+`verify_on=learner` at inference TP>1 (shared engine communicators).
 
 **Environment.** TE 2.18 (built from source against torch 2.11), flash-attn-4 4.0.0b19, CuTe
 DSL 4.6.2 (including `nvidia-cutlass-dsl-libs-core`, the Python frontend), quack-kernels 0.6.4
@@ -498,8 +549,8 @@ batch-invariant Mamba decode (buffered chunk replay) already makes them exact.
   policy, so exact verification against it rejects long drafts: 33-44% of draft tokens kept on
   Qwen3-1.7B's ~3k-token outputs versus 94-98% with the fp32 scorer. The fp32 scorer is the
   default; rollouts then follow the fp32 approximation of the policy, as without BI.
-- *Where the scorer runs.* On the learner it is stable but does not scale under BI: BI
-  requires TP=1, so each learner GPU holds the full fp32 copy (4 B/param) plus a bf16 stash
+- *Where the scorer runs.* On the learner it is stable but does not scale under BI at TP=1
+  (the only BI layout before `thundersync-bi-tp2`): each learner GPU holds the full fp32 copy (4 B/param) plus a bf16 stash
   per pending version on top of training state (Qwen3-8B ran out of memory on 2 and 3 learner
   GPUs). On the inference GPUs (`verify_on=inference`, the recommended BI setting) it first
   broke the engine: acceptance decayed step by step (97% -> ~40%) and the engine eventually
@@ -568,7 +619,7 @@ Qwen3-1.7B's ~3k-token outputs), few drafts finish whole, and the fp32 scorer
 (not fusable: its p is not the training forward) is the better choice. Requirements,
 enforced by `validate_fused_verify_train` and on the worker: `speculate`,
 `verify_mode=block`, `verify_on=learner`, `verify_precision=model`,
-`batch_invariant_mode`, PP=1 (and BI's TP=1, CP=1), generation temperature 1, no fused
+`batch_invariant_mode`, TP=1 and PP=1 (and BI's CP=1), generation temperature 1, no fused
 linear log-probs, no MTP or draft-model training. `THUNDERSYNC_FUSED_CHECK=1` also runs the
 real forward for each fused row and prints the largest logit difference over the verified
 positions (expected 0).

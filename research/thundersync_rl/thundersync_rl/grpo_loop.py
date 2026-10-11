@@ -293,6 +293,13 @@ def validate_fused_verify_train(
         )
     if megatron_cfg["pipeline_model_parallel_size"] != 1:
         problems.append("policy.megatron_cfg.pipeline_model_parallel_size must be 1")
+    if megatron_cfg["tensor_model_parallel_size"] != 1:
+        # Verification reads p from the training forward's logits, which are
+        # vocab-sharded at TP>1 (no gather on that path).
+        problems.append(
+            "policy.megatron_cfg.tensor_model_parallel_size must be 1 (the "
+            "training forward's logits are vocab-sharded at TP>1)"
+        )
     if megatron_cfg["expert_model_parallel_size"] != 1:
         problems.append(
             "policy.megatron_cfg.expert_model_parallel_size must be 1 (fused "

@@ -592,6 +592,14 @@ class MegatronGenerationMixin:
         # Batch-invariant mode needs the policy's RoPE bits, and MCore rejects
         # an explicit True there.
         if getattr(model_config, "batch_invariant_mode", False):
+            if getattr(model_config, "inference_fuse_tp_communication", False):
+                # Under batch invariance the fused reduce-scatter falls back to
+                # NCCL, but the next layer still skips its norm + all-gather and
+                # reads the (stale) symmetric buffer.
+                raise ValueError(
+                    "batch_invariant_mode=True requires "
+                    "inference_fuse_tp_communication=False on the generation model."
+                )
             use_flashinfer_fused_rope = False
             allow_installed_flash_attn_4()
             # Without flashinfer RoPE the engine reads its RoPE table from
