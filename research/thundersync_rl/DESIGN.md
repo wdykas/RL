@@ -365,7 +365,57 @@ draw-for-draw, scorer kernels on GPU, streaming equivalence, speculative driver 
 cohorts and ramp, chunked pools, error surfacing), 7 core zero-advantage tests, and GPU
 functional checks for scorer and refit parallelism.
 
-## 14. Open work
+## 14. Batch invariance (NeMo-RL PR 3208)
+
+Branch `thundersync-rl-bi` applies PR 3208 (`policy.megatron_cfg.zero_train_gen_mismatch`):
+Megatron training and Megatron inference run the same batch-invariant kernel stack, so
+generation log-probs and training log-probs of the same tokens are bitwise equal.
+
+**How the kernels get batch invariance** (`te_native` backend): native cuBLASLt GEMMs with
+a starved workspace (no split-K, so a fixed K-reduction order at every row count),
+batch-invariant `aten::_log_softmax` / `mean`, TE RMSNorm kept native under 64-multiple
+token alignment, FlashAttention 4 with `num_splits=1`. Requirements enforced by the PR's
+validator: BF16, TP=1, CP=1, no packing, generation `transformer_impl=inference_optimized`
+(so no QKV-bias models such as Qwen2.5), `make_sequence_length_divisible_by` a multiple of 64.
+
+**Environment.** TE 2.18 (built from source against torch 2.11), flash-attn-4 4.0.0b19, CuTe
+DSL 4.6.2 (including `nvidia-cutlass-dsl-libs-core`, the Python frontend), quack-kernels 0.6.4
+and apache-tvm-ffi 0.1.11, as a PYTHONPATH overlay (`thundersync_work/build_bi_overlay.sh`).
+
+**Measured with ThunderSync** (`THUNDERSYNC_MISMATCH_CHECK=1`: before the optimizer step the
+learner recomputes the batch's log-probs and compares them with the rollout log-probs):
+
+| Model | Mismatch |
+|---|---|
+| Qwen3-1.7B, BI | 0 on every token (4 steps) |
+| Nemotron-Nano-9B-v2 (hybrid Mamba), BI, validator's hybrid exclusion relaxed | 0 on every token (3 steps) |
+
+The PR's exclusion of hybrid Mamba models is an untested-scope limit: MCore's
+batch-invariant Mamba decode (buffered chunk replay) already makes them exact.
+
+**Speculation under BI.**
+
+- *Scorer precision.* BI kernels are BF16-only (`TransformerConfig` asserts it), so an fp32
+  scorer is built with `batch_invariant_mode=False` on its own copy, keeping the process-wide
+  TE attention settings (its attention is replaced by SDPA anyway). A bf16 scorer would match
+  the policy bitwise once it scores like training (training op sequence, rows padded to the
+  training multiple, full-row LM head, training's fp32 log-softmax: 92-97% of tokens bitwise
+  equal so far), but its rounding jitter between consecutive weight versions is part of the
+  policy, so exact verification against it rejects long drafts: 33-44% of draft tokens kept on
+  Qwen3-1.7B's ~3k-token outputs versus 94-98% with the fp32 scorer. The fp32 scorer is the
+  default; rollouts then follow the fp32 approximation of the policy, as without BI.
+- *Where the scorer runs.* With the fp32 scorer on the learner, BI speculation is stable
+  (Qwen3-1.7B: 94-98% of draft tokens kept, 7 steps), but it does not scale: BI requires TP=1,
+  so each learner GPU holds the full fp32 copy (4 B/param) plus a bf16 stash per pending
+  version on top of training state; Qwen3-8B ran out of memory on 2 and 3 learner GPUs.
+  The scorer belongs on the inference GPUs, but there it currently breaks the BI engine:
+  acceptance decays step by step (97% -> ~40% over 6 steps) and the engine eventually
+  produces NaN logits (sampled token id 155647, out of the 151936 vocab). Not the cause:
+  concurrent execution (pausing the engine during verification did not help), CUDA graphs on
+  the scorer, inference-optimized layers on the scorer. Under investigation.
+- Until fixed, `validate_config` rejects speculation with BI unless `verify_on=learner`.
+
+## 15. Open work
 
 - **Stragglers.** About one rejected draft per step decodes its remainder at about 3 ms
   per token. Only faster single-sequence decoding helps, such as engine-level speculative
@@ -374,8 +424,8 @@ functional checks for scorer and refit parallelism.
   3 + 1 split makes the learner the bottleneck; faster engine decoding is the lever.
 - **Training CPU overhead.** About 130 ms CPU vs 70 ms GPU per micro-batch; training CUDA
   graphs would need static or bucketed shapes.
-- **Batch invariance (PR 3208).** Would make q bitwise the engine's sampling
-  distribution. Needs Transformer Engine 2.18 or later and flash-attn 4.
+- **Batch invariance with inference-side verification.** Find why the scorer in the BI
+  inference process degrades the engine (section 14); then verify on inference GPUs under BI.
 - **Scaling gaps.** Context parallelism in the scorer, MoE validation, zero-advantage
   skip with sequence packing.
 - **Upstream.** Default `make_sequence_length_divisible_by` to 64–128 for Megatron
