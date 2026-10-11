@@ -203,6 +203,7 @@ def validate_config(master_config: ThunderSyncMasterConfig) -> None:
         ts_cfg.speculate
         and master_config.policy["megatron_cfg"].get("batch_invariant_mode")
         and ts_cfg.verify_on != "learner"
+        and not os.environ.get("TMP_DEBUG_ALLOW_BI_INFER_VERIFY")
     ):
         # The fp32 verification scorer inside a batch-invariant inference process
         # (CUDA-graph engine running concurrently) hits an out-of-bounds index in

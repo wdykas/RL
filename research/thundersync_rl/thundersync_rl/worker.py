@@ -70,6 +70,16 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         )
         self._stream_busy_s = 0.0
 
+    def _log_mem(self, where: str) -> None:
+        if os.environ.get("THUNDERSYNC_MEM_LOG"):
+            print(
+                f"[thundersync mem] rank={self.rank} {where}: "
+                f"alloc={torch.cuda.memory_allocated() / 2**30:.1f}G "
+                f"peak={torch.cuda.max_memory_allocated() / 2**30:.1f}G",
+                flush=True,
+            )
+            torch.cuda.reset_peak_memory_stats()
+
     def stream_accumulate(
         self,
         items: list[dict[str, Any]],
@@ -143,6 +153,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         if closes:
             self.close_stream_groups(closes)
         torch.cuda.synchronize()
+        self._log_mem("stream_accumulate")
         self._stream_busy_s += time.perf_counter() - t0
         acc = self._train_step_state["grad_stream"]
         return {"num_items": len(items), "open_buffers": acc.num_open_buffers()}
@@ -427,6 +438,25 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 provider.pipeline_dtype = torch.float32
                 provider.bf16 = False
                 provider.fp16 = False
+            # On inference workers the provider builds MCore's inference-optimized
+            # layers (engine-owned buffers): sharing them corrupted the engine's
+            # weights/logits. The scorer always uses the standard TE layers.
+            if getattr(provider, "transformer_impl", None) == "inference_optimized":
+                from megatron.bridge.models.gpt_provider import (
+                    GPTModelProvider,
+                    default_layer_spec,
+                )
+
+                provider.transformer_impl = "transformer_engine"
+                if isinstance(provider, GPTModelProvider):
+                    provider.transformer_layer_spec = default_layer_spec
+            # The scorer never runs under CUDA graphs; in an inference process a
+            # graph-enabled copy would join the engine's graph registry.
+            provider.cuda_graph_impl = "none"
+            if hasattr(provider, "inference_cuda_graph_scope"):
+                from megatron.core.transformer.enums import InferenceCudaGraphScope
+
+                provider.inference_cuda_graph_scope = InferenceCudaGraphScope.none
             provider.recompute_granularity = None
             provider.recompute_method = None
             provider.recompute_num_layers = None
@@ -475,6 +505,48 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         torch.cuda.synchronize()
         self._prof["export"] = self._prof.get("export", 0.0) + time.perf_counter() - t0
         return self._mfp32
+
+    def tmp_debug_patch_engine_logprobs(self) -> bool:
+        """TEMPORARY debug: host-side shape checks before engine log-prob indexing."""
+        from megatron.core.inference.contexts.dynamic_context import (
+            DynamicInferenceContext,
+        )
+
+        orig = DynamicInferenceContext.calculate_log_probs_tensors
+        if getattr(orig, "_ts_dbg", False):
+            return True
+
+        def wrapped(
+            ctx,
+            logits,
+            new_tokens,
+            only_last_token_logits=False,
+            sampling=None,
+            row_to_request=None,
+        ):
+            rows = logits.squeeze(0).shape[0]
+            vocab = logits.shape[-1]
+            n_new = len(new_tokens)
+            mx = int(new_tokens.max()) if n_new else -1
+            decode = only_last_token_logits or ctx.is_decode_only()
+            if (decode and n_new > rows) or mx >= vocab:
+                raise RuntimeError(
+                    f"[engine logprob dbg] rows={rows} vocab={vocab} n_new={n_new} max_tok={mx} "
+                    f"decode={decode} only_last={only_last_token_logits} total={ctx.total_request_count} "
+                    f"paused={ctx.paused_request_count} row_to_request={None if row_to_request is None else tuple(row_to_request.shape)}"
+                )
+            return orig(
+                ctx,
+                logits,
+                new_tokens,
+                only_last_token_logits,
+                sampling,
+                row_to_request,
+            )
+
+        wrapped._ts_dbg = True
+        DynamicInferenceContext.calculate_log_probs_tensors = wrapped
+        return True
 
     def termination_id(self) -> int | None:
         tok = getattr(self, "megatron_tokenizer", None)
@@ -578,6 +650,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         for v in list(self._weight_stash):
             if v not in keep and v != version:
                 del self._weight_stash[v]
+        self._log_mem(f"stash_weights v={version} n={len(self._weight_stash)}")
         return len(self._weight_stash)
 
     @torch.no_grad()
@@ -704,6 +777,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                     (i, {"accepted": tau, "next": y, "logprobs": logp.tolist()})
                 )
             del logits
+        self._log_mem("verify_drafts_block_stashed")
         if os.environ.get("THUNDERSYNC_SPEC_PROF"):
             pool = (
                 "gen"
@@ -719,7 +793,14 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
 
     @property
     def _batch_invariant(self) -> bool:
-        return bool(self.cfg["megatron_cfg"].get("batch_invariant_mode"))
+        """Whether the scorer runs batch-invariant kernels (bf16 scorer under BI).
+
+        An fp32 scorer is built outside batch-invariant mode, so training-parity
+        measures (full-row scoring, training's log-softmax) do not apply to it.
+        """
+        return bool(self.cfg["megatron_cfg"].get("batch_invariant_mode")) and (
+            getattr(self, "_scorer_precision", "fp32") != "fp32"
+        )
 
     def _score(self, scorer, ids, pos, select=None):
         """Scorer logits: [b, s, V], or [n, V] at ``select = (seq_idx, batch_idx)``."""
