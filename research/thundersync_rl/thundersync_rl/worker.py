@@ -43,14 +43,19 @@ WORKER_FQN = "thundersync_rl.worker.ThunderSyncMegatronPolicyWorker"
 
 
 def _model_in_eval(method):
-    """Run ``method`` with ``self.model`` in eval mode, then restore its mode.
+    """Run ``method`` with ``self.model`` in eval mode.
 
-    Learner-side verification runs while a streamed train step is open; leaving
-    the model in eval mode would silently disable dropout for the rest of the step.
+    Learner: restore the previous mode afterwards, since verification runs while
+    a streamed train step is open and leaving eval mode on would silently disable
+    dropout for the rest of the step. Generation workers: leave it in eval mode;
+    the inference engine runs on the same module concurrently and requires it.
     """
 
     @functools.wraps(method)
     def wrapper(self, *args, **kwargs):
+        if getattr(self, "dynamic_inference_engine", None) is not None:
+            self.model.eval()
+            return method(self, *args, **kwargs)
         was_training = self.model.training
         self.model.eval()
         try:
