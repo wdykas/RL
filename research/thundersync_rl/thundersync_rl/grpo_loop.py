@@ -107,7 +107,9 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # Max new tokens per draft (the rollout length cap is the natural value).
     draft_budget: int = 4096
     # Start drafting once this fraction of the iteration's rollouts finished
-    # (0: from the start of the iteration).
+    # (0: at the first finished rollout). Starting before any rollout finishes
+    # is slower: drafts then compete with the iteration's own rollouts (1.5B,
+    # 100 steps: 3.17 vs 3.01 s mean, 3.10 vs 2.55 s median).
     draft_start_frac: float = 0.0
     # Keyed mode only: top-k of the head scored per position.
     spec_head_k: int = 64
