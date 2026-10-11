@@ -498,7 +498,11 @@ step were fused (10-27k forward tokens saved, no fallbacks), but steady-state st
 forwards that run with autograd, which costs more than the training forwards they save at
 this size. Acceptance was the same either way (41-52% of draft tokens) and well below the
 fp32 scorer's 92-99%, so fused mode is a net loss here. It is worth retesting where
-training forwards are expensive relative to verification (large models, learner-bound runs).
+training forwards are expensive relative to verification (large models, learner-bound runs). On
+Qwen3-8B (1 node, 2 + 2 GPUs) the default settings run out of memory on the learner (weight
+stashes, retained graphs and training state on TP=1 GPUs); it fits with
+`draft_lookahead=1 verify_batch_tokens=4096 fused_max_retained_tokens=8192`, keeping 66-68%
+of draft tokens, but only about one trajectory per step finishes whole and gets fused.
 
 **Keyed verification under BI** (`verify_mode=keyed`). With bitwise parity the learner's
 logits for a draft are the ones the engine sampled from, so keyed verification needs no
@@ -511,7 +515,9 @@ every token of every step once the plan reports full-vocabulary log-probs (sampl
 `vocab_limit` slice the engine's keyed sampler uses). Acceptance across a weight update is
 10-13% of draft tokens, against 92-99% for block verification with the fp32 scorer, so keyed
 mode trades nearly all of the speculation gain for removing the scorer and the stashes; it is
-the memory-light option, not the fast one.
+the memory-light option, not the fast one. On Qwen3-8B (1 node, 2 + 2 GPUs) it fits on the
+learner, keeps 7-10% of draft tokens and takes 66-100 s per step against about 50 s for
+block verification on the inference GPUs.
 
 **No importance-sampling correction.** Generation and training log-probs are bitwise equal
 under BI, so the importance weights are exactly 1 and
