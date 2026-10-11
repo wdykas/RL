@@ -373,7 +373,14 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 agree = emitted[: draft.numel()] == draft
                 n_acc = int(agree.long().cumprod(0).sum())
                 kept = torch.cat([draft[:n_acc], emitted[n_acc : n_acc + 1]])
-                lps = lp[torch.arange(n_acc + 1, device="cuda"), kept].tolist()
+                # Sampling uses the vocab_limit slice (as the engine's keyed sampler
+                # does); the reported log-probs are over the full vocabulary, as
+                # training computes them (bitwise equal under batch invariance).
+                lps = (
+                    torch.log_softmax(logits[r, plen - 1 : plen + n_acc].float(), -1)
+                    .gather(-1, kept.unsqueeze(-1))[:, 0]
+                    .tolist()
+                )
                 results.append(
                     (
                         i,
