@@ -55,3 +55,54 @@ def test_fused_returns_logq_of_accepted_tokens():
     assert (tau, y) == (tau2, y2) and torch.equal(logp, logp2)
     lq = torch.log_softmax(q, -1)[torch.arange(tau, device="cuda"), draft[:tau]]
     torch.testing.assert_close(logq, lq)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("noise", [0.0, 0.003, 0.3, 2.0])
+def test_lazy_logits_pathwise_identical(noise, dtype):
+    """Lazy scan vs eager fused rule: same (tau, y), bitwise logp, same RNG state."""
+    from thundersync_rl.block_verification_fused import (
+        block_verify_logits,
+        block_verify_logits_lazy,
+    )
+
+    torch.manual_seed(1)
+    vocab = 3000
+    rejected = 0
+    for trial in range(60):
+        g = trial % 40
+        p = (torch.randn(g + 1, vocab, device="cuda") * 2).to(dtype)
+        q = (p[:g].float() + torch.randn(g, vocab, device="cuda") * noise).to(dtype)
+        draft = torch.multinomial(torch.softmax(q.float(), -1), 1).flatten()
+        g1 = torch.Generator(device="cuda").manual_seed(trial)
+        g2 = torch.Generator(device="cuda").manual_seed(trial)
+        tau, y, logp = block_verify_logits(p, q, draft, g1)
+        tau2, y2, logp2 = block_verify_logits_lazy(p, q, draft, g2)
+        assert (tau, y) == (tau2, y2)
+        assert torch.equal(logp, logp2)
+        assert torch.equal(g1.get_state(), g2.get_state())
+        rejected += tau < g
+    if noise >= 0.3:
+        assert rejected > 10
+
+
+@pytest.mark.parametrize("scale", [1.0, 30.0, 300.0, 3000.0])
+def test_residual_mass_within_lazy_slack(scale):
+    """The computed r_i never exceeds b_i by more than the lazy slack.
+
+    Adversarial: q is a point mass where p is smallest, so r_i ~ b_i * sum_v p_i(v).
+    """
+    from thundersync_rl.block_verification import lazy_slack
+    from thundersync_rl.block_verification_fused import residual_masses
+
+    torch.manual_seed(2)
+    vocab = 152_064
+    p = torch.randn(16, vocab, device="cuda") * scale
+    q = torch.full_like(p, -1e4)
+    q.scatter_(1, p.argmin(-1, keepdim=True), 0.0)
+    lse_p, lse_q = torch.logsumexp(p, -1), torch.logsumexp(q, -1)
+    b = torch.rand(16, device="cuda", dtype=torch.float64)
+    b[0] = 1.0
+    r = residual_masses(p, q, lse_p, lse_q, b)
+    excess = r / b - 1
+    assert (excess <= lazy_slack(lse_p) - 1e-4).all(), excess.max()

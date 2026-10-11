@@ -687,6 +687,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         keys: list[str],
         batch_tokens: int,
         precision: str,
+        lazy: bool = False,
     ) -> list[tuple[int, dict[str, Any]]]:
         """Block-verify drafts whose q is recomputed per batch from stashed weights.
 
@@ -695,14 +696,33 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         Returns [(row_index, {"accepted", "next", "logprobs", "draft_logq"})]:
         "logprobs" = log p of the kept tokens (accepted prefix + next),
         "draft_logq" = log q of the accepted prefix.
+
+        ``lazy``: lazy block verification (residual masses only where the
+        backward scan needs them; pathwise identical to the eager rule given the
+        same logits). Logit-free when the scorer supports position selection:
+        keep final hidden states [T, d] instead of [T, V] logits, compute the
+        logsumexps and draft-token logits in row chunks, and recompute full rows
+        only at visited positions (``THUNDERSYNC_LAZY_LOGITS=1`` keeps the logits
+        and only makes the scan lazy).
         """
-        from thundersync_rl.block_verification_fused import block_verify_logits
+        from thundersync_rl.block_verification_fused import (
+            block_verify_logits,
+            block_verify_logits_lazy,
+        )
+        from thundersync_rl.scorer_kernels import supports_selection
 
         self._prof = {}
         t_all = time.perf_counter()
         self._scorer_precision = precision
         scorer = self._fp32_scorer()
         from megatron.core import parallel_state as ps
+
+        logit_free = (
+            lazy
+            and supports_selection(scorer)
+            and os.environ.get("THUNDERSYNC_LAZY_LOGITS") != "1"
+        )
+        verify_fn = block_verify_logits_lazy if lazy else block_verify_logits
 
         # Same stream on every TP rank of a replica: identical decisions.
         gen = torch.Generator(device="cuda").manual_seed(
@@ -726,8 +746,24 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 continue
             group, ids = batches[j]
             pos = torch.arange(ids.shape[1], device="cuda").expand(len(group), -1)
-            lq_rows: dict[int, list[tuple[int, torch.Tensor]]] = {i: [] for i in group}
             versions = plans[j] if lockstep is None else lockstep[j]
+            if logit_free:
+                results.extend(
+                    self._verify_batch_logit_free(
+                        scorer,
+                        group,
+                        ids,
+                        pos,
+                        versions,
+                        rows,
+                        prompt_lens,
+                        segments,
+                        vocab_limit,
+                        gen,
+                    )
+                )
+                continue
+            lq_rows: dict[int, list[tuple[int, torch.Tensor]]] = {i: [] for i in group}
             for v in versions:
                 # q of version v is needed only at its segments' positions; causal
                 # attention lets each row stop at its last such position.
@@ -794,8 +830,15 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 assert q_logits.shape[0] == g, (q_logits.shape, g)
                 draft = ids[r, plen:n]
                 # Raw logits in, no [g, V] log-softmax / fp64 temporaries.
-                tau, y, logp, logq = block_verify_logits(
-                    p_logits, q_logits, draft, gen, with_logq=True
+                tau, y, logp = verify_fn(p_logits, q_logits, draft, gen)
+                # log q of the accepted draft tokens (same vocab slice as the
+                # acceptance ratios) for the behavior log-probs (speculative._plan).
+                qa = q_logits[:tau].float()
+                logq = (
+                    qa.gather(-1, draft[:tau].view(-1, 1))[:, 0]
+                    - torch.logsumexp(qa, -1)
+                    if tau
+                    else qa.new_empty(0)
                 )
                 results.append(
                     (
@@ -820,10 +863,243 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             )
             ntok = sum(rows[i].numel() for i in range(len(rows)))
             print(
-                f"[spec prof] verify_stashed pool={pool} rank={self.rank} rows={len(rows)} tok={ntok} total={time.perf_counter() - t_all:.3f} {self._prof}",
+                f"[spec prof] verify_stashed pool={pool} rank={self.rank} rows={len(rows)} tok={ntok} lazy={int(lazy)} logit_free={int(logit_free)} total={time.perf_counter() - t_all:.3f} {self._prof}",
+                flush=True,
+            )
+        if lazy and os.environ.get("THUNDERSYNC_LAZY_CHECK") == "1":
+            # Debug: rerun the eager logits path with the same seed and compare.
+            ref = dict(
+                self.verify_drafts_block_stashed(
+                    rows,
+                    prompt_lens,
+                    segments,
+                    vocab_limit,
+                    seed,
+                    keys,
+                    batch_tokens,
+                    precision,
+                    lazy=False,
+                )
+            )
+            diff = sum(
+                (o["accepted"], o["next"]) != (ref[i]["accepted"], ref[i]["next"])
+                for i, o in results
+            )
+            dlp = max(
+                (
+                    max(abs(a - b) for a, b in zip(o["logprobs"], ref[i]["logprobs"]))
+                    for i, o in results
+                    if o["accepted"] == ref[i]["accepted"]
+                ),
+                default=0.0,
+            )
+            print(
+                f"[lazy check] rank={self.rank} rows={len(results)} logit_free="
+                f"{int(logit_free)} decision_mismatches={diff} max|dlogp|={dlp:.3e}",
                 flush=True,
             )
         return results
+
+    def _verify_batch_logit_free(
+        self,
+        scorer,
+        group,
+        ids,
+        pos,
+        versions,
+        rows,
+        prompt_lens,
+        segments,
+        vocab_limit,
+        gen,
+    ) -> list[tuple[int, dict[str, Any]]]:
+        """One batch of ``verify_drafts_block_stashed`` without [T, V] logits.
+
+        Same forwards, version order and generator calls as the logits path; q
+        and p come as final hidden states, reduced to (logsumexp, draft-token
+        logit) per position in row chunks (``ChunkedHead``). The lazy scan then
+        recomputes full rows only where it needs r_i, plus the row it samples
+        from. q rows of version v are recomputed with the head weight of stash v
+        (the values the scorer held during that forward).
+        """
+        from thundersync_rl.block_verification_fused import block_verify_stats_lazy
+        from thundersync_rl.logit_free import ChunkedHead
+
+        chunk = int(os.environ.get("THUNDERSYNC_LAZY_CHUNK", "512"))
+        # Row id -> [(start, head, base, length, lse, picked)] per q segment.
+        q_parts: dict[int, list[tuple]] = {i: [] for i in group}
+        heads = []
+        for v in versions:
+            segs = [
+                (r, i, a, b)
+                for r, i in enumerate(group)
+                for sv, a, b in segments[i]
+                if sv == v and b > a
+            ]
+            if not segs:
+                # Expert parallelism: another rank needs version v here.
+                self._load_scorer(v)
+                self._dummy_score(scorer)
+                continue
+            sub_rows = sorted({r for r, _, _, _ in segs})
+            local = {r: k for k, r in enumerate(sub_rows)}
+            width = max(prompt_lens[i] - 1 + b for _, i, _, b in segs)
+            s_idx = torch.cat(
+                [
+                    torch.arange(prompt_lens[i] - 1 + a, prompt_lens[i] - 1 + b)
+                    for _, i, a, b in segs
+                ]
+            )
+            b_idx = torch.cat([torch.full((b - a,), local[r]) for r, _, a, b in segs])
+            self._load_scorer(v)
+            out = self._score_hidden(
+                scorer,
+                ids[sub_rows, :width],
+                pos[: len(sub_rows), :width],
+                (s_idx.cuda(), b_idx.cuda()),
+                vocab_limit,
+            )
+            if out is None:  # not the last pipeline stage
+                continue
+            hidden, logits_fn, w_live = out
+            tokens = torch.cat(
+                [
+                    rows[i][prompt_lens[i] + a : prompt_lens[i] + b]
+                    for _, i, a, b in segs
+                ]
+            ).cuda()
+            head = ChunkedHead(hidden, logits_fn, lambda w=w_live: w, chunk)
+            lse, picked = head.stats(tokens)
+            # Rows recomputed later: the scorer then holds other weights.
+            head.weight = self._stashed_head_weight(v, w_live)
+            heads.append(head)
+            off = 0
+            for _, i, a, b in segs:
+                n = b - a
+                q_parts[i].append(
+                    (a, head, off, n, lse[off : off + n], picked[off : off + n])
+                )
+                off += n
+        self._load_scorer(None)
+        spans = [(prompt_lens[i] - 1, rows[i].numel()) for i in group]
+        out = self._score_hidden(
+            scorer,
+            ids,
+            pos,
+            (
+                torch.cat([torch.arange(a, e) for a, e in spans]).cuda(),
+                torch.cat(
+                    [torch.full((e - a,), r) for r, (a, e) in enumerate(spans)]
+                ).cuda(),
+            ),
+            vocab_limit,
+        )
+        if out is None:
+            return []
+        hidden, logits_fn, w_live = out
+        tokens, pins, off = [], [], 0
+        for i in group:
+            draft = rows[i][prompt_lens[i] :]
+            tokens += [draft, torch.zeros(1, dtype=draft.dtype)]  # bonus: no token
+            off += draft.numel() + 1
+            pins.append(off - 1)
+        head_p = ChunkedHead(hidden, logits_fn, lambda: w_live, chunk)
+        heads.append(head_p)
+        lse_p_all, picked_p_all = head_p.stats(torch.cat(tokens).cuda(), pins)
+        results = []
+        off = 0
+        empty = torch.empty(0, dtype=torch.float32, device="cuda")
+        for i in group:
+            g = rows[i].numel() - prompt_lens[i]
+            lse_p = lse_p_all[off : off + g + 1]
+            lpx = picked_p_all[off : off + g] - lse_p[:g]
+            parts = sorted(q_parts.pop(i), key=lambda x: x[0])
+            lse_q = torch.cat([pt[4] for pt in parts]) if parts else empty
+            lqx = (torch.cat([pt[5] for pt in parts]) if parts else empty) - lse_q
+            assert lqx.numel() == g, (lqx.numel(), g)
+
+            def q_rows(idx, parts=parts):
+                out = []
+                for t in idx.tolist():
+                    a, head, base, _, _, _ = next(
+                        pt for pt in parts if pt[0] <= t < pt[0] + pt[3]
+                    )
+                    out.append(head.row(base + t - a))
+                return torch.stack(out)
+
+            tau, y, logp, n_eval = block_verify_stats_lazy(
+                lpx,
+                lqx,
+                lse_p,
+                lse_q,
+                lambda idx, off=off: head_p.rows(idx + off),
+                q_rows,
+                gen,
+            )
+            self._prof["lazy_rows"] = self._prof.get("lazy_rows", 0) + n_eval
+            results.append(
+                (
+                    i,
+                    {
+                        "accepted": tau,
+                        "next": y,
+                        "logprobs": logp.tolist(),
+                        "draft_logq": lqx[:tau].tolist(),
+                    },
+                )
+            )
+            off += g + 1
+        for head in heads:
+            head.release()
+        return results
+
+    def _stashed_head_weight(self, version, w_live):
+        """Callable giving the LM head weight of stash ``version`` (scorer dtype).
+
+        Bitwise the values ``_load_scorer(version)`` copied into ``w_live``.
+        """
+        k = next(j for j, (dst, _) in enumerate(self._mfp32_map) if dst is w_live)
+        return lambda: self._weight_stash[version][k].to(w_live.dtype)
+
+    def _score_hidden(self, scorer, ids, pos, select, vocab_limit):
+        """Final hidden states at ``select`` plus a function computing their logits.
+
+        Returns (hidden [n, h], logits_fn(h, weight) -> fp32 [m, vocab_limit],
+        head weight) on the last pipeline stage, else None. ``logits_fn`` is the
+        forward's LM head (with its logit scaling), all-gathered over the
+        vocabulary under tensor parallelism one row chunk at a time.
+        """
+        from megatron.core import parallel_state as ps
+        from thundersync_rl.scorer_kernels import capture_head_input
+
+        with capture_head_input(scorer, select) as cap:
+            out = self._score_full(scorer, ids, pos)
+        if out is None:
+            return None
+        ((hidden, weight, rgo),) = cap
+        layer = scorer.output_layer
+        w_live = layer.weight if weight is None else weight
+        tp = ps.get_tensor_model_parallel_world_size()
+        gathered = layer.gather_output if rgo is None else rgo
+        scale = getattr(scorer, "_scale_logits", None)
+
+        def logits_fn(h, w):
+            z, _ = layer._ts_orig_forward(
+                h.unsqueeze(1), weight=w, runtime_gather_output=rgo
+            )
+            if scale is not None:
+                z = scale(z)
+            z = z[:, 0].float()
+            if tp > 1 and not gathered:
+                # Vocab-parallel -> full vocab, one chunk of rows at a time.
+                parts = [torch.empty_like(z) for _ in range(tp)]
+                torch.distributed.all_gather(
+                    parts, z.contiguous(), group=ps.get_tensor_model_parallel_group()
+                )
+                z = torch.cat(parts, dim=-1)
+            return z[:, :vocab_limit]
+
+        return hidden, logits_fn, w_live
 
     def _score(self, scorer, ids, pos, select=None):
         """Scorer logits: [b, s, V], or [n, V] at ``select = (seq_idx, batch_idx)``."""

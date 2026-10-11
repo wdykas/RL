@@ -24,6 +24,8 @@ only where that holds:
   instead of the unfused score-matrix path with TF32 score GEMMs (plain causal
   softmax attention only: no sliding window, no attention sinks).
 * ``select_positions``: run the LM head on chosen positions only.
+* ``capture_head_input``: return the LM head's input (final hidden states) at
+  chosen positions instead of logits (logit-free verification).
 """
 
 from __future__ import annotations
@@ -191,11 +193,20 @@ def use_selective_output(model: torch.nn.Module) -> bool:
         return False
     orig_forward = layer.forward
     layer._ts_select = None
+    layer._ts_capture = None
+    layer._ts_orig_forward = orig_forward
 
     def forward(input_, weight=None, runtime_gather_output=None, **kw):
         sel = layer._ts_select
         if sel is not None:
             input_ = input_[sel[0], sel[1]].unsqueeze(1)  # [n, 1, h]
+        cap = layer._ts_capture
+        if cap is not None:
+            # Logit-free: keep the head input and its call arguments; the model
+            # returns a [1, n, 1] placeholder instead of logits.
+            assert sel is not None and not kw, "capture needs a position selection"
+            cap.append((input_[:, 0], weight, runtime_gather_output))
+            return input_.new_zeros(input_.shape[0], 1, 1), None
         return orig_forward(
             input_, weight=weight, runtime_gather_output=runtime_gather_output, **kw
         )
@@ -222,3 +233,22 @@ def select_positions(model: torch.nn.Module, select):
         yield
     finally:
         layer._ts_select = prev
+
+
+@contextlib.contextmanager
+def capture_head_input(model: torch.nn.Module, select):
+    """Capture the LM head input at ``select = (seq_idx, batch_idx)``.
+
+    Forwards inside the block append (hidden [n, h], weight, runtime_gather_output)
+    to the yielded list (on the last pipeline stage) and return a placeholder.
+    Recompute logits with ``model.output_layer._ts_orig_forward``.
+    """
+    layer = model.output_layer
+    captured: list = []
+    prev = layer._ts_capture
+    layer._ts_capture = captured
+    try:
+        with select_positions(model, select):
+            yield captured
+    finally:
+        layer._ts_capture = prev
