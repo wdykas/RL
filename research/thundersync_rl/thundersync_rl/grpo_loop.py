@@ -459,15 +459,21 @@ async def _run_one_step(
         ts_cfg.max_open_groups if ts_cfg.granularity == "trajectory" else 0
     )
     # Expert parallelism runs a token all-to-all across DP ranks in every
-    # forward/backward, so all ranks must run the same number per dispatch.
+    # forward/backward, so all ranks must run the same number per dispatch;
+    # the worker then also trains zero-advantage rows (no skipping).
+    expert_parallel = (
+        master_config.policy["megatron_cfg"]["expert_model_parallel_size"] > 1
+    )
     planner = StreamPlanner(
         adv_fn,
         dp_size=learner.dp_size,
         max_chunk_trajectories=ts_cfg.max_chunk_trajectories,
         max_open_groups=max_open_groups,
         micro_batch_size=mbs,
-        equal_rank_microbatches=(
-            master_config.policy["megatron_cfg"]["expert_model_parallel_size"] > 1
+        equal_rank_microbatches=expert_parallel,
+        skip_zero_advantage_chunks=(
+            bool(getattr(loss_fn, "skip_zero_advantage_rows", False))
+            and not expert_parallel
         ),
     )
     for p in range(n // G):

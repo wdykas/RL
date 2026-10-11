@@ -60,15 +60,35 @@ refit happen once per batch. On Qwen2.5-0.5B in fp32 the streamed gradient diffe
 `Policy.train` by a relative 4.6–7.4e-6, the same order as re-batching the synchronous
 update.
 
+Accumulator memory. With buckets (`max_open_groups > 0`) the accumulator keeps a batch
+accumulator `batch_acc` (one fp32 copy of the rank's grad buffers, always on the GPU)
+plus the open buckets, and the grad buffers are scratch space between chunks. Group
+granularity (`max_open_groups=0`) has no buckets: every chunk carries final advantages,
+so its gradient stays in the grad buffers and accumulates there as in non-streamed
+training. No `batch_acc`, no per-chunk copy, `finalize` is a no-op, and the memory check
+needs 0 bytes (−30.5 GiB/GPU for Qwen3-8B on 2 GPUs). It is bitwise equal to the
+`batch_acc` form when every chunk runs one micro-batch (`acc + (0 + g)` = `acc + g`).
+A chunk of several micro-batches is now summed micro-batch by micro-batch
+(`(acc + g1) + g2`, the order of non-streamed training) instead of chunk-sum first
+(`acc + (g1 + g2)`), so the two forms differ only in fp32 summation order.
+
 Scheduling:
 
 - **Final-first.** Rows of closed groups (final advantages known) always go first. Idle
   learner time streams one open group's rows into buckets.
 - **Length-sorted chunks.** Final rows from different groups share micro-batches, sorted
-  by length to limit padding, balanced over data-parallel ranks by tokens.
+  by length to limit padding, balanced over data-parallel ranks by tokens. With
+  zero-advantage skipping (and no EP) the balance counts only live (nonzero-advantage)
+  chunks' tokens, total tokens breaking ties: a skipped chunk costs no forward. This
+  changes only which rank runs a chunk (fp32 order).
 - **Zero-advantage chunks.** With `loss_fn.skip_zero_advantage_rows`, zero-advantage rows
   are chunked separately; the worker counts their tokens for normalization and drops the
-  whole chunk without a forward pass. Learner time 2.04 → 1.55 s per step.
+  whole chunk without a forward pass. Learner time 2.04 → 1.55 s per step. A rank whose
+  first chunk of a step is all zero-advantage no longer runs a forced forward/backward
+  to report metrics: it reports one synthesized all-masked metric entry (zero sums, ±inf
+  extrema) from the metric keys seen earlier on that worker. Only the worker's very first
+  such chunk still runs. Gradients are unchanged (the forced pass added exact zeros);
+  diagnostic metrics now average over the rows that actually ran.
 - **Expert parallelism.** With `expert_model_parallel_size > 1` every forward/backward
   runs an all-to-all over the EP group, which spans data-parallel ranks, so all ranks must
   run the same number of micro-batches per dispatch. The planner then pads short ranks
