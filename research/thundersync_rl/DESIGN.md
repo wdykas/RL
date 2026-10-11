@@ -546,10 +546,12 @@ learner, keeps 7-10% of draft tokens and takes 66-100 s per step against about 5
 block verification on the inference GPUs.
 
 **No importance-sampling correction.** Generation and training log-probs are bitwise equal
-under BI, so the importance weights are exactly 1 and
-`loss_fn.use_importance_sampling_correction` can be disabled. In fused mode the plan's
-log-probs are computed with training's own log-softmax from the training forward, so this
-holds for fully accepted speculative tokens too.
+under BI for engine-decoded tokens, so their importance weights are exactly 1. That makes
+`loss_fn.use_importance_sampling_correction` unnecessary without speculation, and with
+keyed or fused verification (both report training's own log-probs for accepted tokens;
+measured mismatch 0). With the default fp32-scorer block verification, accepted tokens
+carry the fp32 scorer's log-probs (mean |dlogp| about 0.011 against training), so keep
+the correction on there.
 
 ## 15. Open work
 
