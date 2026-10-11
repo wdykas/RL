@@ -180,3 +180,15 @@ def test_logit_free_worker_matches_logits_path(monkeypatch, chunk):
             )
             n_rejected += e["accepted"] < rows[i].numel() - plens[i]
         assert n_rejected > 3
+
+
+@cuda
+def test_lazy_check_reports_no_mismatch(monkeypatch, capsys):
+    monkeypatch.setenv("THUNDERSYNC_LAZY_CHECK", "1")
+    w = _worker(monkeypatch)
+    rows, plens, segs, keys = _inputs()
+    w.verify_drafts_block_stashed(
+        rows, plens, segs, LIMIT, 0, keys, 64, "fp32", lazy=True
+    )
+    out = capsys.readouterr().out
+    assert "[lazy check]" in out and "decision_mismatches=0" in out

@@ -440,7 +440,8 @@ outcomes and continuation timing), `THUNDERSYNC_LEARNER_PROF` and
 re-draft with the same seeds and verify on unchanged weights before training),
 `THUNDERSYNC_MISMATCH_CHECK` (rollout vs learner log-probs before each optimizer step),
 `THUNDERSYNC_LAZY_LOGITS` (with `verify_lazy`: keep logits, lazy scan only),
-`THUNDERSYNC_LAZY_CHUNK` (logit-free row chunk, default 512).
+`THUNDERSYNC_LAZY_CHUNK` (logit-free row chunk, default 512), `THUNDERSYNC_LAZY_CHECK` (with
+`verify_lazy`: rerun the eager logits path on the same seed and print decision mismatches).
 
 ## 13. Code map
 

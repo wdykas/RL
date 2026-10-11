@@ -781,6 +781,38 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 f"[spec prof] verify_stashed pool={pool} rank={self.rank} rows={len(rows)} tok={ntok} lazy={int(lazy)} logit_free={int(logit_free)} total={time.perf_counter() - t_all:.3f} {self._prof}",
                 flush=True,
             )
+        if lazy and os.environ.get("THUNDERSYNC_LAZY_CHECK") == "1":
+            # Debug: rerun the eager logits path with the same seed and compare.
+            ref = dict(
+                self.verify_drafts_block_stashed(
+                    rows,
+                    prompt_lens,
+                    segments,
+                    vocab_limit,
+                    seed,
+                    keys,
+                    batch_tokens,
+                    precision,
+                    lazy=False,
+                )
+            )
+            diff = sum(
+                (o["accepted"], o["next"]) != (ref[i]["accepted"], ref[i]["next"])
+                for i, o in results
+            )
+            dlp = max(
+                (
+                    max(abs(a - b) for a, b in zip(o["logprobs"], ref[i]["logprobs"]))
+                    for i, o in results
+                    if o["accepted"] == ref[i]["accepted"]
+                ),
+                default=0.0,
+            )
+            print(
+                f"[lazy check] rank={self.rank} rows={len(results)} logit_free="
+                f"{int(logit_free)} decision_mismatches={diff} max|dlogp|={dlp:.3e}",
+                flush=True,
+            )
         return results
 
     def _verify_batch_logit_free(
