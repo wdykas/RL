@@ -504,7 +504,14 @@ training forwards are expensive relative to verification (large models, learner-
 logits for a draft are the ones the engine sampled from, so keyed verification needs no
 scorer copy and no weight stashes: p from the current training weights is all it reads, and
 the check is token-level (keep the agreeing prefix, then the learner's own token). It stays
-exactly on-policy, at the lower token-level acceptance of section 4.
+exactly on-policy, at the lower token-level acceptance of section 4. GPU check (Qwen3-1.7B, BI, 2 + 2
+GPUs, `thundersync_work/keyed_bi.sh`): the self-test re-drafts with the same seeds and keeps
+100% of every draft on unchanged weights, and the train/generation mismatch check reads 0 on
+every token of every step once the plan reports full-vocabulary log-probs (sampling keeps the
+`vocab_limit` slice the engine's keyed sampler uses). Acceptance across a weight update is
+10-13% of draft tokens, against 92-99% for block verification with the fp32 scorer, so keyed
+mode trades nearly all of the speculation gain for removing the scorer and the stashes; it is
+the memory-light option, not the fast one.
 
 **No importance-sampling correction.** Generation and training log-probs are bitwise equal
 under BI, so the importance weights are exactly 1 and
