@@ -358,11 +358,13 @@ outcomes and continuation timing), `THUNDERSYNC_LEARNER_PROF` and
 | `thundersync_rl/block_verification_fused.py` | Block verification from raw logits with a Triton residual-mass kernel |
 | `thundersync_rl/scorer_kernels.py` | SDPA core attention, Triton SwiGLU, selective LM head |
 | `thundersync_rl/keyed_sampling.py` | Position-keyed Gumbel-max sampling kernel (keyed mode) |
+| `thundersync_rl/fused_train.py` | Fused verification + training (BI, experimental): retained graphs, logit stitching, forward substitution |
 | `nemo_rl/algorithms/grad_streaming.py` | Core: per-(group, reward) gradient accumulators, final-first selection (shared with the single controller) |
 
-Tests: 61 research unit tests (block verification by enumeration, fused verification
+Tests: 119 research unit tests (block verification by enumeration, fused verification
 draw-for-draw, scorer kernels on GPU, streaming equivalence, speculative driver plans,
-cohorts and ramp, chunked pools, error surfacing), 7 core zero-advantage tests, and GPU
+cohorts and ramp, chunked pools, error surfacing, fused verification + training: routing,
+claims, config checks and gradient equality on a tiny causal model), 7 core zero-advantage tests, and GPU
 functional checks for scorer and refit parallelism.
 
 ## 14. Batch invariance (NeMo-RL PR 3208)
@@ -415,6 +417,66 @@ batch-invariant Mamba decode (buffered chunk replay) already makes them exact.
   the scorer, inference-optimized layers on the scorer. Under investigation.
 - Until fixed, `validate_config` rejects speculation with BI unless `verify_on=learner`.
 
+### BI-enabled optimizations (opt-in)
+
+Bitwise train/generation parity removes work that exists only to bridge numerics. All
+of these are off by default.
+
+**Fused verification + training** (`thundersync.fused_verify_train`, `fused_train.py`).
+*Experimental: implemented and unit-tested on CPU, not yet run on GPU.* With BI, the
+learner's bf16 training forward is the engine's numerics, so p for verification can come
+from the training model itself at θ_{k+1}, and that p forward is exactly the forward that
+training of iteration k+1 needs for the same trajectory. Fused mode keeps it:
+
+1. q is recomputed from the weight stashes as before (bf16 scorer, no grad).
+2. p is a forward of the training model, inside the already open train step, shaped like a
+   training micro-batch (one row, padded to `make_sequence_length_divisible_by`, same
+   `model_forward` call). Rows whose full acceptance would make a finished rollout (EOS or
+   length cap) run with autograd; the others without.
+3. A draft that is fully accepted and finished keeps its graph on the verifying data-parallel
+   rank, up to `fused_max_retained_tokens` per rank (`FusedGraphStore`); every other graph is
+   freed at once. Its plan is complete, so the rollout returns immediately and the
+   environment rewards it through the normal rollout path; no extra reward hook is needed.
+4. The driver matches the finished trajectory to its retained forward (`claim_fused`), and
+   the planner sends it as a one-row chunk pinned to that rank, into its (group, reward)
+   bucket while the group is open or as a final row once it closed, exactly as any other
+   trajectory. The worker runs the regular `train_microbatch`, with only `model_forward`
+   replaced by the retained logits: same loss, token and sequence counts, bucket capture and
+   finalization. The training row is the verified row plus the environment's reply; causal
+   attention makes the verified logits its prefix, and the reply positions, masked out of the
+   loss, are filled with constants that carry no gradient. Any mismatch (other tokens, an
+   unmasked token after the verified row, a missing graph) falls back to the real forward.
+5. Retained graphs never outlive the step: the barrier drops unclaimed ones before the
+   optimizer step.
+
+The gradient equals the unfused path's up to fp32 summation order (per-row losses are
+additive, and BI makes a row's forward independent of its micro-batch). Each fused
+trajectory saves one full training forward of its row (`fused/trajectories`,
+`fused/forward_tokens_saved`; `fused/retained`, `fused/claimed`, `fused/fallbacks`,
+`fused/unclaimed` track the rest). It pays where bf16 verification keeps most drafts
+whole: short outputs, where block verification against the training-dtype policy keeps
+about 87-91% of tokens. On long outputs bf16 acceptance is low (33-44% of draft tokens on
+Qwen3-1.7B's ~3k-token outputs), few drafts finish whole, and the fp32 scorer
+(not fusable: its p is not the training forward) is the better choice. Requirements,
+enforced by `validate_fused_verify_train` and on the worker: `speculate`,
+`verify_mode=block`, `verify_on=learner`, `verify_precision=model`,
+`batch_invariant_mode`, PP=1 (and BI's TP=1, CP=1), generation temperature 1, no fused
+linear log-probs, no MTP or draft-model training. `THUNDERSYNC_FUSED_CHECK=1` also runs the
+real forward for each fused row and prints the largest logit difference over the verified
+positions (expected 0).
+
+**Keyed verification under BI** (`verify_mode=keyed`). With bitwise parity the learner's
+logits for a draft are the ones the engine sampled from, so keyed verification needs no
+scorer copy and no weight stashes: p from the current training weights is all it reads, and
+the check is token-level (keep the agreeing prefix, then the learner's own token). It stays
+exactly on-policy, at the lower token-level acceptance of section 4.
+
+**No importance-sampling correction.** Generation and training log-probs are bitwise equal
+under BI, so the importance weights are exactly 1 and
+`loss_fn.use_importance_sampling_correction` can be disabled. In fused mode the plan's
+log-probs are computed with training's own log-softmax from the training forward, so this
+holds for fully accepted speculative tokens too.
+
 ## 15. Open work
 
 - **Stragglers.** About one rejected draft per step decodes its remainder at about 3 ms
@@ -430,3 +492,6 @@ batch-invariant Mamba decode (buffered chunk replay) already makes them exact.
   skip with sequence packing.
 - **Upstream.** Default `make_sequence_length_divisible_by` to 64–128 for Megatron
   training.
+- **Fused verification + training on GPU.** Validate `fused_verify_train` end to end
+  (`THUNDERSYNC_FUSED_CHECK=1`, gradient against the unfused path) and measure the saved
+  learner time on short-output tasks (section 14).
