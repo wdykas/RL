@@ -256,6 +256,11 @@ def validate_fused_verify_train(
         )
     if megatron_cfg["pipeline_model_parallel_size"] != 1:
         problems.append("policy.megatron_cfg.pipeline_model_parallel_size must be 1")
+    if megatron_cfg["expert_model_parallel_size"] != 1:
+        problems.append(
+            "policy.megatron_cfg.expert_model_parallel_size must be 1 (fused "
+            "forwards run per rank, not in expert-parallel lockstep)"
+        )
     if megatron_cfg.get("use_fused_linear_logprobs"):
         problems.append(
             "policy.megatron_cfg.use_fused_linear_logprobs must be false "
