@@ -224,7 +224,12 @@ def build_chunk_data(
     master_config: ThunderSyncMasterConfig,
     pad_to_multiple: int,
 ) -> BatchedDataDict:
-    """Flatten a chunk's message logs into a ClippedPG training batch."""
+    """Flatten a chunk's message logs into a ClippedPG training batch.
+
+    A padding chunk keeps its template's tokens but is fully masked out
+    (``sample_mask = token_mask = advantages = 0``): it runs a forward/backward
+    that adds neither gradient nor normalization count.
+    """
     message_logs = [t.payload["message_log"] for t in chunk.trajectories]
     add_grpo_token_loss_masks_and_generation_logprobs(message_logs)
     flat, input_lengths = batched_message_log_to_flat_message(
@@ -253,6 +258,9 @@ def build_chunk_data(
             "advantages": adv.unsqueeze(-1).expand(n, s).clone(),
         }
     )
+    if chunk.padding:
+        for k in ("sample_mask", "token_mask", "advantages"):
+            data[k] = torch.zeros_like(data[k])
     return pad_batch_to_multiple(data, pad_to_multiple)
 
 
@@ -269,7 +277,10 @@ def train_gen_mismatch(trajectories, learner, tokenizer, master_config) -> dict:
     """
     data = build_chunk_data(
         SimpleNamespace(
-            trajectories=trajectories, group=None, advantages=[0.0] * len(trajectories)
+            trajectories=trajectories,
+            group=None,
+            advantages=[0.0] * len(trajectories),
+            padding=False,
         ),
         tokenizer,
         master_config,
@@ -324,11 +335,17 @@ async def _run_one_step(
     max_open_groups = (
         ts_cfg.max_open_groups if ts_cfg.granularity == "trajectory" else 0
     )
+    # Expert parallelism runs a token all-to-all across DP ranks in every
+    # forward/backward, so all ranks must run the same number per dispatch.
     planner = StreamPlanner(
         adv_fn,
         dp_size=learner.dp_size,
         max_chunk_trajectories=ts_cfg.max_chunk_trajectories,
         max_open_groups=max_open_groups,
+        micro_batch_size=mbs,
+        equal_rank_microbatches=(
+            master_config.policy["megatron_cfg"]["expert_model_parallel_size"] > 1
+        ),
     )
     for p in range(n // G):
         planner.register_group((step, p), G)
@@ -400,12 +417,12 @@ async def _run_one_step(
                 await asyncio.gather(*learner.submit(per_rank, d.closes))
                 t1 = time.perf_counter()
                 learner_busy += t1 - t0
-                chunks = [c for cs in d.per_rank for c in cs]
+                chunks = [c for cs in d.per_rank for c in cs if not c.padding]
                 dispatches.append(
                     (
                         t0 - t_start,
                         t1 - t_start,
-                        sum(len(c.trajectories) for c in chunks),
+                        d.num_trajectories,
                         sum(c.num_tokens for c in chunks),
                         sum(1 for c in chunks if c.group is not None),
                     )

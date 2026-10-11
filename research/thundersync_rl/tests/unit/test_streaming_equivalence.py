@@ -14,10 +14,12 @@
 """CPU tests: streamed accumulation reproduces sum_i a_i H_i exactly."""
 
 import random
+from types import SimpleNamespace
 
 import pytest
 import torch
-from thundersync_rl.streaming import StreamPlanner, Trajectory
+from thundersync_rl.grpo_loop import build_chunk_data
+from thundersync_rl.streaming import Chunk, StreamPlanner, Trajectory
 
 from nemo_rl.algorithms.advantage_estimator import GRPOAdvantageEstimator
 from nemo_rl.algorithms.grad_streaming import StreamingGroupAccumulator
@@ -52,6 +54,8 @@ def _simulate(
     chunk=3,
     group_only=False,
     max_open_groups=100,
+    mbs=2,
+    equal_rank_microbatches=False,
 ):
     """Drive planner + one accumulator per DP rank with random arrivals."""
     rng = random.Random(seed)
@@ -75,6 +79,8 @@ def _simulate(
         dp_size=dp_size,
         max_chunk_trajectories=chunk,
         max_open_groups=0 if group_only else max_open_groups,
+        micro_batch_size=mbs,
+        equal_rank_microbatches=equal_rank_microbatches,
     )
     for g in range(len(rewards_per_group)):
         planner.register_group(g, G)
@@ -86,14 +92,19 @@ def _simulate(
 
     def run_dispatch():
         d = planner.next_dispatch()
+        dispatches.append(d)
         for rank, chunks in enumerate(d.per_rank):
             for c in chunks:
                 advs = c.advantages if c.group is None else [1.0] * len(c.trajectories)
+                # A padding chunk is fully masked: its rows add no gradient.
+                if c.padding:
+                    advs = [0.0] * len(c.trajectories)
                 backward(rank, c.trajectories, advs)
                 accs[rank].capture(c.group, c.reward)
             for gid, adv in d.closes:
                 accs[rank].close_group(gid, adv)
 
+    dispatches = []
     order = list(range(n))
     rng.shuffle(order)
     for i in order:
@@ -104,7 +115,7 @@ def _simulate(
                 index=i,
                 reward=rewards_per_group[g][i % G],
                 payload=None,
-                num_tokens=1,
+                num_tokens=rng.randint(1, 50),
             )
         )
         if rng.random() < 0.5:
@@ -123,7 +134,7 @@ def _simulate(
         for j, a in enumerate(advs):
             for w, h in zip(want, H[g * G + j]):
                 w.add_(h, alpha=a)
-    return got, want, accs
+    return got, want, accs, dispatches
 
 
 @pytest.mark.parametrize("loo", [True, False])
@@ -132,7 +143,7 @@ def _simulate(
 def test_binary_rewards_exact(loo, dp_size, seed):
     rng = random.Random(100 + seed)
     rewards = [[float(rng.random() < 0.4) for _ in range(8)] for _ in range(6)]
-    got, want, accs = _simulate(rewards, _adv_fn(loo), dp_size, 2, seed)
+    got, want, accs, _ = _simulate(rewards, _adv_fn(loo), dp_size, 2, seed)
     for g, w in zip(got, want):
         torch.testing.assert_close(g, w, rtol=1e-12, atol=1e-12)
     # binary rewards never need more than 2 buffers per group
@@ -144,7 +155,7 @@ def test_binary_rewards_exact(loo, dp_size, seed):
 def test_multi_valued_rewards_bucket_mode(seed):
     rng = random.Random(seed)
     rewards = [[rng.choice([0.0, 0.5, 1.0]) for _ in range(6)] for _ in range(4)]
-    got, want, _ = _simulate(rewards, _adv_fn(True), 2, 3, seed)
+    got, want, _, _ = _simulate(rewards, _adv_fn(True), 2, 3, seed)
     for g, w in zip(got, want):
         torch.testing.assert_close(g, w, rtol=1e-12, atol=1e-12)
 
@@ -154,7 +165,7 @@ def test_continuous_rewards_affine_mode(seed):
     # shared mean/std (no leave-one-out) => advantage is affine in reward
     rng = random.Random(seed)
     rewards = [[rng.random() for _ in range(8)] for _ in range(3)]
-    got, want, _ = _simulate(rewards, _adv_fn(False), 2, 2, seed, chunk=1)
+    got, want, _, _ = _simulate(rewards, _adv_fn(False), 2, 2, seed, chunk=1)
     # The estimator returns fp32 advantages, so the fitted (alpha, beta)
     # carry fp32 rounding (~1e-7 relative); bucket mode above is bit-exact.
     for g, w in zip(got, want):
@@ -174,7 +185,7 @@ def test_non_affine_estimator_raises():
 def test_group_granularity_exact_and_never_buckets(seed):
     rng = random.Random(seed)
     rewards = [[float(rng.random() < 0.5) for _ in range(8)] for _ in range(4)]
-    got, want, accs = _simulate(rewards, _adv_fn(True), 2, 2, seed, group_only=True)
+    got, want, accs, _ = _simulate(rewards, _adv_fn(True), 2, 2, seed, group_only=True)
     for g, w in zip(got, want):
         torch.testing.assert_close(g, w, rtol=1e-12, atol=1e-12)
     assert all(a.peak_open_buffers == 0 for a in accs)
@@ -185,7 +196,9 @@ def test_group_granularity_exact_and_never_buckets(seed):
 def test_open_group_cap_exact_and_bounds_buffers(cap, seed):
     rng = random.Random(seed)
     rewards = [[float(rng.random() < 0.5) for _ in range(8)] for _ in range(6)]
-    got, want, accs = _simulate(rewards, _adv_fn(True), 1, 2, seed, max_open_groups=cap)
+    got, want, accs, _ = _simulate(
+        rewards, _adv_fn(True), 1, 2, seed, max_open_groups=cap
+    )
     for g, w in zip(got, want):
         torch.testing.assert_close(g, w, rtol=1e-12, atol=1e-12)
     assert accs[0].peak_open_buffers <= 2 * cap
@@ -197,6 +210,8 @@ def test_zero_advantage_rows_never_share_a_chunk_with_trained_rows():
         dp_size=1,
         max_open_groups=0,
         max_chunk_trajectories=4,
+        micro_batch_size=1,
+        equal_rank_microbatches=False,
     )
     # Group 0: mixed rewards (nonzero advantages); groups 1-2: all equal (zero).
     members = {0: [1.0, 0.0, 1.0, 0.0, 1.0], 1: [1.0, 1.0], 2: [0.0]}
@@ -214,3 +229,129 @@ def test_zero_advantage_rows_never_share_a_chunk_with_trained_rows():
     kinds = [{a == 0.0 for a in c.advantages} for c in d.per_rank[0]]
     assert all(len(k) == 1 for k in kinds)  # every chunk is all-zero or all-nonzero
     assert sorted(len(c.trajectories) for c in d.per_rank[0]) == [1, 3, 4]
+
+
+def _microbatches_per_rank(d, mbs):
+    return [sum(c.num_microbatches(mbs) for c in cs) for cs in d.per_rank]
+
+
+@pytest.mark.parametrize("dp_size", [2, 3, 4])
+@pytest.mark.parametrize("mbs", [1, 2, 4])
+@pytest.mark.parametrize("seed", range(4))
+def test_equal_rank_microbatches_pads_short_ranks_exactly(dp_size, mbs, seed):
+    rng = random.Random(seed)
+    rewards = [[float(rng.random() < 0.4) for _ in range(8)] for _ in range(6)]
+    got, want, _, dispatches = _simulate(
+        rewards,
+        _adv_fn(True),
+        dp_size,
+        2,
+        seed,
+        chunk=5,
+        mbs=mbs,
+        equal_rank_microbatches=True,
+    )
+    # Padding chunks are masked out: the update is unchanged.
+    for g, w in zip(got, want):
+        torch.testing.assert_close(g, w, rtol=1e-12, atol=1e-12)
+    for d in dispatches:
+        counts = _microbatches_per_rank(d, mbs)
+        assert len(set(counts)) == 1, counts
+        # Only short ranks are padded, one micro-batch per padding chunk, and
+        # padding is never counted as dispatched work.
+        real = [
+            sum(c.num_microbatches(mbs) for c in cs if not c.padding)
+            for cs in d.per_rank
+        ]
+        assert max(real) == counts[0]
+        for cs, r in zip(d.per_rank, real):
+            pads = [c for c in cs if c.padding]
+            assert len(pads) == counts[0] - r
+            assert all(
+                c.group is None and c.advantages == [0.0] and len(c.trajectories) == 1
+                for c in pads
+            )
+    assert sum(d.num_trajectories for d in dispatches) == 6 * 8
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_without_equal_rank_microbatches_no_padding(seed):
+    rng = random.Random(seed)
+    rewards = [[float(rng.random() < 0.4) for _ in range(8)] for _ in range(6)]
+    got, want, _, dispatches = _simulate(
+        rewards, _adv_fn(True), 3, 2, seed, chunk=5, mbs=2
+    )
+    for g, w in zip(got, want):
+        torch.testing.assert_close(g, w, rtol=1e-12, atol=1e-12)
+    assert not any(c.padding for d in dispatches for cs in d.per_rank for c in cs)
+    # Token balancing alone leaves ranks with different micro-batch counts.
+    assert any(len(set(_microbatches_per_rank(d, 2))) > 1 for d in dispatches)
+
+
+def test_equal_rank_microbatches_counts_microbatches_not_chunks():
+    # Six nonzero-advantage rows in chunks of 3: each chunk is padded to 4 rows
+    # and runs as 2 micro-batches of 2. Two ranks get one chunk each; the third
+    # gets two one-row padding chunks (2 micro-batches), not one.
+    planner = StreamPlanner(
+        lambda rs: [r - sum(rs) / len(rs) for r in rs],
+        dp_size=3,
+        max_open_groups=0,
+        max_chunk_trajectories=3,
+        micro_batch_size=2,
+        equal_rank_microbatches=True,
+    )
+    rewards = [1.0, 0.0, 1.0, 0.0, 1.0, 0.0]
+    planner.register_group(0, len(rewards))
+    for i, r in enumerate(rewards):
+        planner.add(
+            Trajectory(group=0, index=i, reward=r, payload=None, num_tokens=10 + i)
+        )
+    d = planner.next_dispatch()
+    real = sorted(len([c for c in cs if not c.padding]) for cs in d.per_rank)
+    assert real == [0, 1, 1]
+    assert _microbatches_per_rank(d, 2) == [2, 2, 2]
+    (empty,) = [cs for cs in d.per_rank if not any(not c.padding for c in cs)]
+    assert len(empty) == 2
+    # The padding template is the dispatch's shortest trajectory.
+    assert all(c.trajectories[0].num_tokens == 10 for c in empty)
+    assert d.num_trajectories == 6
+    assert planner.all_done()
+
+
+def test_padding_chunk_data_is_fully_masked():
+    traj = Trajectory(
+        group=0,
+        index=0,
+        reward=1.0,
+        payload={
+            "message_log": [
+                {"role": "user", "token_ids": torch.tensor([1, 2, 3])},
+                {
+                    "role": "assistant",
+                    "token_ids": torch.tensor([4, 5]),
+                    "generation_logprobs": torch.tensor([-0.5, -0.25]),
+                },
+            ],
+            "loss_multiplier": 1.0,
+        },
+        num_tokens=5,
+    )
+    cfg = SimpleNamespace(policy={"make_sequence_length_divisible_by": 1})
+    tok = SimpleNamespace(pad_token_id=0)
+
+    def build(padding):
+        chunk = Chunk(
+            group=None,
+            reward=None,
+            trajectories=[traj],
+            advantages=[0.0 if padding else 0.7],
+            padding=padding,
+        )
+        return build_chunk_data(chunk, tok, cfg, 1)
+
+    real, pad = build(False), build(True)
+    assert real["sample_mask"].sum() > 0 and real["token_mask"].sum() > 0
+    # Same tokens (a real forward), but no gradient and no normalization count.
+    assert torch.equal(pad["input_ids"], real["input_ids"])
+    for k in ("sample_mask", "token_mask", "advantages"):
+        assert not pad[k].any(), k
