@@ -254,7 +254,13 @@ distribution at lower acceptance (section 14); keyed mode avoids the issue too.
 strings, so `validate_config` rejects speculation with temperature ≠ 1, top-p < 1, top-k,
 or stop strings. Streaming computes advantages per group as each group closes, so it
 requires `grpo.adv_estimator.name=grpo` and no `seq_logprob_error_in_loss`. A streamed
-draft stopped by `draft_budget` below `max_new_tokens` is not a finished rollout.
+draft stopped by `draft_budget` below `max_new_tokens` is not a finished rollout. Inference-side verification
+requires inference TP = PP = 1 (the scorer and the running engine would share
+communicators); keyed verification requires learner TP = PP = 1. Streaming rejects reward
+penalties and per-sample advantage overrides, and MoE settings that are not
+advantage-weighted or depend on micro-batch composition (load-balancing or z-loss, expert-
+bias updates, capacity token dropping). Generation workers stay in eval mode after
+verification (the engine shares the module); the learner restores its training mode.
 
 **Reward check over 100 steps.** Speculation vs a second no-speculation baseline: reward
 difference −0.0016 ± 0.0037 (paired by step). The two baselines differ from each other by
