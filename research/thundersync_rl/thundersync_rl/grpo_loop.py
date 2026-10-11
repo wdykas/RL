@@ -214,6 +214,7 @@ def validate_config(master_config: ThunderSyncMasterConfig) -> None:
     assert ddp["grad_reduce_in_fp32"], (
         "per-trajectory gradients are moved out of the grad buffer; keep it fp32"
     )
+    validate_expert_parallel(master_config.thundersync, master_config.policy)
     validate_fused_verify_train(master_config.thundersync, master_config.policy)
 
 
@@ -268,6 +269,29 @@ def validate_fused_verify_train(
     if problems:
         raise ValueError(
             "thundersync.fused_verify_train=true: " + "; ".join(problems) + "."
+        )
+
+
+def validate_expert_parallel(
+    ts_cfg: ThunderSyncConfig, policy_cfg: PolicyConfig
+) -> None:
+    """Reject open-group gradient buckets under expert parallelism.
+
+    An open-group bucket is scaled by its group's advantage after the fact,
+    which assumes a rank's gradient comes only from its own rows. Expert weights
+    also receive gradient from tokens other EP ranks route to them (rows of
+    other groups), so their buckets would be mis-scaled. Final chunks carry
+    their advantages in the loss and stay exact.
+    """
+    if (
+        policy_cfg["megatron_cfg"]["expert_model_parallel_size"] > 1
+        and ts_cfg.granularity == "trajectory"
+        and ts_cfg.max_open_groups > 0
+    ):
+        raise ValueError(
+            "expert_model_parallel_size > 1 requires thundersync.granularity="
+            "'group' (or max_open_groups=0): open-group gradient buckets are not "
+            "exact under expert parallelism"
         )
 
 

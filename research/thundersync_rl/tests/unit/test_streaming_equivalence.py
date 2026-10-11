@@ -356,3 +356,24 @@ def test_padding_chunk_data_is_fully_masked():
     assert torch.equal(pad["input_ids"], real["input_ids"])
     for k in ("sample_mask", "token_mask", "advantages"):
         assert not pad[k].any(), k
+
+
+@pytest.mark.parametrize(
+    "ep,granularity,open_groups,ok",
+    [
+        (1, "trajectory", 4, True),
+        (2, "group", 4, True),
+        (2, "trajectory", 0, True),
+        (2, "trajectory", 4, False),
+    ],
+)
+def test_expert_parallel_rejects_open_group_buckets(ep, granularity, open_groups, ok):
+    from thundersync_rl.grpo_loop import ThunderSyncConfig, validate_expert_parallel
+
+    ts = ThunderSyncConfig(granularity=granularity, max_open_groups=open_groups)
+    policy = {"megatron_cfg": {"expert_model_parallel_size": ep}}
+    if ok:
+        validate_expert_parallel(ts, policy)
+    else:
+        with pytest.raises(ValueError, match="expert parallelism"):
+            validate_expert_parallel(ts, policy)
