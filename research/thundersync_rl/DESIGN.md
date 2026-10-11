@@ -457,6 +457,14 @@ draw-for-draw, scorer kernels on GPU, streaming equivalence, speculative driver 
 cohorts and ramp, chunked pools, error surfacing), 7 core zero-advantage tests, and GPU
 functional checks for scorer and refit parallelism.
 
+**Precision of an exact policy (offline measurement).** With q the exact sampling law and
+p the same numeric function at the next weights (Qwen2.5-Math-1.5B, one Adam step at lr
+1e-6, 128 MATH-500 drafts up to 3072 tokens; `thundersync_work/fp16_acceptance.py`):
+bf16 keeps 57.0% of draft tokens (46.3% of drafts whole), fp16 90.0% (85.7%), fp32 96.0%
+(94.5%); per-token TV 3.3e-3 / 6.6e-4 / 2.4e-4. bf16's rounding noise between consecutive
+versions is the policy's own, so exact bf16 speculation is inherently ~50%; an fp16
+(batch-invariant) policy would allow exact speculation without the fp32 scorer or stashes.
+
 ## 14. Open work
 
 - **Stragglers.** About one rejected draft per step decodes its remainder at about 3 ms
