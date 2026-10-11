@@ -83,6 +83,7 @@ class SpeculativeGeneration:
         longest_first: bool,
         verify_on: str,
         pool_weights: tuple[int, ...] | None,
+        verify_lazy: bool = False,
     ):
         self.base = base
         self.learner_policy = learner_policy
@@ -96,6 +97,7 @@ class SpeculativeGeneration:
         self.stream_interval = 16
         self.verify_mode = verify_mode
         self.verify_precision = verify_precision
+        self.verify_lazy = verify_lazy
         self.verify_batch_tokens = verify_batch_tokens
         self.longest_first = longest_first
         # Where stash + block verification run: "learner" or "inference" (the
@@ -375,6 +377,7 @@ class SpeculativeGeneration:
                             keys=[d[4] for _, d in flat[a:b]],
                             precision=self.verify_precision,
                             batch_tokens=self.verify_batch_tokens,
+                            lazy=self.verify_lazy,
                         ),
                     )
                 )
@@ -515,6 +518,7 @@ class SpeculativeGeneration:
                 keys=[d[4] for _, d in flat[a:b]],
                 batch_tokens=self.verify_batch_tokens,
                 precision=self.verify_precision,
+                lazy=self.verify_lazy,
             )
             calls.append((a, refs))
         kept = total = full = 0

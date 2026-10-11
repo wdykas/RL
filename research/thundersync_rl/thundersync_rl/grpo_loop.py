@@ -125,6 +125,11 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # removes activation-rounding noise from p/q; 4 B/param per shard) or
     # "model" (the training dtypes; half the memory, ~90% kept).
     verify_precision: Literal["model", "fp32"] = "fp32"
+    # Lazy, logit-free block verification: residual masses only where the
+    # backward scan needs them, and final hidden states [T, d] instead of
+    # [T, V] logits (rows recomputed on demand). Same decisions as the eager
+    # rule given the same logits; off until validated on GPU.
+    verify_lazy: bool = False
     # Iterations drafted concurrently. A draft cut off at one deadline resumes
     # from its prefix, under the newer weights, in the next iteration.
     draft_lookahead: int = 3
@@ -702,6 +707,7 @@ def thundersync_grpo_train(
             variant_eps=ts_cfg.variant_eps,
             verify_mode=ts_cfg.verify_mode,
             verify_precision=ts_cfg.verify_precision,
+            verify_lazy=ts_cfg.verify_lazy,
             verify_batch_tokens=ts_cfg.verify_batch_tokens,
             longest_first=ts_cfg.verify_longest_first,
             verify_on=ts_cfg.verify_on,

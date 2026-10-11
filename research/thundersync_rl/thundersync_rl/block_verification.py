@@ -101,7 +101,7 @@ def lazy_stop_index(
     rule would take the max of an empty set.
     """
     g = b.numel() - 1
-    b_h, eta_h = b.cpu(), eta.cpu()
+    b_h, eta_h = torch.stack([b, eta]).cpu()  # one device sync
     if bool(eta_h[g] <= b_h[g]):
         return g, 0
     if isinstance(slack, torch.Tensor):
