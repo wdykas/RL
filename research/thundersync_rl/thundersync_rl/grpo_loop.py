@@ -224,6 +224,30 @@ def validate_config(master_config: ThunderSyncMasterConfig) -> None:
         "loss_fn.seq_logprob_error_in_loss renormalizes over surviving sequences, "
         "which the streamed per-chunk loss does not see"
     )
+    # Per-sample advantage overrides and reward penalties of the synchronous
+    # trainer are not applied by the streaming path.
+    grpo_cfg = master_config.grpo
+    for key in ("invalid_tool_call_advantage", "malformed_thinking_advantage"):
+        assert getattr(grpo_cfg, key, None) is None, (
+            f"grpo.{key} is not supported with gradient streaming"
+        )
+    penalty_cfg = getattr(grpo_cfg, "reward_penalties", None) or {}
+    if not isinstance(penalty_cfg, dict):
+        penalty_cfg = penalty_cfg.model_dump()
+    penalties = [k for k, v in penalty_cfg.items() if k.startswith("penalize_") and v]
+    assert not penalties, f"grpo.reward_penalties not supported: {penalties}"
+    # The router's load-balancing loss and expert-bias update depend on which
+    # rows share a micro-batch, which streaming changes.
+    megatron_cfg = master_config.policy["megatron_cfg"]
+    assert megatron_cfg.get("moe_router_load_balancing_type", "none") in (
+        "none",
+        ["none"],
+    ), (
+        "gradient streaming needs policy.megatron_cfg.moe_router_load_balancing_type='none'"
+    )
+    assert not megatron_cfg.get("moe_router_bias_update_rate", 0.0), (
+        "gradient streaming needs policy.megatron_cfg.moe_router_bias_update_rate=0"
+    )
     validate_speculation(master_config.thundersync, master_config.policy)
     validate_expert_parallel(master_config.thundersync, master_config.policy)
     validate_fused_verify_train(master_config.thundersync, master_config.policy)
@@ -289,7 +313,7 @@ def validate_fused_verify_train(
 
 
 def validate_speculation(ts_cfg: ThunderSyncConfig, policy_cfg: PolicyConfig) -> None:
-    """Reject sampling settings speculative verification does not reproduce.
+    """Reject settings speculative verification does not reproduce or support.
 
     Verification compares raw (temperature 1, untruncated) logits of the
     drafting and current weights, and drafts run without stop strings, so the
@@ -303,7 +327,7 @@ def validate_speculation(ts_cfg: ThunderSyncConfig, policy_cfg: PolicyConfig) ->
         problems.append(
             f"policy.generation.temperature must be 1.0 (got {gen['temperature']})"
         )
-    if gen.get("top_p", 1.0) != 1.0:
+    if gen.get("top_p") not in (None, 1.0):
         problems.append(f"policy.generation.top_p must be 1.0 (got {gen['top_p']})")
     if gen.get("top_k") not in (None, -1, 0):
         problems.append(f"policy.generation.top_k must be unset (got {gen['top_k']})")
@@ -311,6 +335,26 @@ def validate_speculation(ts_cfg: ThunderSyncConfig, policy_cfg: PolicyConfig) ->
         problems.append(
             "policy.generation.stop_strings must be unset (drafts ignore them)"
         )
+    from nemo_rl.models.generation.megatron.config import merged_inference_megatron_cfg
+
+    inference = merged_inference_megatron_cfg(policy_cfg)
+    if ts_cfg.verify_on != "learner" and (
+        inference["tensor_model_parallel_size"] > 1
+        or inference["pipeline_model_parallel_size"] > 1
+    ):
+        # The scorer's collectives would share the engine's TP/PP communicators
+        # with the running engine, which nothing pauses (as under EP).
+        problems.append(
+            "thundersync.verify_on must be 'learner' with inference TP or PP > 1"
+        )
+    megatron_cfg = policy_cfg["megatron_cfg"]
+    if ts_cfg.verify_mode == "keyed" and (
+        megatron_cfg["tensor_model_parallel_size"] > 1
+        or megatron_cfg["pipeline_model_parallel_size"] > 1
+    ):
+        # Keyed verification calls the training model directly: vocab-sharded
+        # logits under TP, no pipeline schedule under PP.
+        problems.append("thundersync.verify_mode='keyed' requires learner TP=PP=1")
     if problems:
         raise ValueError("thundersync.speculate=true: " + "; ".join(problems) + ".")
 

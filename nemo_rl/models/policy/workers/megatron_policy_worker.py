@@ -2437,6 +2437,21 @@ class MegatronPolicyWorkerImpl(
                 f"{feature} requires moe_router_load_balancing_type='none': "
                 "MoE auxiliary losses are not advantage-weighted"
             )
+        # Settings that come from the model provider rather than the config:
+        # the router z-loss is not advantage-weighted, and expert-bias updates
+        # and capacity-based token dropping depend on which rows share a batch.
+        model_cfg = getattr(self.model, "config", None)
+        if getattr(model_cfg, "num_moe_experts", None):
+            if getattr(model_cfg, "moe_z_loss_coeff", None):
+                raise ValueError(f"{feature} requires moe_z_loss_coeff=0")
+            if getattr(model_cfg, "moe_router_enable_expert_bias", False) and getattr(
+                model_cfg, "moe_router_bias_update_rate", 0.0
+            ):
+                raise ValueError(f"{feature} requires moe_router_bias_update_rate=0")
+            if getattr(model_cfg, "moe_expert_capacity_factor", None) is not None:
+                raise ValueError(
+                    f"{feature} requires dropless MoE (moe_expert_capacity_factor=None)"
+                )
 
     def _make_grad_stream_accumulator(
         self, spec: GradStreamingSpec

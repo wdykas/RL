@@ -46,3 +46,11 @@ def test_mode_restored_on_error():
     with pytest.raises(RuntimeError):
         h.verify(fail=True)
     assert h.model.training is True
+
+
+def test_generation_worker_stays_in_eval():
+    # The inference engine shares the module and asserts eval mode.
+    h = _Holder(True)
+    h.dynamic_inference_engine = object()
+    assert h.verify() == "ok"
+    assert h.model.training is False

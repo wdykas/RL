@@ -176,7 +176,9 @@ class SpeculativeGeneration:
         fields = {
             "input_ids": ids,
             "input_lengths": torch.tensor([prompts[i].numel() for i, _ in rows]),
-            "max_new_tokens": torch.full((len(rows),), self.draft_budget),
+            "max_new_tokens": torch.full(
+                (len(rows),), min(self.draft_budget, self.max_new_tokens)
+            ),
         }
         if self.verify_mode == "keyed":
             fields["noise_seed"] = torch.tensor([seeds[i] for i, _ in rows])
@@ -446,7 +448,9 @@ class SpeculativeGeneration:
         # or the deadline: a fully accepted draft is then a finished rollout.
         finished = d[3] if len(d) > 3 else True
         # Cohort/streamed drafts carry the full budget: finished = EOS or the cap.
-        return finished and (len(d) > 4 or len(d[2]) < self.draft_budget)
+        stopped = finished and (len(d) > 4 or len(d[2]) < self.draft_budget)
+        # A draft at the length cap is a finished rollout: nothing follows it.
+        return stopped or len(d[2]) >= self.max_new_tokens
 
     def _plan(self, d, r) -> Plan:
         """Turn one draft and its verification result into a rollout plan."""
@@ -642,6 +646,11 @@ class SpeculativeGeneration:
             yield await fut
 
     async def _one(self, index: int, datum: BatchedDataDict):
+        if any(datum.get("stop_strings") or []):
+            # Drafts run without stop strings, so a plan could pass one.
+            raise ValueError(
+                "thundersync.speculate does not support per-sample stop_strings"
+            )
         plen = int(datum["input_lengths"][0])
         prompt = datum["input_ids"][0, :plen]
         key = _key(prompt)
