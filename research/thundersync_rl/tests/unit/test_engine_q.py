@@ -92,11 +92,20 @@ def test_hidden_log_hook_on_a_fake_engine(monkeypatch):
     class Head(torch.nn.Module):
         sequence_parallel = False
 
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(1, 6))
+
         def forward(self, input_, weight=None, runtime_gather_output=None):
             return input_.sum(-1, keepdim=True), None
 
     model = SimpleNamespace(module=SimpleNamespace(output_layer=Head()))
+    sampled = []
+    sampling = SimpleNamespace(
+        sample_kernel=lambda logits, n, context, **kw: sampled.append(n)
+    )
     ctx = SimpleNamespace(
+        max_requests=8,
         config=SimpleNamespace(materialize_only_last_token_logits=True),
         num_speculative_tokens=0,
         paused_request_count=0,
@@ -107,7 +116,8 @@ def test_hidden_log_hook_on_a_fake_engine(monkeypatch):
     )
     w = object.__new__(ThunderSyncMegatronPolicyWorker.__ray_metadata__.modified_class)
     w.dynamic_inference_engine = SimpleNamespace(
-        requests={1: req("d|0", 4), 2: req(None, 2)}
+        requests={1: req("d|0", 4), 2: req(None, 2)},
+        controller=SimpleNamespace(_sampling=sampling),
     )
     w.inference_context = ctx
     w._gen_model = lambda: model
@@ -119,6 +129,9 @@ def test_hidden_log_hook_on_a_fake_engine(monkeypatch):
         h = torch.randn(2, 1, 6)
         steps.append(h[0, 0])
         head(h)
+        # Rows are logged by the sampler that follows the forward (it also runs
+        # after CUDA-graph replays, which skip Python hooks).
+        sampling.sample_kernel(None, 2, ctx)
         ctx.request_kv_length_offsets += ctx.request_query_lengths
         ctx.request_query_lengths = torch.tensor([1, 1])
     out = w.pop_draft_hidden(["d|0", "x"], [3, 1])
@@ -145,14 +158,24 @@ def test_hidden_log_install_under_tensor_parallelism(
     monkeypatch.setattr(ps, "get_tensor_model_parallel_rank", lambda *a, **k: tp_rank)
 
     class Head(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(1, 6))
+
         def forward(self, input_, weight=None, runtime_gather_output=None):
             return input_, None
 
     head = Head()
     head.sequence_parallel = sequence_parallel
     w = object.__new__(ThunderSyncMegatronPolicyWorker.__ray_metadata__.modified_class)
-    w.dynamic_inference_engine = SimpleNamespace(requests={})
+    w.dynamic_inference_engine = SimpleNamespace(
+        requests={},
+        controller=SimpleNamespace(
+            _sampling=SimpleNamespace(sample_kernel=lambda *a, **k: None)
+        ),
+    )
     w.inference_context = SimpleNamespace(
+        max_requests=8,
         config=SimpleNamespace(materialize_only_last_token_logits=materialized),
         num_speculative_tokens=0,
     )
