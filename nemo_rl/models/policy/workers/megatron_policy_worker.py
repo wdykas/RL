@@ -626,6 +626,10 @@ class MegatronPolicyWorkerImpl(
             from nemo_rl.models.megatron import fp32_residual
 
             fp32_residual.install()
+        if config["megatron_cfg"].get("forward_gemm_precision") is not None:
+            from nemo_rl.models.megatron import fp16_gemm
+
+            fp16_gemm.install(config["megatron_cfg"].get("lm_head_precision"))
         hysteresis_tau = config["megatron_cfg"].get("param_hysteresis_tau")
         if hysteresis_tau is not None:
             from nemo_rl.models.megatron import param_hysteresis

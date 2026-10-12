@@ -587,6 +587,20 @@ class MegatronConfig(TypedDict):
     param_hysteresis_tau: NotRequired[float | None]
     # Megatron fp32 residual stream (TransformerConfig.fp32_residual_connection).
     fp32_residual_connection: NotRequired[bool]
+    # Forward GEMM numerics (nemo_rl/models/megatron/fp16_gemm.py). Unset: the
+    # default bf16 forward. "fp16": every linear layer (and the LM head) casts its
+    # input and bf16 weight to fp16 and emits fp32 (fp32 accumulation); norms run in
+    # fp32; q/k/v, attention and the generation KV cache are fp16; logits fp32.
+    # Weights, checkpoints and the optimizer are unchanged. Requires
+    # fp32_residual_connection=true; must match between training and generation.
+    # Dense (non-MoE) models only.
+    forward_gemm_precision: NotRequired[str | None]
+    # LM-head GEMM under forward_gemm_precision="fp16": "fp32" (default when
+    # unset) multiplies the fp32 final-norm output (not rounded to fp16) by the
+    # head weight, all products exact (fp16_gemm.fp32_gemm: two fp16 GEMMs on a
+    # hi/lo split of the input); "fp16" uses the fp16 GEMM. Must match
+    # between training and generation.
+    lm_head_precision: NotRequired[str | None]
 
 
 class TokenizerConfig(TypedDict):

@@ -1460,9 +1460,14 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         weight = layer.weight
         if weight is None:
             weight = model.shared_embedding_or_output_weight()
+        from nemo_rl.models.megatron.fp16_gemm import head_input_dtype
+
+        # The head input dtype: fp16 under forward_gemm_precision=fp16, where the
+        # head GEMM rounds its fp32 input to fp16 first (the copy rounds the same
+        # way, so q recomputed from these rows is exact); else the weight dtype.
         static = torch.empty(
             (int(context.max_requests), weight.shape[1]),
-            dtype=weight.dtype,
+            dtype=head_input_dtype(weight.dtype),
             device=weight.device,
         )
         filled = [False]
@@ -1519,6 +1524,8 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         from megatron.core import parallel_state as ps
         from thundersync_rl.engine_q import HIDDEN_KEY_ATTR, HiddenLog
 
+        from nemo_rl.models.megatron.fp16_gemm import head_matmul
+
         engine = getattr(self, "dynamic_inference_engine", None)
         ctx = getattr(self, "inference_context", None)
         if engine is None or ctx is None:
@@ -1556,6 +1563,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             return False
         static, filled, weight = copy["static"], copy["filled"], copy["weight"]
         dbg = {"kernel": 0, "rows": 0, "rejected": 0}
+        probe = os.environ.get("THUNDERSYNC_ENGINE_Q_CHECK") == "1"
         debug = bool(os.environ.get("THUNDERSYNC_HIDDEN_DEBUG"))
 
         sampling = engine.controller._sampling
@@ -1592,12 +1600,14 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             out = inner(logits, n, context, **kw)
             if not entries:
                 return out
-            # Source check: a logged row must reproduce the logit of the token
-            # the engine sampled from it (one dot product per row). In ~2% of
-            # decode graph replays one row of the buffer is stale (measured);
-            # such rows are not recorded, so their drafts are truncated there
-            # (HiddenLog.pop returns the longest logged prefix).
-            if logits is not None and torch.is_tensor(logits):
+            # Source check (THUNDERSYNC_ENGINE_Q_CHECK=1 only: its .tolist() is
+            # a GPU->CPU sync per decode step): a logged row must reproduce
+            # 16 probe logits of the row the engine sampled from. Rows follow
+            # the controller's async-schedule compaction (compact() below), so
+            # the check should never reject; rejected rows are not recorded and
+            # their drafts are truncated there (HiddenLog.pop returns the
+            # longest logged prefix).
+            if probe and logits is not None and torch.is_tensor(logits):
                 rows_t = torch.tensor([r for r, _, _ in entries], device=static.device)
                 lg = logits.reshape(-1, logits.shape[-1])
                 w = weight
@@ -1609,7 +1619,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 # Probe columns of this rank's vocabulary shard (any TP, any
                 # sampled token): a stale row disagrees on all of them.
                 cols = torch.linspace(0, w.shape[0] - 1, 16, device=w.device).long()
-                mine = static[rows_t].float() @ w[cols].float().t()
+                mine = head_matmul(static[rows_t], w[cols])
                 ref = lg[rows_t][:, lo + cols].float()
                 ok = ((mine - ref).abs().amax(-1) <= 1.0).tolist()
                 if not all(ok):
@@ -1623,6 +1633,25 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             return out
 
         sampling.sample_kernel = logging_kernel
+
+        # Under async scheduling the controller launches the next forward
+        # before finished requests are resolved, then compacts the surviving
+        # rows and reorders the pending logits to match
+        # (``_compact_async_sched_logits``). Apply the same permutation to the
+        # hidden-copy buffer, on the same stream, so row i of the buffer stays
+        # the hidden state of logits row i.
+        controller = engine.controller
+        orig_compact = controller._compact_async_sched_logits
+
+        def compact(survivor_idxs, *args, **kwargs):
+            n = survivor_idxs.numel()
+            if n and not torch.equal(
+                survivor_idxs, torch.arange(n, device=survivor_idxs.device)
+            ):
+                static[:n].copy_(static[survivor_idxs.to(static.device)])
+            return orig_compact(survivor_idxs, *args, **kwargs)
+
+        controller._compact_async_sched_logits = compact
         self._hidden_log = log
         return True
 
@@ -1741,8 +1770,10 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         from thundersync_rl.engine_q import gathered_log_softmax
 
         layer, _, scale = self._lm_head()
+        from nemo_rl.models.megatron.fp16_gemm import head_input_dtype
+
         w = self._head_stash[version]
-        h = hidden.to(device=w.device, dtype=w.dtype)
+        h = hidden.to(device=w.device, dtype=head_input_dtype(w.dtype))
         sp = getattr(layer, "sequence_parallel", False)
         if sp:
             # The rows are full (not sequence-sharded), as in the engine.
