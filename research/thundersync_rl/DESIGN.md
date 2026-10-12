@@ -544,6 +544,25 @@ throughput-bound for the whole iteration and gradient streaming already hides th
 so zero staleness equals async and speculation only adds verification work. Use
 speculation when the rollout phase ends in a latency-bound tail on mostly idle GPUs.
 
+### 10.1 Exact acceptance under batch invariance (bf16)
+
+With BI and engine-sourced q, verification compares the true bf16 laws of π_n and π_{n+1}.
+Measured in the real system (Qwen3-1.7B): 27–48% of draft tokens kept, vs 99.4% with the
+earlier (inexact) fp32 scorer. With that acceptance, engine-q speculation on a
+generation-saturated run (MAXLEN 4096) took ~80 s/step vs 29.5 s without speculation
+(`thundersync_work/runs_perf`).
+
+Offline ablation (Qwen2.5-Math-1.5B, steady-state masters, one AdamW step, 2048-token
+drafts; full table in `thundersync_work/research/ACCEPTANCE_LEDGER.md`): bf16 weights with
+fp32 compute keep 96.6% (whole drafts 95.3%), all-bf16 62–68%, so the weights (and their 17x
+amplified bf16 update) are not the cause; rounding activations to bf16 is. No single site
+dominates: fp32 residual stream 73.9%; + fp32 logits 78.3%; + fp32 norms/softmax/LM head 82.0%;
++ every GEMM emitting fp32 86.8%; + fp32 inputs to attention-out / MLP-down 90.1%. LM head
+alone in fp32: 69.7%. Hysteresis rounding of the weights (`param_hysteresis_tau`, opt-in):
++4 pts only. Next: the same placements in Megatron (training and inference identically, BI
+preserved), starting with `fp32_residual_connection` (now passed through; BI requires it to
+match on both sides).
+
 ## 11. Scaling status
 
 | Piece | Status |
