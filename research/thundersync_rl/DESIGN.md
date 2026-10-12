@@ -318,6 +318,18 @@ at equal weights). The output law is linear in the engine's q': out = p + Kᵀ(q
 and with ~98% acceptance K ≈ I, so an accepted draft token x is distributed as about
 p(x)·q'(x)/q(x), not p(x).
 
+**Draft content from engine records.** An unfinished draft cut at the deadline is read
+from the engine's request record (`record.merge()`, as the engine's final reply is), not
+from its streamed partial frames: after an eviction Megatron resumes the request as a new
+record whose generated tokens restart at 0 while its per-request emitted-length counter
+does not (`DynamicInferenceEngine._try_send_streaming_partials`), so the frames silently
+skip tokens. Collection asks every generation engine for the merged records of the
+unfinished draft requests it holds (`draft_request_ids`, `draft_records`) and rank 0
+snapshots from those before aborting (`collect_drafts(records=...)`; frames remain the
+fallback for a request no engine holds). Before this fix, on GPU 24/24 record-rebuilt
+drafts differed from their frames, so cut drafts (tokens and engine log-probs) were not
+the sequences the engine sampled. Finished drafts were unaffected.
+
 **Behavior log-probs.** Generation log-probs feed the importance-sampling correction
 (`loss_fn.use_importance_sampling_correction`, TIS), so they must describe that law.
 Every draft carries the engine's own log q'(x) of each sampled token (`start_drafts`
