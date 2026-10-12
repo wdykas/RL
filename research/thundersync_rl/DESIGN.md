@@ -443,9 +443,9 @@ speculation when the rollout phase ends in a latency-bound tail on mostly idle G
 | q storage | bf16 weight stash per pending version; memory O(parameters + batch x vocabulary) |
 | Scorer memory | fp32 adds 4 bytes per parameter per shard; `verify_precision=model` keeps training dtypes (about 90% kept vs 99%); under BI, `verify_source=engine` needs no scorer and only an LM-head stash per version (section 14) |
 | Tensor parallelism | Vocab-parallel logits gathered per batch; validated at TP=2 (99.9% kept) |
-| Pipeline parallelism | Forward-only pipeline schedule, last stage verifies; scorer log-probs at PP=2 bitwise equal PP=1. Inference must be pinned to PP=1 (`mcore_generation_config.pipeline_model_parallel_size=1`) |
+| Pipeline parallelism | Forward-only pipeline schedule, last stage verifies; scorer log-probs at PP=2 bitwise equal PP=1. Inference must be pinned to PP=1 (`mcore_generation_config.pipeline_model_parallel_size=1`) for inference-side scorers; under BI `verify_source=engine` runs PP>1 on both sides (unit-tested, section 14) |
 | Context parallelism | Not implemented; the scorer raises. Needs packed (THD) scoring |
-| MoE / expert parallelism | Streaming exact on GPU with EP=2 (group granularity; tiny random MoE); verification on the learner in EP lockstep (inference-side verification rejected under EP); no real-model run yet |
+| MoE / expert parallelism | Streaming exact on GPU with EP=2 (group granularity; tiny random MoE); verification on the learner in EP lockstep (inference-side verification rejected under EP); under BI `verify_source=engine` at EP>1 pads training forwards to the EP group's count (unit-tested, section 14); no real-model run yet |
 | Large models on few learner GPUs | At 4B with one learner GPU: verify on the inference pool, or `verify_batch_tokens=4096` and the bf16 scorer to fit |
 
 ## 12. Configuration
@@ -706,7 +706,8 @@ stashes, retained graphs and training state on TP=1 GPUs); it fits with
 of draft tokens, but only about one trajectory per step finishes whole and gets fused.
 
 **Engine-sourced q** (`thundersync.verify_source=engine`, `engine_q.py`). *Opt-in; CPU and
-short GPU unit tests pass (TP 1/2/4 with fake TP groups), not yet run end to end.* The
+short GPU unit tests pass (TP 1/2/4, PP 2, EP 2 and their combinations with fake process
+groups), not yet run end to end.* The
 default verifier needs an fp32 copy of the model (4 B/param) plus a bf16 whole-model stash
 per pending version (2 B/param each): about 82 GB on each learner GPU at 8B with three
 pending versions at TP=1, impossible at 70B. Under BI neither is needed. The engine's decode
@@ -723,7 +724,10 @@ distribution, and p can be the training model's forward at θ_{k+1}:
   (η_i ≤ b_i(1 + slack), visited from the top) and the residual row at τ. Whole-accepted
   drafts (η_g ≤ b_g) need no q row at all.
 - **Rows on demand from hidden states.** Every engine forward runs a pre-hook on the
-  engine model's output layer (`install_draft_hidden_log`). For each draft request (tagged
+  engine model's output layer (`install_draft_hidden_log`) that copies the head input rows
+  into a static buffer (captured into CUDA-graph decode, which skips Python hooks); a
+  wrapper around the engine's sampler, which runs in Python after every forward, logs
+  them. For each draft request (tagged
   through a sampling-params attribute) it copies the row of its last input token to pinned
   host memory: the final hidden state after the final norm, from which that token was
   sampled (`HiddenLog`, d × 2 B per drafted token). Rows are keyed by (draft, generated
@@ -817,9 +821,67 @@ embedding's shard, same split). How each part scales:
   seconds); `stash_head` keeps 1/TP of the head per rank; the hidden-log install rules per TP
   rank; and the validator accepts any TP with the same layout and rejects a train/generation
   TP mismatch and non-materialized logits at TP>1.
-- *Still limited:* PP = 1 (p would come from the last stage only, and the scan's rows from a
-  schedule that spans stages) and EP = 1. Neither is trivially supportable, so both stay
-  rejected. CP is 1 under BI anyway.
+- *Not covered:* CP (1 under BI anyway) and virtual (interleaved) pipeline stages (not
+  implemented; the validator says so).
+
+**Engine-sourced q under EP and PP** (branch `thundersync-scalable-ep-pp`, for large MoE
+models). Status: *unit-tested* (CPU, fake groups); GPU launchers written, not yet run.
+BI requires the same PP and EP on both sides, so the layouts match as for TP.
+
+- *Expert parallelism.* p comes from the training model at the current weights only, and q
+  rows only from the dense LM head (no experts). So the one collective that spans
+  data-parallel replicas is the expert all-to-all inside each training forward, and the
+  only requirement is an equal number of training forwards per verification call across
+  the EP group (an unequal count hangs the all-to-all, as seen for the scorer path, section
+  2). The EP ranks agree on the largest per-rank row count (`_expert_parallel_lockstep` with
+  empty version plans: q needs no forward) and short ranks run one-token dummy forwards
+  after their real rows (`_dummy_training_forward`: no autograd, eval mode, padded to
+  `make_sequence_length_divisible_by`, a multiple of TP, so sequence parallelism splits it
+  evenly; output discarded). Logged as `ep_dummy_forwards` in `[spec prof]`.
+- *Lazy-scan gathers under EP.* The q-row and p-row vocab gathers use the dense TP group,
+  whose ranks belong to one replica (same rows, same seed, same decisions, same order), so
+  their collective sequences match without cross-replica lockstep. With EP and TP groups
+  overlapping (MCore carves EP out of DP x TP), the interleaving is still consistent: every
+  rank runs [forward (EP all-to-all), its replica's gathers] per row, then its dummies.
+  Tested with EP=2 x TP=2 (x PP=2) thread ranks and barriers for the all-to-all.
+- *Dropless MoE only.* With an expert capacity factor, whether a token reaches its experts
+  depends on every other token routed to them in that forward (other replicas' rows, the
+  dummies), so p of a row is not a function of the row and weights: provably inexact, so
+  the worker raises (`_check_dropless_moe`). Megatron's default is dropless.
+- *Pipeline parallelism (learner).* `_training_forward` runs the row through Megatron's
+  pipeline schedule (`get_forward_backward_func`, `forward_only=True`,
+  `collect_non_loss_data=True`, one micro-batch of one row, `seq_length` = padded length, as
+  training passes it), each stage calling the same `model_forward`. The DDP `no_sync` hook
+  is bypassed for the call (the forward-only schedule enters it and never leaves it). The
+  last stage receives the logits (vocab-parallel at TP>1) and runs the lazy scan, q rows and
+  `THUNDERSYNC_ENGINE_Q_CHECK`; it alone holds the LM head, so `stash_head` stashes nothing
+  on other stages. Results come back from the last stage only: other stages return [] and
+  the driver already merges every rank's (row, result) pairs, as for the scorer under PP.
+  All stages of a replica run the same rows in the same order (the schedule's send/receive
+  needs it); stage 0's next forward overlaps the last stage's scan. Autograd through the
+  schedule (fused mode) is not implemented.
+- *Pipeline parallelism (engine).* The output layer exists only on the engine's last stage,
+  which computes the logits and broadcasts them to the other stages for sampling. The
+  hidden-state pre-hook and sampler wrapper (`install_draft_hidden_log`) are installed there
+  (other stages return None); the dynamic engine broadcasts each request with its
+  serialized sampling params to every model-parallel rank, so the last stage sees the draft
+  tags. Whether batch-invariant generation is exact at inference PP=2 is not yet measured
+  (`engine_q_pp.sh` checks it: with `ARGS=++thundersync.speculate=false` the mismatch check
+  isolates the BI/PP part).
+- *Tests* (`test_engine_q_ep_pp.py`, CPU; ranks are threads, process groups fakes, the
+  expert all-to-all and the pipeline send/receive modeled as barriers per forward): for
+  (TP, PP, EP) in {(1,1,2), (2,1,2), (1,2,1), (2,2,1), (1,2,2), (2,2,2)} with replicas owning
+  9 and 3 rows, every rank of an EP group runs the same forward count (dummies one padded
+  token, after the real rows), last stages return exactly the TP=PP=EP=1 results (decisions,
+  log p, log q), other stages [], stages of a replica run identical row sequences, and
+  vocab gathers occur only on last stages, identically per TP rank; a control without the
+  lockstep breaks the fake all-to-all. `_training_forward` at PP=2 calls the schedule
+  forward-only with one micro-batch of the padded length, returns the PP=1 logits on the
+  last stage and None elsewhere, restores `no_sync_func`, and refuses autograd;
+  `stash_head` is a no-op off the last stage; the hidden log and sampler wrapper install on
+  the engine's last stage only; capacity-factor MoE is rejected; the validator accepts
+  PP/EP>1 with matching generation layout (warning "untested end to end") and rejects a
+  train/generation PP or EP mismatch and virtual pipeline stages.
 
 Memory, per learner GPU, three pending versions, ~1.5M drafted tokens per step (128 rollouts
 x 3 cohorts x 4k):
@@ -840,8 +902,9 @@ most 4096 gathered fp32 rows. Hidden states move engine → driver → learner t
 once per draft, and only the rows the scan visits go to the GPU (on every TP rank).
 
 Requirements, enforced by `validate_engine_verify_source` and on the worker: `speculate`,
-`verify_mode=block`, `verify_on=learner`, `batch_invariant_mode`, PP = EP = 1, generation TP
-equal to training TP (the BI validator also checks the full layout), at TP>1
+`verify_mode=block`, `verify_on=learner`, `batch_invariant_mode`, generation TP, PP and EP
+equal to training's (the BI validator also checks the full layout), no virtual pipeline
+stages (not implemented), dropless MoE (worker), at TP>1
 `materialize_only_last_token_logits=true`, no `fused_verify_train`, Megatron generation with
 `num_speculative_tokens=0` and `logprobs_mode=raw_logprobs`. Possible extension: combining
 with fused mode, whose p forward is the same training forward.
@@ -853,6 +916,11 @@ baseline). It sets `THUNDERSYNC_ENGINE_Q_CHECK=1 THUNDERSYNC_MISMATCH_CHECK=1`. 
 mismatch check reads 0 on every token of every step, every `[engine q check]` line has
 `exact == tok` and `max|dlogq|=0`, and there is no fallback to the scorer. Also expect
 `spec/engine_q_dropped` near 0 and the same kept fraction as `verify_precision=model`.
+EP and PP (same pass criteria; `engine_q_tp.sh` now takes `TP`, `PP`, `EP`):
+`bash research/thundersync_rl/scripts/bi_tp/engine_q_moe.sh` (tiny random Qwen3-MoE,
+`thundersync_work/models/tiny-qwen3-moe`, EP=2 on 2 + 2 GPUs; also expect nonzero
+`ep_dummy_forwards` on some steps and no hang) and
+`bash research/thundersync_rl/scripts/bi_tp/engine_q_pp.sh` (Qwen3-1.7B, PP=2 on 2 + 2 GPUs).
 
 **Keyed verification under BI** (`verify_mode=keyed`). With bitwise parity the learner's
 logits for a draft are the ones the engine sampled from, so keyed verification needs no
@@ -906,7 +974,8 @@ versions is the policy's own, so exact bf16 speculation is inherently ~50%; an f
 - **Engine-sourced q on GPU.** Run the `verify_source=engine` A/B against
   `verify_precision=model` on Qwen3-1.7B under BI (same kept fraction, engine q check 0,
   mismatch 0, few dropped drafts), then Qwen3-8B where scorer mode runs out of memory, then
-  at TP=2 (`scripts/bi_tp/engine_q_tp.sh`) and TP=4 (2 nodes).
+  at TP=2 (`scripts/bi_tp/engine_q_tp.sh`) and TP=4 (2 nodes); EP=2 on the tiny MoE
+  (`engine_q_moe.sh`) and PP=2 (`engine_q_pp.sh`), then a real MoE at EP x PP.
 - **Fused verification + training on GPU.** Validate `fused_verify_train` end to end
   (`THUNDERSYNC_FUSED_CHECK=1`, gradient against the unfused path) and measure the saved
   learner time on short-output tasks (section 14).

@@ -39,6 +39,7 @@ import collections
 import itertools
 import os
 import time
+import warnings
 from types import SimpleNamespace
 from typing import Any, Callable, Literal, Optional
 
@@ -280,13 +281,16 @@ def validate_engine_verify_source(
 
     q is taken from the engine (its log-probs, and rows rebuilt from its
     hidden states with the training model's LM head) and p from the training
-    model, so both must run the same numerics (batch-invariant kernels) and p
-    must be a single-stage forward on the learner. Any tensor parallelism
-    works when training and generation use the same one (batch invariance
-    enforces it): the learner's LM-head shard is then the engine's, and q rows
-    are gathered over the vocabulary as the engine gathers its logits. At
-    TP>1 the engine must materialize only last-token logits, so the head input
-    it logs is gathered over sequence parallelism.
+    model on the learner, so both must run the same numerics (batch-invariant
+    kernels). Any tensor, pipeline and expert parallelism works when training
+    and generation use the same layout (batch invariance enforces it): the
+    learner's LM-head shard is then the engine's, and q rows are gathered over
+    the vocabulary as the engine gathers its logits. At TP>1 the engine must
+    materialize only last-token logits, so the head input it logs is gathered
+    over sequence parallelism. PP>1 (forward-only pipeline schedule, last
+    stage verifies) and EP>1 (equal forward counts over the expert-parallel
+    group) are unit-tested only: a warning says so. Virtual (interleaved)
+    pipeline stages are not implemented.
     """
     if ts_cfg.verify_source != "engine":
         return
@@ -313,10 +317,24 @@ def validate_engine_verify_source(
             "log-probs and hidden states are the training forward's only under "
             "batch invariance)"
         )
-    if megatron_cfg.get("pipeline_model_parallel_size", 1) != 1:
-        problems.append("policy.megatron_cfg.pipeline_model_parallel_size must be 1")
-    if megatron_cfg.get("expert_model_parallel_size", 1) != 1:
-        problems.append("policy.megatron_cfg.expert_model_parallel_size must be 1")
+    if (megatron_cfg.get("virtual_pipeline_model_parallel_size") or 1) > 1:
+        problems.append(
+            "policy.megatron_cfg.virtual_pipeline_model_parallel_size > 1 is not "
+            "implemented (the verification forward runs the non-interleaved "
+            "pipeline schedule on one model chunk)"
+        )
+    for key, why in (
+        ("pipeline_model_parallel_size", "the engine's last stage logs the head input"),
+        ("expert_model_parallel_size", "the expert all-to-alls and GEMM shapes"),
+    ):
+        train_v = megatron_cfg.get(key, 1)
+        gen_v = mcore_gen.get(key)
+        if gen_v is not None and gen_v != train_v:
+            problems.append(
+                f"policy.generation.mcore_generation_config.{key} ({gen_v}) must "
+                f"equal policy.megatron_cfg.{key} ({train_v}): batch invariance "
+                f"needs the same layout ({why})"
+            )
     gen_tp = mcore_gen.get("tensor_model_parallel_size")
     train_tp = megatron_cfg.get("tensor_model_parallel_size", 1)
     if gen_tp is not None and gen_tp != train_tp:
@@ -350,6 +368,20 @@ def validate_engine_verify_source(
     if problems:
         raise ValueError(
             "thundersync.verify_source='engine': " + "; ".join(problems) + "."
+        )
+    untested = [
+        f"{key}={megatron_cfg[key]}"
+        for key in ("pipeline_model_parallel_size", "expert_model_parallel_size")
+        if (megatron_cfg.get(key) or 1) > 1
+    ]
+    if untested:
+        warnings.warn(
+            "thundersync.verify_source='engine' with "
+            + ", ".join(untested)
+            + " is untested end to end (unit-tested only; GPU validation: "
+            "research/thundersync_rl/scripts/bi_tp/engine_q_pp.sh, engine_q_moe.sh)",
+            UserWarning,
+            stacklevel=2,
         )
 
 
