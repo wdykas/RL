@@ -56,7 +56,7 @@ def test_step_rows_maps_tagged_requests_to_generated_index():
     assert step_rows([7], [0], [7], info.get) == [(0, "a", 2)]
 
 
-def test_hidden_log_pop_needs_every_row_and_closes_the_key():
+def test_hidden_log_pop_returns_logged_prefix_and_closes_the_key():
     log = HiddenLog(chunk_rows=3)
     h0 = torch.arange(12.0).view(3, 4)
     log.record([(0, "a", 0), (2, "b", 0)], h0)
@@ -65,7 +65,10 @@ def test_hidden_log_pop_needs_every_row_and_closes_the_key():
     assert torch.equal(log.pop("a", 3), torch.stack([h0[0], h0[1] + 100, h0[0] + 200]))
     log.record([(0, "a", 3)], h0)  # late row of a closed key: dropped
     assert log.live_rows() == 2
-    assert log.pop("b", 3) is None  # row 2 missing
+    # Row 2 missing: the longest logged prefix (rows 0-1); the driver truncates.
+    assert torch.equal(log.pop("b", 3), torch.stack([h0[2], h0[1] + 200]))
+    log.record([(1, "d", 1)], h0)  # no row 0: nothing usable
+    assert log.pop("d", 2) is None
     assert log.live_rows() == 0
     # A recomputed row (eviction) replaces the earlier one.
     log.record([(0, "c", 0)], h0)
@@ -86,7 +89,11 @@ def test_hidden_log_hook_on_a_fake_engine(monkeypatch):
     def req(key, plen):
         sp = SimpleNamespace() if key is None else SimpleNamespace(ts_hidden_key=key)
         return SimpleNamespace(
-            record=[SimpleNamespace(sampling_params=sp, prompt_tokens=[0] * plen)]
+            record=[
+                SimpleNamespace(
+                    sampling_params=sp, prompt_tokens=[0] * plen, generated_tokens=[]
+                )
+            ]
         )
 
     class Head(torch.nn.Module):
@@ -132,6 +139,8 @@ def test_hidden_log_hook_on_a_fake_engine(monkeypatch):
         # Rows are logged by the sampler that follows the forward (it also runs
         # after CUDA-graph replays, which skip Python hooks).
         sampling.sample_kernel(None, 2, ctx)
+        for r in w.dynamic_inference_engine.requests.values():
+            r.record[-1].generated_tokens.append(0)  # the engine's update phase
         ctx.request_kv_length_offsets += ctx.request_query_lengths
         ctx.request_query_lengths = torch.tensor([1, 1])
     out = w.pop_draft_hidden(["d|0", "x"], [3, 1])

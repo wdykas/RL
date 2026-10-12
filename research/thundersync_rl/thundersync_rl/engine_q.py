@@ -141,7 +141,7 @@ class HiddenLog:
             self.recorded += len(entries)
 
     def pop(self, key: str, n: int) -> Optional[torch.Tensor]:
-        """Rows 0..n-1 of draft ``key`` [n, d] (CPU), or None if any is missing.
+        """Rows 0..m-1 of draft ``key`` [m, d] (CPU): the longest logged prefix (m <= n).
 
         Closes the key: rows the engine records for it later are dropped.
         """
@@ -150,14 +150,17 @@ class HiddenLog:
             slots = self._rows.pop(key, {})
             for chunk, _ in slots.values():
                 chunk[2] -= 1
-            if any(t not in slots for t in range(n)):
-                return None
-            if n == 0:
-                return torch.empty(0, 0)
-            for ev in {id(c): c[3] for c, _ in slots.values()}.values():
+            # The longest contiguous prefix of rows: a row the engine did not
+            # log (or the source check rejected) truncates the draft there.
+            m = 0
+            while m < n and m in slots:
+                m += 1
+            if m == 0:
+                return None if n else torch.empty(0, 0)
+            for ev in {id(slots[t][0]): slots[t][0][3] for t in range(m)}.values():
                 if ev is not None:
                     ev.synchronize()
-            return torch.stack([slots[t][0][0][slots[t][1]] for t in range(n)])
+            return torch.stack([slots[t][0][0][slots[t][1]] for t in range(m)])
 
     def live_rows(self) -> int:
         with self._lock:

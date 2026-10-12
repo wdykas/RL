@@ -133,7 +133,10 @@ def test_worker_pop_draft_hidden_as_refs(monkeypatch):
     w._hidden_log.record([(r, "a", r) for r in range(3)], h[:3])
     w._hidden_log.record([(0, "b", 0)], h[3:4])
     out = w.pop_draft_hidden(["a", "b", "c"], [3, 2, 1], as_refs=True)
-    assert set(out) == {"a"}  # b misses a row, c was never logged
+    # b has only its first row (a 1-row prefix; the driver truncates it), c none.
+    assert set(out) == {"a", "b"}
+    ((ref_b, n_b, _),) = out["b"]
+    assert n_b == 1 and torch.equal(store.objs[ref_b], h[3:4])
     ((ref, n, nbytes),) = out["a"]
     assert isinstance(ref, _Ref) and n == 3 and nbytes == 3 * 3 * 4
     assert torch.equal(store.objs[ref], h[:3])

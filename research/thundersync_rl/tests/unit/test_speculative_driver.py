@@ -370,3 +370,19 @@ def test_cohort_drafts_keep_engine_logprobs_across_resumptions():
     assert d1["tokens"] == [7, 9, 10] and d1["logprobs"] is None
     assert cohort_draft(d0)[6] == [-0.1, -0.2, -0.4]
     assert cohort_draft(d0)[:6] == (p0, -1, d0["tokens"], True, "3:0", d0["segments"])
+
+
+def test_truncate_draft_to_logged_rows():
+    import torch
+    from thundersync_rl.speculative import _truncate_to_rows
+
+    toks, lps = [5, 6, 7, 8], [-0.1, -0.2, -0.3, -0.4]
+    full = torch.zeros(4, 2)
+    assert _truncate_to_rows((toks, True, lps), full) == (toks, True, lps)
+    assert _truncate_to_rows((toks, True, lps), None) == (toks, True, lps)
+    # Fewer rows than tokens: the prefix is a valid draft, no longer finished.
+    assert _truncate_to_rows((toks, True, lps), torch.zeros(2, 2)) == (
+        [5, 6],
+        False,
+        [-0.1, -0.2],
+    )

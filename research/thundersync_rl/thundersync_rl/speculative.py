@@ -103,6 +103,24 @@ def cohort_draft(d: dict[str, Any]) -> tuple:
     )
 
 
+def _truncate_to_rows(drafted, hidden):
+    """Cut a drafted segment to the rows the engine logged for it.
+
+    ``hidden`` holds the longest logged prefix of rows (see ``HiddenLog.pop``).
+    Any prefix of a draft is a valid draft, so a segment with fewer rows than
+    tokens is truncated there and no longer counts as finished. Exact as long
+    as whether a row is logged does not depend on the draft's token values
+    (rows are dropped by engine bookkeeping, not by content).
+    """
+    toks, done, lps = drafted
+    if hidden is None:
+        return drafted
+    m = hidden_num_rows(hidden)
+    if m >= len(toks):
+        return drafted
+    return toks[:m], False, (None if lps is None else lps[:m])
+
+
 def engine_q_ready(d: tuple) -> bool:
     """Whether a draft carries what engine-sourced verification needs.
 
@@ -378,6 +396,7 @@ class SpeculativeGeneration:
         def collect():
             res = [_drafted(x) for x in ray.get(rank0.collect_drafts.remote())]
             hid = self._pop_hidden(hkeys, [len(x[0]) for x in res])
+            res = [_truncate_to_rows(x, h) for x, h in zip(res, hid)]
             return [
                 [
                     (
@@ -526,7 +545,7 @@ class SpeculativeGeneration:
             res = ray.get(rank0.collect_drafts.remote()) if live else []
             hid = self._pop_hidden(hkeys, [len(_drafted(x)[0]) for x in res])
             for d, x, h in zip(live, res, hid):
-                toks, done, lps = _drafted(x)
+                toks, done, lps = _truncate_to_rows(_drafted(x), h)
                 if d.get("hidden") is not None and h is not None:
                     d["hidden"].append(h)
                 else:

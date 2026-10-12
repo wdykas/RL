@@ -1313,7 +1313,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         nothing.
         """
         from megatron.core import parallel_state as ps
-        from thundersync_rl.engine_q import HIDDEN_KEY_ATTR, HiddenLog, step_rows
+        from thundersync_rl.engine_q import HIDDEN_KEY_ATTR, HiddenLog
 
         engine = getattr(self, "dynamic_inference_engine", None)
         ctx = getattr(self, "inference_context", None)
@@ -1336,24 +1336,16 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         except ImportError:  # pragma: no cover
             InferenceMode = None
         log = HiddenLog()
-        cache: dict[int, tuple[str, int] | None] = {}
-        owner: list[Any] = [None]
 
         def lookup(rid, engine):
-            if owner[0] is not engine or len(cache) > 1_000_000:
-                # Request ids are per engine: a rebuilt engine starts over.
-                cache.clear()
-                owner[0] = engine
-            if rid not in cache:
-                entry = engine.requests.get(rid)
-                info = None
-                if entry is not None:
-                    req = entry.record[-1]
-                    key = getattr(req.sampling_params, HIDDEN_KEY_ATTR, None)
-                    if key is not None:
-                        info = (key, len(req.prompt_tokens))
-                cache[rid] = info
-            return cache[rid]
+            # Not cached: the engine may reuse request ids, so a cached id
+            # could point at an earlier request's draft key.
+            entry = engine.requests.get(rid)
+            if entry is None:
+                return None
+            req = entry.record[-1]
+            key = getattr(req.sampling_params, HIDDEN_KEY_ATTR, None)
+            return None if key is None else (key, len(req.prompt_tokens))
 
         # Decode steps replay CUDA graphs, which never run Python hooks. So the
         # pre-hook only *copies* the LM-head input rows into a static buffer
@@ -1371,16 +1363,19 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         )
         filled = [False]
 
+        dbg = {"hook": 0, "kernel": 0, "rows": 0, "rejected": 0}
+        debug = bool(os.environ.get("THUNDERSYNC_HIDDEN_DEBUG"))
+
         def hook(module, args, kwargs):
             if InferenceMode is not None and not InferenceMode.is_active():
                 return  # not an engine forward
+            dbg["hook"] += 1
             h = args[0] if args else kwargs["input_"]
             rows = h.reshape(-1, h.shape[-1])
             if not materialized:
                 if torch.cuda.is_current_stream_capturing():
                     return  # per-token rows: only logged on eager forwards
-                ctx_now = self.inference_context
-                rows = ctx_now.last_token_logits(rows.unsqueeze(0))
+                rows = self.inference_context.last_token_logits(rows.unsqueeze(0))
             k = min(rows.shape[0], static.shape[0])
             static[:k].copy_(rows[:k])
             filled[0] = True
@@ -1389,26 +1384,98 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         inner = sampling.sample_kernel
 
         def logging_kernel(logits, n, context, **kw):
+            dbg["kernel"] += 1
             # With materialized last-token rows every forward (eager or graph
             # replay) refills the buffer; per-token rows are only copied on
             # eager forwards, flagged from Python.
+            entries = []
             if materialized or filled[0]:
                 filled[0] = False
-                engine_now, ctx_now = self.dynamic_inference_engine, context
-                a, e = ctx_now.paused_request_count, ctx_now.total_request_count
-                if e > a:
-                    entries = step_rows(
-                        ctx_now.request_ids[a:e].tolist(),
-                        ctx_now.request_kv_length_offsets[a:e].tolist(),
-                        ctx_now.request_query_lengths[a:e].tolist(),
-                        lambda rid: lookup(rid, engine_now),
+                engine_now = self.dynamic_inference_engine
+                a, e = context.paused_request_count, context.total_request_count
+                for row, rid in enumerate(context.request_ids[a:e].tolist()):
+                    info = lookup(rid, engine_now)
+                    if info is None:
+                        continue
+                    rec = engine_now.requests.get(rid)
+                    if rec is None:
+                        continue
+                    # Index of the token this row samples, relative to the
+                    # request's original prompt: after an eviction the engine
+                    # resumes the request as a new record whose prompt includes
+                    # the earlier tokens and whose generated tokens restart at 0.
+                    cur = rec.record[-1]
+                    t = (
+                        len(cur.prompt_tokens)
+                        + len(cur.generated_tokens)
+                        - len(rec.record[0].prompt_tokens)
                     )
-                    if entries:
-                        log.record(entries, static[: e - a])
-            return inner(logits, n, context, **kw)
+                    entries.append((row, info[0], t))
+            out = inner(logits, n, context, **kw)
+            if not entries:
+                return out
+            # Source check: a logged row must reproduce the logit of the token
+            # the engine sampled from it (one dot product per row). In ~2% of
+            # decode graph replays one row of the buffer is stale (measured);
+            # such rows are not recorded, so their drafts are truncated there
+            # (HiddenLog.pop returns the longest logged prefix).
+            if torch.is_tensor(out) and logits is not None and torch.is_tensor(logits):
+                rows_t = torch.tensor([r for r, _, _ in entries], device=static.device)
+                lg = logits.reshape(-1, logits.shape[-1])
+                x = out.reshape(-1)[rows_t].long()
+                w = weight
+                lo = 0
+                if w.shape[0] < lg.shape[-1]:  # vocab-parallel shard (TP > 1)
+                    from megatron.core import parallel_state as ps_
+
+                    lo = ps_.get_tensor_model_parallel_rank() * w.shape[0]
+                in_shard = (x >= lo) & (x < lo + w.shape[0])
+                xs = (x - lo).clamp(0, w.shape[0] - 1)
+                mine = (static[rows_t].float() * w[xs].float()).sum(-1)
+                ref = lg[rows_t].float().gather(-1, x.view(-1, 1))[:, 0]
+                ok = ((mine - ref).abs() <= 1.0) | ~in_shard
+                if not bool(ok.all()):
+                    keep = ok.tolist()
+                    dbg["rejected"] += len(entries) - sum(keep)
+                    entries = [en for en, k_ in zip(entries, keep) if k_]
+            if entries:
+                dbg["rows"] += len(entries)
+                log.record(entries, static[: max(r for r, _, _ in entries) + 1])
+            if debug and dbg["kernel"] % 500 == 1:
+                print(f"[hidden dbg] {dbg}", flush=True)
+            return out
 
         sampling.sample_kernel = logging_kernel
+        # Register the copy before recapturing, so the captures include it.
         layer.register_forward_pre_hook(hook, with_kwargs=True)
+        # The engine captured its CUDA graphs when it was built, before this
+        # hook existed, so replays would not copy the rows. Recapture them now
+        # (the engine is idle: drafting has not started) so every captured graph
+        # contains the copy into ``static``.
+        if getattr(engine, "cuda_graph_impl", None) == "local":
+            from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
+
+            def recapture():
+                torch.cuda.synchronize()
+                delete_cuda_graphs()
+                engine.create_cuda_graphs()
+                torch.cuda.synchronize()
+
+            loop = getattr(self, "_inference_loop", None)
+            if loop is not None and loop.is_running():
+                import asyncio
+
+                async def _run():
+                    recapture()
+
+                asyncio.run_coroutine_threadsafe(_run(), loop).result()
+            else:
+                recapture()
+        if debug:
+            print(
+                f"[hidden dbg] installed on {type(layer).__name__} id={id(layer)} sampling={id(sampling)}",
+                flush=True,
+            )
         self._hidden_log = log
         return True
 
@@ -1692,6 +1759,19 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                     chk_max = max(chk_max, float(d.max()))
                     chk_exact += int((d == 0).sum())
                     chk_tok += idx.numel()
+                    bad = (d > 0).nonzero().flatten()
+                    if bad.numel() and os.environ.get("THUNDERSYNC_HIDDEN_DEBUG"):
+                        pos = (bad + a).tolist()[:8]
+                        print(
+                            f"[engine q check] inexact positions {pos} of g={g} "
+                            f"d={[round(float(d[b]), 2) for b in bad[:8]]} "
+                            f"rec={[round(float(rec[b]), 2) for b in bad[:4]]} "
+                            f"eng={[round(float(lq[a + int(b)]), 2) for b in bad[:4]]} "
+                            f"eng_prev={[round(float(lq[a + int(b) - 1]), 2) if a + int(b) > 0 else None for b in bad[:4]]} "
+                            f"eng_next={[round(float(lq[a + int(b) + 1]), 2) if a + int(b) + 1 < g else None for b in bad[:4]]} "
+                            f"versions_at={[version[t] for t in pos]} segs={segments[i]}",
+                            flush=True,
+                        )
             results.append(
                 (
                     i,
