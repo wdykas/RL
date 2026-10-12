@@ -1237,6 +1237,16 @@ shared experts, expert TP, latent MoE (rejected at config time); the NCCL infere
 EP>=3 is untested (the default NVLS dispatcher is used); TP=4 training forward measured
 batch-invariant (0/16 sequences differ), TP=4 engine not yet run.
 
+**fp16 range.** Max |GEMM input| over 16 MATH prompts x 512 greedy tokens (HF bf16, decode
+included; `thundersync_work/fp16_range_probe.py`): Qwen3-8B 10752 (6.1x headroom to 65504),
+Qwen3-14B 7296 (9x), Qwen3-30B-A3B 484 (135x, expert down_proj). The dense down-projection input
+(the SwiGLU output) is the only site near the limit; every other site is under 260. Opt-in
+`down_proj_prescale_log2: s` multiplies the down-projection input (dense fc2 and the MoE expert
+fc2) by 2^-s before the fp16 cast and the fp32 output by 2^s, with wgrad scaled to match. That
+is exact apart from fp16 subnormals and widens the range by 2^s. Default 0; probe a new dense model
+before running it and set s=2-4 if headroom is below ~4x. The setting must match in training and
+generation (checked by the mismatch validator).
+
 ## 15. Open work
 
 - **Stragglers.** About one rejected draft per step decodes its remainder at about 3 ms
