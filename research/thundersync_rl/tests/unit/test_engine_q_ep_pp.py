@@ -352,7 +352,10 @@ def test_hidden_log_is_installed_on_the_engine_last_stage_only(monkeypatch):
         kernel = lambda *a, **k: None  # noqa: E731
         w.dynamic_inference_engine = SimpleNamespace(
             requests={},
-            controller=SimpleNamespace(_sampling=SimpleNamespace(sample_kernel=kernel)),
+            controller=SimpleNamespace(
+                _sampling=SimpleNamespace(sample_kernel=kernel),
+                _compact_async_sched_logits=lambda idx: None,
+            ),
         )
         w.inference_context = SimpleNamespace(
             config=SimpleNamespace(materialize_only_last_token_logits=True),

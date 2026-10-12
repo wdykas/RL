@@ -124,13 +124,22 @@ def test_hidden_log_hook_on_a_fake_engine(monkeypatch):
     w = object.__new__(ThunderSyncMegatronPolicyWorker.__ray_metadata__.modified_class)
     w.dynamic_inference_engine = SimpleNamespace(
         requests={1: req("d|0", 4), 2: req(None, 2)},
-        controller=SimpleNamespace(_sampling=sampling),
+        controller=SimpleNamespace(
+            _sampling=sampling, _compact_async_sched_logits=lambda idx: None
+        ),
     )
     w.inference_context = ctx
     w._gen_model = lambda: model
     w.inference_model = None
     w._install_hidden_copy(ctx)  # at engine construction, every rank
     assert w.install_draft_hidden_log() is True
+    # The controller's async-schedule compaction permutes the hidden copy too.
+    static = w._hidden_copy["static"]
+    static[:3] = torch.arange(3.0).unsqueeze(1)
+    w.dynamic_inference_engine.controller._compact_async_sched_logits(
+        torch.tensor([2, 0])
+    )
+    assert static[:2, 0].tolist() == [2.0, 0.0]
     head = model.module.output_layer
     steps = []
     for s in range(3):  # prefill, then two decode steps
@@ -181,7 +190,8 @@ def test_hidden_log_install_under_tensor_parallelism(
     w.dynamic_inference_engine = SimpleNamespace(
         requests={},
         controller=SimpleNamespace(
-            _sampling=SimpleNamespace(sample_kernel=lambda *a, **k: None)
+            _sampling=SimpleNamespace(sample_kernel=lambda *a, **k: None),
+            _compact_async_sched_logits=lambda idx: None,
         ),
     )
     w.inference_context = SimpleNamespace(
