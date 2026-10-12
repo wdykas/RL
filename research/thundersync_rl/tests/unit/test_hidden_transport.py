@@ -404,3 +404,18 @@ def test_driver_transport_is_selectable(_no_ray):
     assert s.hidden_transport == "driver"
     with pytest.raises(ValueError, match="hidden_transport"):
         _spec({}, {"install_draft_hidden_log": lambda: True}, hidden_transport="x")
+
+
+def test_verify_row_batches_respect_the_padded_token_budget():
+    from thundersync_rl.worker import ThunderSyncMegatronPolicyWorker
+
+    w = object.__new__(ThunderSyncMegatronPolicyWorker.__ray_metadata__.modified_class)
+    w.cfg = {"make_sequence_length_divisible_by": 128}
+    rows = [torch.zeros(n, dtype=torch.long) for n in (100, 200, 250, 1000, 3000, 50)]
+    # Padded lengths 128, 256, 256, 1024, 3072, 128; budget 1024 tokens.
+    assert w._row_batches(rows, 1024) == [[0, 1, 2], [3], [4], [5]]
+    # No budget: one row per forward (the previous behaviour).
+    assert w._row_batches(rows, 0) == [[0], [1], [2], [3], [4], [5]]
+    # Every row appears once, in order.
+    flat = [j for b in w._row_batches(rows, 4096) for j in b]
+    assert flat == list(range(len(rows)))

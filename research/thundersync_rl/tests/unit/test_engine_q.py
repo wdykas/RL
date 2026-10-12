@@ -310,7 +310,21 @@ def _engine_worker(monkeypatch):
         return w.model.module.output_layer(h.unsqueeze(1))[0].transpose(0, 1)
 
     w._training_forward = training_forward
+    w._training_forward_rows = _rows_forward(training_forward)
     return w, emb, heads
+
+
+def _rows_forward(one_row):
+    """Batched stub of ``_training_forward_rows``: per-row logits, zero-padded to one length."""
+
+    def forward_rows(rows):
+        outs = [one_row(r) for r in rows]
+        s = max(o.shape[1] for o in outs)
+        return torch.cat(
+            [torch.nn.functional.pad(o, (0, 0, 0, s - o.shape[1])) for o in outs]
+        )
+
+    return forward_rows
 
 
 def _engine_drafts(emb, heads, n=20, seed=1, device="cuda", key_names=None):
@@ -664,6 +678,7 @@ def _tp_engine_workers(monkeypatch, tp):
             return w.model.module.output_layer(h.unsqueeze(1))[0].transpose(0, 1)
 
         w._training_forward = training_forward
+        w._training_forward_rows = _rows_forward(training_forward)
         workers.append(w)
 
     def run(r):
