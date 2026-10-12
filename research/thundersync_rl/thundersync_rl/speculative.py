@@ -743,12 +743,17 @@ class SpeculativeGeneration:
                 best[t] = (d, by_row[r])
         self.plans.clear()
         kept = total = full = 0
+        # Draft age (versions between the drafting weights and the verifying
+        # ones), token-weighted: drafted and kept tokens per age bucket.
+        age_tok: dict[int, int] = {}
+        age_kept: dict[int, int] = {}
         for i in range(len(drafts)):
             d, r = best[i]
             plan = self._plan(d, r)
             full += plan.complete and r["accepted"] == len(d[2])
             kept += r["accepted"]
             total += len(d[2])
+            self._count_ages(d, r["accepted"], age_tok, age_kept)
             self.plans[_key(d[0])].append(plan)
         self.stats.update(
             {
@@ -758,6 +763,7 @@ class SpeculativeGeneration:
                 "spec/variant_wins": float(variant_wins),
             }
         )
+        self._age_stats(age_tok, age_kept)
         if self.verify_source == "engine":
             self.stats["spec/engine_q_dropped"] = float(dropped)
 
@@ -808,6 +814,21 @@ class SpeculativeGeneration:
         prefix = draft[:n_acc] + [r["next"]]
         done = r["next"] == self.eod or len(prefix) >= self.max_new_tokens
         return Plan(seed, prefix, lps, complete=done)
+
+    def _count_ages(self, d, accepted: int, age_tok: dict, age_kept: dict) -> None:
+        """Add draft ``d``'s drafted and kept tokens per age (versions behind; 4 = 4+)."""
+        for v, a, b in d[5] if len(d) > 5 and d[5] else ():
+            age = min(max(self.current_step - v, 0), 4)
+            age_tok[age] = age_tok.get(age, 0) + (b - a)
+            age_kept[age] = age_kept.get(age, 0) + max(0, min(b, accepted) - a)
+
+    def _age_stats(self, age_tok: dict, age_kept: dict) -> None:
+        """spec/age{a}_token_frac and spec/age{a}_accepted_frac per draft age."""
+        n_aged = sum(age_tok.values())
+        for age, n in age_tok.items():
+            label = f"{age}+" if age == 4 else str(age)
+            self.stats[f"spec/age{label}_token_frac"] = n / max(n_aged, 1)
+            self.stats[f"spec/age{label}_accepted_frac"] = age_kept[age] / max(n, 1)
 
     async def verify_chunked(self, drafts, chunks: int) -> None:
         """Run ``_verify_chunked``; on failure, wake every waiting rollout.
@@ -902,6 +923,8 @@ class SpeculativeGeneration:
                 refs = group.run_all_workers_single_data(method, **kwargs, **extra)
             calls.append((a, refs))
         kept = total = full = fused = 0
+        age_tok: dict[int, int] = {}
+        age_kept: dict[int, int] = {}
 
         async def fetch(a, refs):
             return (
@@ -948,6 +971,7 @@ class SpeculativeGeneration:
                     fused += plan.fused is not None
                     kept += r["accepted"]
                     total += len(d[2])
+                    self._count_ages(d, r["accepted"], age_tok, age_kept)
                     self.plans[_key(d[0])].append(plan)
                     self._pending[_key(d[0])] -= 1
                 self._plan_cv.notify_all()
@@ -958,6 +982,7 @@ class SpeculativeGeneration:
                 "spec/full_accept": full / max(n, 1),
             }
         )
+        self._age_stats(age_tok, age_kept)
         if self.fused_verify_train:
             self.stats["fused/retained"] = float(fused)
         if self.verify_source == "engine":
