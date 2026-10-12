@@ -1355,33 +1355,56 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 cache[rid] = info
             return cache[rid]
 
+        # Decode steps replay CUDA graphs, which never run Python hooks. So the
+        # pre-hook only *copies* the LM-head input rows into a static buffer
+        # allocated here, before any capture; that copy is part of the captured
+        # graph and runs on every replay. The rows are read and logged after the
+        # forward, in the sampler (Python, runs every step, outside the graph).
+        d = layer.weight.shape[1]
+        static = torch.empty(
+            (int(ctx.max_requests), d),
+            dtype=layer.weight.dtype,
+            device=layer.weight.device,
+        )
+        filled = [False]
+
         def hook(module, args, kwargs):
             if InferenceMode is not None and not InferenceMode.is_active():
                 return  # not an engine forward
-            if torch.cuda.is_current_stream_capturing():
-                return  # a captured graph would replay without the hook
             h = args[0] if args else kwargs["input_"]
-            # Looked up per call: the worker may rebuild its engine and context.
-            engine, ctx = self.dynamic_inference_engine, self.inference_context
-            if engine is None or ctx is None:
-                return
-            a, e = ctx.paused_request_count, ctx.total_request_count
-            if e <= a:
-                return
-            entries = step_rows(
-                ctx.request_ids[a:e].tolist(),
-                ctx.request_kv_length_offsets[a:e].tolist(),
-                ctx.request_query_lengths[a:e].tolist(),
-                lambda rid: lookup(rid, engine),
-            )
-            if not entries:
-                return
             rows = h.reshape(-1, h.shape[-1])
             if not materialized:
-                # One row per input token: keep each request's last one.
-                rows = ctx.last_token_logits(rows.unsqueeze(0))
-            log.record(entries, rows)
+                if torch.cuda.is_current_stream_capturing():
+                    return  # per-token rows: only logged on eager forwards
+                ctx_now = self.inference_context
+                rows = ctx_now.last_token_logits(rows.unsqueeze(0))
+            k = min(rows.shape[0], static.shape[0])
+            static[:k].copy_(rows[:k])
+            filled[0] = True
 
+        sampling = engine.controller._sampling
+        inner = sampling.sample_kernel
+
+        def logging_kernel(logits, n, context, **kw):
+            # With materialized last-token rows every forward (eager or graph
+            # replay) refills the buffer; per-token rows are only copied on
+            # eager forwards, flagged from Python.
+            if materialized or filled[0]:
+                filled[0] = False
+                engine_now, ctx_now = self.dynamic_inference_engine, context
+                a, e = ctx_now.paused_request_count, ctx_now.total_request_count
+                if e > a:
+                    entries = step_rows(
+                        ctx_now.request_ids[a:e].tolist(),
+                        ctx_now.request_kv_length_offsets[a:e].tolist(),
+                        ctx_now.request_query_lengths[a:e].tolist(),
+                        lambda rid: lookup(rid, engine_now),
+                    )
+                    if entries:
+                        log.record(entries, static[: e - a])
+            return inner(logits, n, context, **kw)
+
+        sampling.sample_kernel = logging_kernel
         layer.register_forward_pre_hook(hook, with_kwargs=True)
         self._hidden_log = log
         return True
