@@ -279,7 +279,9 @@ class RMSNormFp32(torch.autograd.Function):
     dx = r * w * g - r^3 * x * sum(w * g * x) / D, dw = sum(g * x * r).
     (``BatchInvariantRMSNormFn.backward`` multiplies its second dx term by w
     once more, which is exact only for w == 1; measured on Qwen3-1.7B, whose
-    q/k norm weights are far from 1, as a 100x wrong gradient norm.)
+    q/k norm weights are far from 1, as a 100x wrong gradient norm. Fixed
+    upstream by NVIDIA/Megatron-LM#6859; switch back to MCore's class once our
+    Megatron-LM pin includes it.)
     """
 
     @staticmethod
