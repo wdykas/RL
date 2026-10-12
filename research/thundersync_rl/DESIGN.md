@@ -547,9 +547,9 @@ speculation when the rollout phase ends in a latency-bound tail on mostly idle G
 ### 10.1 Exact acceptance under batch invariance (bf16)
 
 With BI and engine-sourced q, verification compares the true bf16 laws of π_n and π_{n+1}.
-Measured in the real system (Qwen3-1.7B): 27–48% of draft tokens kept, vs 99.4% with the
+Measured in the real system (Qwen3-1.7B): 24–52% of draft tokens kept (control run: mean 45%, 15–25% of drafts whole), vs 99.4% with the
 earlier (inexact) fp32 scorer. With that acceptance, engine-q speculation on a
-generation-saturated run (MAXLEN 4096) took ~80 s/step vs 29.5 s without speculation
+generation-saturated run (MAXLEN 4096) took a mean 92.8 s/step (81–120 s; 13 of 30 steps completed before a timeout) vs 29.5 s without speculation
 (`thundersync_work/runs_perf`).
 
 Offline ablation (Qwen2.5-Math-1.5B, steady-state masters, one AdamW step, 2048-token
@@ -671,7 +671,7 @@ a TP=1 gate; branch `thundersync-bi-tp2` replaces it.
 design notes in `thundersync_work/research/bi_tensor_parallel.md`). Rules, checked by
 `validate_batch_invariant_mode`:
 
-- training TP, PP, EP and expert TP equal the merged generation config's (an unset expert TP
+- training TP, EP and expert TP equal the merged generation config's (PP may differ) (an unset expert TP
   resolves to TP; generation pins expert TP to 1, so training needs 1 too). A different TP
   changes the K split of the row-parallel GEMMs, which no kernel choice undoes;
 - at TP>1, `sequence_parallel=true` on both sides (`inference_optimized` layers require it;
@@ -1125,8 +1125,8 @@ A/B: it moves more bytes but makes no on-demand `ray.get` inside the scan, whose
 rejected draft is not measured yet.
 
 Requirements, enforced by `validate_engine_verify_source` and on the worker: `speculate`,
-`verify_mode=block`, `verify_on=learner`, `batch_invariant_mode`, generation TP, PP and EP
-equal to training's (the BI validator also checks the full layout), no virtual pipeline
+`verify_mode=block`, `verify_on=learner`, `batch_invariant_mode`, generation TP and EP
+equal to training's (PP may differ) (the BI validator also checks the full layout), no virtual pipeline
 stages (not implemented), dropless MoE (worker), at TP>1
 `materialize_only_last_token_logits=true`, no `fused_verify_train`, Megatron generation with
 `num_speculative_tokens=0` and `logprobs_mode=raw_logprobs`. Possible extension: combining
