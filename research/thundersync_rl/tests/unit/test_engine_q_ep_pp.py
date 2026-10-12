@@ -349,15 +349,24 @@ def test_hidden_log_is_installed_on_the_engine_last_stage_only(monkeypatch):
         monkeypatch.setattr(ps, "is_pipeline_last_stage", lambda *a, _l=last, **k: _l)
         monkeypatch.setattr(ps, "get_tensor_model_parallel_rank", lambda *a, **k: 0)
         w = object.__new__(_cls())
-        w.dynamic_inference_engine = SimpleNamespace(requests={})
+        kernel = lambda *a, **k: None  # noqa: E731
+        w.dynamic_inference_engine = SimpleNamespace(
+            requests={},
+            controller=SimpleNamespace(_sampling=SimpleNamespace(sample_kernel=kernel)),
+        )
         w.inference_context = SimpleNamespace(
             config=SimpleNamespace(materialize_only_last_token_logits=True),
             num_speculative_tokens=0,
+            max_requests=8,
         )
         w._gen_model = lambda: SimpleNamespace(
             module=SimpleNamespace(output_layer=head)
         )
         assert w.install_draft_hidden_log() is expected
+        # The sampler wrapper (logs rows after CUDA-graph replays too) is
+        # installed on the last stage only.
+        sampling = w.dynamic_inference_engine.controller._sampling
+        assert (sampling.sample_kernel is not kernel) == bool(expected)
 
 
 # --------------------------------------------------------------------------
