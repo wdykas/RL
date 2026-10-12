@@ -1597,25 +1597,24 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             # decode graph replays one row of the buffer is stale (measured);
             # such rows are not recorded, so their drafts are truncated there
             # (HiddenLog.pop returns the longest logged prefix).
-            if torch.is_tensor(out) and logits is not None and torch.is_tensor(logits):
+            if logits is not None and torch.is_tensor(logits):
                 rows_t = torch.tensor([r for r, _, _ in entries], device=static.device)
                 lg = logits.reshape(-1, logits.shape[-1])
-                x = out.reshape(-1)[rows_t].long()
                 w = weight
                 lo = 0
                 if w.shape[0] < lg.shape[-1]:  # vocab-parallel shard (TP > 1)
                     from megatron.core import parallel_state as ps_
 
                     lo = ps_.get_tensor_model_parallel_rank() * w.shape[0]
-                in_shard = (x >= lo) & (x < lo + w.shape[0])
-                xs = (x - lo).clamp(0, w.shape[0] - 1)
-                mine = (static[rows_t].float() * w[xs].float()).sum(-1)
-                ref = lg[rows_t].float().gather(-1, x.view(-1, 1))[:, 0]
-                ok = ((mine - ref).abs() <= 1.0) | ~in_shard
-                if not bool(ok.all()):
-                    keep = ok.tolist()
-                    dbg["rejected"] += len(entries) - sum(keep)
-                    entries = [en for en, k_ in zip(entries, keep) if k_]
+                # Probe columns of this rank's vocabulary shard (any TP, any
+                # sampled token): a stale row disagrees on all of them.
+                cols = torch.linspace(0, w.shape[0] - 1, 16, device=w.device).long()
+                mine = static[rows_t].float() @ w[cols].float().t()
+                ref = lg[rows_t][:, lo + cols].float()
+                ok = ((mine - ref).abs().amax(-1) <= 1.0).tolist()
+                if not all(ok):
+                    dbg["rejected"] += len(entries) - sum(ok)
+                    entries = [en for en, k_ in zip(entries, ok) if k_]
             if entries:
                 dbg["rows"] += len(entries)
                 log.record(entries, static[: max(r for r, _, _ in entries) + 1])
