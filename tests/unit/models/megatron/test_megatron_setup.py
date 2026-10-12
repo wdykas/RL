@@ -3763,7 +3763,8 @@ class TestSetupModelConfig:
         ("field_name", "field_value"),
         [
             ("multi_latent_attention", True),
-            ("hybrid_layer_pattern", "M*-"),
+            # Hybrid Mamba layer patterns are allowed (batch-invariant Mamba decode;
+            # Nemotron-Nano-9B-v2 measured with zero train/gen mismatch).
             ("experimental_attention_variant", "gated_delta_net"),
         ],
     )

@@ -43,7 +43,9 @@ def test_grouped_linear_matches_per_expert_fp16_reference():
     assert y.dtype == torch.float32
     ref, s = [], 0
     for we, m in zip(w, splits):
-        ref.append(x[s : s + m].to(torch.float16).double() @ we.to(torch.float16).double().t())
+        ref.append(
+            x[s : s + m].to(torch.float16).double() @ we.to(torch.float16).double().t()
+        )
         s += m
     torch.testing.assert_close(y.double(), torch.cat(ref), rtol=1e-5, atol=1e-5)
 
@@ -58,7 +60,9 @@ def test_grouped_linear_backward_bf16():
     dx = torch.cat([gb[:3] @ w[0].detach().float(), gb[3:] @ w[1].detach().float()])
     torch.testing.assert_close(x.grad, dx)
     xb = x.detach().to(torch.float16).to(torch.bfloat16).float()
-    torch.testing.assert_close(w[1].grad.float(), (gb[3:].t() @ xb[3:]).to(torch.bfloat16).float())
+    torch.testing.assert_close(
+        w[1].grad.float(), (gb[3:].t() @ xb[3:]).to(torch.bfloat16).float()
+    )
     assert w[0].grad.dtype == torch.bfloat16
 
 

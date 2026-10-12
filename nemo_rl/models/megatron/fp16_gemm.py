@@ -98,7 +98,7 @@ def _active(weight: Optional[torch.Tensor]) -> bool:
 
 
 def _mm(a: torch.Tensor, b: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
-    """a [M, K] @ b [K, N] with fp32 accumulation, emitted in ``out_dtype``.
+    """A [M, K] @ b [K, N] with fp32 accumulation, emitted in ``out_dtype``.
 
     CUDA: one cuBLAS GEMM (``torch.mm(..., out_dtype=...)``; under the te_native
     batch-invariant backend cuBLASLt runs without workspace, i.e. without
@@ -162,7 +162,7 @@ def head_precision() -> str:
 
 
 def head_input_dtype(weight_dtype: torch.dtype) -> torch.dtype:
-    """dtype that holds an LM-head input losslessly for the head GEMM.
+    """Dtype that holds an LM-head input losslessly for the head GEMM.
 
     Under the fp16 forward: fp32 with the fp32 head (the final-norm output as
     is; twice the bytes of bf16), fp16 with the fp16 head (the GEMM rounds its
@@ -393,11 +393,15 @@ def _te_linear_forward(module: Any, x: torch.Tensor, norm: bool):
 
     Returns (output, bias-or-None) as Megatron's TE wrappers do.
     """
-    if getattr(module, "fp8", False) or getattr(module, "primary_weights_in_fp8", False):
+    if getattr(module, "fp8", False) or getattr(
+        module, "primary_weights_in_fp8", False
+    ):
         raise NotImplementedError("forward_gemm_precision=fp16 does not support FP8.")
     weight = module.weight
     tp_size, group = _tp(module)
-    sequence_parallel = bool(getattr(module, "sequence_parallel", False)) and tp_size > 1
+    sequence_parallel = (
+        bool(getattr(module, "sequence_parallel", False)) and tp_size > 1
+    )
     mode = getattr(module, "parallel_mode", None)
     if norm:
         if getattr(module, "normalization", "RMSNorm") != "RMSNorm":
@@ -427,7 +431,9 @@ def _te_linear_forward(module: Any, x: torch.Tensor, norm: bool):
         comm = COMM_NONE
     out = fp16_linear(x, weight, comm, group)
     bias = getattr(module, "bias", None)
-    has_bias = bool(getattr(module, "use_bias", False)) and bias is not None and bias.numel()
+    has_bias = (
+        bool(getattr(module, "use_bias", False)) and bias is not None and bias.numel()
+    )
     if has_bias:
         if getattr(module, "te_return_bias", False):
             return out, bias
@@ -456,7 +462,9 @@ def _make_output_layer_forward(cls: type):
     def forward(self, input_, weight=None, runtime_gather_output=None):
         w = self.weight if weight is None else weight
         if not _active(w):
-            return orig(self, input_, weight=weight, runtime_gather_output=runtime_gather_output)
+            return orig(
+                self, input_, weight=weight, runtime_gather_output=runtime_gather_output
+            )
         from megatron.core.tensor_parallel.mappings import (
             gather_from_tensor_model_parallel_region,
         )
@@ -474,7 +482,11 @@ def _make_output_layer_forward(cls: type):
         out = fp16_linear(input_, w, comm, group, _STATE["head"])
         if self.bias is not None and not self.skip_bias_add:
             out = out + self.bias.float()
-        gather = self.gather_output if runtime_gather_output is None else runtime_gather_output
+        gather = (
+            self.gather_output
+            if runtime_gather_output is None
+            else runtime_gather_output
+        )
         if gather and tp_size > 1:
             out = gather_from_tensor_model_parallel_region(out, group=group)
         return out, (self.bias if self.skip_bias_add else None)
@@ -503,7 +515,11 @@ def _patch_te_rmsnorm() -> None:
 
 def _cast_qkv(outputs: Any, box: Optional[_GradScaleBox]) -> Any:
     def cast(t: Any) -> Any:
-        if not torch.is_tensor(t) or not t.is_floating_point() or t.dtype == torch.float16:
+        if (
+            not torch.is_tensor(t)
+            or not t.is_floating_point()
+            or t.dtype == torch.float16
+        ):
             return t
         if box is not None:
             return ToFp16Scaled.apply(t, box)
@@ -515,7 +531,7 @@ def _cast_qkv(outputs: Any, box: Optional[_GradScaleBox]) -> Any:
 
 
 def _patch_attention() -> None:
-    """q / k / v to fp16 after the q/k norms; scaled fp16 boundary for autograd."""
+    """Q / k / v to fp16 after the q/k norms; scaled fp16 boundary for autograd."""
     from megatron.core.transformer.attention import Attention, SelfAttention
 
     orig_qkv = SelfAttention.get_query_key_value_tensors
@@ -627,8 +643,12 @@ def _patch_moe() -> None:
 
     def te_experts_forward(self, x, tokens_per_expert, permuted_probs, *args, **kwargs):
         if not _active(getattr(self.linear_fc1, "weight0", None)) or args or kwargs:
-            return orig_te_experts(self, x, tokens_per_expert, permuted_probs, *args, **kwargs)
-        return fp16_moe.training_experts_forward(self, x, tokens_per_expert, permuted_probs)
+            return orig_te_experts(
+                self, x, tokens_per_expert, permuted_probs, *args, **kwargs
+            )
+        return fp16_moe.training_experts_forward(
+            self, x, tokens_per_expert, permuted_probs
+        )
 
     TEGroupedMLP.forward = te_experts_forward
 
@@ -642,7 +662,12 @@ def _patch_moe() -> None:
             getattr(self.linear_fc1, "weight0", None)
         ):
             return orig_inf_experts(
-                self, x, tokens_per_expert, permuted_probs, routing_map=routing_map, **kwargs
+                self,
+                x,
+                tokens_per_expert,
+                permuted_probs,
+                routing_map=routing_map,
+                **kwargs,
             )
         return fp16_moe.inference_experts_forward(self, x, permuted_probs, routing_map)
 
@@ -685,9 +710,13 @@ def _nvls_token_combine_fp32(self, hidden_states):
         dtype=rsv["tensor"].dtype,
         device=hidden_states.device,
     )
-    use_ordered = batch_invariant.enabled() and get_batch_invariant_collective() == "ordered"
+    use_ordered = (
+        batch_invariant.enabled() and get_batch_invariant_collective() == "ordered"
+    )
     reduce_scatter_v = (
-        batch_invariant.ordered_reduce_scatter_v if use_ordered else multimem_reduce_scatter_v
+        batch_invariant.ordered_reduce_scatter_v
+        if use_ordered
+        else multimem_reduce_scatter_v
     )
     reduce_scatter_v(
         output,
@@ -707,22 +736,26 @@ def _nccl_token_combine_fp32(self, hidden_states):
     training) only up to EP=2; use the NVLS dispatcher (ordered) beyond that.
     """
     import torch.distributed as dist
-    from megatron.core.tensor_parallel.mappings import reduce_scatter_to_sequence_parallel_region
+    from megatron.core.tensor_parallel.mappings import (
+        reduce_scatter_to_sequence_parallel_region,
+    )
     from megatron.core.utils import get_pg_rank
 
     if self.ep_size == 1:
         return hidden_states
     if not self.__class__._use_allgather_v:
-        return reduce_scatter_to_sequence_parallel_region(hidden_states, group=self.tp_ep_group)
+        return reduce_scatter_to_sequence_parallel_region(
+            hidden_states, group=self.tp_ep_group
+        )
     tokens_per_rank = self.__class__._local_tokens_per_rank
     max_tokens = max(tokens_per_rank)
     ep_rank = get_pg_rank(self.ep_group)
     padded = hidden_states.new_zeros(self.ep_size * max_tokens, hidden_states.shape[1])
     offset = 0
     for dst_rank, n_tokens in enumerate(tokens_per_rank):
-        padded[dst_rank * max_tokens : dst_rank * max_tokens + n_tokens] = hidden_states[
-            offset : offset + n_tokens
-        ]
+        padded[dst_rank * max_tokens : dst_rank * max_tokens + n_tokens] = (
+            hidden_states[offset : offset + n_tokens]
+        )
         offset += n_tokens
     scattered = padded.new_empty(max_tokens, hidden_states.shape[1])
     dist.reduce_scatter_tensor(scattered, padded, group=self.ep_group)
@@ -739,7 +772,9 @@ def install(lm_head_precision: Optional[str] = None) -> None:
         return
     head = FP32_HEAD if lm_head_precision is None else lm_head_precision
     if head not in HEAD_PRECISIONS:
-        raise ValueError(f"lm_head_precision must be one of {HEAD_PRECISIONS} (got {head!r}).")
+        raise ValueError(
+            f"lm_head_precision must be one of {HEAD_PRECISIONS} (got {head!r})."
+        )
     _STATE["head"] = head
     from megatron.core.extensions import transformer_engine as mte
     from megatron.core.tensor_parallel import inference_layers as il
@@ -769,7 +804,9 @@ def install(lm_head_precision: Optional[str] = None) -> None:
     )
 
 
-def validate_config(megatron_cfg: dict[str, Any], inference_cfg: Optional[dict] = None) -> list[str]:
+def validate_config(
+    megatron_cfg: dict[str, Any], inference_cfg: Optional[dict] = None
+) -> list[str]:
     """Config violations of ``forward_gemm_precision`` (empty when unset)."""
     value = megatron_cfg.get("forward_gemm_precision")
     if value is None:
@@ -813,10 +850,14 @@ def validate_config(megatron_cfg: dict[str, Any], inference_cfg: Optional[dict] 
     for key in ("fp8_cfg", "fp4_cfg"):
         cfg = megatron_cfg.get(key)
         enabled_flag = (
-            cfg.get("enabled") if isinstance(cfg, dict) else getattr(cfg, "enabled", False)
+            cfg.get("enabled")
+            if isinstance(cfg, dict)
+            else getattr(cfg, "enabled", False)
         )
         if enabled_flag:
-            errors.append(f"forward_gemm_precision='fp16' does not support {key}.enabled=true.")
+            errors.append(
+                f"forward_gemm_precision='fp16' does not support {key}.enabled=true."
+            )
     head = megatron_cfg.get("lm_head_precision")
     if head is not None and head not in HEAD_PRECISIONS:
         errors.append(

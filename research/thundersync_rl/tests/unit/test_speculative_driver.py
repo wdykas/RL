@@ -439,7 +439,11 @@ def test_tail_lookup_references_dead_suffix_then_siblings():
     s = object.__new__(SpeculativeGeneration)
     s.tail_lookup, s.tail_lookup_max_refs = True, 3
     prompt = torch.tensor([1, 2, 3])
-    flat = [(0, (prompt, 0, [5, 6, 7])), (1, (prompt, 0, [8, 9])), (2, (prompt, 0, [4]))]
+    flat = [
+        (0, (prompt, 0, [5, 6, 7])),
+        (1, (prompt, 0, [8, 9])),
+        (2, (prompt, 0, [4])),
+    ]
     s._record_siblings(flat)
     plan = Plan(seed=-1, prefix=[5, 6, 10], dead_suffix=[7])
     refs = s._lookup_references(_key(prompt), plan)

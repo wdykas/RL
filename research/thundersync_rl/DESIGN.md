@@ -558,7 +558,7 @@ fp32 compute keep 96.6% (whole drafts 95.3%), all-bf16 62–68%, so the weights 
 amplified bf16 update) are not the cause; rounding activations to bf16 is. No single site
 dominates: fp32 residual stream 73.9%; + fp32 logits 78.3%; + fp32 norms/softmax/LM head 82.0%;
 + every GEMM emitting fp32 86.8%; + fp32 inputs to attention-out / MLP-down 90.1%. LM head
-alone in fp32: 69.7%. Hysteresis rounding of the weights (`param_hysteresis_tau`, opt-in):
+alone in fp32: 69.7%. Hysteresis rounding of the weights (prototyped, removed):
 +4 pts only. Next: the same placements in Megatron (training and inference identically, BI
 preserved), starting with `fp32_residual_connection` (now passed through; BI requires it to
 match on both sides).
@@ -700,21 +700,13 @@ all-reduce give a token the same bits at every batch size whatever NCCL algorith
 TP>=3 the order of a token's partial sums may depend on which rank owns the token, i.e. on
 the token count. `scripts/bi_tp/nccl_tp_invariance.py` measures it (TP 2/3/4, reduce-scatter
 and all-reduce, plus an ordered all-to-all + fixed-rank-order fp32 sum as the reference fix).
-Measured: TP=2 invariant under every algorithm; at TP>=3 default/Ring reduce-scatter and
-all-reduce depend on the token count, NVLS and the ordered reduction do not (forcing
-`NCCL_ALGO=NVLS` process-wide broke NCCL init, so it is not the fix). Implemented
-(`nemo_rl/models/megatron/ordered_tp_reduce.py`, installed by `enable_batch_invariant_kernels`
-on training and generation workers): every floating-point SUM reduce-scatter / all-reduce on
-the TP or expert-TP group of size >= 3 runs as an all-to-all of the partial rows (same bytes per
-rank as a ring reduce-scatter) plus an ascending-rank fp32 sum rounded once; all-reduce = that
-reduce-scatter of the flattened tensor + all-gather. It patches `torch.distributed` (TE calls it
-directly) and MCore's `mappings.dist_reduce_scatter_func` alias; groups of size <= 2 keep NCCL,
-so TP=1/2 bits are unchanged. The batch-invariant token multiple is now lcm(64, 32*TP) on both
-sides (validator and MCore's inference `TOKEN_ROUNDER`, raised at TP>=3), so each rank's
-sequence-parallel norm keeps a 32-row class. CPU unit test (gloo, TP 3/4): bitwise equal to the
-rank-order fp32 sum at every token count, async handles, padding, non-SUM ops untouched. End-to-end check: `scripts/bi_tp/tp_parity.sh` (TP=1/2 on 2 + 2 GPUs of one node;
-TP=4 on 2 nodes via `tp_parity_submit.sh`), pass = mismatch 0 and exact fraction 1 every step.
-Status: unit-tested only, GPU parity not yet run.
+Measured end to end (2026-10-12, `tests/functional/check_bi_tp_logprobs.py`): the
+batch-invariant training forward of Qwen3-1.7B at TP=4 (sequence parallel), stock NCCL, gives
+bitwise identical log-probs for 16 sequences whether each sits in one micro-batch layout or
+another (different micro-batch, row, padded length and companions): 0/16 differ. The earlier
+collective-level probe (synthetic token counts) does not reflect what the model runs, and no
+ordered-reduction workaround is kept. Remaining check: training TP=4 against the engine at TP=4
+(2 nodes, `tp_parity_submit.sh`).
 
 ThunderSync under BI at TP>1: the learner's bf16 (`verify_precision=model`) scorer
 all-gathers its vocab-parallel logits before the log-softmax (same bits as training's

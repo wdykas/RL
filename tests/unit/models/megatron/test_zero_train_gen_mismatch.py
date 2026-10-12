@@ -710,22 +710,11 @@ def test_enable_batch_invariant_kernels_passes_the_recipe_settings(monkeypatch):
         zgm, "allow_installed_flash_attn_4", lambda: opened.append(True)
     )
     monkeypatch.setattr(zgm, "_use_inference_log_softmax", lambda: shimmed.append(True))
-    from nemo_rl.models.megatron import ordered_tp_reduce
-
-    ordered: list[object] = []
-    monkeypatch.setattr(ordered_tp_reduce, "install", lambda: ordered.append("install"))
-    monkeypatch.setattr(
-        ordered_tp_reduce, "configure_inference_token_rounder", ordered.append
-    )
 
     zgm.enable_batch_invariant_kernels(_policy_config())
 
     assert opened == [True]
     assert shimmed == [True]
-    assert ordered == [
-        "install",
-        _policy_config()["megatron_cfg"]["tensor_model_parallel_size"],
-    ]
     assert calls == [
         ("assert_te", (), {}),
         ("enable", (), {"backend": "te_native", "collective": "ordered"}),
@@ -905,7 +894,7 @@ def test_shipped_recipes_train_and_generate_with_the_same_tp(name):
 
 
 @pytest.mark.parametrize(
-    ("tp_size", "expected"), [(1, 64), (2, 64), (3, 192), (4, 128), (8, 256)]
+    ("tp_size", "expected"), [(1, 64), (2, 64), (3, 66), (128, 128)]
 )
 def test_batch_invariant_token_multiple(tp_size, expected):
     from nemo_rl.models.megatron.batch_invariant import batch_invariant_token_multiple

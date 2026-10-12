@@ -581,10 +581,6 @@ class MegatronConfig(TypedDict):
     flash_attention_version: NotRequired[Literal[2, 3, 4] | None]
     # flag to enable zero train/gen KL with generation.backend='megatron'.
     zero_train_gen_mismatch: NotRequired[bool]
-    # Hysteresis rounding of fp32 masters into bf16 weights (nemo_rl/models/megatron/
-    # param_hysteresis.py): a weight changes only once its master is tau ulps away.
-    # 0.5 = round-to-nearest. Requires optimizer.use_precision_aware_optimizer=false.
-    param_hysteresis_tau: NotRequired[float | None]
     # Megatron fp32 residual stream (TransformerConfig.fp32_residual_connection).
     fp32_residual_connection: NotRequired[bool]
     # Forward GEMM numerics (nemo_rl/models/megatron/fp16_gemm.py). Unset: the

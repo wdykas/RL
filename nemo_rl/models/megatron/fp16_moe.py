@@ -142,7 +142,9 @@ if HAVE_TRITON:
         up = tl.load(h_ptr + row * 2 * F + F + cols, mask=mask, other=0.0)
         p = tl.load(p_ptr + row)
         value = (gate / (1.0 + tl.exp(-gate))) * up * p
-        tl.store(out_ptr + row * F + cols, value.to(out_ptr.dtype.element_ty), mask=mask)
+        tl.store(
+            out_ptr + row * F + cols, value.to(out_ptr.dtype.element_ty), mask=mask
+        )
 
     @triton.jit
     def _unpermute_fp64_kernel(
@@ -166,10 +168,15 @@ if HAVE_TRITON:
                 pos = tl.load(inverse_map_ptr + tok_i64 * num_local_experts + lid)
                 if pos >= 0:
                     vals = tl.load(
-                        expert_out_ptr + pos.to(tl.int64) * hidden_dim + offsets, mask=mask_h
+                        expert_out_ptr + pos.to(tl.int64) * hidden_dim + offsets,
+                        mask=mask_h,
                     )
                     acc += vals.to(tl.float64)
-            tl.store(output_ptr + tok_i64 * hidden_dim + offsets, acc.to(tl.float32), mask=mask_h)
+            tl.store(
+                output_ptr + tok_i64 * hidden_dim + offsets,
+                acc.to(tl.float32),
+                mask=mask_h,
+            )
 
 
 def _weight_table(weights: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
@@ -298,7 +305,9 @@ def unpermute_fp64(
     _, hidden_dim = expert_output.shape
     num_tokens, num_local_experts = inverse_map.shape
     if out is None:
-        out = torch.empty(num_tokens, hidden_dim, dtype=torch.float32, device=expert_output.device)
+        out = torch.empty(
+            num_tokens, hidden_dim, dtype=torch.float32, device=expert_output.device
+        )
     block_h = min(triton.next_power_of_2(hidden_dim), 1024)
     grid = (num_tokens, triton.cdiv(hidden_dim, block_h))
     _unpermute_fp64_kernel[grid](
@@ -392,7 +401,9 @@ def _expert_weights(linear: Any) -> list[torch.Tensor]:
 # ---------------------------------------------------------------------------
 
 
-def training_experts_forward(module: Any, x, tokens_per_expert, permuted_probs) -> tuple:
+def training_experts_forward(
+    module: Any, x, tokens_per_expert, permuted_probs
+) -> tuple:
     """TEGroupedMLP forward (training and the training model's no-grad forwards)."""
     if isinstance(tokens_per_expert, torch.Tensor):
         tokens_per_expert = tokens_per_expert.tolist()
@@ -403,7 +414,9 @@ def training_experts_forward(module: Any, x, tokens_per_expert, permuted_probs) 
     return y, None
 
 
-def inference_experts_forward(module: Any, hidden_states, permuted_probs, routing_map) -> tuple:
+def inference_experts_forward(
+    module: Any, hidden_states, permuted_probs, routing_map
+) -> tuple:
     """InferenceGroupedMLP forward in the engine (CUDA-graph safe)."""
     from megatron.core.inference.moe.permute import permute_tokens
     from megatron.core.transformer.moe.token_dispatcher_inference import (
@@ -414,14 +427,18 @@ def inference_experts_forward(module: Any, hidden_states, permuted_probs, routin
     if not module._concatenated_weights_built:
         module._build_concatenated_weights()
         module._concatenated_weights_built = True
-    x16 = hidden_states.view(torch.float16) if hidden_states.dtype == torch.bfloat16 else (
-        hidden_states.to(torch.float16)
+    x16 = (
+        hidden_states.view(torch.float16)
+        if hidden_states.dtype == torch.bfloat16
+        else (hidden_states.to(torch.float16))
     )
     valid_tokens = InferenceAllGatherDispatcherBase._valid_tokens()
     local_expert_start = module.ep_group.rank() * module.num_local_experts
     # Expected rows per local expert: tokens x top-k spread over every expert.
     topk = routing_map.shape[1]
-    rows_per_expert = x16.shape[0] * topk / (module.num_local_experts * module.ep_group.size())
+    rows_per_expert = (
+        x16.shape[0] * topk / (module.num_local_experts * module.ep_group.size())
+    )
     cfg = select_config(rows_per_expert)
     xp, pp, _pmap, offs, inverse_map = permute_tokens(
         x16,

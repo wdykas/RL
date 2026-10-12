@@ -64,7 +64,10 @@ def test_fp16_linear_forward_matches_gemm_and_backward_is_bf16():
     assert x.grad.dtype == torch.float32 and w.grad.dtype == torch.bfloat16
     g_b = g.reshape(-1, 16).to(torch.bfloat16).float()
     dx = (g_b @ w.detach().float()).view_as(x)
-    dw = g_b.t() @ x.detach().reshape(-1, 32).to(torch.float16).to(torch.bfloat16).float()
+    dw = (
+        g_b.t()
+        @ x.detach().reshape(-1, 32).to(torch.float16).to(torch.bfloat16).float()
+    )
     torch.testing.assert_close(x.grad, dx)
     torch.testing.assert_close(w.grad.float(), dw.to(torch.bfloat16).float())
 
@@ -183,13 +186,22 @@ def test_validate_config():
         for e in fg.validate_config(_cfg(), _cfg(forward_gemm_precision=None))
     )
     assert fg.validate_config(_cfg(gradient_accumulation_fusion=True))
-    assert fg.validate_config(_cfg(pipeline_model_parallel_size=2, pipeline_dtype="bfloat16"))
-    assert not fg.validate_config(_cfg(pipeline_model_parallel_size=2, pipeline_dtype="float32"))
+    assert fg.validate_config(
+        _cfg(pipeline_model_parallel_size=2, pipeline_dtype="bfloat16")
+    )
+    assert not fg.validate_config(
+        _cfg(pipeline_model_parallel_size=2, pipeline_dtype="float32")
+    )
     assert fg.validate_config(_cfg(fp8_cfg={"enabled": True}))
     assert fg.validate_config(_cfg(lm_head_precision="bf16"))
     assert fg.validate_config({"lm_head_precision": "fp32"})
     assert fg.validate_config(_cfg(lm_head_precision="fp32"), _cfg()) != []
-    assert fg.validate_config(_cfg(lm_head_precision="fp32"), _cfg(lm_head_precision="fp32")) == []
+    assert (
+        fg.validate_config(
+            _cfg(lm_head_precision="fp32"), _cfg(lm_head_precision="fp32")
+        )
+        == []
+    )
 
 
 def test_validate_model_rejects_moe():
