@@ -1302,6 +1302,15 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         replicated on every TP rank. TP rank 0 alone logs them (one device-to-
         host copy per forward, no extra collective). Without it the head input
         is sequence-sharded; that layout is unsupported (False).
+
+        Pipeline parallelism: the output layer exists only on the engine's last
+        stage, which computes the logits (the controller then broadcasts them
+        to the other stages for sampling), so the hook is installed there; the
+        dynamic engine's requests, with their sampling params, reach every
+        model-parallel rank, so the last stage sees the tags. Other stages
+        return None. Expert parallelism: each engine replica logs the drafts
+        it runs; an expert-parallel dummy step has no requests and logs
+        nothing.
         """
         from megatron.core import parallel_state as ps
         from thundersync_rl.engine_q import HIDDEN_KEY_ATTR, HiddenLog, step_rows
@@ -1397,9 +1406,17 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         return out
 
     def _lm_head(self):
-        """(output layer, live head weight, logit scaling or None) of the training model."""
+        """(output layer, live head weight, logit scaling or None) of the training model.
+
+        None off the last pipeline stage: Megatron builds the output layer only
+        there (under tied embeddings the last stage keeps its own copy of the
+        embedding weight as the output weight, synchronized by the embedding
+        group, which ``shared_embedding_or_output_weight`` returns).
+        """
         gpt = _unwrap(self.model)
-        layer = gpt.output_layer
+        layer = getattr(gpt, "output_layer", None)
+        if layer is None or not getattr(gpt, "post_process", True):
+            return None
         weight = (
             gpt.shared_embedding_or_output_weight()
             if getattr(gpt, "share_embeddings_and_output_weights", False)
@@ -1414,8 +1431,13 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         The live weight is this rank's vocab-parallel shard (V/TP x d; under
         tied embeddings the embedding's shard, same vocabulary split), so each
         tensor-parallel rank keeps 1/TP of the head per pending version.
+        Pipeline parallelism: only the last stage holds the head and verifies;
+        other stages stash nothing and return 0.
         """
-        _, weight, _ = self._lm_head()
+        head = self._lm_head()
+        if head is None:
+            return 0
+        _, weight, _ = head
         if not hasattr(self, "_head_stash"):
             self._head_stash: dict[int, torch.Tensor] = {}
         self._head_stash[version] = weight.detach().clone()
@@ -1471,7 +1493,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
 
         layer, _, scale = self._lm_head()
         w = self._head_stash[version]
-        h = hidden.to(device="cuda", dtype=w.dtype)
+        h = hidden.to(device=w.device, dtype=w.dtype)
         sp = getattr(layer, "sequence_parallel", False)
         if sp:
             # The rows are full (not sequence-sharded), as in the engine.
@@ -1502,7 +1524,8 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         """Block verification with q from the engine and p from the training model.
 
         Requires batch-invariant kernels (the engine's decode is the training
-        forward) and the same tensor parallelism as the engine. Per draft i:
+        forward) and the same parallel layout as the engine (TP, PP, EP; batch
+        invariance enforces it). Per draft i:
         p = log-softmax of the training model's forward of ``rows[i]`` at the
         current weights (a training-shaped forward, as
         ``verify_drafts_block_fused`` runs it, without autograd; at TP>1 its
@@ -1521,6 +1544,22 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         seed and bitwise the same gathered p and q rows, so the lazy scans
         take the same decisions and call the row gathers in lockstep.
 
+        Pipeline parallelism: every stage of a replica runs the same rows'
+        forwards through the forward-only pipeline schedule
+        (``_training_forward``); only the last stage holds logits (and the LM
+        head and its stashes), so it alone runs the lazy scans and returns the
+        results. Other stages return [] (the driver merges all ranks' rows).
+
+        Expert parallelism: each training forward runs all-to-alls over the
+        expert-parallel group, which spans data-parallel replicas with
+        different row counts. The group agrees on the largest count
+        (``_expert_parallel_lockstep`` with empty version plans: q needs no
+        forward here) and short ranks pad with one-row dummy forwards
+        (``_dummy_training_forward``, output discarded). The q rows (LM head
+        only) and the lazy scan's vocab gathers involve no experts and only
+        the tensor-parallel group, i.e. ranks of one replica that verify the
+        same rows in the same order, so they need no lockstep across replicas.
+
         ``THUNDERSYNC_ENGINE_Q_CHECK=1``: also rebuild every q row of each draft
         and print how many drafted tokens' log q match the engine bitwise and
         the largest difference (expected: all, 0).
@@ -1532,26 +1571,38 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             raise RuntimeError(
                 "verify_source='engine' requires policy.megatron_cfg.batch_invariant_mode"
             )
-        if ps.get_pipeline_model_parallel_world_size() != 1:
-            raise RuntimeError(
-                "verify_source='engine' requires pipeline parallel size 1"
-            )
+        self._check_dropless_moe()
         tp = ps.get_tensor_model_parallel_world_size()
-        gather = self._tp_vocab_gather()
+        last_stage = (
+            ps.get_pipeline_model_parallel_world_size() == 1
+            or ps.is_pipeline_last_stage(ignore_virtual=True)
+        )
+        gather = self._tp_vocab_gather() if last_stage else None
         self._prof = {}
         t_all = time.perf_counter()
-        gen = torch.Generator(device="cuda").manual_seed(
-            seed * 1_000_003 + ps.get_data_parallel_rank()
-        )
+        gen = None  # created on the logits' device (last stage only)
         check = os.environ.get("THUNDERSYNC_ENGINE_Q_CHECK") == "1"
         chk_max, chk_tok, chk_exact = 0.0, 0, 0
         results = []
         n_rows = 0
-        for i in self._my_rows(rows, keys):
+        mine = self._my_rows(rows, keys)
+        lockstep = self._expert_parallel_lockstep([[] for _ in mine])
+        n_dummy = 0 if lockstep is None else len(lockstep) - len(mine)
+        for i in mine:
             n, plen = rows[i].numel(), prompt_lens[i]
             g = n - plen
             t0 = time.perf_counter()
             logits = self._training_forward(rows[i])
+            self._prof["forward"] = (
+                self._prof.get("forward", 0.0) + time.perf_counter() - t0
+            )
+            if logits is None:  # not the last pipeline stage
+                continue
+            dev = logits.device
+            if gen is None:
+                gen = torch.Generator(device=dev).manual_seed(
+                    seed * 1_000_003 + ps.get_data_parallel_rank()
+                )
             if tp == 1:
                 # Log-probs exactly as training computes them (fp32 log-softmax).
                 p_lp = torch.log_softmax(
@@ -1562,11 +1613,8 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 # invariant training's gathered log-softmax computes them.
                 p_lp = GatheredLogprobRows(logits[0, plen - 1 : n], gather, vocab_limit)
             del logits
-            self._prof["forward"] = (
-                self._prof.get("forward", 0.0) + time.perf_counter() - t0
-            )
-            draft = rows[i][plen:].cuda()
-            lq = torch.tensor(engine_logq[i], dtype=torch.float32, device="cuda")
+            draft = rows[i][plen:].to(dev)
+            lq = torch.tensor(engine_logq[i], dtype=torch.float32, device=dev)
             assert lq.numel() == g, (lq.numel(), g)
             h = hidden[i]
             assert h.shape[0] == g, (tuple(h.shape), g)
@@ -1591,7 +1639,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             if check:
                 for a in range(0, g, 512):
                     idx = torch.arange(a, min(g, a + 512))
-                    rec = q_rows(idx).gather(-1, draft[idx.cuda()].view(-1, 1))[:, 0]
+                    rec = q_rows(idx).gather(-1, draft[idx.to(dev)].view(-1, 1))[:, 0]
                     d = (rec - lq[a : a + idx.numel()]).abs()
                     chk_max = max(chk_max, float(d.max()))
                     chk_exact += int((d == 0).sum())
@@ -1608,9 +1656,13 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 )
             )
             del p_lp
+        for _ in range(n_dummy):
+            # Expert parallelism: out of rows, join the other replicas' forwards.
+            self._dummy_training_forward()
+        self._prof["ep_dummy_forwards"] = n_dummy
         self._prof["q_rows"] = n_rows
         self._log_mem("verify_drafts_block_engine")
-        if check:
+        if check and last_stage:
             print(
                 f"[engine q check] rank={self.rank} rows={len(results)} tok={chk_tok} "
                 f"exact={chk_exact} max|dlogq|={chk_max:.3e}",
@@ -1624,6 +1676,30 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 flush=True,
             )
         return results
+
+    def _check_dropless_moe(self) -> None:
+        """Raise if MoE layers drop tokens (expert capacity factor set).
+
+        With a capacity factor, whether a token reaches its experts depends on
+        every other token routed to them in the same forward (other rows, other
+        expert-parallel ranks' rows, lockstep dummies), so p of a row is not a
+        function of the row and its weights: verification against it is not
+        exact. Dropless MoE (capacity factor None, Megatron's default) only.
+        """
+        from megatron.core.utils import get_model_config
+
+        try:
+            config = get_model_config(self.model)
+        except (AttributeError, RuntimeError):  # no Megatron config (fakes)
+            return
+        if getattr(config, "num_moe_experts", None) and (
+            getattr(config, "moe_expert_capacity_factor", None) is not None
+        ):
+            raise RuntimeError(
+                "verify_source='engine' requires dropless MoE "
+                "(moe_expert_capacity_factor=None): token dropping makes a "
+                "row's p depend on the other tokens in its forward"
+            )
 
     # ---- Fused verification + training (batch-invariant kernels; fused_train.py) ----
 
@@ -1655,20 +1731,27 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 "fused verification + training unsupported: " + "; ".join(problems)
             )
 
-    def _training_forward(self, row: torch.Tensor) -> torch.Tensor:
+    def _training_forward(self, row: torch.Tensor) -> torch.Tensor | None:
         """Logits [1, S, V] of one row, computed exactly as a training forward.
 
         Same padding (``make_sequence_length_divisible_by``), micro-batch
         processing and ``model_forward`` call as ``train_microbatch``; autograd
         follows the caller's grad mode.
+
+        Pipeline parallelism: the same forward through Megatron's pipeline
+        schedule, forward-only (``_pipeline_forward_only``), as training runs
+        each micro-batch. Every stage must call it for the same row; the last
+        stage returns the logits (vocab-parallel at TP>1), the others None.
         """
+        from megatron.core import parallel_state as ps
+
         m = self.cfg["make_sequence_length_divisible_by"]
         n = row.numel()
         ids = torch.zeros((1, -(-n // m) * m), dtype=torch.long)
         ids[0, :n] = row
         data = BatchedDataDict({"input_ids": ids, "input_lengths": torch.tensor([n])})
         attach_media_token_validity_mask(data, self.media_placeholder_token_id)
-        iterator, *_ = get_microbatch_iterator(
+        iterator, _, _, _, padded_seq_length = get_microbatch_iterator(
             data,
             self.cfg,
             1,
@@ -1679,21 +1762,85 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             mtp_enabled=self.mtp_enabled,
         )
         mb = next(iterator)
-        return megatron_train.model_forward(
-            model=self.model,
-            data_dict=mb.data_dict,
-            input_ids_cp_sharded=mb.input_ids_cp_sharded,
-            position_ids=mb.position_ids,
-            attention_mask=mb.attention_mask,
-            packed_seq_params=mb.packed_seq_params,
-            defer_fp32_logits=self.defer_fp32_logits,
-            mtp_loss_mask=mb.mtp_loss_mask,
-            padding_mask=mb.padding_mask,
-            straggler_timer=self.mcore_state.straggler_timer,
-            use_fused_linear_logprobs=False,
-            media_token_validity_mask=mb.media_token_validity_mask,
-            model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
-        )
+
+        def forward(model):
+            return megatron_train.model_forward(
+                model=model,
+                data_dict=mb.data_dict,
+                input_ids_cp_sharded=mb.input_ids_cp_sharded,
+                position_ids=mb.position_ids,
+                attention_mask=mb.attention_mask,
+                packed_seq_params=mb.packed_seq_params,
+                defer_fp32_logits=self.defer_fp32_logits,
+                mtp_loss_mask=mb.mtp_loss_mask,
+                padding_mask=mb.padding_mask,
+                straggler_timer=self.mcore_state.straggler_timer,
+                use_fused_linear_logprobs=False,
+                media_token_validity_mask=mb.media_token_validity_mask,
+                model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
+            )
+
+        if ps.get_pipeline_model_parallel_world_size() == 1:
+            return forward(self.model)
+        return self._pipeline_forward_only(forward, padded_seq_length)
+
+    def _pipeline_forward_only(self, forward, seq_length: int) -> torch.Tensor | None:
+        """``forward(model)`` of one micro-batch through the pipeline schedule.
+
+        Megatron's ``get_forward_backward_func`` with ``forward_only=True`` and
+        ``collect_non_loss_data=True`` (one micro-batch of size 1, sequence
+        length ``seq_length`` as training passes it): each stage runs its layers
+        on the activations received from the previous stage, and the last stage
+        collects the output (logits). Returns them on the last stage, None on
+        the others. No autograd: a graph across stages would need the backward
+        schedule. The DDP ``no_sync`` hook is bypassed for the call (the
+        forward-only schedule enters it without leaving it, and verification
+        must not change gradient-sync state mid-step).
+        """
+        from megatron.core import parallel_state as ps
+        from megatron.core.pipeline_parallel import get_forward_backward_func
+        from megatron.core.utils import get_model_config
+
+        if torch.is_grad_enabled():
+            raise NotImplementedError(
+                "autograd through a pipeline-parallel verification forward is "
+                "not implemented (it needs the backward schedule)"
+            )
+
+        def step(data_iterator, model):
+            next(data_iterator)
+            return forward(model), lambda out, non_loss_data=True: out.detach()
+
+        config = get_model_config(self.model)
+        no_sync = config.no_sync_func
+        config.no_sync_func = None
+        try:
+            out = get_forward_backward_func()(
+                forward_step_func=step,
+                data_iterator=iter([None]),
+                model=self.model,
+                num_microbatches=1,
+                seq_length=seq_length,
+                micro_batch_size=1,
+                decoder_seq_length=seq_length,
+                forward_only=True,
+                collect_non_loss_data=True,
+            )
+        finally:
+            config.no_sync_func = no_sync
+        if not ps.is_pipeline_last_stage(ignore_virtual=True):
+            return None
+        return out[0]
+
+    def _dummy_training_forward(self) -> None:
+        """One-row training forward whose output is discarded (EP lockstep filler).
+
+        A single token padded to ``make_sequence_length_divisible_by`` (a
+        multiple of TP, so sequence parallelism splits it evenly), no autograd,
+        through the pipeline schedule at PP>1: it joins the expert-parallel
+        group's all-to-alls like a real row.
+        """
+        self._training_forward(torch.zeros(1, dtype=torch.long))
 
     def verify_drafts_block_fused(
         self,

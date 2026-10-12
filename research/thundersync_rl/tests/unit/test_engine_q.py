@@ -279,21 +279,21 @@ def _engine_worker(monkeypatch):
     return w, emb, heads
 
 
-def _engine_drafts(emb, heads, n=20, seed=1):
+def _engine_drafts(emb, heads, n=20, seed=1, device="cuda", key_names=None):
     """Drafts sampled 'by the engine' from versions 0/1, with its log q and hidden."""
-    gen = torch.Generator(device="cuda").manual_seed(seed)
+    gen = torch.Generator(device=device).manual_seed(seed)
     rows, plens, segs, lqs, hids, keys = [], [], [], [], [], []
     for i in range(n):
         plen = 2 + i % 3
         g = [0, 1, 4, 9, 15][i % 5]
         cut = g // 2 if i % 2 else g
-        ids = torch.randint(0, V, (plen,), device="cuda", generator=gen)
+        ids = torch.randint(0, V, (plen,), device=device, generator=gen)
         lq, hs = [], []
         for t in range(g):
             v = 0 if t < cut else 1
             h = _hidden(ids, emb)[-1]
             # The engine's forward: a batch of 5 rows, this request's in row 3.
-            batch = torch.randn(5, D, device="cuda", generator=gen)
+            batch = torch.randn(5, D, device=device, generator=gen)
             batch[3] = h
             lp = torch.log_softmax(_logits(batch, heads[v]).float(), -1)[3]
             x = torch.multinomial(lp.exp(), 1, generator=gen)
@@ -305,7 +305,7 @@ def _engine_drafts(emb, heads, n=20, seed=1):
         segs.append([(0, 0, cut), (1, cut, g)])
         lqs.append(lq)
         hids.append(torch.stack(hs) if hs else torch.empty(0, 0))
-        keys.append(f"k{i}")
+        keys.append(f"k{i}" if key_names is None else key_names[i])
     return rows, plens, segs, lqs, hids, keys
 
 
@@ -849,8 +849,21 @@ def _tp_gen(tp, **mcore):
         ({"verify_on": "inference"}, _policy(), "verify_on"),
         ({"fused_verify_train": True}, _policy(), "fused_verify_train"),
         ({}, _policy(batch_invariant_mode=False), "batch_invariant_mode"),
-        ({}, _policy(pipeline_model_parallel_size=2), "pipeline"),
-        ({}, _policy(expert_model_parallel_size=2), "expert_model_parallel"),
+        (
+            {},
+            _policy(virtual_pipeline_model_parallel_size=2),
+            "virtual_pipeline_model_parallel_size > 1 is not implemented",
+        ),
+        (
+            {},
+            _gen(pipeline_model_parallel_size=2),
+            r"pipeline_model_parallel_size \(2\) must equal",
+        ),
+        (
+            {},
+            _gen(expert_model_parallel_size=2),
+            r"expert_model_parallel_size \(2\) must equal",
+        ),
         ({}, _gen(num_speculative_tokens=2), "num_speculative_tokens"),
         ({}, _gen(logprobs_mode="processed_logprobs"), "logprobs_mode"),
         ({}, _gen(tensor_model_parallel_size=2), "tensor_model_parallel_size"),
