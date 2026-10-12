@@ -1216,10 +1216,32 @@ whole): every step mismatch 0 / exact_token_frac 1, engine-q checks exact, 0 dro
 
 Bug found on the way: MCore `BatchInvariantRMSNormFn.backward` multiplies its second dx
 term by the norm weight once more (exact only for w = 1); with Qwen3's q/k norm weights the
-gradient norm was ~100x too large (RL grad_norm 15-28, then NaN). Not built yet: MoE expert
-GEMMs (training TE grouped GEMM and the engine's fused-MoE Triton path need a shared
-fp16-in / fp32-out batch-invariant grouped GEMM, fp32 activation-with-probs and fp32
-combine); models with MoE are rejected.
+gradient norm was ~100x too large (RL grad_norm 15-28, then NaN).
+
+**MoE** (`nemo_rl/models/megatron/fp16_moe.py`). Training `TEGroupedMLP` and the engine's
+`InferenceGroupedMLP` run one Triton grouped GEMM: rows grouped by expert, each expert's
+rows padded to 64, fixed 64x128x64 tiles, fp16 x fp16 products accumulated and emitted in
+fp32, the bf16 expert weights read in place (converted to fp16 in registers). A row's result
+depends only on the row and its expert (batch invariant; checked bitwise across batch
+layouts, and under CUDA-graph replay). SwiGLU-with-probs in fp32 (same eager ops on both
+sides). Router logits fp32 through the exact fp32 GEMM. Combine: the engine sums a token's
+local experts in fp64 in ascending expert order and rounds the rank partial to fp32 (as
+Megatron's batch-invariant training unpermute), then MCore's `ordered_reduce_scatter_v`
+(fp32, rank order; the bf16 cast after it is dropped). The engine all-gathers fp16 token
+rows bit-cast through MCore's bf16 NVLS buffers (a copy); training dispatches fp32 rows.
+Backward per expert on bf16 casts. Tiny Qwen3-MoE (8 experts, top-2): grad norm 0.177897
+vs fp32 reference 0.177899 (bf16 baseline 0.178224). EP=2, 4 steps, checks on: mismatch 0,
+engine-q exact, 0 dropped; the random tiny model gets reward 0, so no weight changes and
+both this run and the bf16 control keep 100% (acceptance is not measurable on it). The
+engine's MoE step is 2-4x slower than the bf16 vLLM kernel at decode (64-row expert
+padding, untuned kernel, fp64 combine): drafts are shorter within the same window.
+Qwen3-30B-A3B at EP=2 on 2 + 2 GPUs does not fit (about 15B parameters per training GPU
+with bf16 weights, fp32 grads, masters and Adam state: ~270 GB).
+
+Known gaps: engine PP>1 (Megatron's inference wrapper casts last-stage logits to
+params_dtype before broadcasting them; training PP>1 with engine PP=1 is fine); MoE with
+shared experts, expert TP, latent MoE, NCCL inference dispatcher at EP>=3 (its reduce-scatter
+order is NCCL's; NVLS ordered is used by default); TP>=3 untested.
 
 ## 15. Open work
 
