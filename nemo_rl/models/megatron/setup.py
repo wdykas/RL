@@ -302,6 +302,7 @@ from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.generation.megatron.config import (
     dedicated_inference_megatron_cfg,
+    merged_inference_megatron_cfg,
 )
 from nemo_rl.models.megatron.community_import import (
     import_model_from_hf_name,
@@ -388,6 +389,28 @@ def enable_batch_invariant_mode(config: PolicyConfig) -> None:
     validate_zero_train_gen_kl(config, check_environment=True)
     if config["megatron_cfg"].get("batch_invariant_mode"):
         enable_batch_invariant_kernels(config)
+    _validate_forward_gemm_precision(config)
+
+
+def _validate_forward_gemm_precision(config: PolicyConfig) -> None:
+    """Raise on an invalid ``forward_gemm_precision`` setup (no-op when unset)."""
+    from nemo_rl.models.megatron import fp16_gemm
+
+    megatron_cfg = config["megatron_cfg"]
+    inference_cfg = None
+    generation = config.get("generation")
+    if generation is not None and generation.get("backend") == "megatron":
+        inference_cfg = merged_inference_megatron_cfg(config)
+    errors = fp16_gemm.validate_config(megatron_cfg, inference_cfg)
+    if megatron_cfg.get("forward_gemm_precision") is not None and (
+        generation is not None and generation.get("backend") != "megatron"
+    ):
+        errors.append(
+            "forward_gemm_precision requires policy.generation.backend='megatron' "
+            "(other engines do not run the fp16 GEMM forward)."
+        )
+    if errors:
+        raise ValueError("\n".join(errors))
 
 
 def destroy_parallel_state():
@@ -1097,6 +1120,10 @@ def setup_model_config(
     _validate_training_config(config, model_cfg)
 
     validate_zero_train_gen_model_provider(config, model_cfg)
+    if config["megatron_cfg"].get("forward_gemm_precision") is not None:
+        from nemo_rl.models.megatron import fp16_gemm
+
+        fp16_gemm.validate_model(model_cfg)
 
     # Create final megatron config
     megatron_cfg = _create_megatron_config(

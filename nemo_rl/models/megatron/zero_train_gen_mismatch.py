@@ -250,6 +250,7 @@ def validate_batch_invariant_mode(config: PolicyConfig) -> ZeroTrainGenValidatio
             "attention_backend",
             "flash_attention_version",
             "fp32_residual_connection",
+            "forward_gemm_precision",
         )
         mismatched_fields = [
             field
