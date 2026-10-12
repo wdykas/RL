@@ -411,3 +411,23 @@ def test_verification_seeds_never_repeat_across_calls_and_steps():
     for _ in range(5):  # steps, chunked verification on two pools
         asyncio.run(s.verify_chunked(_drafts(16), chunks=4))
     assert len(seeds) == len(set(seeds)) > 10
+
+
+def test_draft_age_stats_are_token_weighted_per_drafting_version():
+    from thundersync_rl.speculative import SpeculativeGeneration
+
+    s = object.__new__(SpeculativeGeneration)
+    s.current_step, s.stats = 10, {}
+    tok, kept = {}, {}
+    # Tokens 0-99 drafted at version 9 (age 1), 100-299 at version 7 (age 3);
+    # 150 tokens accepted: all of age 1, 50 of age 3.
+    draft = (None, 0, [0] * 300, True, "k", [(9, 0, 100), (7, 100, 300)])
+    s._count_ages(draft, 150, tok, kept)
+    # A second draft at version 4 counts as age 4+; nothing accepted.
+    s._count_ages((None, 0, [0] * 50, True, "k2", [(4, 0, 50)]), 0, tok, kept)
+    s._age_stats(tok, kept)
+    assert s.stats["spec/age1_token_frac"] == 100 / 350
+    assert s.stats["spec/age1_accepted_frac"] == 1.0
+    assert s.stats["spec/age3_accepted_frac"] == 50 / 200
+    assert s.stats["spec/age4+_token_frac"] == 50 / 350
+    assert s.stats["spec/age4+_accepted_frac"] == 0.0
