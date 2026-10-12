@@ -396,7 +396,7 @@ class SpeculativeGeneration:
         def collect():
             res = [_drafted(x) for x in self._collect_drafts(rank0)]
             hid = self._pop_hidden(hkeys, [len(x[0]) for x in res])
-            res = [_truncate_to_rows(x, h) for x, h in zip(res, hid)]
+            res = [self._truncate(x, h) for x, h in zip(res, hid)]
             return [
                 [
                     (
@@ -483,6 +483,18 @@ class SpeculativeGeneration:
         self._count_hidden("spec/hidden_bytes_logged", sum(map(hidden_nbytes, out)))
         return out
 
+    def _truncate(self, drafted, hidden):
+        """``_truncate_to_rows``, counting truncated drafts / tokens in the stats."""
+        out = _truncate_to_rows(drafted, hidden)
+        cut = len(drafted[0]) - len(out[0])
+        if cut:
+            for name, v in (
+                ("spec/hidden_truncated_drafts", 1.0),
+                ("spec/hidden_truncated_tokens", float(cut)),
+            ):
+                self.stats[name] = self.stats.get(name, 0.0) + v
+        return out
+
     def _count_hidden(self, name: str, nbytes: int) -> None:
         if self.verify_source == "engine":
             self.stats[name] = self.stats.get(name, 0.0) + float(nbytes)
@@ -566,7 +578,7 @@ class SpeculativeGeneration:
             res = self._collect_drafts(rank0) if live else []
             hid = self._pop_hidden(hkeys, [len(_drafted(x)[0]) for x in res])
             for d, x, h in zip(live, res, hid):
-                toks, done, lps = _truncate_to_rows(_drafted(x), h)
+                toks, done, lps = self._truncate(_drafted(x), h)
                 if d.get("hidden") is not None and h is not None:
                     d["hidden"].append(h)
                 else:
