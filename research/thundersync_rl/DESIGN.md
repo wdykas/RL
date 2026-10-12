@@ -705,9 +705,27 @@ stashes, retained graphs and training state on TP=1 GPUs); it fits with
 `draft_lookahead=1 verify_batch_tokens=4096 fused_max_retained_tokens=8192`, keeping 66-68%
 of draft tokens, but only about one trajectory per step finishes whole and gets fused.
 
-**Engine-sourced q** (`thundersync.verify_source=engine`, `engine_q.py`). *Opt-in; CPU and
-short GPU unit tests pass (TP 1/2/4, PP 2, EP 2 and their combinations with fake process
-groups), not yet run end to end.* The
+**Engine-sourced q** (`thundersync.verify_source=engine`, `engine_q.py`). *Opt-in. Exact end
+to end on GPU at TP=1 (Qwen3-1.7B, BI, 4 steps: every `[engine q check]` exact, train/generation
+mismatch 0, no dropped drafts, 40% of draft tokens kept — the exact-bf16 rate); TP 2, EP 2
+and PP 2 are unit-tested (fake process groups), GPU runs in progress.*
+
+Getting the engine-side capture right on a real engine took four fixes, each found on GPU:
+(1) decode steps replay CUDA graphs, which skip Python hooks, so the LM-head pre-hook only
+copies rows into a static buffer, and the copy must be registered *before* the graphs are
+recaptured; (2) rows are keyed by token index relative to the request's original prompt
+(an evicted request resumes as a new record whose generated tokens restart at 0); (3) in
+~2% of decode graph replays one row of the buffer is stale — every logged row is checked at
+the source against the logit of the token the engine sampled from it (one dot product per
+row) and stale rows are not recorded; the draft is truncated at its first missing row (any
+prefix of a draft is a valid draft); (4) **Megatron's streamed partial frames skip tokens
+after an eviction** (`DynamicInferenceEngine._try_send_streaming_partials` keeps an emitted-
+length counter per request id that survives the record reset), so unfinished drafts
+assembled from frames were not the sequences the engine generated — in every verification
+mode, not only engine-q. Draft content is now read from each engine's merged request record
+(`record.merge()`, as the engine's own final reply does) when the drafts are collected.
+
+The
 default verifier needs an fp32 copy of the model (4 B/param) plus a bf16 whole-model stash
 per pending version (2 B/param each): about 82 GB on each learner GPU at 8B with three
 pending versions at TP=1, impossible at 70B. Under BI neither is needed. The engine's decode
