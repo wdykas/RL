@@ -20,7 +20,7 @@ thundersync:
   draft_budget: 4096  # max new tokens per draft
   draft_start_frac: 0.0  # start drafting at this fraction of finished rollouts
   draft_lookahead: 3  # iterations drafted concurrently; cut drafts resume next iteration
-  verify_mode: block  # block (~99% tokens kept) | keyed (exactly on-policy, ~55% kept)
+  verify_mode: block  # block (max expected kept prefix) | keyed (shared-randomness; reproduces plain decoding). Both exact with verify_source=engine under batch invariance
   verify_precision: fp32  # fp32 Megatron scorer copy | model (training dtypes, ~90% kept)
   verify_lazy: false  # lazy, logit-free block verification (same decisions; A/B pending)
   verify_on: both  # learner | inference | both: worker groups that verify
