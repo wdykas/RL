@@ -710,11 +710,22 @@ def test_enable_batch_invariant_kernels_passes_the_recipe_settings(monkeypatch):
         zgm, "allow_installed_flash_attn_4", lambda: opened.append(True)
     )
     monkeypatch.setattr(zgm, "_use_inference_log_softmax", lambda: shimmed.append(True))
+    from nemo_rl.models.megatron import ordered_tp_reduce
+
+    ordered: list[object] = []
+    monkeypatch.setattr(ordered_tp_reduce, "install", lambda: ordered.append("install"))
+    monkeypatch.setattr(
+        ordered_tp_reduce, "configure_inference_token_rounder", ordered.append
+    )
 
     zgm.enable_batch_invariant_kernels(_policy_config())
 
     assert opened == [True]
     assert shimmed == [True]
+    assert ordered == [
+        "install",
+        _policy_config()["megatron_cfg"]["tensor_model_parallel_size"],
+    ]
     assert calls == [
         ("assert_te", (), {}),
         ("enable", (), {"backend": "te_native", "collective": "ordered"}),
