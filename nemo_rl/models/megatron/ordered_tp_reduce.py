@@ -62,6 +62,7 @@ class _DoneWork:
 
 
 def _ordered_groups() -> list:
+    """TP and expert-TP groups of size >= 3 (empty before Megatron initializes them)."""
     from megatron.core import parallel_state
 
     groups = []
@@ -69,13 +70,17 @@ def _ordered_groups() -> list:
         parallel_state.get_tensor_model_parallel_group,
         parallel_state.get_expert_tensor_parallel_group,
     ):
-        try:
-            group = get(check_initialized=False)
-        except Exception:  # noqa: BLE001 - not initialized yet
-            group = None
+        group = get(check_initialized=False)
         if group is not None and dist.get_world_size(group) >= 3:
             groups.append(group)
     return groups
+
+
+# id(group) -> (group, whether it spans the same ranks as a TP / expert-TP
+# group). Ranks, not identity: a model may hold its own handle to the TP ranks.
+# Holding the group keeps its id from being reused.
+_MATCH: dict[int, tuple[Any, bool]] = {}
+_REPORTED: set[tuple[int, ...]] = set()
 
 
 def _is_sum(op: Any) -> bool:
@@ -85,7 +90,22 @@ def _is_sum(op: Any) -> bool:
 def _use_ordered(tensor: torch.Tensor, op: Any, group: Any) -> bool:
     if group is None or not tensor.is_floating_point() or not _is_sum(op):
         return False
-    return any(group is g for g in _ordered_groups())
+    cached = _MATCH.get(id(group))
+    if cached is not None and cached[0] is group:
+        return cached[1]
+    tp_ranks = [dist.get_process_group_ranks(g) for g in _ordered_groups()]
+    if not tp_ranks:
+        return False  # not initialized yet: decide again on a later call
+    ranks = dist.get_process_group_ranks(group)
+    match = ranks in tp_ranks
+    _MATCH[id(group)] = (group, match)
+    if match and tuple(ranks) not in _REPORTED:
+        _REPORTED.add(tuple(ranks))
+        print(
+            f"[ordered_tp_reduce] ordered SUM reductions on ranks {ranks}",
+            flush=True,
+        )
+    return match
 
 
 def ordered_reduce_scatter(
@@ -120,7 +140,9 @@ def ordered_all_reduce(tensor: torch.Tensor, group: Any) -> None:
     tensor.copy_(padded[: flat.numel()].view_as(tensor))
 
 
-def _reduce_scatter_tensor(output, input, op=dist.ReduceOp.SUM, group=None, async_op=False):  # noqa: A002
+def _reduce_scatter_tensor(
+    output, input, op=dist.ReduceOp.SUM, group=None, async_op=False
+):  # noqa: A002
     if not _use_ordered(input, op, group):
         return _ORIG["reduce_scatter_tensor"](
             output, input, op=op, group=group, async_op=async_op
@@ -129,7 +151,9 @@ def _reduce_scatter_tensor(output, input, op=dist.ReduceOp.SUM, group=None, asyn
     return _DoneWork() if async_op else None
 
 
-def _reduce_scatter_base(output, input, op=dist.ReduceOp.SUM, group=None, async_op=False):  # noqa: A002
+def _reduce_scatter_base(
+    output, input, op=dist.ReduceOp.SUM, group=None, async_op=False
+):  # noqa: A002
     if not _use_ordered(input, op, group):
         return _ORIG["_reduce_scatter_base"](
             output, input, op=op, group=group, async_op=async_op

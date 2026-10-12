@@ -75,12 +75,10 @@ def _worker(rank: int, world: int, port: int, errors) -> None:
             dist.all_reduce(t, group=group)
             assert torch.equal(t, ref[:tokens]), tokens
 
-        # Non-sum ops and other groups keep the original collective.
+        # Non-sum ops keep the original collective.
         t = mine[:2].float().clone()
         dist.all_reduce(t, op=dist.ReduceOp.MAX, group=group)
         assert torch.equal(t, parts[:, :2].float().amax(0))
-        t = mine[:2].clone()
-        dist.all_reduce(t)  # default group, not registered
         dist.destroy_process_group()
     except Exception as e:  # noqa: BLE001
         errors.put(f"rank {rank}: {type(e).__name__}: {e}")
@@ -93,8 +91,7 @@ def test_ordered_reductions_are_rank_order_sums(world):
     errors = ctx.Queue()
     port = _free_port()
     procs = [
-        ctx.Process(target=_worker, args=(r, world, port, errors))
-        for r in range(world)
+        ctx.Process(target=_worker, args=(r, world, port, errors)) for r in range(world)
     ]
     for p in procs:
         p.start()
