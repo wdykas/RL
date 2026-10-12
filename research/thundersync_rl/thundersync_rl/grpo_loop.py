@@ -39,6 +39,7 @@ import collections
 import itertools
 import os
 import time
+import warnings
 from types import SimpleNamespace
 from typing import Any, Literal, Optional
 
@@ -274,19 +275,24 @@ def validate_speculation(ts_cfg: ThunderSyncConfig, policy_cfg: PolicyConfig) ->
         inference["tensor_model_parallel_size"] > 1
         or inference["pipeline_model_parallel_size"] > 1
     ):
-        # The scorer's collectives would share the engine's TP/PP communicators
-        # with the running engine, which nothing pauses (as under EP).
-        problems.append(
-            "thundersync.verify_on must be 'learner' with inference TP or PP > 1"
+        # Untested: the scorer's TP/PP collectives share communicators with the
+        # running engine. Under inference EP this deadlocked (observed); at TP/PP
+        # it has not been run. Warn rather than reject until it is measured.
+        warnings.warn(
+            "thundersync: inference-side verification with inference TP or PP > 1 is "
+            "untested (the analogous EP case deadlocked); verify_on='learner' is the "
+            "tested setting"
         )
     megatron_cfg = policy_cfg["megatron_cfg"]
     if ts_cfg.verify_mode == "keyed" and (
         megatron_cfg["tensor_model_parallel_size"] > 1
         or megatron_cfg["pipeline_model_parallel_size"] > 1
     ):
-        # Keyed verification calls the training model directly: vocab-sharded
-        # logits under TP, no pipeline schedule under PP.
-        problems.append("thundersync.verify_mode='keyed' requires learner TP=PP=1")
+        # Not implemented: keyed verification calls the training model directly,
+        # which returns vocab-sharded logits under TP and has no pipeline schedule.
+        problems.append(
+            "thundersync.verify_mode='keyed' is not implemented for learner TP or PP > 1"
+        )
     if problems:
         raise ValueError("thundersync.speculate=true: " + "; ".join(problems) + ".")
 

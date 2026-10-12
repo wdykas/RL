@@ -354,8 +354,9 @@ or stop strings. Streaming computes advantages per group as each group closes, s
 requires `grpo.adv_estimator.name=grpo` and no `seq_logprob_error_in_loss`. A streamed
 draft stopped by `draft_budget` below `max_new_tokens` is not a finished rollout.
 Inference-side verification
-requires inference TP = PP = 1 (the scorer and the running engine would share
-communicators); keyed verification requires learner TP = PP = 1. Streaming rejects reward
+with inference TP or PP > 1 is untested and warns (under inference EP it deadlocked against
+the running engine; TP/PP have not been run); keyed verification is not implemented for
+learner TP or PP > 1. Streaming rejects reward
 penalties and per-sample advantage overrides, and MoE settings that are not
 advantage-weighted or depend on micro-batch composition (load-balancing or z-loss, expert-
 bias updates, capacity token dropping). Generation workers stay in eval mode after
