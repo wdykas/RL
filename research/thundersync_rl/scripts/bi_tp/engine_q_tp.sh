@@ -27,8 +27,13 @@ TAG=${TAG:-engine-q-tp$TP-pp$PP-ep$EP-$(basename "$MODEL")}
 export RL_ROOT_OVERRIDE=${RL_ROOT_OVERRIDE:-$(cd "$HERE/../../../.." && pwd)}
 source $W/env_sbatch.sh bi
 cd "$RL_ROOT" || exit 2
-export NVIDIA_TF32_OVERRIDE=1 THUNDERSYNC_MISMATCH_CHECK=1 THUNDERSYNC_ENGINE_Q_CHECK=1
-export THUNDERSYNC_SPEC_PROF=1 THUNDERSYNC_MEM_LOG=1
+export NVIDIA_TF32_OVERRIDE=1
+# PERF=1: timing runs, no debug checks (each adds forwards); the PASS check then only
+# confirms the run completed.
+if [ "${PERF:-0}" != 1 ]; then
+  export THUNDERSYNC_MISMATCH_CHECK=1 THUNDERSYNC_ENGINE_Q_CHECK=1
+  export THUNDERSYNC_SPEC_PROF=1 THUNDERSYNC_MEM_LOG=1
+fi
 
 case $((TP * PP)) in
   1|2) RES=(cluster.num_nodes=1 cluster.gpus_per_node=4
