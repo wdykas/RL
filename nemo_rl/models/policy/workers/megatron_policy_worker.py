@@ -622,6 +622,10 @@ class MegatronPolicyWorkerImpl(
         os.environ["LOCAL_RANK"] = str(local_rank)
         # Batch-invariant / zero-KL kernels must be enabled before CUDA init.
         enable_batch_invariant_mode(config)
+        if config["megatron_cfg"].get("fp32_residual_connection"):
+            from nemo_rl.models.megatron import fp32_residual
+
+            fp32_residual.install()
         hysteresis_tau = config["megatron_cfg"].get("param_hysteresis_tau")
         if hysteresis_tau is not None:
             from nemo_rl.models.megatron import param_hysteresis
