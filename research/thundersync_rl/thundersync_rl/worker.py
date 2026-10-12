@@ -417,6 +417,29 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
 
     # ---- Exact cross-iteration speculative rollouts (keyed sampling) ----
 
+    def install_lookup_references(self) -> None:
+        """Generation workers: forward per-request ``lookup_references`` to the engine.
+
+        Requests whose data carries ``lookup_references`` (a list of token
+        sequences per row) get them on their SamplingParams, for the engine's
+        exact lookup speculative decoding (``speculative_method="lookup"``).
+        """
+        if getattr(self, "_lookup_refs_installed", False):
+            return
+        inner = self._prepare_data_for_generation
+
+        def prepare(data, greedy=False):
+            prompts, mm, sps = inner(data, greedy)
+            if "lookup_references" in data:
+                for i, sp in enumerate(sps):
+                    sp.lookup_references = [
+                        list(r) for r in data["lookup_references"][i]
+                    ]
+            return prompts, mm, sps
+
+        self._prepare_data_for_generation = prepare
+        self._lookup_refs_installed = True
+
     def install_keyed_sampler(self, vocab_limit: int, head_k: int) -> int | None:
         """Generation workers: sample requests that carry ``noise_seed`` with keyed noise.
 

@@ -172,6 +172,12 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # Tokens per scorer forward batch (bounds logits memory; lower it for large
     # vocabularies or when verification shares the learner GPUs, e.g. 4096 at 4B).
     verify_batch_tokens: int = 16384
+    # Exact lookup speculative decoding of continuations after a rejection: pass the
+    # rejected draft's tail and the prompt's other drafts as engine lookup
+    # references. Needs the engine's lookup method (mcore_generation_config
+    # speculative_method="lookup", num_speculative_tokens).
+    tail_lookup: bool = False
+    tail_lookup_max_refs: int = 8
     # Verify the longest drafts first so likely stragglers continue earliest.
     verify_longest_first: bool = True
     # Worker groups that run weight stashes and verification: "learner",
@@ -990,6 +996,8 @@ def thundersync_grpo_train(
             verify_precision=ts_cfg.verify_precision,
             verify_lazy=ts_cfg.verify_lazy,
             verify_batch_tokens=ts_cfg.verify_batch_tokens,
+            tail_lookup=ts_cfg.tail_lookup,
+            tail_lookup_max_refs=ts_cfg.tail_lookup_max_refs,
             longest_first=ts_cfg.verify_longest_first,
             verify_on=ts_cfg.verify_on,
             pool_weights=ts_cfg.verify_pool_weights,

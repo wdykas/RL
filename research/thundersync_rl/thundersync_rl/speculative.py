@@ -63,6 +63,9 @@ class Plan:
     # Fused verification + training: the learner kept the verification
     # forward of this (complete, fully accepted) draft for training.
     fused: Optional[FusedRef] = None
+    # Tail lookup: the rejected draft's tokens after the rejection point, a
+    # reference for exact lookup speculative decoding of the continuation.
+    dead_suffix: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -196,6 +199,8 @@ class SpeculativeGeneration:
         verify_precision: str,
         verify_batch_tokens: int,
         longest_first: bool,
+        tail_lookup: bool = False,
+        tail_lookup_max_refs: int = 8,
         verify_on: str,
         pool_weights: tuple[int, ...] | None,
         fused_verify_train: bool,
@@ -235,6 +240,8 @@ class SpeculativeGeneration:
         self._free_refs = None
         self._hidden_nonce = itertools.count()
         self.verify_batch_tokens = verify_batch_tokens
+        self.tail_lookup = tail_lookup
+        self.tail_lookup_max_refs = tail_lookup_max_refs
         self.longest_first = longest_first
         # Fused verification + training (fused_train.py): p comes from the
         # training model with autograd, and the forwards of drafts that become
@@ -276,6 +283,8 @@ class SpeculativeGeneration:
             else workers.run_all_workers_single_data("termination_id")
         )
         self.eod = next(e for e in eods if e is not None)
+        if tail_lookup:
+            ray.get(workers.run_all_workers_single_data("install_lookup_references"))
         if verify_source == "engine":
             ok = ray.get(
                 workers.run_all_workers_single_data("install_draft_hidden_log")
@@ -693,6 +702,7 @@ class SpeculativeGeneration:
             )
         drafts, dropped = self._engine_q_filter(drafts)
         flat, rows = self._flat_rows(drafts)
+        self._record_siblings(flat)
         if self.verify_mode == "block":
             # Contiguous row slices per verifier pool, verified concurrently.
             k = len(self.verifiers)
@@ -825,7 +835,32 @@ class SpeculativeGeneration:
             )
         prefix = draft[:n_acc] + [r["next"]]
         done = r["next"] == self.eod or len(prefix) >= self.max_new_tokens
-        return Plan(seed, prefix, lps, complete=done)
+        dead = list(draft[n_acc + 1 :]) if getattr(self, "tail_lookup", False) else []
+        return Plan(seed, prefix, lps, complete=done, dead_suffix=dead)
+
+    def _record_siblings(self, flat) -> None:
+        """Draft tokens of every prompt verified this step (tail-lookup references)."""
+        self._sibling_drafts: dict[tuple[int, ...], list[list[int]]] = {}
+        if not self.tail_lookup:
+            return
+        for _, d in flat:
+            self._sibling_drafts.setdefault(_key(d[0]), []).append(list(d[2]))
+
+    def _lookup_references(self, key, plan: Plan) -> list[list[int]]:
+        """References for the continuation's exact lookup decoding.
+
+        The rejected draft's own tail first (the continuation often
+        re-converges with it), then the drafts of the same prompt (its GRPO
+        group). The engine also searches the request's own context. These only
+        propose tokens; the engine's accept rule keeps the output an exact
+        sample of the current policy whatever they contain.
+        """
+        refs = [plan.dead_suffix] if plan.dead_suffix else []
+        for sib in getattr(self, "_sibling_drafts", {}).get(key, []):
+            if len(refs) >= self.tail_lookup_max_refs:
+                break
+            refs.append(sib)
+        return refs
 
     def _count_ages(self, d, accepted: int, age_tok: dict, age_kept: dict) -> None:
         """Add draft ``d``'s drafted and kept tokens per age (versions behind; 4 = 4+)."""
@@ -890,6 +925,7 @@ class SpeculativeGeneration:
         """
         drafts, dropped = self._engine_q_filter(drafts)
         flat, rows = self._flat_rows(drafts)
+        self._record_siblings(flat)
         if os.environ.get("THUNDERSYNC_SPEC_CHECK") and len(self.verifiers) > 1:
             await self._debug_compare_pools(rows[:4])
         if self.longest_first:
@@ -1094,6 +1130,10 @@ class SpeculativeGeneration:
             )
             if plan.seed >= 0:
                 cont["noise_seed"] = torch.tensor([plan.seed])
+            if self.tail_lookup:
+                refs = self._lookup_references(key, plan)
+                if refs:
+                    cont["lookup_references"] = [refs]
             if "stop_strings" in datum:
                 cont["stop_strings"] = datum["stop_strings"]
             t0 = time.perf_counter()

@@ -270,6 +270,11 @@ def _apply_optional_inference_config_kwargs(
         "prefix_cache_ttl_seconds": float,
         "prefix_caching_routing_alpha": float,
         "logging_step_interval": int,
+        # Lookup (n-gram) speculative decoding; forwarded only when set, so
+        # Megatron versions without it are unaffected.
+        "speculative_method": str,
+        "lookup_ngram_max": int,
+        "lookup_ngram_min": int,
     }
     for key, enum_type in enum_fields.items():
         if key in mcore_generation_config:
