@@ -1034,6 +1034,13 @@ def setup_model_config(
     if "layernorm_epsilon" in config["megatron_cfg"]:
         model_cfg.layernorm_epsilon = config["megatron_cfg"]["layernorm_epsilon"]
 
+    # Optional fp32 residual stream (training and, through the merged inference
+    # config, generation models).
+    if "fp32_residual_connection" in config["megatron_cfg"]:
+        model_cfg.fp32_residual_connection = config["megatron_cfg"][
+            "fp32_residual_connection"
+        ]
+
     # Provider objects loaded from checkpoint metadata otherwise retain the
     # serialized defaults. Apply explicit recipe controls before model
     # construction so RADIO positional encoding and frozen towers are stable

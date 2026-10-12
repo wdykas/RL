@@ -585,6 +585,8 @@ class MegatronConfig(TypedDict):
     # param_hysteresis.py): a weight changes only once its master is tau ulps away.
     # 0.5 = round-to-nearest. Requires optimizer.use_precision_aware_optimizer=false.
     param_hysteresis_tau: NotRequired[float | None]
+    # Megatron fp32 residual stream (TransformerConfig.fp32_residual_connection).
+    fp32_residual_connection: NotRequired[bool]
 
 
 class TokenizerConfig(TypedDict):
