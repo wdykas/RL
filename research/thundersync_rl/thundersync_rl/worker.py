@@ -1294,6 +1294,14 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         None on ranks that hold no rows to log (not the last pipeline stage,
         tensor-parallel rank > 0), False when unsupported (no engine, MTP
         speculative decoding inside the engine, sequence-parallel head input).
+
+        Tensor parallelism: with ``materialize_only_last_token_logits`` the
+        engine all-gathers the sequence-parallel hidden states and selects each
+        request's last row before the output layer (with its sequence
+        parallelism switched off), so the hook's input is the full set of rows,
+        replicated on every TP rank. TP rank 0 alone logs them (one device-to-
+        host copy per forward, no extra collective). Without it the head input
+        is sequence-sharded; that layout is unsupported (False).
         """
         from megatron.core import parallel_state as ps
         from thundersync_rl.engine_q import HIDDEN_KEY_ATTR, HiddenLog, step_rows
@@ -1401,7 +1409,12 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
 
     @torch.no_grad()
     def stash_head(self, version: int, keep: list[int]) -> int:
-        """Stash only the LM-head weight as ``version`` (V x d per version)."""
+        """Stash only the LM-head weight as ``version``.
+
+        The live weight is this rank's vocab-parallel shard (V/TP x d; under
+        tied embeddings the embedding's shard, same vocabulary split), so each
+        tensor-parallel rank keeps 1/TP of the head per pending version.
+        """
         _, weight, _ = self._lm_head()
         if not hasattr(self, "_head_stash"):
             self._head_stash: dict[int, torch.Tensor] = {}
@@ -1409,25 +1422,68 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         for v in list(self._head_stash):
             if v not in keep and v != version:
                 del self._head_stash[v]
-        self._log_mem(f"stash_head v={version} n={len(self._head_stash)}")
+        self._log_mem(
+            f"stash_head v={version} n={len(self._head_stash)} "
+            f"bytes={self.head_stash_bytes()}"
+        )
         return len(self._head_stash)
+
+    def head_stash_bytes(self) -> int:
+        """Bytes of the LM-head stashes on this GPU (all pending versions)."""
+        return sum(
+            w.numel() * w.element_size()
+            for w in getattr(self, "_head_stash", {}).values()
+        )
+
+    def _tp_vocab_gather(self):
+        """Rank-order all-gather of vocab shards over the tensor-parallel group.
+
+        The concatenation the engine's gathered output layer and
+        batch-invariant training (``_GatheredVocabLogprob``) perform; identity
+        at TP=1.
+        """
+        from megatron.core import parallel_state as ps
+        from thundersync_rl.engine_q import no_gather
+
+        from nemo_rl.models.megatron.zero_train_gen_mismatch import _all_gather_vocab
+
+        if ps.get_tensor_model_parallel_world_size() == 1:
+            return no_gather
+        group = ps.get_tensor_model_parallel_group()
+        return lambda x: _all_gather_vocab(x, group)
 
     def _head_logprobs(
         self, hidden: torch.Tensor, version: int, vocab_limit: int
     ) -> torch.Tensor:
         """Q log-prob rows [n, V] (fp32) of ``hidden`` [n, d] under head ``version``.
 
-        The training model's own output layer with the stashed weight. Under
-        batch invariance its GEMM gives each row's logits independently of the
-        row count, so a row equals the engine's row for the same hidden state.
+        The training model's own output layer with the stashed weight (this
+        rank's vocab shard at TP>1), run as the engine runs it on its gathered
+        last-token rows: sequence parallelism off, local logits, logit scaling,
+        then the shards all-gathered in rank order and one fp32 log-softmax
+        (``gathered_log_softmax``). Under batch invariance the GEMM gives each
+        row's logits independently of the row count, so a row equals the
+        engine's row for the same hidden state. A collective at TP>1: every
+        rank of the group calls it with the same rows (the lazy scan's
+        decisions are identical on all of them).
         """
+        from thundersync_rl.engine_q import gathered_log_softmax
+
         layer, _, scale = self._lm_head()
         w = self._head_stash[version]
         h = hidden.to(device="cuda", dtype=w.dtype)
-        z, _ = layer(h.unsqueeze(1), weight=w, runtime_gather_output=True)
+        sp = getattr(layer, "sequence_parallel", False)
+        if sp:
+            # The rows are full (not sequence-sharded), as in the engine.
+            layer.sequence_parallel = False
+        try:
+            z, _ = layer(h.unsqueeze(1), weight=w, runtime_gather_output=False)
+        finally:
+            if sp:
+                layer.sequence_parallel = True
         if scale is not None:
             z = scale(z)
-        return torch.log_softmax(z[:, 0, :vocab_limit].float(), -1)
+        return gathered_log_softmax(z[:, 0], self._tp_vocab_gather(), vocab_limit)
 
     @torch.no_grad()
     @_model_in_eval
@@ -1446,9 +1502,12 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         """Block verification with q from the engine and p from the training model.
 
         Requires batch-invariant kernels (the engine's decode is the training
-        forward). Per draft i: p = log-softmax of the training model's forward
-        of ``rows[i]`` at the current weights (a training-shaped forward, as
-        ``verify_drafts_block_fused`` runs it, without autograd); log q(x_j) =
+        forward) and the same tensor parallelism as the engine. Per draft i:
+        p = log-softmax of the training model's forward of ``rows[i]`` at the
+        current weights (a training-shaped forward, as
+        ``verify_drafts_block_fused`` runs it, without autograd; at TP>1 its
+        vocab-parallel logits are all-gathered in rank order before the
+        log-softmax, as ``_GatheredVocabLogprob`` does); log q(x_j) =
         ``engine_logq[i][j]``; q rows only where the lazy scan needs them, from
         ``hidden[i]`` [g, d] (the engine's final hidden states) and the
         LM-head stash of the version that drafted position j (``segments``).
@@ -1457,19 +1516,28 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         log-probs of the kept tokens and "draft_logq" the engine's, so the
         behavior-log-prob correction is exactly zero.
 
+        Tensor parallelism: every TP rank of a replica verifies the same rows
+        (``_my_rows`` hashes by data-parallel rank) with the same generator
+        seed and bitwise the same gathered p and q rows, so the lazy scans
+        take the same decisions and call the row gathers in lockstep.
+
         ``THUNDERSYNC_ENGINE_Q_CHECK=1``: also rebuild every q row of each draft
         and print how many drafted tokens' log q match the engine bitwise and
         the largest difference (expected: all, 0).
         """
         from megatron.core import parallel_state as ps
-        from thundersync_rl.engine_q import verify_engine_q
+        from thundersync_rl.engine_q import GatheredLogprobRows, verify_engine_q
 
         if not self.cfg["megatron_cfg"].get("batch_invariant_mode"):
             raise RuntimeError(
                 "verify_source='engine' requires policy.megatron_cfg.batch_invariant_mode"
             )
-        if ps.get_tensor_model_parallel_world_size() != 1:
-            raise RuntimeError("verify_source='engine' requires tensor parallel size 1")
+        if ps.get_pipeline_model_parallel_world_size() != 1:
+            raise RuntimeError(
+                "verify_source='engine' requires pipeline parallel size 1"
+            )
+        tp = ps.get_tensor_model_parallel_world_size()
+        gather = self._tp_vocab_gather()
         self._prof = {}
         t_all = time.perf_counter()
         gen = torch.Generator(device="cuda").manual_seed(
@@ -1484,8 +1552,15 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             g = n - plen
             t0 = time.perf_counter()
             logits = self._training_forward(rows[i])
-            # Log-probs exactly as training computes them (fp32 log-softmax).
-            p_lp = torch.log_softmax(logits[0, plen - 1 : n, :vocab_limit].float(), -1)
+            if tp == 1:
+                # Log-probs exactly as training computes them (fp32 log-softmax).
+                p_lp = torch.log_softmax(
+                    logits[0, plen - 1 : n, :vocab_limit].float(), -1
+                )
+            else:
+                # Vocab-parallel logits: rows gathered on demand, as batch-
+                # invariant training's gathered log-softmax computes them.
+                p_lp = GatheredLogprobRows(logits[0, plen - 1 : n], gather, vocab_limit)
             del logits
             self._prof["forward"] = (
                 self._prof.get("forward", 0.0) + time.perf_counter() - t0
@@ -1776,11 +1851,12 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         t0 = time.perf_counter()
         seq_len = ids.shape[1]
         m = self.cfg["make_sequence_length_divisible_by"]
-        if (
+        padded = (
             self._batch_invariant
             and ps.get_tensor_model_parallel_world_size() > 1
             and seq_len % m
-        ):
+        )
+        if padded:
             # Batch-invariant scorer at TP>1: sequence parallelism splits the
             # sequence over TP ranks, and each rank's norm row count must stay
             # in training's shape class, so pad like training. Causal attention
@@ -1870,7 +1946,9 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 parts, logits.contiguous(), group=ps.get_tensor_model_parallel_group()
             )
             logits = torch.cat(parts, dim=-1)
-        if logits.shape[1] != seq_len:
+        if padded:
+            # Only full-row forwards are padded (batch invariance never selects
+            # positions); selected logits are [1, n_selected, V] and kept whole.
             logits = logits[:, :seq_len]
         torch.cuda.synchronize()
         self._prof["forward"] = (

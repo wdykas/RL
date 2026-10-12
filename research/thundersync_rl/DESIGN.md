@@ -580,9 +580,13 @@ all-gathers its vocab-parallel logits before the log-softmax (same bits as train
 gathered path) and pads its rows to `make_sequence_length_divisible_by` (sequence
 parallelism needs a multiple of TP; the norm row class needs training's multiple); fused
 verification + training still requires TP=1 (it reads p from the training forward's logits,
-which are vocab-sharded at TP>1); keyed verification still requires learner TP=PP=1 (it calls
+which are vocab-sharded at TP>1); engine-sourced q works at any TP (below, "Engine-sourced q
+at TP>1"); keyed verification still requires learner TP=PP=1 (it calls
 the training model directly); scorers on the inference workers still require
-`verify_on=learner` at inference TP>1 (shared engine communicators).
+`verify_on=learner` at inference TP>1 (shared engine communicators). The scorer's padding
+applies to full-row forwards only and its output is sliced back to the real length only when
+it padded (the logit-free path's selected-position logits, `[1, n_selected, V]`, are never
+padded, since batch invariance always scores full rows).
 
 **Environment.** TE 2.18 (built from source against torch 2.11), flash-attn-4 4.0.0b19, CuTe
 DSL 4.6.2 (including `nvidia-cutlass-dsl-libs-core`, the Python frontend), quack-kernels 0.6.4
@@ -702,10 +706,10 @@ stashes, retained graphs and training state on TP=1 GPUs); it fits with
 of draft tokens, but only about one trajectory per step finishes whole and gets fused.
 
 **Engine-sourced q** (`thundersync.verify_source=engine`, `engine_q.py`). *Opt-in; CPU and
-short GPU unit tests pass, not yet run end to end.* The default verifier needs an fp32 copy
-of the model (4 B/param, unsharded under BI since BI needs TP=1) plus a bf16 whole-model
-stash per pending version (2 B/param each): about 82 GB on each learner GPU at 8B with
-three pending versions, impossible at 70B. Under BI neither is needed. The engine's decode
+short GPU unit tests pass (TP 1/2/4 with fake TP groups), not yet run end to end.* The
+default verifier needs an fp32 copy of the model (4 B/param) plus a bf16 whole-model stash
+per pending version (2 B/param each): about 82 GB on each learner GPU at 8B with three
+pending versions at TP=1, impossible at 70B. Under BI neither is needed. The engine's decode
 is bitwise the training forward, so the drafts' true law q is the engine's own
 distribution, and p can be the training model's forward at θ_{k+1}:
 
@@ -756,37 +760,99 @@ distribution, and p can be the training model's forward at θ_{k+1}:
   on long outputs; see the offline measurement below).
 - **Fallbacks.** If the engine cannot log hidden states, `SpeculativeGeneration` reverts to
   `verify_source=scorer` with a printed warning. That happens with no engine, MTP
-  speculative decoding inside the engine, or a sequence-parallel head input. A single draft
+  speculative decoding inside the engine, or a sequence-sharded head input
+  (`materialize_only_last_token_logits=false` with sequence parallelism; the validator
+  rejects it at TP>1). A single draft
   without full engine log-probs or hidden rows is dropped before verification and its
   rollout decodes from scratch (`spec/engine_q_dropped`). Dropping is exact because
   whether a draft was logged does not depend on its tokens. A hook that never fires (for
   example under a whole-model CUDA graph, which replays without Python) shows up as every
   draft dropped. No path re-runs a forward of a stashed version.
 
+**Engine-sourced q at TP>1** (branch `thundersync-bi-scalable`: `thundersync-bi-engine-q`
+plus `thundersync-bi-tp2`). BI requires the same TP, PP, EP and sequence parallelism in
+training and generation, so the learner's vocab-parallel LM-head shard on TP rank r is the
+engine's shard on its rank r (same vocabulary split, rank order; tied embeddings use the
+embedding's shard, same split). How each part scales:
+
+- *Head stash.* `stash_head` clones the live head weight, which at TP>1 is already the rank's
+  shard: V/TP x d per pending version on each GPU (`head_stash_bytes`, logged with
+  `THUNDERSYNC_MEM_LOG=1`).
+- *Engine hidden states.* With `materialize_only_last_token_logits=true` (the default, and
+  required at TP>1 by the validator), MCore's `GPTModel._postprocess` all-gathers the
+  sequence-parallel hidden states, keeps each request's last row and calls the output layer
+  with its sequence parallelism switched off. The pre-hook therefore sees the full rows,
+  identical on every TP rank, and TP rank 0 alone logs them: one device-to-host copy per
+  forward and no extra collective (other ranks return None from `install_draft_hidden_log`).
+- *How the engine computes q at TP>1.* `ColumnParallelLinear` computes the local logits
+  shard `h W_r^T` (`[n, V/TP]`), all-gathers it along the vocabulary (NCCL
+  `all_gather_into_tensor` then a rank-order concatenation, or the NVLS multimem gather,
+  both pure copies), applies the logit scaling, and the controller's `raw_logprobs` path
+  runs `log_softmax(logits.float())` over the full padded vocabulary.
+- *q rows on demand* (`_head_logprobs`, `gathered_log_softmax`). Each rank runs the training
+  model's output layer on the logged rows with its stashed shard (sequence parallelism
+  switched off for the call, `runtime_gather_output=False`), applies the logit scaling,
+  all-gathers the shards in rank order (`_all_gather_vocab`, the same helper as
+  `_GatheredVocabLogprob`) and runs the same fp32 `log_softmax`. Per element this is the
+  engine's computation: the local GEMM has the same shard shape, and under BI's cuBLAS
+  settings a row's logits do not depend on the row count.
+- *p at TP>1.* The training forward's logits are vocab-parallel. `GatheredLogprobRows` keeps
+  the local shard (`[g+1, V/TP]`), computes the drafted tokens' log p in chunks of up to
+  4096 rows (gather, fp32 log-softmax, pick), and gathers full rows only where the lazy scan
+  asks for them. This is `_GatheredVocabLogprob`'s forward, so log p is bitwise what
+  training uses. The full `[g+1, V]` fp32 matrix is never materialized (TP=1 keeps the dense
+  path).
+- *Identical decisions on every TP rank.* All ranks of a replica receive the same rows,
+  hidden states and engine log-probs. They select the same rows (`_my_rows` hashes by DP
+  rank), seed the generator with `seed * 1_000_003 + DP rank`, and see bitwise identical
+  gathered p and q rows. Their lazy scans therefore make the same `rand`/`multinomial` calls
+  and issue the same gathers in the same order, and every rank returns the same plan. A
+  divergence would deadlock the gathers; the unit tests assert lockstep.
+- *Tests* (`test_engine_q.py`; TP ranks are threads sharing a fake rank-order all_gather):
+  q rows from sharded heads equal the full-vocabulary row bitwise (TP 1/2/4, bf16 and fp32);
+  gathered p (chunked and on demand) equals the dense log-softmax; the engine rule on every
+  fake rank matches the TP=1 rule on dense rows (decisions, log p, generator state,
+  identical gather sequences); the worker's `verify_drafts_block_engine` at TP 2/4 returns
+  exactly the TP=1 worker's results, with every rank's `[engine q check]` exact (GPU, a few
+  seconds); `stash_head` keeps 1/TP of the head per rank; the hidden-log install rules per TP
+  rank; and the validator accepts any TP with the same layout and rejects a train/generation
+  TP mismatch and non-materialized logits at TP>1.
+- *Still limited:* PP = 1 (p would come from the last stage only, and the scan's rows from a
+  schedule that spans stages) and EP = 1. Neither is trivially supportable, so both stay
+  rejected. CP is 1 under BI anyway.
+
 Memory, per learner GPU, three pending versions, ~1.5M drafted tokens per step (128 rollouts
 x 3 cohorts x 4k):
 
-| | scorer mode (fp32 scorer + bf16 stashes) | engine mode |
+| | scorer mode (fp32 scorer + bf16 stashes) | engine mode (LM-head stashes) |
 |---|---|---|
-| Qwen3-8B (d = 4096, V = 151,936) | 33 GB + 3 x 16 GB = 82 GB | 3 x 1.24 GB = 3.7 GB LM-head stashes |
-| 70B (Llama-3, d = 8192, V = 128,256) | 282 GB + 3 x 141 GB (does not fit at TP=1) | 3 x 2.1 GB = 6.3 GB |
-| Hidden states (host memory, not GPU) | none | 8 KB/token at 8B (12.6 GB per 1.5M tokens), 16 KB/token at 70B (25 GB) |
+| Qwen3-8B (d = 4096, V = 151,936), TP=1 | 33 GB + 3 x 16 GB = 82 GB | 3 x 1.24 GB = 3.7 GB |
+| Qwen3-8B, TP=2 | 16.5 GB + 3 x 8 GB = 40.5 GB | 3 x 0.62 GB = 1.9 GB |
+| 70B (Llama-3, d = 8192, V = 128,256), TP=1 | 282 GB + 3 x 141 GB (does not fit) | 3 x 2.1 GB = 6.3 GB |
+| 70B, TP=8 (V padded to 129,024) | 35 GB + 3 x 17.6 GB = 88 GB | 3 x 0.26 GB = 0.79 GB |
+| Hidden states (host memory, not GPU; logged once per replica, on TP rank 0) | none | 8 KB/token at 8B (12.6 GB per 1.5M tokens), 16 KB/token at 70B (25 GB) |
 
-Transient GPU memory per verified row is the training forward's logits plus fp32 log-probs,
-(g+1) x V x 4 B each (about 2.5 GB each for a 4k-token draft at V = 152k), and a few q rows.
-Hidden states move engine → driver → learner through Ray (CPU) once per draft, and only
-the rows the scan visits go to the GPU.
+The head stash is V/TP x d x 2 B per version per GPU: 2.1 GB / 8 ≈ 0.26 GB at 70B and TP=8.
+Transient GPU memory per verified row at TP=1 is the training forward's logits plus fp32
+log-probs, (g+1) x V x 4 B each (about 2.5 GB each for a 4k-token draft at V = 152k), and a
+few q rows. At TP>1 it is the local logits shard, (g+1) x V/TP x 4 B, plus one chunk of at
+most 4096 gathered fp32 rows. Hidden states move engine → driver → learner through Ray (CPU)
+once per draft, and only the rows the scan visits go to the GPU (on every TP rank).
 
 Requirements, enforced by `validate_engine_verify_source` and on the worker: `speculate`,
-`verify_mode=block`, `verify_on=learner`, `batch_invariant_mode`, PP = EP = 1 (and BI's
-TP=1, checked on the worker), no `fused_verify_train`, Megatron generation with
-`num_speculative_tokens=0` and `logprobs_mode=raw_logprobs`. Possible extensions: BI with
-TP > 1 (vocab-parallel head rows gathered, stash V/TP x d), and combining with fused mode,
-whose p forward is the same training forward.
+`verify_mode=block`, `verify_on=learner`, `batch_invariant_mode`, PP = EP = 1, generation TP
+equal to training TP (the BI validator also checks the full layout), at TP>1
+`materialize_only_last_token_logits=true`, no `fused_verify_train`, Megatron generation with
+`num_speculative_tokens=0` and `logprobs_mode=raw_logprobs`. Possible extension: combining
+with fused mode, whose p forward is the same training forward.
 
-GPU validation to run (Qwen3-1.7B, BI flags from `thundersync_work/bi_flags.txt`, A/B against
-`verify_precision=model`): expect the same kept fraction, `[engine q check]` with
-`max|dlogq|=0`, `spec/engine_q_dropped` near 0, and the mismatch check at 0 on every token.
+GPU validation to run (BI flags from `thundersync_work/bi_flags.txt`):
+`TP=2 MODEL=Qwen/Qwen3-1.7B bash research/thundersync_rl/scripts/bi_tp/engine_q_tp.sh` (2
+inference + 2 training GPUs on one node; `MODEL=Qwen/Qwen3-8B` next; `TP=1` for the A/B
+baseline). It sets `THUNDERSYNC_ENGINE_Q_CHECK=1 THUNDERSYNC_MISMATCH_CHECK=1`. Pass: the
+mismatch check reads 0 on every token of every step, every `[engine q check]` line has
+`exact == tok` and `max|dlogq|=0`, and there is no fallback to the scorer. Also expect
+`spec/engine_q_dropped` near 0 and the same kept fraction as `verify_precision=model`.
 
 **Keyed verification under BI** (`verify_mode=keyed`). With bitwise parity the learner's
 logits for a draft are the ones the engine sampled from, so keyed verification needs no
@@ -839,7 +905,8 @@ versions is the policy's own, so exact bf16 speculation is inherently ~50%; an f
   training.
 - **Engine-sourced q on GPU.** Run the `verify_source=engine` A/B against
   `verify_precision=model` on Qwen3-1.7B under BI (same kept fraction, engine q check 0,
-  mismatch 0, few dropped drafts), then Qwen3-8B where scorer mode runs out of memory.
+  mismatch 0, few dropped drafts), then Qwen3-8B where scorer mode runs out of memory, then
+  at TP=2 (`scripts/bi_tp/engine_q_tp.sh`) and TP=4 (2 nodes).
 - **Fused verification + training on GPU.** Validate `fused_verify_train` end to end
   (`THUNDERSYNC_FUSED_CHECK=1`, gradient against the unfused path) and measure the saved
   learner time on short-output tasks (section 14).

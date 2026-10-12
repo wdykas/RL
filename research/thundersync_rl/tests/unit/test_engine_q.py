@@ -18,12 +18,21 @@ import os
 import subprocess
 import sys
 import textwrap
+import threading
 from types import SimpleNamespace
 
 import pytest
 import thundersync_rl.speculative as spec_mod
 import torch
-from thundersync_rl.engine_q import HiddenLog, step_rows, verify_engine_q
+from thundersync_rl.engine_q import (
+    GatheredLogprobRows,
+    HiddenLog,
+    gathered_log_softmax,
+    head_stash_bytes,
+    no_gather,
+    step_rows,
+    verify_engine_q,
+)
 from thundersync_rl.grpo_loop import ThunderSyncConfig, validate_engine_verify_source
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
@@ -117,6 +126,40 @@ def test_hidden_log_hook_on_a_fake_engine(monkeypatch):
     assert torch.equal(out["d|0"], torch.stack(steps))
 
 
+@pytest.mark.parametrize(
+    "tp_rank, sequence_parallel, materialized, expected",
+    [
+        (0, True, True, True),  # engine gathers SP rows before the head: log
+        (1, True, True, None),  # replicated rows: TP rank 0 alone logs
+        (0, True, False, False),  # sequence-sharded head input: unsupported
+        (0, False, False, True),
+    ],
+)
+def test_hidden_log_install_under_tensor_parallelism(
+    monkeypatch, tp_rank, sequence_parallel, materialized, expected
+):
+    from megatron.core import parallel_state as ps
+    from thundersync_rl.worker import ThunderSyncMegatronPolicyWorker
+
+    monkeypatch.setattr(ps, "is_pipeline_last_stage", lambda *a, **k: True)
+    monkeypatch.setattr(ps, "get_tensor_model_parallel_rank", lambda *a, **k: tp_rank)
+
+    class Head(torch.nn.Module):
+        def forward(self, input_, weight=None, runtime_gather_output=None):
+            return input_, None
+
+    head = Head()
+    head.sequence_parallel = sequence_parallel
+    w = object.__new__(ThunderSyncMegatronPolicyWorker.__ray_metadata__.modified_class)
+    w.dynamic_inference_engine = SimpleNamespace(requests={})
+    w.inference_context = SimpleNamespace(
+        config=SimpleNamespace(materialize_only_last_token_logits=materialized),
+        num_speculative_tokens=0,
+    )
+    w._gen_model = lambda: SimpleNamespace(module=SimpleNamespace(output_layer=head))
+    assert w.install_draft_hidden_log() is expected
+
+
 # --------------------------------------------------------------------------
 # The verification rule: engine log q + rows on demand == eager block rule
 # --------------------------------------------------------------------------
@@ -177,7 +220,7 @@ def test_behavior_logprobs_are_exactly_log_p_with_engine_q():
 # Worker path on GPU with a fake training model / engine
 # --------------------------------------------------------------------------
 
-V, D, VERSIONS = 37, 16, 3
+V, D, VERSIONS = 40, 16, 3  # V divisible by the fake TP sizes
 
 
 class _Head(torch.nn.Module):
@@ -212,6 +255,7 @@ def _engine_worker(monkeypatch):
         ("get_data_parallel_world_size", 1),
         ("get_data_parallel_rank", 0),
         ("get_tensor_model_parallel_world_size", 1),
+        ("get_pipeline_model_parallel_world_size", 1),
     ]:
         monkeypatch.setattr(ps, name, lambda *a, _v=val, **k: _v)
     gen = torch.Generator().manual_seed(0)
@@ -367,6 +411,265 @@ def test_head_rows_are_batch_invariant_under_bi_cublas_settings():
 
 
 # --------------------------------------------------------------------------
+# Tensor parallelism: vocab-sharded heads, rows gathered in rank order
+# (TP ranks are threads exchanging shards through a fake all_gather)
+# --------------------------------------------------------------------------
+
+
+class _ThreadTP:
+    """TP ranks as threads; ``gather`` is a rank-order all-gather of the last dim.
+
+    Every rank records the shapes it gathered, so lockstep (same collectives
+    in the same order) can be asserted.
+    """
+
+    def __init__(self, tp):
+        self.tp = tp
+        self.slots = [None] * tp
+        self.barrier = threading.Barrier(tp, timeout=60)
+        self.calls = [[] for _ in range(tp)]
+
+    def all_gather(self, rank, parts, x):
+        self.calls[rank].append(tuple(x.shape))
+        self.slots[rank] = x.clone()
+        self.barrier.wait()
+        for i, slot in enumerate(self.slots):
+            parts[i].copy_(slot)
+        self.barrier.wait()
+
+    def gather(self, rank):
+        def g(x):
+            parts = [torch.empty_like(x) for _ in range(self.tp)]
+            self.all_gather(rank, parts, x.contiguous())
+            return torch.cat(parts, -1)
+
+        return g
+
+    def run(self, fn):
+        """``fn(rank)`` on every rank (thread); returns the results."""
+        out, errors = [None] * self.tp, []
+
+        def body(r):
+            try:
+                out[r] = fn(r)
+            except BaseException as exc:  # noqa: BLE001 - re-raised below
+                errors.append(exc)
+                self.barrier.abort()
+
+        threads = [threading.Thread(target=body, args=(r,)) for r in range(self.tp)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        if errors:
+            raise errors[0]
+        return out
+
+
+@pytest.mark.parametrize("tp", [1, 2, 4])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_q_rows_from_sharded_heads_equal_the_full_vocab_row_bitwise(tp, dtype):
+    """Each rank: logits of its head shard; gathered row == the TP=1 row."""
+    torch.manual_seed(0)
+    v, d, n = 48, 16, 7
+    h = torch.randn(n, d).to(dtype)
+    w = (torch.randn(v, d) * 2).to(dtype)
+    full = torch.log_softmax(_logits(h, w).float(), -1)
+    shards = w.chunk(tp, 0)
+    grp = _ThreadTP(tp)
+
+    def rank(r):
+        assert shards[r].shape == (v // tp, d)  # stash: 1/TP of the head
+        return gathered_log_softmax(_logits(h, shards[r]), grp.gather(r), 1 << 30)
+
+    for row in grp.run(rank):
+        assert torch.equal(row, full)
+    # vocab_limit slices the gathered row, as at TP=1.
+    out = grp.run(
+        lambda r: gathered_log_softmax(_logits(h, shards[r]), grp.gather(r), 40)
+    )
+    assert torch.equal(out[0], torch.log_softmax(_logits(h, w)[:, :40].float(), -1))
+
+
+@pytest.mark.parametrize("tp", [2, 4])
+def test_gathered_p_rows_equal_dense_training_logprobs(tp):
+    """Token log-probs (chunked) and rows on demand == the dense log-softmax."""
+    torch.manual_seed(1)
+    n, v = 11, 32
+    logits = (torch.randn(n, v) * 3).to(torch.bfloat16)
+    dense = torch.log_softmax(logits.float(), -1)
+    tok = torch.randint(0, v, (n - 1,))
+    grp = _ThreadTP(tp)
+
+    def rank(r):
+        rows = GatheredLogprobRows(
+            logits.chunk(tp, -1)[r], grp.gather(r), 1 << 30, chunk_rows=3
+        )
+        return rows.token_logprobs(tok), rows(torch.tensor([4, 0, 10]))
+
+    for lp, picked in grp.run(rank):
+        assert torch.equal(lp, dense[torch.arange(n - 1), tok])
+        assert torch.equal(picked, dense[[4, 0, 10]])
+    # TP=1 through the same class.
+    one = GatheredLogprobRows(logits, no_gather, 1 << 30, chunk_rows=4)
+    assert torch.equal(one.token_logprobs(tok), dense[torch.arange(n - 1), tok])
+
+
+@pytest.mark.parametrize("tp", [2, 4])
+def test_engine_rule_decisions_identical_across_tp_ranks(tp):
+    """Lazy scans on every rank: same decisions, generator state and gathers.
+
+    p from sharded training logits, q rows from sharded head stashes and the
+    engine's hidden states; all equal to the TP=1 rule on dense rows.
+    """
+    torch.manual_seed(2)
+    v, d = 40, 8
+    rejected = 0
+    for trial in range(30):
+        g = trial % 9
+        hp = torch.randn(g + 1, d)
+        w_p = torch.randn(v, d)
+        w_q = w_p + torch.randn(v, d) * (0.05 if trial % 2 else 0.6)
+        lp_dense = torch.log_softmax(_logits(hp, w_p).float(), -1)
+        lq_dense = torch.log_softmax(_logits(hp[:g], w_q).float(), -1)
+        draft = (
+            torch.multinomial(lq_dense.exp(), 1).flatten()
+            if g
+            else torch.zeros(0).long()
+        )
+        engine_lq = lq_dense[torch.arange(g), draft]
+        g_ref = torch.Generator().manual_seed(trial)
+        ref = verify_engine_q(lp_dense, draft, engine_lq, lambda i: lq_dense[i], g_ref)
+        rejected += ref[0] < g
+        grp = _ThreadTP(tp)
+
+        def rank(r, hp=hp, w_p=w_p, w_q=w_q, draft=draft, engine_lq=engine_lq):
+            gather = grp.gather(r)
+            p = GatheredLogprobRows(_logits(hp, w_p.chunk(tp)[r]), gather, 1 << 30)
+            wq = w_q.chunk(tp)[r]
+
+            def q_rows(idx):
+                return gathered_log_softmax(_logits(hp[idx], wq), gather, 1 << 30)
+
+            gen = torch.Generator().manual_seed(trial)  # same seed on every rank
+            out = verify_engine_q(p, draft, engine_lq, q_rows, gen)
+            return out, gen.get_state()
+
+        for (tau, y, logp, n_eval), state in grp.run(rank):
+            assert (tau, y, n_eval) == (ref[0], ref[1], ref[3])
+            assert torch.equal(logp, ref[2])
+            assert torch.equal(state, g_ref.get_state())
+        assert all(c == grp.calls[0] for c in grp.calls)
+    assert rejected >= 5
+
+
+def test_head_stash_memory_divides_by_tp():
+    gb = 1e9
+    # Qwen3-8B head, bf16: 1.24 GB per version at TP=1.
+    assert round(head_stash_bytes(151_936, 4096, 1) / gb, 2) == 1.24
+    # 70B (Llama-3: V = 128,256, padded to 129,024 at TP=8; d = 8192).
+    assert round(head_stash_bytes(128_256, 8192, 1) / gb, 2) == 2.10
+    assert round(head_stash_bytes(129_024, 8192, 8) / gb, 2) == 0.26
+    assert head_stash_bytes(129_024, 8192, 8, versions=3) == 3 * 16_128 * 8192 * 2
+
+
+def test_stash_head_keeps_only_this_ranks_vocab_shard():
+    """stash_head on each TP rank stores its V/TP x d shard (bytes / TP)."""
+    from thundersync_rl.worker import ThunderSyncMegatronPolicyWorker
+
+    v, d, tp = 64, 8, 4
+    w_full = torch.randn(v, d).to(torch.bfloat16)
+    sizes = []
+    for r in range(tp):
+        w = object.__new__(
+            ThunderSyncMegatronPolicyWorker.__ray_metadata__.modified_class
+        )
+        w.rank = r
+        w.model = torch.nn.Module()
+        w.model.module = torch.nn.Module()
+        w.model.module.output_layer = _Head(w_full.chunk(tp)[r])
+        for ver in range(3):
+            w.stash_head(version=ver, keep=[1, 2])
+        assert sorted(w._head_stash) == [1, 2]
+        assert torch.equal(w._head_stash[2], w_full.chunk(tp)[r])
+        sizes.append(w.head_stash_bytes())
+    assert sizes == [head_stash_bytes(v, d, tp, versions=2)] * tp
+    assert sum(sizes) == head_stash_bytes(v, d, 1, versions=2)
+
+
+def _tp_engine_workers(monkeypatch, tp):
+    """``tp`` fake learner ranks (threads) of one replica, heads vocab-sharded."""
+    from megatron.core import parallel_state as ps
+
+    local = threading.local()
+    grp = _ThreadTP(tp)
+    w1, emb, heads = _engine_worker(monkeypatch)  # TP=1 reference worker
+    monkeypatch.setattr(
+        ps, "get_tensor_model_parallel_world_size", lambda *a, **k: local.tp
+    )
+    monkeypatch.setattr(ps, "get_tensor_model_parallel_group", lambda *a, **k: local)
+    monkeypatch.setattr(
+        torch.distributed, "get_world_size", lambda group=None: group.tp
+    )
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather",
+        lambda parts, x, group=None: grp.all_gather(group.rank, parts, x),
+    )
+    workers = []
+    for r in range(tp):
+        w = object.__new__(type(w1))
+        w.cfg, w.rank = w1.cfg, r
+        w.model = torch.nn.Module()
+        w.model.module = torch.nn.Module()
+        w.model.module.output_layer = _Head(heads[-1].chunk(tp)[r])
+        w._head_stash = {v: heads[v].chunk(tp)[r].clone() for v in range(VERSIONS - 1)}
+
+        def training_forward(row, w=w):
+            h = _hidden(row.cuda(), emb)
+            return w.model.module.output_layer(h.unsqueeze(1))[0].transpose(0, 1)
+
+        w._training_forward = training_forward
+        workers.append(w)
+
+    def run(r):
+        local.tp, local.rank = tp, r
+        return workers[r]
+
+    return w1, run, emb, heads, grp, local
+
+
+@cuda
+@pytest.mark.parametrize("tp", [2, 4])
+def test_engine_worker_at_tp_matches_tp1_bitwise(monkeypatch, capfd, tp):
+    """verify_drafts_block_engine on TP thread ranks == the TP=1 worker."""
+    monkeypatch.setenv("THUNDERSYNC_ENGINE_Q_CHECK", "1")
+    w1, rank_worker, emb, heads, grp, local = _tp_engine_workers(monkeypatch, tp)
+    rows, plens, segs, lqs, hids, keys = _engine_drafts(emb, heads)
+    kw = dict(
+        rows=rows,
+        prompt_lens=plens,
+        segments=segs,
+        engine_logq=lqs,
+        hidden=hids,
+        vocab_limit=1 << 30,
+        seed=3,
+        keys=keys,
+    )
+    local.tp, local.rank = 1, 0
+    ref = w1.verify_drafts_block_engine(**kw)
+    assert sum(r["accepted"] < len(lqs[i]) for i, r in ref) >= 2
+    res = grp.run(lambda r: rank_worker(r).verify_drafts_block_engine(**kw))
+    for out in res:
+        assert out == ref
+    assert grp.calls[0] and all(c == grp.calls[0] for c in grp.calls)
+    n_tok = sum(len(x) for x in lqs)
+    # Every rank's rebuilt q rows match the engine's log q bitwise.
+    out = capfd.readouterr().out
+    assert out.count(f"tok={n_tok} exact={n_tok} max|dlogq|=0") == tp + 1
+
+
+# --------------------------------------------------------------------------
 # Driver
 # --------------------------------------------------------------------------
 
@@ -516,6 +819,11 @@ def _ts(**kw):
 
 def test_engine_source_config_valid():
     validate_engine_verify_source(_ts(), _policy())
+    # Any TP with the same layout on both sides.
+    validate_engine_verify_source(_ts(), _policy(tensor_model_parallel_size=2))
+    p = _gen(tensor_model_parallel_size=4, materialize_only_last_token_logits=True)
+    p["megatron_cfg"]["tensor_model_parallel_size"] = 4
+    validate_engine_verify_source(_ts(), p)
     validate_engine_verify_source(
         ThunderSyncConfig(), _policy(batch_invariant_mode=False)
     )
@@ -524,6 +832,12 @@ def test_engine_source_config_valid():
 def _gen(**mcore):
     p = _policy()
     p["generation"]["mcore_generation_config"].update(mcore)
+    return p
+
+
+def _tp_gen(tp, **mcore):
+    p = _gen(**mcore)
+    p["megatron_cfg"]["tensor_model_parallel_size"] = tp
     return p
 
 
@@ -539,6 +853,12 @@ def _gen(**mcore):
         ({}, _policy(expert_model_parallel_size=2), "expert_model_parallel"),
         ({}, _gen(num_speculative_tokens=2), "num_speculative_tokens"),
         ({}, _gen(logprobs_mode="processed_logprobs"), "logprobs_mode"),
+        ({}, _gen(tensor_model_parallel_size=2), "tensor_model_parallel_size"),
+        (
+            {},
+            _tp_gen(2, materialize_only_last_token_logits=False),
+            "materialize_only_last_token_logits",
+        ),
     ],
 )
 def test_engine_source_config_rejects(ts_kw, policy, match):

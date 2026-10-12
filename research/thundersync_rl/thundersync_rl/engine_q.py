@@ -29,14 +29,24 @@ engine logs h_i per drafted token (d x 2 bytes, ``HiddenLog``) and the learner
 keeps only the LM head per pending version (V x d x 2 bytes). p comes from the
 training model's own bf16 forward at theta_{k+1}.
 
+Tensor parallelism (training TP = inference TP, as batch invariance requires):
+the LM head is vocab-parallel, so each rank stashes only its shard
+(V/TP x d), computes its logits shard of a row, and the full row is the
+shards all-gathered in rank order followed by one fp32 log-softmax: what the
+engine does (``ColumnParallelLinear`` with gathered output, then the
+controller's ``log_softmax(logits.float())``) and what batch-invariant
+training does (``_GatheredVocabLogprob``). All-gathers are copies, so the row
+is bitwise the TP=1 row of the same logits.
+
 This module holds the parts that need no Megatron: the engine-side hidden
-store and per-step row mapping, and the per-draft verification rule.
+store and per-step row mapping, the gathered log-prob rows, and the per-draft
+verification rule.
 """
 
 from __future__ import annotations
 
 import threading
-from typing import Callable, Optional
+from typing import Callable, Optional, Union
 
 import torch
 
@@ -153,13 +163,95 @@ class HiddenLog:
             return sum(len(s) for s in self._rows.values())
 
 
+# Rows per full-vocabulary log-softmax when log-probs of many positions are
+# gathered at once (bounds the [rows, V] fp32 temporaries, as training's
+# gathered TP log-probs do).
+GATHER_CHUNK_ROWS = 4096
+
+VocabGather = Callable[[torch.Tensor], torch.Tensor]
+
+
+def no_gather(x: torch.Tensor) -> torch.Tensor:
+    """The vocab gather of tensor-parallel size 1."""
+    return x
+
+
+def gathered_log_softmax(
+    local: torch.Tensor, gather: VocabGather, vocab_limit: int
+) -> torch.Tensor:
+    """Full-vocabulary fp32 log-prob rows of vocab-sharded logits [k, V/TP].
+
+    ``gather`` concatenates the tensor-parallel ranks' shards along the last
+    dimension in rank (= vocabulary) order (``no_gather`` at TP=1): the
+    engine's logits all-gather. Then the engine's ``raw_logprobs`` path: fp32
+    cast and one full-row ``log_softmax``. A collective at TP>1: every rank
+    of the group must call it with the same row count.
+    """
+    z = gather(local.contiguous())
+    return torch.log_softmax(z[..., :vocab_limit].float(), -1)
+
+
+class GatheredLogprobRows:
+    """Log-prob rows of one draft's vocab-sharded logits, gathered on demand.
+
+    ``local`` [n, V/TP]: this rank's logits shard per position. Rows are
+    computed by ``gathered_log_softmax`` only where asked (lazy scan) and,
+    for the drafted tokens' log-probs, ``GATHER_CHUNK_ROWS`` rows at a time.
+    Under batch-invariant kernels a row's log-softmax does not depend on how
+    many rows run together, so both give the bits of training's gathered
+    log-probs. Memory: the local shard plus one chunk of full rows, instead of
+    [n, V] fp32. Every call is a collective at TP>1.
+    """
+
+    def __init__(
+        self,
+        local: torch.Tensor,
+        gather: VocabGather,
+        vocab_limit: int,
+        chunk_rows: int = GATHER_CHUNK_ROWS,
+    ):
+        self.local = local
+        self.gather = gather
+        self.vocab_limit = vocab_limit
+        self.chunk_rows = chunk_rows
+
+    def __call__(self, idx: torch.Tensor) -> torch.Tensor:
+        return gathered_log_softmax(
+            self.local[idx.to(self.local.device)], self.gather, self.vocab_limit
+        )
+
+    def token_logprobs(self, tokens: torch.Tensor) -> torch.Tensor:
+        """[k] fp32 log-prob of ``tokens[j]`` at row j, for rows 0..k-1."""
+        k = tokens.numel()
+        out = []
+        for a in range(0, k, self.chunk_rows):
+            b = min(k, a + self.chunk_rows)
+            lp = gathered_log_softmax(self.local[a:b], self.gather, self.vocab_limit)
+            out.append(lp.gather(-1, tokens[a:b].view(-1, 1).to(lp.device))[:, 0])
+            del lp
+        if not out:
+            return torch.zeros(0, dtype=torch.float32, device=self.local.device)
+        return torch.cat(out)
+
+
+def head_stash_bytes(
+    vocab: int, hidden: int, tp: int, versions: int = 1, elem_bytes: int = 2
+) -> int:
+    """GPU bytes of the LM-head stash on one tensor-parallel rank.
+
+    Each rank keeps its vocab-parallel shard per pending version: ceil(V/TP)
+    x d elements (Megatron pads V to a multiple of TP, so V/TP exactly).
+    """
+    return versions * (-(-vocab // tp)) * hidden * elem_bytes
+
+
 def residual_rows_needed(n_eval: int, tau: int, g: int) -> int:
     """Q rows a lazy verification computed: residual masses plus the emit row."""
     return n_eval + (tau < g)
 
 
 def verify_engine_q(
-    p_logprobs: torch.Tensor,
+    p_logprobs: Union[torch.Tensor, GatheredLogprobRows],
     draft: torch.Tensor,
     engine_logq: torch.Tensor,
     q_logprob_rows: Callable[[torch.Tensor], torch.Tensor],
@@ -168,7 +260,9 @@ def verify_engine_q(
     """Block-verify one draft with p from training and q from the engine.
 
     ``p_logprobs``: [g+1, V] fp32 log-probs of the training model at
-    theta_{k+1} (log-softmax rows, as training computes them).
+    theta_{k+1} (log-softmax rows, as training computes them), or a
+    ``GatheredLogprobRows`` over its vocab-sharded logits (tensor parallelism:
+    rows gathered on demand, the same values).
     ``engine_logq``: [g] fp32 log q(x_i), the engine's log-probs of the drafted
     tokens. ``q_logprob_rows(idx)``: [k, V] fp32 q log-prob rows at positions
     ``idx`` (reconstructed from the engine's hidden states), called only where
@@ -182,17 +276,19 @@ def verify_engine_q(
     from thundersync_rl.block_verification_fused import block_verify_stats_lazy
 
     g = draft.numel()
-    dev = p_logprobs.device
-    ar = torch.arange(g, device=dev)
-    lpx = p_logprobs[ar, draft]
+    if isinstance(p_logprobs, GatheredLogprobRows):
+        dev = p_logprobs.local.device
+        lpx = p_logprobs.token_logprobs(draft.to(dev))
+        p_rows = p_logprobs
+    else:
+        dev = p_logprobs.device
+        lpx = p_logprobs[torch.arange(g, device=dev), draft]
+
+        def p_rows(idx):
+            return p_logprobs[idx]
+
     lqx = engine_logq.to(device=dev, dtype=torch.float32)
     zeros = torch.zeros(g + 1, dtype=torch.float32, device=dev)
     return block_verify_stats_lazy(
-        lpx,
-        lqx,
-        zeros,
-        zeros[:g],
-        lambda idx: p_logprobs[idx],
-        q_logprob_rows,
-        generator,
+        lpx, lqx, zeros, zeros[:g], p_rows, q_logprob_rows, generator
     )

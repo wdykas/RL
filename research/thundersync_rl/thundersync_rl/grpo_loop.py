@@ -281,7 +281,12 @@ def validate_engine_verify_source(
     q is taken from the engine (its log-probs, and rows rebuilt from its
     hidden states with the training model's LM head) and p from the training
     model, so both must run the same numerics (batch-invariant kernels) and p
-    must be a single-stage, single-replica forward on the learner.
+    must be a single-stage forward on the learner. Any tensor parallelism
+    works when training and generation use the same one (batch invariance
+    enforces it): the learner's LM-head shard is then the engine's, and q rows
+    are gathered over the vocabulary as the engine gathers its logits. At
+    TP>1 the engine must materialize only last-token logits, so the head input
+    it logs is gathered over sequence parallelism.
     """
     if ts_cfg.verify_source != "engine":
         return
@@ -312,6 +317,24 @@ def validate_engine_verify_source(
         problems.append("policy.megatron_cfg.pipeline_model_parallel_size must be 1")
     if megatron_cfg.get("expert_model_parallel_size", 1) != 1:
         problems.append("policy.megatron_cfg.expert_model_parallel_size must be 1")
+    gen_tp = mcore_gen.get("tensor_model_parallel_size")
+    train_tp = megatron_cfg.get("tensor_model_parallel_size", 1)
+    if gen_tp is not None and gen_tp != train_tp:
+        problems.append(
+            "policy.generation.mcore_generation_config.tensor_model_parallel_size "
+            f"({gen_tp}) must equal policy.megatron_cfg.tensor_model_parallel_size "
+            f"({train_tp}): the LM-head shards must match the engine's"
+        )
+    if (
+        max(train_tp, gen_tp or 1) > 1
+        and mcore_gen.get("materialize_only_last_token_logits") is False
+    ):
+        problems.append(
+            "policy.generation.mcore_generation_config."
+            "materialize_only_last_token_logits must be true at tensor parallel "
+            "size > 1 (the engine then gathers the sequence-parallel head input "
+            "that is logged)"
+        )
     if gen_cfg.get("backend") not in (None, "megatron"):
         problems.append("policy.generation.backend must be 'megatron'")
     if mcore_gen.get("num_speculative_tokens"):
