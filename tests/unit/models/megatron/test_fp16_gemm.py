@@ -217,3 +217,51 @@ def test_validate_model_rejects_moe():
         normalization = "RMSNorm"
 
     fg.validate_model(Dense())
+
+
+def test_engine_pipeline_logits_stay_fp32(monkeypatch):
+    """Engine PP > 1: last-stage logits are returned and broadcast in fp32."""
+    amw = pytest.importorskip(
+        "megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper"
+    )
+    from megatron.core.inference.text_generation_controllers import (
+        text_generation_controller as tgc,
+    )
+
+    calls = []
+    monkeypatch.setattr(
+        tgc,
+        "broadcast_from_last_pipeline_stage",
+        lambda size, dtype, tensor=None, pp_group=None: calls.append(
+            (dtype, tensor.dtype)
+        ),
+    )
+    cls = amw.AbstractModelInferenceWrapper
+    logits32 = torch.randn(1, 3, 5)
+
+    def fake_pp(
+        self, *args, **kwargs
+    ):  # mirrors MCore: forward, then cast to params_dtype
+        return self._forward(None).to(torch.bfloat16)
+
+    monkeypatch.setattr(cls, "forward_pass_with_pipeline_parallel", fake_pp)
+    monkeypatch.setattr(cls, "_forward", lambda self, inp: logits32)
+    saved = dict(fg._STATE["orig"])
+    try:
+        fg._patch_inference_pp_logits()
+        concrete = type(
+            "Wrapper",
+            (cls,),
+            {"get_batch_for_context_window": None, "prep_inference_input": None},
+        )
+        w = object.__new__(concrete)
+        out = w.forward_pass_with_pipeline_parallel()
+        assert out.dtype == torch.float32 and torch.equal(out, logits32)
+        assert "_forward" not in w.__dict__  # the capture hook is removed again
+        tgc.broadcast_from_last_pipeline_stage(
+            [1, 3, 5], torch.bfloat16, tensor=logits32
+        )
+        assert calls == [(torch.float32, torch.float32)]
+    finally:
+        fg._STATE["orig"].clear()
+        fg._STATE["orig"].update(saved)

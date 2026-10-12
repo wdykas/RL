@@ -1230,10 +1230,12 @@ padding, untuned kernel, fp64 combine): drafts are shorter within the same windo
 Qwen3-30B-A3B at EP=2 on 2 + 2 GPUs does not fit (about 15B parameters per training GPU
 with bf16 weights, fp32 grads, masters and Adam state: ~270 GB).
 
-Known gaps: engine PP>1 (Megatron's inference wrapper casts last-stage logits to
-params_dtype before broadcasting them; training PP>1 with engine PP=1 is fine); MoE with
-shared experts, expert TP, latent MoE, NCCL inference dispatcher at EP>=3 (its reduce-scatter
-order is NCCL's; NVLS ordered is used by default); TP>=3 untested.
+Engine PP>1: Megatron's inference wrapper casts last-stage logits to params_dtype and the
+controller broadcasts them in params_dtype; under the fp16 GEMM forward both are patched to fp32
+(`_patch_inference_pp_logits`, unit-tested; no engine-PP>1 GPU run yet). Known gaps: MoE with
+shared experts, expert TP, latent MoE (rejected at config time); the NCCL inference dispatcher at
+EP>=3 is untested (the default NVLS dispatcher is used); TP=4 training forward measured
+batch-invariant (0/16 sequences differ), TP=4 engine not yet run.
 
 ## 15. Open work
 

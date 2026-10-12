@@ -564,6 +564,60 @@ def _patch_attention() -> None:
     Attention.forward_post_core_attn = forward_post_core_attn
 
 
+def _patch_inference_pp_logits() -> None:
+    """Engine PP > 1: keep last-stage logits fp32 and broadcast them in fp32.
+
+    MCore's ``forward_pass_with_pipeline_parallel`` casts the last stage's
+    logits to ``params_dtype`` and the controller broadcasts them to the other
+    stages in ``params_dtype``; under the fp16 GEMM forward the logits are fp32
+    (the training forward's), so both would round them to bf16.
+    """
+    from megatron.core.inference.model_inference_wrappers import (
+        abstract_model_inference_wrapper as amw,
+    )
+    from megatron.core.inference.text_generation_controllers import (
+        text_generation_controller as tgc,
+    )
+
+    cls = amw.AbstractModelInferenceWrapper
+    orig_pp = cls.forward_pass_with_pipeline_parallel
+    _STATE["orig"][(cls, "pp_forward")] = orig_pp
+
+    def forward_pass_with_pipeline_parallel(self, *args, **kwargs):
+        inner = self._forward
+        held: dict[str, torch.Tensor] = {}
+
+        def capture(*a, **k):
+            out = inner(*a, **k)
+            held["out"] = out
+            return out
+
+        self._forward = capture
+        try:
+            logits = orig_pp(self, *args, **kwargs)
+        finally:
+            del self._forward  # back to the class method
+        out = held.get("out")
+        if logits is not None and torch.is_tensor(out) and out.dtype == torch.float32:
+            return out
+        return logits
+
+    cls.forward_pass_with_pipeline_parallel = forward_pass_with_pipeline_parallel
+
+    orig_bcast = tgc.broadcast_from_last_pipeline_stage
+    _STATE["orig"][(tgc, "broadcast")] = orig_bcast
+
+    def broadcast_from_last_pipeline_stage(size, dtype, tensor=None, pp_group=None):
+        # Every stage calls this with the same arguments; logits are fp32 here.
+        if dtype in (torch.bfloat16, torch.float16):
+            dtype = torch.float32
+            if tensor is not None:
+                tensor = tensor.float()
+        return orig_bcast(size, dtype, tensor=tensor, pp_group=pp_group)
+
+    tgc.broadcast_from_last_pipeline_stage = broadcast_from_last_pipeline_stage
+
+
 def _patch_inference_buffers() -> None:
     """fp16 KV cache; fp32 logits buffer of the CUDA-graph text generation controller."""
     from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
@@ -795,6 +849,7 @@ def install(lm_head_precision: Optional[str] = None) -> None:
     _patch_te_rmsnorm()
     _patch_attention()
     _patch_inference_buffers()
+    _patch_inference_pp_logits()
     _patch_moe()
     _STATE["enabled"] = True
     print(
