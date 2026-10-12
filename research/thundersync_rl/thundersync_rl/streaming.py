@@ -135,6 +135,17 @@ class StreamPlanner:
             without expert parallelism). Ranks are then balanced by the tokens
             of live chunks only, since a skipped chunk costs ~nothing; total
             tokens break ties so skipped chunks still spread over ranks.
+        min_pipeline_microbatches: under pipeline parallelism, hold rows of
+            closed groups back until they make at least this many micro-batches
+            per DP rank (``dp_size`` times as many in total), so the rank's one
+            pipeline call per dispatch has enough micro-batches to amortize
+            the fill/drain bubble. Counted as the worker will run them
+            (chunks of ``max_chunk_trajectories`` rows, ``micro_batch_size``
+            rows per micro-batch; skipped all-zero-advantage chunks count 0).
+            Held rows never stall the step: ``flush=True`` (the default of
+            :meth:`has_work` / :meth:`next_dispatch`, used once the step's
+            rollouts are done) ignores the threshold. Open-group bucket work
+            and pending group closes are not held. 0 disables holding.
     """
 
     def __init__(
@@ -147,8 +158,10 @@ class StreamPlanner:
         micro_batch_size: int,
         equal_rank_microbatches: bool,
         skip_zero_advantage_chunks: bool = False,
+        min_pipeline_microbatches: int = 0,
     ):
         self.compute_group_advantages = compute_group_advantages
+        self.min_pipeline_microbatches = min_pipeline_microbatches
         self.skip_zero_advantage_chunks = skip_zero_advantage_chunks
         self.max_open_groups = max_open_groups
         self.dp_size = dp_size
@@ -172,9 +185,50 @@ class StreamPlanner:
             g.advantage_by_reward = dict(zip(rewards, map(float, advantages)))
         self.ready.append(traj)
 
-    def _pick(self) -> list[Trajectory]:
+    def _advantage(self, t: Trajectory) -> float:
+        return self.groups[t.group].advantage_by_reward[t.reward]
+
+    def final_microbatches(self, trajs: list[Trajectory]) -> int:
+        """Micro-batches the learner runs for these closed-group rows.
+
+        Mirrors :meth:`next_dispatch`'s chunking (fused rows: one-row chunks;
+        the rest split by zero/nonzero advantage into chunks of at most
+        ``max_chunk_trajectories`` rows) and the worker's micro-batching
+        (``ceil(rows / micro_batch_size)`` per chunk). With zero-advantage
+        skipping an all-zero chunk runs nothing and counts 0.
+        """
+        n = sum(1 for t in trajs if t.fused is not None)
+        rest = [t for t in trajs if t.fused is None]
+        m = self.max_chunk_trajectories
+        for zero in (False, True):
+            if zero and self.skip_zero_advantage_chunks:
+                continue
+            k = sum(1 for t in rest if (self._advantage(t) == 0.0) == zero)
+            for s in range(0, k, m):
+                n += math.ceil(min(m, k - s) / self.micro_batch_size)
+        return n
+
+    def holding(self) -> bool:
+        """Whether closed-group rows are held back for the pipeline threshold."""
+        if self.min_pipeline_microbatches <= 0:
+            return False
+        final = [
+            t
+            for t in self.ready
+            if self.groups[t.group].advantage_by_reward is not None
+        ]
+        return bool(final) and (
+            self.final_microbatches(final)
+            < self.min_pipeline_microbatches * self.dp_size
+        )
+
+    def _pick(self, flush: bool = True) -> list[Trajectory]:
+        rows = self.ready
+        if not flush and self.holding():
+            # Rows of closed groups wait; idle time still goes to bucket work.
+            rows = [t for t in rows if self.groups[t.group].advantage_by_reward is None]
         return pick_final_first(
-            [(t.group, t.reward, t) for t in self.ready],
+            [(t.group, t.reward, t) for t in rows],
             closed={gid for gid, g in self.groups.items() if g.advantage_by_reward},
             streaming={
                 gid
@@ -193,8 +247,13 @@ class StreamPlanner:
                 g.close_sent = True
         return closes
 
-    def has_work(self) -> bool:
-        return bool(self._pick()) or any(
+    def has_work(self, flush: bool = True) -> bool:
+        """Whether :meth:`next_dispatch` has anything to send.
+
+        ``flush=False`` (rollouts still running) applies
+        ``min_pipeline_microbatches``; ``flush=True`` sends whatever is ready.
+        """
+        return bool(self._pick(flush)) or any(
             g.advantage_by_reward is not None and g.streaming and not g.close_sent
             for g in self.groups.values()
         )
@@ -207,16 +266,15 @@ class StreamPlanner:
             and self.num_dispatched == sum(g.size for g in self.groups.values())
         )
 
-    def next_dispatch(self) -> Dispatch:
-        picked = self._pick()
+    def next_dispatch(self, flush: bool = True) -> Dispatch:
+        picked = self._pick(flush)
         taken = {id(t) for t in picked}
         self.ready = [t for t in self.ready if id(t) not in taken]
         final: list[Trajectory] = []
         buckets: dict[tuple[GroupId, float], list[Trajectory]] = {}
         chunks: list[Chunk] = []
 
-        def advantage(t: Trajectory) -> float:
-            return self.groups[t.group].advantage_by_reward[t.reward]
+        advantage = self._advantage
 
         for t in picked:
             g = self.groups[t.group]
@@ -336,6 +394,21 @@ class StreamPlanner:
             )
 
 
+def pipeline_bubble_fraction(microbatches_per_call: list[int], pp: int) -> float:
+    """Idle fraction of a pipeline stage over a sequence of schedule calls.
+
+    Each 1F1B (non-interleaved) call of ``m`` micro-batches takes
+    ``m + pp - 1`` micro-batch slots (forward + backward of one micro-batch
+    per slot, uniform cost), of which ``m`` are busy, so one call idles
+    ``(pp - 1) / (m + pp - 1)``. ``k`` calls idle ``k (pp - 1)`` slots.
+    """
+    calls = [m for m in microbatches_per_call if m > 0]
+    if not calls:
+        return 0.0
+    busy = sum(calls)
+    return 1.0 - busy / (busy + len(calls) * (pp - 1))
+
+
 def balance_chunks(
     chunks: list[Chunk],
     dp_size: int,
@@ -418,6 +491,7 @@ class StreamingLearner:
         storage_device: str,
         max_buckets_per_group: int,
         max_open_groups: int,
+        merge_pipeline_calls: bool = True,
     ) -> None:
         ray.get(
             self.worker_group.run_all_workers_single_data(
@@ -428,6 +502,7 @@ class StreamingLearner:
                 storage_device=storage_device,
                 max_buckets_per_group=max_buckets_per_group,
                 max_open_groups=max_open_groups,
+                merge_pipeline_calls=merge_pipeline_calls,
             )
         )
 

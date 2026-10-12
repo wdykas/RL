@@ -8,6 +8,11 @@ thundersync:
   max_buckets_per_group: 2  # distinct rewards per open group before collapsing to (G1, G2)
   max_open_groups: 4  # cap on groups holding gradient buckets (bounds accumulator memory)
   max_chunk_trajectories: 8
+  # Pipeline parallelism (DESIGN.md section 2): one pipeline call per dispatch and
+  # gradient destination; hold closed-group rows until this many micro-batches per
+  # learner rank are queued (null: 2 * PP when PP > 1, else 0), flushed at the end.
+  merge_pipeline_calls: true
+  min_pipeline_microbatches: null
   # Cross-iteration speculative rollouts (DESIGN.md). Off by default; the values below
   # are the defaults that apply when it is on (validated at 1.5B on 2+2 GPUs). Also set
   # NVIDIA_TF32_OVERRIDE=1 for TF32 GEMMs in the fp32 verification scorer.

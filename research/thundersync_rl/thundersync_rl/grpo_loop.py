@@ -98,6 +98,18 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     max_open_groups: int = 4
     # Upper bound on trajectories per backward chunk (bounds activation memory).
     max_chunk_trajectories: int = 8
+    # Pipeline parallelism (DESIGN.md section 2, "Streaming under pipeline
+    # parallelism"). Each learner rank runs all chunks of a dispatch that share
+    # a gradient destination (all final chunks; one open-group bucket) as ONE
+    # pipeline schedule call, paying the (PP - 1)-slot fill/drain bubble once
+    # per dispatch instead of once per chunk. False: one call per chunk.
+    merge_pipeline_calls: bool = True
+    # While rollouts are running, hold rows of closed groups back until they
+    # make at least this many micro-batches per learner DP rank, so a
+    # dispatch's pipeline call amortizes its bubble ((PP-1)/(m+PP-1) for m
+    # micro-batches). Always flushed once the step's rollouts are done, so the
+    # tail never waits. None: 2 * PP when PP > 1, else 0 (no holding).
+    min_pipeline_microbatches: Optional[int] = None
     # Exact cross-iteration speculative rollouts (speculative.py, DESIGN.md):
     # while iteration k runs, the inference engine drafts the rollouts of the next
     # ``draft_lookahead`` iterations; after the optimizer step every draft is
@@ -188,6 +200,15 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # (bounds their activation memory, about one training micro-batch of this
     # many tokens). Drafts over the budget are trained the regular way.
     fused_max_retained_tokens: int = 16384
+
+
+def resolve_min_pipeline_microbatches(ts_cfg: ThunderSyncConfig, pp: int) -> int:
+    """``thundersync.min_pipeline_microbatches`` with its PP-dependent default."""
+    if ts_cfg.min_pipeline_microbatches is not None:
+        if ts_cfg.min_pipeline_microbatches < 0:
+            raise ValueError("thundersync.min_pipeline_microbatches must be >= 0")
+        return ts_cfg.min_pipeline_microbatches
+    return 2 * pp if pp > 1 else 0
 
 
 def new_cohort_targets(
@@ -687,6 +708,10 @@ async def _run_one_step(
     expert_parallel = (
         master_config.policy["megatron_cfg"]["expert_model_parallel_size"] > 1
     )
+    pp = (
+        master_config.policy["megatron_cfg"].get("pipeline_model_parallel_size", 1) or 1
+    )
+    min_pipeline_microbatches = resolve_min_pipeline_microbatches(ts_cfg, pp)
     planner = StreamPlanner(
         adv_fn,
         dp_size=learner.dp_size,
@@ -698,6 +723,7 @@ async def _run_one_step(
             bool(getattr(loss_fn, "skip_zero_advantage_rows", False))
             and not expert_parallel
         ),
+        min_pipeline_microbatches=min_pipeline_microbatches,
     )
     for p in range(n // G):
         planner.register_group((step, p), G)
@@ -709,6 +735,7 @@ async def _run_one_step(
         storage_device=ts_cfg.storage_device,
         max_buckets_per_group=ts_cfg.max_buckets_per_group,
         max_open_groups=max_open_groups,
+        merge_pipeline_calls=ts_cfg.merge_pipeline_calls,
     )
 
     t_start = time.perf_counter()
@@ -717,6 +744,8 @@ async def _run_one_step(
     rewards = [0.0] * n
     sample_metrics: list[dict[str, Any]] = [None] * n  # type: ignore[list-item]
     learner_busy = 0.0
+    # Pipeline schedule calls of the busiest rank, summed over dispatches.
+    pipeline_calls = 0
     num_dispatches = 0
     # Timeline for offline analysis: (t, group, tokens, reward) per arrival and
     # (t_start, t_end, n_trajectories, n_tokens, n_bucket_chunks) per dispatch.
@@ -742,15 +771,17 @@ async def _run_one_step(
         return i, state, metrics
 
     async def learner_loop():
-        nonlocal learner_busy, num_dispatches
+        nonlocal learner_busy, num_dispatches, pipeline_calls
         while True:
             await wake.wait()
             wake.clear()
             # Batch-synchronous baseline: hold everything until the batch closes.
-            while planner.has_work() and (
+            # Under PP, rows of closed groups are held until they fill the
+            # pipeline (min_pipeline_microbatches) unless the rollouts are done.
+            while planner.has_work(flush=rollouts_done) and (
                 ts_cfg.granularity != "batch" or rollouts_done
             ):
-                d = planner.next_dispatch()
+                d = planner.next_dispatch(flush=rollouts_done)
                 per_rank = [
                     [
                         {
@@ -772,6 +803,9 @@ async def _run_one_step(
                 t0 = time.perf_counter()
                 rank_results = await asyncio.gather(*learner.submit(per_rank, d.closes))
                 t1 = time.perf_counter()
+                pipeline_calls += max(
+                    (r.get("num_calls", 0) for r in rank_results), default=0
+                )
                 for r in rank_results:
                     for k in ("fused_trained", "fused_tokens", "fused_fallback"):
                         fused_counts[k] += r[k]
@@ -901,6 +935,7 @@ async def _run_one_step(
         "time/step_total": t_end - t_start,
         "learner/busy_s": learner_busy,
         "learner/dispatches": num_dispatches,
+        "learner/pipeline_calls": pipeline_calls,
         "learner/peak_open_buffers": results["stream_peak_open_buffers"],
         "timeline/arrivals": arrivals,
         "timeline/dispatches": dispatches,
