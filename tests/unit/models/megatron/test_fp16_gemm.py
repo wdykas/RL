@@ -122,7 +122,7 @@ def test_head_helpers_fp32_head(enabled):
     h = torch.randn(3, 16)
     w = torch.randn(5, 16).to(torch.bfloat16)
     ref = (h.double() @ w.double().t()).float()
-    torch.testing.assert_close(fg.head_matmul(h, w), ref, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(fg.head_matmul(h, w), ref, rtol=1e-5, atol=1e-5)
     assert torch.equal(fg.head_matmul(h, w), fg.fp32_gemm(h, w))
 
 
@@ -137,10 +137,20 @@ def test_head_helpers_fp16_head(enabled, monkeypatch):
 
 
 def test_fp32_head_linear_keeps_fp32_input():
-    x = torch.full((1, 4), 1.0 + 2.0**-20)  # not representable in fp16
+    x = torch.full((1, 4), 1.0 + 2.0**-20)  # needs 21 bits: not fp16
     w = torch.ones(1, 4, dtype=torch.bfloat16)
     y = fg.fp16_linear(x, w, precision="fp32")
     assert y.item() == 4 * (1.0 + 2.0**-20)
+
+
+def test_fp32_gemm_is_much_closer_than_fp16():
+    torch.manual_seed(5)
+    x = torch.randn(64, 256) * 3
+    w = (torch.randn(128, 256) * 0.05).to(torch.bfloat16)
+    ref = x.double() @ w.double().t()
+    err32 = (fg.fp32_gemm(x, w).double() - ref).abs().max()
+    err16 = (fg.fp16_gemm(x, w).double() - ref).abs().max()
+    assert err32 < err16 / 100
 
 
 def test_head_helpers_disabled():

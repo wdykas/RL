@@ -28,7 +28,7 @@ same functions in Megatron training and in the Megatron inference engine:
 - q / k / v are rounded to fp16 after the q/k norms, so RoPE, FlashAttention
   (fp16 probabilities in its PV product) and the engine's KV cache are fp16;
 - the LM head (``lm_head_precision``, default "fp32") multiplies the fp32
-  final-norm output by the head weight upcast to fp32 in IEEE fp32 (TF32 off;
+  final-norm output by the head weight with fp32-input numerics (``fp32_gemm``;
   "fp16" uses the fp16 GEMM instead); logits are fp32 and the batch-invariant
   fp32 log-softmax is unchanged.
 
@@ -60,8 +60,9 @@ import torch
 FP16_GEMM = "fp16"
 SUPPORTED_PRECISIONS = (FP16_GEMM,)
 # LM-head GEMM under the fp16 forward (``lm_head_precision``): "fp32" (default)
-# multiplies the fp32 final-norm output by the bf16 head weight upcast to fp32
-# (exact) in IEEE fp32 (TF32 off); "fp16" uses the fp16 GEMM like every layer.
+# multiplies the fp32 final-norm output by the bf16 head weight with fp32-input
+# numerics (``fp32_gemm``: two exact fp16 GEMMs on a hi/lo split of the input);
+# "fp16" uses the fp16 GEMM like every layer.
 FP32_HEAD = "fp32"
 HEAD_PRECISIONS = (FP32_HEAD, FP16_GEMM)
 
@@ -126,27 +127,29 @@ def fp16_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return out.view(*x.shape[:-1], weight.shape[0])
 
 
-def fp32_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """``x @ weight.T`` in IEEE fp32 (TF32 off), fp32 output.
+_SPLIT_SCALE = 2048.0  # 2^11: the fp16 significand width
 
-    x [..., K] (upcast to fp32), weight [N, K] (bf16 upcast to fp32: exact).
-    TF32 is switched off for this call only, so the result does not depend on
-    the process's TF32 setting (``NVIDIA_TF32_OVERRIDE`` can only disable TF32).
+
+def fp32_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """``x @ weight.T`` for an fp32 x and a bf16 weight, fp32 output.
+
+    x is split into two fp16 terms, x = hi + lo / 2^11 (hi = fp16(x),
+    lo = fp16((x - hi) * 2^11); ~22 significant bits of x), and the weight is
+    cast to fp16 (exact for a bf16 weight in fp16's normal range). Two fp16
+    GEMMs with fp32 accumulation give every product exactly; the result is
+    hi @ w.T + (lo @ w.T) / 2^11 in fp32.
+
+    Why not one IEEE fp32 cuBLAS GEMM: measured on GB200, fp32 SGEMM rows at
+    M = 1, 3, 8 differ from the same rows in a 4096-row GEMM (kernel choice
+    changes the reduction), so it is not batch invariant for few decoding
+    requests; and ``NVIDIA_TF32_OVERRIDE=1`` (set by the engine-q scripts)
+    turns it into TF32 regardless of ``allow_tf32``. The fp16 GEMM is batch
+    invariant at every M tested (1..4096) and runs on tensor cores.
     """
-    k = x.shape[-1]
-    x2 = x.reshape(-1, k).float().contiguous()
-    w32 = weight.float()
-    if x2.is_cuda:
-        flags = torch.backends.cuda.matmul
-        prev = flags.allow_tf32
-        flags.allow_tf32 = False
-        try:
-            out = torch.mm(x2, w32.t())
-        finally:
-            flags.allow_tf32 = prev
-    else:
-        out = torch.mm(x2, w32.t())
-    return out.view(*x.shape[:-1], weight.shape[0])
+    x32 = x.float()
+    hi = x32.to(torch.float16)
+    lo = ((x32 - hi.float()) * _SPLIT_SCALE).to(torch.float16)
+    return fp16_gemm(hi, weight) + fp16_gemm(lo, weight) / _SPLIT_SCALE
 
 
 _GEMMS = {FP16_GEMM: fp16_gemm, FP32_HEAD: fp32_gemm}
