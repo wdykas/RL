@@ -1,0 +1,588 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""fp16 GEMM forward numerics (``policy.megatron_cfg.forward_gemm_precision: fp16``).
+
+The "V8b" forward of thundersync_work/research/bf16_ablation.md, computed by the
+same functions in Megatron training and in the Megatron inference engine:
+
+- every linear layer (attention QKV / output projection, MLP fc1 / fc2, LM head)
+  casts its input and its bf16 weight to fp16 and runs one cuBLAS GEMM with fp32
+  accumulation and an **fp32 output** (``fp16_gemm``). A bf16 weight is exactly
+  representable in fp16 when |w| is in [6.1e-5, 65504]; weights, checkpoints,
+  fp32 master weights and the optimizer are unchanged (bf16 / fp32);
+- the residual stream is fp32 (``fp32_residual_connection``, required);
+- RMSNorm (fused input norms, q/k norms, final norm) runs in fp32 on the fp32
+  input with the batch-invariant row kernel and emits fp32; SwiGLU runs on the
+  fp32 fc1 output. The next GEMM rounds its input to fp16;
+- q / k / v are rounded to fp16 after the q/k norms, so RoPE, FlashAttention
+  (fp16 probabilities in its PV product) and the engine's KV cache are fp16;
+- logits are the fp32 output of the head GEMM; the batch-invariant fp32
+  log-softmax is unchanged.
+
+Tensor parallelism (sequence parallel): a norm output is rounded to fp16 before
+its all-gather (same bytes as bf16 today); row-parallel GEMM outputs are
+reduce-scattered in fp32 (2x the bytes of today's bf16 reduce-scatter). Both
+sides call the same code, so their collectives match.
+
+Backward (training only; only the forward has to match the engine): the
+dgrad / wgrad GEMMs run on bf16 casts with fp32 accumulation. Gradients never
+pass through fp16 except inside FlashAttention's backward, where the incoming
+gradient is scaled by a power of two chosen from its amax (and unscaled on the
+q / k / v side) so it does not underflow fp16's exponent range.
+
+``install()`` patches the Megatron-Core / Transformer Engine classes from NeMo-RL
+(the Megatron sources are shared and not edited); every patched method falls
+back to the original unless ``install()`` ran in this process and the module's
+weight is 16-bit (a separately built fp32 model keeps its own numerics).
+Dense models only: MoE grouped GEMMs are not built yet.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Optional
+
+import torch
+
+FP16_GEMM = "fp16"
+SUPPORTED_PRECISIONS = (FP16_GEMM,)
+
+_STATE: dict[str, Any] = {"enabled": False, "orig": {}}
+
+# Target |amax| of an attention-output gradient after scaling into fp16
+# (2^8 leaves 2^8 headroom below fp16's max for FlashAttention's backward).
+_ATTN_GRAD_TARGET_LOG2 = 8.0
+
+
+def enabled() -> bool:
+    """Whether the fp16 GEMM forward is installed in this process."""
+    return bool(_STATE["enabled"])
+
+
+def _active(weight: Optional[torch.Tensor]) -> bool:
+    return (
+        _STATE["enabled"]
+        and weight is not None
+        and weight.dtype in (torch.bfloat16, torch.float16)
+    )
+
+
+# ---------------------------------------------------------------------------
+# The shared GEMM.
+# ---------------------------------------------------------------------------
+
+
+def _mm(a: torch.Tensor, b: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """a [M, K] @ b [K, N] with fp32 accumulation, emitted in ``out_dtype``.
+
+    CUDA: one cuBLAS GEMM (``torch.mm(..., out_dtype=...)``; under the te_native
+    batch-invariant backend cuBLASLt runs without workspace, i.e. without
+    split-K). CPU (tests): fp32 matmul of the 16-bit operands, which is exact per
+    product (11- or 8-bit significands) with fp32 accumulation.
+    """
+    if a.is_cuda:
+        if a.dtype == out_dtype:
+            return torch.mm(a, b)
+        return torch.mm(a, b, out_dtype=out_dtype)
+    return torch.mm(a.float(), b.float()).to(out_dtype)
+
+
+def fp16_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """``x @ weight.T`` with fp16 operands, fp32 accumulation and fp32 output.
+
+    x [..., K] (any float dtype; rounded to fp16), weight [N, K] (bf16 or fp16;
+    rounded to fp16). Returns fp32 [..., N]. The single GEMM of the fp16 forward:
+    the training linear layers, the inference linear layers, the LM head and
+    ThunderSync's engine-q head recomputation all call it.
+    """
+    k = x.shape[-1]
+    x2 = x.reshape(-1, k).to(torch.float16).contiguous()
+    w16 = weight.to(torch.float16)
+    out = _mm(x2, w16.t(), torch.float32)
+    return out.view(*x.shape[:-1], weight.shape[0])
+
+
+def head_input_dtype(weight_dtype: torch.dtype) -> torch.dtype:
+    """dtype that holds an LM-head input losslessly for the head GEMM.
+
+    fp16 under the fp16 GEMM forward (the GEMM rounds its input to fp16 first,
+    so storing that rounding loses nothing); otherwise the weight dtype, as
+    before.
+    """
+    return torch.float16 if _STATE["enabled"] else weight_dtype
+
+
+def head_matmul(h: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """fp32 logits ``h @ weight.T`` as the model's LM head computes them."""
+    if _STATE["enabled"]:
+        return fp16_gemm(h, weight)
+    return h.float() @ weight.float().t()
+
+
+# ---------------------------------------------------------------------------
+# Autograd: fp16 forward, bf16 backward.
+# ---------------------------------------------------------------------------
+
+# Collectives fused into the linear function (sequence dimension = dim 0).
+COMM_NONE = None
+COMM_SP_GATHER = "sp_gather"  # all-gather input rows; bwd: reduce-scatter dgrad
+COMM_SP_SCATTER = "sp_scatter"  # reduce-scatter output rows; bwd: all-gather grad
+COMM_TP_COPY = "tp_copy"  # input replicated; bwd: all-reduce dgrad
+COMM_TP_ALLREDUCE = "tp_allreduce"  # all-reduce output; bwd: identity
+
+
+def _gather_rows(x: torch.Tensor, group: Any) -> torch.Tensor:
+    from megatron.core.tensor_parallel.mappings import _gather_along_first_dim
+
+    return _gather_along_first_dim(x, group)
+
+
+def _reduce_scatter_rows(x: torch.Tensor, group: Any) -> torch.Tensor:
+    from megatron.core.tensor_parallel.mappings import _reduce_scatter_along_first_dim
+
+    return _reduce_scatter_along_first_dim(x, group)
+
+
+def _all_reduce(x: torch.Tensor, group: Any) -> torch.Tensor:
+    torch.distributed.all_reduce(x, group=group)
+    return x
+
+
+class Fp16Linear(torch.autograd.Function):
+    """y = fp16_gemm(x, w) (fp32), with an optional fused TP collective.
+
+    Forward: x and w rounded to fp16 (x before its all-gather), fp32 GEMM
+    output, fp32 reduce-scatter / all-reduce. Backward: dgrad and wgrad GEMMs on
+    bf16 casts with fp32 accumulation; dgrad returned in x's dtype, wgrad in the
+    weight's dtype (Megatron DDP adds ``param.grad`` into the fp32 main grad).
+    """
+
+    @staticmethod
+    def forward(ctx, x, weight, comm, group):  # noqa: D102
+        x16 = x.to(torch.float16)
+        if comm == COMM_SP_GATHER:
+            x16 = _gather_rows(x16, group)
+        out = fp16_gemm(x16, weight)
+        if comm == COMM_SP_SCATTER:
+            out = _reduce_scatter_rows(out, group)
+        elif comm == COMM_TP_ALLREDUCE:
+            out = _all_reduce(out, group)
+        if torch.is_grad_enabled() or ctx.needs_input_grad[0] or ctx.needs_input_grad[1]:
+            ctx.save_for_backward(x16, weight)
+        ctx.x_dtype = x.dtype
+        ctx.comm = comm
+        ctx.group = group
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):  # noqa: D102
+        x16, weight = ctx.saved_tensors
+        g = grad_out
+        if ctx.comm == COMM_SP_SCATTER:
+            g = _gather_rows(g.contiguous(), ctx.group)
+        n = weight.shape[0]
+        g2 = g.reshape(-1, n).to(torch.bfloat16).contiguous()
+        dgrad = wgrad = None
+        if ctx.needs_input_grad[0]:
+            w16 = weight.to(torch.bfloat16)
+            dgrad = _mm(g2, w16, torch.float32).view(*x16.shape[:-1], weight.shape[1])
+            if ctx.comm == COMM_SP_GATHER:
+                dgrad = _reduce_scatter_rows(dgrad, ctx.group)
+            elif ctx.comm == COMM_TP_COPY:
+                dgrad = _all_reduce(dgrad, ctx.group)
+            dgrad = dgrad.to(ctx.x_dtype)
+        if ctx.needs_input_grad[1]:
+            x2 = x16.reshape(-1, x16.shape[-1]).to(torch.bfloat16)
+            wgrad = _mm(g2.t(), x2, torch.float32).to(weight.dtype)
+        return dgrad, wgrad, None, None
+
+
+def fp16_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    comm: Optional[str] = COMM_NONE,
+    group: Any = None,
+) -> torch.Tensor:
+    """Autograd-aware ``Fp16Linear``; plain forward under no_grad / inference."""
+    return Fp16Linear.apply(x, weight, comm, group)
+
+
+def rms_norm_fp32(
+    x: torch.Tensor, weight: torch.Tensor, eps: float, zero_centered_gamma: bool = False
+) -> torch.Tensor:
+    """RMSNorm of x in fp32 (fp32 output), weight upcast to fp32.
+
+    CUDA: Megatron-Core's batch-invariant RMSNorm (one program per row, fixed
+    reduction order; fp32 backward). CPU (tests): the same formula in torch.
+    """
+    x32 = x.float()
+    if x32.is_cuda:
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            BatchInvariantRMSNormFn,
+        )
+
+        return BatchInvariantRMSNormFn.apply(x32, weight, eps, zero_centered_gamma)
+    w = weight.float() + 1.0 if zero_centered_gamma else weight.float()
+    rsigma = torch.rsqrt((x32 * x32).mean(-1, keepdim=True) + eps)
+    return (x32 * rsigma) * w
+
+
+class _GradScaleBox:
+    """Scale shared by one attention forward's fp16 boundary ops."""
+
+    __slots__ = ("scale",)
+
+    def __init__(self) -> None:
+        self.scale: Optional[torch.Tensor] = None
+
+
+class ToFp16Scaled(torch.autograd.Function):
+    """x -> fp16 (forward). Backward: grad / box.scale, in x's dtype."""
+
+    @staticmethod
+    def forward(ctx, x, box):  # noqa: D102
+        ctx.x_dtype = x.dtype
+        ctx.box = box
+        return x.to(torch.float16)
+
+    @staticmethod
+    def backward(ctx, grad):  # noqa: D102
+        g = grad.float()
+        if ctx.box.scale is not None:
+            g = g / ctx.box.scale
+        return g.to(ctx.x_dtype), None
+
+
+class FromFp16Scaled(torch.autograd.Function):
+    """fp16 -> fp32 (exact, forward). Backward: grad * 2^e into fp16.
+
+    2^e brings the gradient's amax to about 2^8 so FlashAttention's fp16
+    backward neither underflows nor overflows; ``ToFp16Scaled`` divides it out.
+    """
+
+    @staticmethod
+    def forward(ctx, x16, box):  # noqa: D102
+        ctx.box = box
+        return x16.float()
+
+    @staticmethod
+    def backward(ctx, grad):  # noqa: D102
+        g = grad.float()
+        amax = g.abs().amax().clamp_min(torch.finfo(torch.float32).tiny)
+        exponent = torch.floor(_ATTN_GRAD_TARGET_LOG2 - torch.log2(amax)).clamp(-60, 60)
+        scale = torch.exp2(exponent)
+        ctx.box.scale = scale
+        return (g * scale).to(torch.float16), None
+
+
+# ---------------------------------------------------------------------------
+# Megatron-Core / Transformer Engine patches.
+# ---------------------------------------------------------------------------
+
+
+def _tp(module: Any) -> tuple[int, Any]:
+    group = getattr(module, "tp_group", None)
+    if group is None:
+        return 1, None
+    size = torch.distributed.get_world_size(group)
+    return size, group
+
+
+def _te_linear_forward(module: Any, x: torch.Tensor, norm: bool):
+    """Forward of a TE (or inference-optimized) linear under the fp16 GEMM.
+
+    Returns (output, bias-or-None) as Megatron's TE wrappers do.
+    """
+    if getattr(module, "fp8", False) or getattr(module, "primary_weights_in_fp8", False):
+        raise NotImplementedError("forward_gemm_precision=fp16 does not support FP8.")
+    weight = module.weight
+    tp_size, group = _tp(module)
+    sequence_parallel = bool(getattr(module, "sequence_parallel", False)) and tp_size > 1
+    mode = getattr(module, "parallel_mode", None)
+    if norm:
+        if getattr(module, "normalization", "RMSNorm") != "RMSNorm":
+            raise NotImplementedError(
+                "forward_gemm_precision=fp16 supports RMSNorm only "
+                f"(got {module.normalization})."
+            )
+        x = rms_norm_fp32(
+            x,
+            module.layer_norm_weight,
+            module.eps,
+            bool(getattr(module, "zero_centered_gamma", False)),
+        )
+    if mode == "column":
+        comm = (
+            COMM_SP_GATHER
+            if sequence_parallel
+            else (COMM_TP_COPY if tp_size > 1 else COMM_NONE)
+        )
+    elif mode == "row":
+        comm = (
+            COMM_SP_SCATTER
+            if sequence_parallel
+            else (COMM_TP_ALLREDUCE if tp_size > 1 else COMM_NONE)
+        )
+    else:
+        comm = COMM_NONE
+    out = fp16_linear(x, weight, comm, group)
+    bias = getattr(module, "bias", None)
+    has_bias = bool(getattr(module, "use_bias", False)) and bias is not None and bias.numel()
+    if has_bias:
+        if getattr(module, "te_return_bias", False):
+            return out, bias
+        out = out + bias.float()
+    return out, None
+
+
+def _make_te_forward(cls: type, norm: bool):
+    orig = cls.__dict__.get("forward") or cls.forward
+    _STATE["orig"][cls] = orig
+
+    def forward(self, x, *args, **kwargs):
+        if not _active(getattr(self, "weight", None)):
+            return orig(self, x, *args, **kwargs)
+        return _te_linear_forward(self, x, norm)
+
+    forward.__wrapped__ = orig  # type: ignore[attr-defined]
+    cls.forward = forward
+
+
+def _make_output_layer_forward(cls: type):
+    """tensor_parallel.ColumnParallelLinear (the GPT LM head)."""
+    orig = cls.__dict__["forward"]
+    _STATE["orig"][cls] = orig
+
+    def forward(self, input_, weight=None, runtime_gather_output=None):
+        w = self.weight if weight is None else weight
+        if not _active(w):
+            return orig(self, input_, weight=weight, runtime_gather_output=runtime_gather_output)
+        from megatron.core.tensor_parallel.mappings import (
+            gather_from_tensor_model_parallel_region,
+        )
+
+        tp_size, group = _tp(self)
+        if self.sequence_parallel and tp_size > 1:
+            comm = COMM_SP_GATHER
+        elif tp_size > 1 and not (
+            getattr(self, "explicit_expert_comm", False)
+            or getattr(self, "disable_grad_reduce", False)
+        ):
+            comm = COMM_TP_COPY
+        else:
+            comm = COMM_NONE
+        out = fp16_linear(input_, w, comm, group)
+        if self.bias is not None and not self.skip_bias_add:
+            out = out + self.bias.float()
+        gather = self.gather_output if runtime_gather_output is None else runtime_gather_output
+        if gather and tp_size > 1:
+            out = gather_from_tensor_model_parallel_region(out, group=group)
+        return out, (self.bias if self.skip_bias_add else None)
+
+    forward.__wrapped__ = orig  # type: ignore[attr-defined]
+    cls.forward = forward
+
+
+def _patch_te_rmsnorm() -> None:
+    """TE RMSNorm modules (q/k norms, final norm): fp32 batch-invariant norm."""
+    import transformer_engine.pytorch as te
+
+    cls = te.RMSNorm
+    orig = cls.forward
+    _STATE["orig"][cls] = orig
+
+    def forward(self, x, *args, **kwargs):
+        if not _active(getattr(self, "weight", None)):
+            return orig(self, x, *args, **kwargs)
+        return rms_norm_fp32(
+            x, self.weight, self.eps, bool(getattr(self, "zero_centered_gamma", False))
+        )
+
+    cls.forward = forward
+
+
+def _cast_qkv(outputs: Any, box: Optional[_GradScaleBox]) -> Any:
+    def cast(t: Any) -> Any:
+        if not torch.is_tensor(t) or not t.is_floating_point() or t.dtype == torch.float16:
+            return t
+        if box is not None:
+            return ToFp16Scaled.apply(t, box)
+        return t.to(torch.float16)
+
+    if isinstance(outputs, tuple):
+        return tuple(cast(t) for t in outputs)
+    return cast(outputs)
+
+
+def _patch_attention() -> None:
+    """q / k / v to fp16 after the q/k norms; scaled fp16 boundary for autograd."""
+    from megatron.core.transformer.attention import Attention, SelfAttention
+
+    orig_qkv = SelfAttention.get_query_key_value_tensors
+    orig_post = Attention.forward_post_core_attn
+    _STATE["orig"][(SelfAttention, "qkv")] = orig_qkv
+    _STATE["orig"][(Attention, "post")] = orig_post
+
+    def get_query_key_value_tensors(self, *args, **kwargs):
+        outputs = orig_qkv(self, *args, **kwargs)
+        if not _active(getattr(self.linear_qkv, "weight", None)):
+            return outputs
+        box = None
+        if torch.is_grad_enabled():
+            box = _GradScaleBox()
+            self._fp16_gemm_box = box
+        return _cast_qkv(outputs, box)
+
+    def forward_post_core_attn(self, core_attn_out):
+        box = self.__dict__.pop("_fp16_gemm_box", None)
+        if (
+            box is not None
+            and torch.is_grad_enabled()
+            and core_attn_out.dtype == torch.float16
+            and core_attn_out.requires_grad
+        ):
+            core_attn_out = FromFp16Scaled.apply(core_attn_out, box)
+        return orig_post(self, core_attn_out)
+
+    SelfAttention.get_query_key_value_tensors = get_query_key_value_tensors
+    Attention.forward_post_core_attn = forward_post_core_attn
+
+
+def _patch_inference_buffers() -> None:
+    """fp16 KV cache; fp32 logits buffer of the CUDA-graph text generation controller."""
+    from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+    from megatron.core.inference.text_generation_controllers.text_generation_controller import (
+        TextGenerationController,
+    )
+
+    orig_alloc = DynamicInferenceContext._allocate_memory_buffer
+    _STATE["orig"][(DynamicInferenceContext, "alloc")] = orig_alloc
+
+    def _allocate_memory_buffer(self, *args, **kwargs):
+        if getattr(self, "cache_mla_latent", False):
+            return orig_alloc(self, *args, **kwargs)
+        saved = self.params_dtype
+        self.params_dtype = torch.float16
+        try:
+            return orig_alloc(self, *args, **kwargs)
+        finally:
+            self.params_dtype = saved
+
+    DynamicInferenceContext._allocate_memory_buffer = _allocate_memory_buffer
+
+    orig_init = TextGenerationController.__init__
+    _STATE["orig"][(TextGenerationController, "init")] = orig_init
+
+    def __init__(self, *args, **kwargs):
+        orig_init(self, *args, **kwargs)
+        buf = getattr(self, "_all_logits_cuda", None)
+        if torch.is_tensor(buf) and buf.dtype != torch.float32:
+            self._all_logits_cuda = torch.zeros_like(buf, dtype=torch.float32)
+
+    TextGenerationController.__init__ = __init__
+
+
+def install() -> None:
+    """Install the fp16 GEMM forward for this process (idempotent).
+
+    Call before the models are built and before the inference engine captures
+    its CUDA graphs, in every training and generation worker.
+    """
+    if _STATE["enabled"]:
+        return
+    from megatron.core.extensions import transformer_engine as mte
+    from megatron.core.tensor_parallel import inference_layers as il
+    from megatron.core.tensor_parallel.layers import ColumnParallelLinear
+
+    for cls, norm in (
+        (mte.TELinear, False),
+        (mte.TEColumnParallelLinear, False),
+        (mte.TERowParallelLinear, False),
+        (mte.TELayerNormColumnParallelLinear, True),
+        (il.InferenceLinear, False),
+        (il.InferenceColumnParallelLinear, False),
+        (il.InferenceRowParallelLinear, False),
+        (il.InferenceLayerNormColumnParallelLinear, True),
+    ):
+        _make_te_forward(cls, norm)
+    _make_output_layer_forward(ColumnParallelLinear)
+    _patch_te_rmsnorm()
+    _patch_attention()
+    _patch_inference_buffers()
+    _STATE["enabled"] = True
+    print(
+        "[fp16_gemm] forward_gemm_precision=fp16: fp16 GEMM operands, fp32 GEMM "
+        "outputs / norms / residual, fp16 attention and KV cache",
+        flush=True,
+    )
+
+
+def validate_config(megatron_cfg: dict[str, Any], inference_cfg: Optional[dict] = None) -> list[str]:
+    """Config violations of ``forward_gemm_precision`` (empty when unset)."""
+    value = megatron_cfg.get("forward_gemm_precision")
+    if value is None:
+        return []
+    errors = []
+    if value not in SUPPORTED_PRECISIONS:
+        return [
+            f"policy.megatron_cfg.forward_gemm_precision must be one of "
+            f"{SUPPORTED_PRECISIONS} or unset (got {value!r})."
+        ]
+    if not megatron_cfg.get("fp32_residual_connection"):
+        errors.append(
+            "forward_gemm_precision='fp16' requires "
+            "policy.megatron_cfg.fp32_residual_connection=true (fp32 residual stream)."
+        )
+    if megatron_cfg.get("gradient_accumulation_fusion"):
+        errors.append(
+            "forward_gemm_precision='fp16' requires "
+            "policy.megatron_cfg.gradient_accumulation_fusion=false (its wgrad "
+            "is returned as param.grad)."
+        )
+    if megatron_cfg.get("use_fused_linear_logprobs"):
+        errors.append(
+            "forward_gemm_precision='fp16' requires use_fused_linear_logprobs=false "
+            "(the fused head does not use the fp16 GEMM)."
+        )
+    for key in ("fp8_cfg", "fp4_cfg"):
+        cfg = megatron_cfg.get(key)
+        enabled_flag = (
+            cfg.get("enabled") if isinstance(cfg, dict) else getattr(cfg, "enabled", False)
+        )
+        if enabled_flag:
+            errors.append(f"forward_gemm_precision='fp16' does not support {key}.enabled=true.")
+    if inference_cfg is not None and inference_cfg.get("forward_gemm_precision") != value:
+        errors.append(
+            "forward_gemm_precision must be the same in training and generation "
+            f"(generation: {inference_cfg.get('forward_gemm_precision')!r})."
+        )
+    return errors
+
+
+def validate_model(model_cfg: Any) -> None:
+    """Reject model architectures the fp16 GEMM forward does not cover yet."""
+    unsupported = []
+    if getattr(model_cfg, "num_moe_experts", None):
+        unsupported.append("MoE (num_moe_experts; grouped expert GEMMs not built yet)")
+    if getattr(model_cfg, "multi_latent_attention", False):
+        unsupported.append("multi_latent_attention")
+    if getattr(model_cfg, "normalization", "RMSNorm") != "RMSNorm":
+        unsupported.append(f"normalization={model_cfg.normalization}")
+    if getattr(model_cfg, "mtp_num_layers", None):
+        unsupported.append("mtp_num_layers")
+    if getattr(model_cfg, "attention_output_gate", False):
+        unsupported.append("attention_output_gate")
+    if unsupported:
+        raise ValueError(
+            "forward_gemm_precision='fp16' does not support: " + ", ".join(unsupported)
+        )
