@@ -19,6 +19,11 @@ casts its fp32 input to the activation dtype before the norm
 norm + linear passes the fp32 tensor straight to TE's ``rmsnorm_fwd`` with bf16
 weights, for which TE has no kernel. ``install()`` makes the inference norm do
 the same cast as training, so the two paths keep computing the same function.
+
+Under ``forward_gemm_precision=fp16`` (``fp16_gemm.py``) neither side rounds the
+residual: the fused norm + linear forwards of both training and inference are
+replaced by an fp32 norm on the fp32 residual, so this kernel is not reached;
+the cast below is skipped then as well.
 """
 
 from __future__ import annotations
@@ -37,7 +42,9 @@ def install() -> None:
     inner = inference_layers._te_rms_norm_kernel
 
     def _te_rms_norm_kernel(x: torch.Tensor, weight: torch.Tensor, eps: float):
-        if x.dtype != weight.dtype:
+        from nemo_rl.models.megatron import fp16_gemm
+
+        if x.dtype != weight.dtype and not fp16_gemm.enabled():
             x = x.to(weight.dtype)
         return inner(x=x, weight=weight, eps=eps)
 

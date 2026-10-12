@@ -177,7 +177,7 @@ class Fp16Linear(torch.autograd.Function):
             out = _reduce_scatter_rows(out, group)
         elif comm == COMM_TP_ALLREDUCE:
             out = _all_reduce(out, group)
-        if torch.is_grad_enabled() or ctx.needs_input_grad[0] or ctx.needs_input_grad[1]:
+        if ctx.needs_input_grad[0] or ctx.needs_input_grad[1]:
             ctx.save_for_backward(x16, weight)
         ctx.x_dtype = x.dtype
         ctx.comm = comm
