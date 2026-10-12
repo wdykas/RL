@@ -45,6 +45,7 @@ verification rule.
 
 from __future__ import annotations
 
+import os
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Union
@@ -265,8 +266,10 @@ def free_hidden(hiddens, free: Optional[Callable[[list], None]] = None) -> int:
 # Rows per object-store object. The learner fetches whole blocks, so this
 # bounds what a rejected draft pulls beyond the rows its lazy scan visits
 # (at most one partial block per visited run); 256 rows are 2 MB at d = 4096
-# and 3.7 MB at d = 7168 (bf16), well above Ray's inline-object size.
-HIDDEN_BLOCK_ROWS = 256
+# and 3.7 MB at d = 7168 (bf16), well above Ray's inline-object size. Each
+# block is one ray.put, so larger blocks cut per-put overhead at the step
+# deadline (THUNDERSYNC_HIDDEN_BLOCK_ROWS overrides it for measurements).
+HIDDEN_BLOCK_ROWS = int(os.environ.get("THUNDERSYNC_HIDDEN_BLOCK_ROWS", "256"))
 
 
 def put_hidden(
