@@ -711,6 +711,9 @@ learner recomputes the batch's log-probs and compares them with the rollout log-
 | Model | Mismatch |
 |---|---|
 | Qwen3-1.7B, BI | 0 on every token (4 steps) |
+| Qwen3-1.7B, BI, TP=2 (train and inference) | 0 on every token (4 steps) |
+| Qwen3-1.7B, BI, training PP=2, inference PP=1 | 0 on every token (2 steps) |
+| Qwen3-1.7B, BI, training PP=2, inference PP=2 | broken generation: reward 0.05, ~43-nat gap (Megatron inference at PP>1 under BI); use inference PP=1 |
 | Nemotron-Nano-9B-v2 (hybrid Mamba), BI, validator's hybrid exclusion relaxed | 0 on every token (3 steps) |
 
 The PR's exclusion of hybrid Mamba models is an untested-scope limit: MCore's
@@ -819,7 +822,10 @@ stashes, retained graphs and training state on TP=1 GPUs); it fits with
 of draft tokens, but only about one trajectory per step finishes whole and gets fused.
 
 **Engine-sourced q** (`thundersync.verify_source=engine`, `engine_q.py`). *Opt-in. Exact end
-to end on GPU at TP=1 (Qwen3-1.7B, BI, 4 steps: every `[engine q check]` exact, train/generation
+to end on GPU at TP=1 and at training PP=2 / inference PP=1 (Qwen3-1.7B, BI, 4 steps each: every
+`[engine q check]` exact, train/generation mismatch 0, nothing dropped, 35-48% kept); at TP=2
+the train/generation mismatch is 0 and 7 of 9 checks were exact before the probe-column source
+check (below) was added. Earlier at TP=1: every `[engine q check]` exact, train/generation
 mismatch 0, no dropped drafts, 40% of draft tokens kept — the exact-bf16 rate); TP 2, EP 2
 and PP 2 are unit-tested (fake process groups), GPU runs in progress.*
 
