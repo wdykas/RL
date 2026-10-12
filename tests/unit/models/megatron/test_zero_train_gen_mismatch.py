@@ -267,12 +267,6 @@ def test_batch_invariant_accepts_any_tp_with_the_same_generation_layout(tp_size)
         ),
         (
             lambda c: c["generation"]["mcore_generation_config"].update(
-                pipeline_model_parallel_size=2
-            ),
-            "pipeline_model_parallel_size",
-        ),
-        (
-            lambda c: c["generation"]["mcore_generation_config"].update(
                 expert_model_parallel_size=2
             ),
             "expert_model_parallel_size",
@@ -291,7 +285,6 @@ def test_batch_invariant_accepts_any_tp_with_the_same_generation_layout(tp_size)
         "fuse-gen",
         "tp-comm-overlap",
         "gen-tp",
-        "gen-pp",
         "gen-ep",
         "token-multiple",
     ],
@@ -1187,3 +1180,16 @@ def test_logprob_shim_is_idempotent_and_keeps_tp1_local(monkeypatch):
 
     chunked = model_utils.ChunkedDistributedLogprob
     assert torch.equal(chunked.apply(logits, target, 0, 16, 2, "tp1", True), expected)
+
+
+def test_batch_invariant_allows_different_pipeline_parallelism():
+    """PP only moves activations point to point: train PP may differ from inference PP."""
+    config = _tp_config(2)
+    config["generation"]["mcore_generation_config"].update(
+        pipeline_model_parallel_size=1
+    )
+    config["megatron_cfg"]["pipeline_model_parallel_size"] = 2
+    result = zgm.validate_batch_invariant_mode(config)
+    assert not any("pipeline_model_parallel_size" in v for v in result.violations), (
+        result.violations
+    )

@@ -46,7 +46,7 @@ PAR=(policy.megatron_cfg.tensor_model_parallel_size=$TP
      policy.megatron_cfg.sequence_parallel=$SP
      policy.megatron_cfg.expert_tensor_parallel_size=1
      ++policy.generation.mcore_generation_config.tensor_model_parallel_size=$TP
-     ++policy.generation.mcore_generation_config.pipeline_model_parallel_size=$PP
+     ++policy.generation.mcore_generation_config.pipeline_model_parallel_size=${GEN_PP:-$PP}
      ++policy.generation.mcore_generation_config.expert_model_parallel_size=$EP
      ++policy.generation.mcore_generation_config.materialize_only_last_token_logits=true
      policy.megatron_cfg.activation_checkpointing=false)

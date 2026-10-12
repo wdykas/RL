@@ -239,11 +239,14 @@ def validate_batch_invariant_mode(config: PolicyConfig) -> ZeroTrainGenValidatio
                 f"top_k={sampling.top_k})."
             )
         # Batch invariance needs the identical parallel layout on both sides:
-        # a different TP changes the row-parallel GEMMs' K split, and PP/EP/
-        # expert TP change the collectives and expert GEMM shapes.
+        # a different TP changes the row-parallel GEMMs' K split, and EP/expert
+        # TP change the collectives and expert GEMM shapes. Pipeline parallelism
+        # only moves activations between stages (point to point, no reduction),
+        # so training and inference may use different PP (e.g. inference PP=1,
+        # where Megatron inference at PP>1 under BI was measured to generate
+        # garbage: reward 0.05, every rollout at the length cap).
         matching_fields = (
             "tensor_model_parallel_size",
-            "pipeline_model_parallel_size",
             "expert_model_parallel_size",
             "expert_tensor_parallel_size",
             "context_parallel_size",

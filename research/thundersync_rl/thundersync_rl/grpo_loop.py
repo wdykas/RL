@@ -353,7 +353,6 @@ def validate_engine_verify_source(
             "pipeline schedule on one model chunk)"
         )
     for key, why in (
-        ("pipeline_model_parallel_size", "the engine's last stage logs the head input"),
         ("expert_model_parallel_size", "the expert all-to-alls and GEMM shapes"),
     ):
         train_v = megatron_cfg.get(key, 1)

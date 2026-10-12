@@ -894,11 +894,6 @@ def _tp_gen(tp, **mcore):
         ),
         (
             {},
-            _gen(pipeline_model_parallel_size=2),
-            r"pipeline_model_parallel_size \(2\) must equal",
-        ),
-        (
-            {},
             _gen(expert_model_parallel_size=2),
             r"expert_model_parallel_size \(2\) must equal",
         ),
