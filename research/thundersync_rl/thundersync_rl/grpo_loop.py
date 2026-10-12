@@ -144,6 +144,14 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # speculative decoding in the engine. Falls back to "scorer" when the
     # engine cannot log hidden states.
     verify_source: Literal["scorer", "engine"] = "scorer"
+    # verify_source=engine: how the engine's hidden states (d x 2 B per drafted
+    # token) reach the learner. "object_store": the generation worker puts each
+    # draft's rows into the Ray object store once (256-row blocks) and only
+    # handles pass through the driver, which frees them after verification; the verifying learner rank fetches a block only
+    # when its lazy scan needs a q row in it (fully accepted drafts fetch
+    # nothing). "driver": every draft's rows go generation worker -> driver ->
+    # each learner worker (the earlier path, kept for A/B).
+    hidden_transport: Literal["object_store", "driver"] = "object_store"
     # Iterations drafted concurrently. A draft cut off at one deadline resumes
     # from its prefix, under the newer weights, in the next iteration.
     draft_lookahead: int = 3
@@ -954,6 +962,7 @@ def thundersync_grpo_train(
             fused_verify_train=ts_cfg.fused_verify_train,
             fused_max_retained_tokens=ts_cfg.fused_max_retained_tokens,
             verify_source=ts_cfg.verify_source,
+            hidden_transport=ts_cfg.hidden_transport,
         )
     G = master_config.grpo.num_generations_per_prompt
     if spec is not None and os.environ.get("THUNDERSYNC_SPEC_SELFTEST"):

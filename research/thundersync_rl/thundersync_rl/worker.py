@@ -1413,14 +1413,23 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         return True
 
     def pop_draft_hidden(
-        self, keys: list[str], lengths: list[int]
-    ) -> dict[str, torch.Tensor]:
+        self, keys: list[str], lengths: list[int], as_refs: bool = False
+    ) -> dict[str, Any]:
         """Logged hidden states [n, d] (CPU) of the drafts this engine ran.
 
         Drafts another engine ran, or with a missing row, are left out. Every
         key is closed: rows of later engine steps (an aborted stream finishing
         its step) are discarded.
+
+        ``as_refs``: put each draft's rows into the Ray object store (one
+        object per ``HIDDEN_BLOCK_ROWS`` rows) and return [(ObjectRef, rows,
+        bytes)] per block instead of the tensor, so the caller only handles references
+        and the verifying learner fetches the rows directly from this node,
+        only if its lazy scan needs them. This worker owns the objects but
+        keeps no reference: the driver frees them after verification.
         """
+        from thundersync_rl.engine_q import put_hidden
+
         log = getattr(self, "_hidden_log", None)
         if log is None:
             return {}
@@ -1428,7 +1437,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         for k, n in zip(keys, lengths):
             h = log.pop(k, n)
             if h is not None and n > 0:
-                out[k] = h
+                out[k] = put_hidden(h) if as_refs else h
         return out
 
     def _lm_head(self):
@@ -1541,7 +1550,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         prompt_lens: list[int],
         segments: list[list[tuple[int, int, int]]],
         engine_logq: list[list[float]],
-        hidden: list[torch.Tensor],
+        hidden: list[Any],
         vocab_limit: int,
         seed: int,
         keys: list[str],
@@ -1558,12 +1567,18 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         vocab-parallel logits are all-gathered in rank order before the
         log-softmax, as ``_GatheredVocabLogprob`` does); log q(x_j) =
         ``engine_logq[i][j]``; q rows only where the lazy scan needs them, from
-        ``hidden[i]`` [g, d] (the engine's final hidden states) and the
-        LM-head stash of the version that drafted position j (``segments``).
+        ``hidden[i]`` (the engine's final hidden states: a [g, d] tensor, or
+        ``HiddenRefs`` object-store block handles) and the LM-head stash
+        of the version that drafted position j (``segments``). With handles,
+        a block is fetched (``ray.get``, directly from the generation
+        worker's node) only when the lazy scan first needs a q row in it:
+        phase 1 (p, b, the whole-draft test) reads only log q of the drafted
+        tokens, so a fully accepted draft fetches nothing.
         No scorer copy and no whole-model stash. Returns the same per-row dicts
         as ``verify_drafts_block_stashed``: "logprobs" are training's own
         log-probs of the kept tokens and "draft_logq" the engine's, so the
-        behavior-log-prob correction is exactly zero.
+        behavior-log-prob correction is exactly zero; plus
+        "hidden_bytes_fetched" (bytes this draft pulled from the object store).
 
         Tensor parallelism: every TP rank of a replica verifies the same rows
         (``_my_rows`` hashes by data-parallel rank) with the same generator
@@ -1591,7 +1606,12 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         the largest difference (expected: all, 0).
         """
         from megatron.core import parallel_state as ps
-        from thundersync_rl.engine_q import GatheredLogprobRows, verify_engine_q
+        from thundersync_rl.engine_q import (
+            GatheredLogprobRows,
+            HiddenRows,
+            hidden_num_rows,
+            verify_engine_q,
+        )
 
         if not self.cfg["megatron_cfg"].get("batch_invariant_mode"):
             raise RuntimeError(
@@ -1642,8 +1662,9 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             draft = rows[i][plen:].to(dev)
             lq = torch.tensor(engine_logq[i], dtype=torch.float32, device=dev)
             assert lq.numel() == g, (lq.numel(), g)
-            h = hidden[i]
-            assert h.shape[0] == g, (tuple(h.shape), g)
+            assert hidden_num_rows(hidden[i]) == g, (hidden_num_rows(hidden[i]), g)
+            # Phase 2 only: rows (per segment) fetched when the scan asks.
+            h = HiddenRows(hidden[i])
             version = [0] * g
             for v, a, b in segments[i]:
                 version[a:b] = [v] * (b - a)
@@ -1655,13 +1676,14 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 for j, t in enumerate(idx_l):
                     by_v.setdefault(version[t], []).append(j)
                 for v, js in by_v.items():
-                    lp = self._head_logprobs(h[[idx_l[j] for j in js]], v, vocab_limit)
+                    lp = self._head_logprobs(h([idx_l[j] for j in js]), v, vocab_limit)
                     for k, j in enumerate(js):
                         out[j] = lp[k]
                 return torch.stack(out)
 
             tau, y, logp, n_eval = verify_engine_q(p_lp, draft, lq, q_rows, gen)
             n_rows += n_eval + (tau < g)
+            fetched = h.fetched_bytes  # what the scan needed (not the check)
             if check:
                 for a in range(0, g, 512):
                     idx = torch.arange(a, min(g, a + 512))
@@ -1678,10 +1700,11 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                         "next": y,
                         "logprobs": logp.tolist(),
                         "draft_logq": lq[:tau].tolist(),
+                        "hidden_bytes_fetched": fetched,
                     },
                 )
             )
-            del p_lp
+            del p_lp, h
         for _ in range(n_dummy):
             # Expert parallelism: out of rows, join the other replicas' forwards.
             self._dummy_training_forward()

@@ -716,7 +716,7 @@ def test_engine_source_falls_back_when_the_engine_cannot_log(_no_ray, capsys):
     assert s.verify_source == "engine"
 
 
-def test_engine_source_drafts_stash_and_verify(_no_ray):
+def test_engine_source_drafts_stash_and_verify_driver_transport(_no_ray):
     started, popped = [], []
     hid = {
         0: torch.ones(2, 4),  # draft 0: fully logged
@@ -760,6 +760,7 @@ def test_engine_source_drafts_stash_and_verify(_no_ray):
             ],
             "pop_draft_hidden": pop,
         },
+        hidden_transport="driver",
     )
     prompts = [torch.tensor([1]), torch.tensor([2])]
     collect = asyncio.run(s.draft_streaming(prompts))
@@ -781,7 +782,7 @@ def spec_mod_eod():
     return EOD
 
 
-def test_cohort_hidden_states_follow_segments(_no_ray):
+def test_cohort_hidden_states_follow_segments_driver_transport(_no_ray):
     from thundersync_rl.speculative import cohort_draft
 
     collected = [[([5, 6], False, [-0.1, -0.2])], [([7], True, [-0.3])]]
@@ -794,6 +795,7 @@ def test_cohort_hidden_states_follow_segments(_no_ray):
             "collect_drafts": lambda: collected.pop(0),
             "pop_draft_hidden": lambda keys, lengths: {keys[0]: hids.pop(0)},
         },
+        hidden_transport="driver",
     )
     asyncio.run(s.draft_cohorts(0, {2: [torch.tensor([1, 1])]}))()
     asyncio.run(s.draft_cohorts(1, {}))()

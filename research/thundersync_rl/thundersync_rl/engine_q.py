@@ -46,7 +46,8 @@ verification rule.
 from __future__ import annotations
 
 import threading
-from typing import Callable, Optional, Union
+from dataclasses import dataclass, field
+from typing import Any, Callable, Optional, Union
 
 import torch
 
@@ -161,6 +162,212 @@ class HiddenLog:
     def live_rows(self) -> int:
         with self._lock:
             return sum(len(s) for s in self._rows.values())
+
+
+# ---------------------------------------------------------------------------
+# Moving hidden states: generation worker -> object store -> verifying learner
+# ---------------------------------------------------------------------------
+#
+# A draft's hidden states are d x 2 bytes per drafted token, but only drafts
+# the lazy scan does not accept whole ever read a q row, and those read only
+# the rows the scan visits (top candidates down to tau). So the generation
+# worker puts each draft's rows of one drafting round into the Ray object
+# store once, in blocks of ``HIDDEN_BLOCK_ROWS`` rows, and only the handles
+# travel engine -> driver -> learner. The learner fetches a block the first
+# time its lazy scan asks for a row in it (``HiddenRows``): fully accepted
+# drafts fetch nothing, and the data moves from the generation node's object
+# store to the learner's node without passing through the driver. The driver
+# frees the objects (``free_hidden``) once the draft is verified or dropped.
+
+
+@dataclass
+class HiddenSeg:
+    """Handle to one block of a draft's hidden states in the object store.
+
+    ``ref``: ObjectRef of a [rows, d] tensor (put by the generation worker
+    that drafted these rows; it owns the object), None once released. The
+    driver holds only these handles, never the rows.
+    """
+
+    ref: Any
+    rows: int
+    nbytes: int
+
+    def release(self) -> None:
+        """Drop this handle's reference (``free_hidden`` also deletes the object)."""
+        self.ref = None
+
+
+@dataclass
+class HiddenRefs:
+    """A draft's hidden states as object-store block handles, in row order.
+
+    Draft tuple index 7 under ``hidden_transport="object_store"``; a [g, d]
+    tensor under ``"driver"``. A cohort draft chains the blocks of its
+    drafting rounds; the handles are shared with the cohort dict, so releasing
+    them clears the draft's references everywhere on the driver.
+    """
+
+    segs: list[HiddenSeg] = field(default_factory=list)
+
+    @property
+    def rows(self) -> int:
+        return sum(s.rows for s in self.segs)
+
+    @property
+    def nbytes(self) -> int:
+        return sum(s.nbytes for s in self.segs)
+
+    def release(self) -> None:
+        for s in self.segs:
+            s.release()
+
+    @classmethod
+    def from_blocks(cls, blocks: list[tuple]) -> "HiddenRefs":
+        """From ``put_hidden``'s [(ref, rows, bytes)]."""
+        return cls([HiddenSeg(*b) for b in blocks])
+
+
+def ray_free(refs: list) -> None:
+    """Delete objects from every object store now (Ray internal API).
+
+    Called by the driver once the learner calls that could read them have
+    returned, so a lingering Python reference anywhere (driver, owner,
+    learner) cannot keep a step's hidden states alive.
+    """
+    from ray._private import internal_api
+
+    internal_api.free(refs, local_only=False)
+
+
+def free_hidden(hiddens, free: Optional[Callable[[list], None]] = None) -> int:
+    """Release the handles of ``HiddenRefs`` in ``hiddens`` and free their objects.
+
+    Other entries (tensors, None) are ignored. Returns the bytes released.
+    """
+    refs, nbytes = [], 0
+    for h in hiddens:
+        if not isinstance(h, HiddenRefs):
+            continue
+        for s in h.segs:
+            if s.ref is not None:
+                refs.append(s.ref)
+                nbytes += s.nbytes
+                s.release()
+    if refs:
+        (free or ray_free)(refs)
+    return nbytes
+
+
+# Rows per object-store object. The learner fetches whole blocks, so this
+# bounds what a rejected draft pulls beyond the rows its lazy scan visits
+# (at most one partial block per visited run); 256 rows are 2 MB at d = 4096
+# and 3.7 MB at d = 7168 (bf16), well above Ray's inline-object size.
+HIDDEN_BLOCK_ROWS = 256
+
+
+def put_hidden(
+    h: torch.Tensor,
+    put: Optional[Callable[[Any], Any]] = None,
+    block_rows: int = HIDDEN_BLOCK_ROWS,
+) -> list[tuple]:
+    """Generation-worker side: put rows [n, d] in the object store once.
+
+    One object per ``block_rows`` rows. Returns [(ref, rows, bytes)] per
+    block, the only thing sent back to the driver (``HiddenRefs.from_blocks``).
+    """
+    if put is None:
+        import ray
+
+        put = ray.put
+    out = []
+    for a in range(0, int(h.shape[0]), block_rows):
+        b = h[a : a + block_rows].contiguous()
+        out.append((put(b), int(b.shape[0]), b.numel() * b.element_size()))
+    return out
+
+
+def cat_hidden(parts: list) -> Any:
+    """A draft's hidden states from its per-segment parts.
+
+    Tensors (``hidden_transport="driver"``) are concatenated, skipping empty
+    segments; ``HiddenRefs`` are chained (no data is touched).
+    """
+    if parts and isinstance(parts[0], HiddenRefs):
+        return HiddenRefs([s for p in parts for s in p.segs if s.rows])
+    parts = [h for h in parts if h.numel()]
+    return torch.cat(parts) if parts else torch.empty(0, 0)
+
+
+def hidden_num_rows(h: Any) -> int:
+    """Rows of draft tuple index 7 (tensor or ``HiddenRefs``)."""
+    return h.rows if isinstance(h, HiddenRefs) else int(h.shape[0])
+
+
+def hidden_nbytes(h: Any) -> int:
+    if h is None:
+        return 0
+    if isinstance(h, HiddenRefs):
+        return h.nbytes
+    return h.numel() * h.element_size()
+
+
+class HiddenRows:
+    """Learner side: rows of one draft's hidden states, fetched on first use.
+
+    ``src`` is a [g, d] tensor (driver transport: already here) or a
+    ``HiddenRefs``. ``__call__(positions)`` returns rows [k, d] (CPU). With
+    refs, each block that holds a requested position is fetched once
+    (``get``, ``ray.get`` by default) and cached for this draft; untouched
+    blocks are never fetched. ``fetched_bytes`` counts what was pulled.
+    Tensor-parallel ranks of a replica run the same lazy scan, so they ask
+    for the same positions in the same order and fetch the same objects
+    (immutable, so every rank sees identical bytes; ranks on one node share
+    the node's copy in the object store).
+    """
+
+    def __init__(self, src: Any, get: Optional[Callable[[Any], Any]] = None):
+        self.src = src
+        self.fetched_bytes = 0
+        self._get = get
+        if isinstance(src, HiddenRefs):
+            self._starts = []
+            a = 0
+            for s in src.segs:
+                self._starts.append(a)
+                a += s.rows
+            self._cache: dict[int, torch.Tensor] = {}
+
+    def _block(self, k: int) -> torch.Tensor:
+        h = self._cache.get(k)
+        if h is None:
+            seg = self.src.segs[k]
+            if seg.ref is None:
+                raise RuntimeError("hidden states of this draft were already released")
+            get = self._get
+            if get is None:
+                import ray
+
+                get = ray.get
+            h = get(seg.ref)
+            if h.shape[0] != seg.rows:
+                raise RuntimeError(
+                    f"hidden block has {h.shape[0]} rows, expected {seg.rows}"
+                )
+            self._cache[k] = h
+            self.fetched_bytes += seg.nbytes
+        return h
+
+    def __call__(self, positions: list[int]) -> torch.Tensor:
+        if not isinstance(self.src, HiddenRefs):
+            return self.src[positions]
+        import bisect
+
+        out = []
+        for t in positions:
+            k = bisect.bisect_right(self._starts, t) - 1
+            out.append(self._block(k)[t - self._starts[k]])
+        return torch.stack(out)
 
 
 # Rows per full-vocabulary log-softmax when log-probs of many positions are
