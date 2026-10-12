@@ -894,7 +894,7 @@ def test_shipped_recipes_train_and_generate_with_the_same_tp(name):
 
 
 @pytest.mark.parametrize(
-    ("tp_size", "expected"), [(1, 64), (2, 64), (3, 66), (128, 128)]
+    ("tp_size", "expected"), [(1, 64), (2, 64), (3, 192), (4, 128), (8, 256)]
 )
 def test_batch_invariant_token_multiple(tp_size, expected):
     from nemo_rl.models.megatron.batch_invariant import batch_invariant_token_multiple

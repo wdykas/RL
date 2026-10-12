@@ -681,10 +681,19 @@ all-reduce give a token the same bits at every batch size whatever NCCL algorith
 TP>=3 the order of a token's partial sums may depend on which rank owns the token, i.e. on
 the token count. `scripts/bi_tp/nccl_tp_invariance.py` measures it (TP 2/3/4, reduce-scatter
 and all-reduce, plus an ordered all-to-all + fixed-rank-order fp32 sum as the reference fix).
-If TP>=3 shows a dependence, the follow-up is an ordered TP reduce-scatter behind a flag
-(patching TE's and MCore's `reduce_scatter_along_first_dim` and the inference layer's), plus
-MCore's inference `TOKEN_ROUNDER` raised to lcm(64, 32*TP) at TP>=4; it is not a validator
-rejection. End-to-end check: `scripts/bi_tp/tp_parity.sh` (TP=1/2 on 2 + 2 GPUs of one node;
+Measured: TP=2 invariant under every algorithm; at TP>=3 default/Ring reduce-scatter and
+all-reduce depend on the token count, NVLS and the ordered reduction do not (forcing
+`NCCL_ALGO=NVLS` process-wide broke NCCL init, so it is not the fix). Implemented
+(`nemo_rl/models/megatron/ordered_tp_reduce.py`, installed by `enable_batch_invariant_kernels`
+on training and generation workers): every floating-point SUM reduce-scatter / all-reduce on
+the TP or expert-TP group of size >= 3 runs as an all-to-all of the partial rows (same bytes per
+rank as a ring reduce-scatter) plus an ascending-rank fp32 sum rounded once; all-reduce = that
+reduce-scatter of the flattened tensor + all-gather. It patches `torch.distributed` (TE calls it
+directly) and MCore's `mappings.dist_reduce_scatter_func` alias; groups of size <= 2 keep NCCL,
+so TP=1/2 bits are unchanged. The batch-invariant token multiple is now lcm(64, 32*TP) on both
+sides (validator and MCore's inference `TOKEN_ROUNDER`, raised at TP>=3), so each rank's
+sequence-parallel norm keeps a 32-row class. CPU unit test (gloo, TP 3/4): bitwise equal to the
+rank-order fp32 sum at every token count, async handles, padding, non-SUM ops untouched. End-to-end check: `scripts/bi_tp/tp_parity.sh` (TP=1/2 on 2 + 2 GPUs of one node;
 TP=4 on 2 nodes via `tp_parity_submit.sh`), pass = mismatch 0 and exact fraction 1 every step.
 Status: unit-tested only, GPU parity not yet run.
 

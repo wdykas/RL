@@ -20,7 +20,6 @@ The recipe sets every required value; this module only checks them. Only BF16
 
 from __future__ import annotations
 
-import math
 import os
 import warnings
 from dataclasses import dataclass, field, fields
@@ -146,16 +145,11 @@ def validate_batch_invariant_mode(config: PolicyConfig) -> ZeroTrainGenValidatio
             "packing changes microbatch composition and the packed log-prob path "
             "does not share generation's fused log-softmax."
         )
+    # Under sequence parallelism each rank's RMSNorm sees tokens/TP rows, which
+    # must stay a multiple of 32 (TE native norm bit class): lcm(64, 32*TP).
     token_multiple = batch_invariant_token_multiple(
         megatron_cfg["tensor_model_parallel_size"]
     )
-    if megatron_cfg["tensor_model_parallel_size"] > 1:
-        # Under sequence parallelism each rank's RMSNorm sees tokens/TP rows,
-        # which must stay a multiple of 32 (TE native norm bit class):
-        # lcm(64, 32*TP), i.e. 64 at TP=2.
-        token_multiple = math.lcm(
-            token_multiple, 32 * megatron_cfg["tensor_model_parallel_size"]
-        )
     if config["make_sequence_length_divisible_by"] % token_multiple:
         out.violations.append(
             "batch_invariant_mode=True requires policy.make_sequence_length_divisible_by "
@@ -575,6 +569,14 @@ def enable_batch_invariant_kernels(config: PolicyConfig) -> None:
         backend=megatron_cfg["batch_invariant_backend"], collective=collective
     )
     _use_inference_log_softmax()
+    # TP>=3 sum reductions in rank order (NCCL's order depends on the token
+    # count there); a no-op for groups of size <= 2.
+    from nemo_rl.models.megatron import ordered_tp_reduce
+
+    ordered_tp_reduce.install()
+    ordered_tp_reduce.configure_inference_token_rounder(
+        megatron_cfg["tensor_model_parallel_size"]
+    )
     print(
         "[zero_train_gen_mismatch] batch-invariant kernels enabled: "
         f"backend={megatron_cfg['batch_invariant_backend']} "
