@@ -20,6 +20,7 @@ The recipe sets every required value; this module only checks them. Only BF16
 
 from __future__ import annotations
 
+import math
 import os
 import warnings
 from dataclasses import dataclass, field, fields
@@ -128,11 +129,12 @@ def validate_batch_invariant_mode(config: PolicyConfig) -> ZeroTrainGenValidatio
             f"{', '.join(missing_fields)}."
         )
 
-    if megatron_cfg.get("tensor_model_parallel_size") != 1:
-        out.violations.append(
-            "batch_invariant_mode=True currently requires "
-            "policy.megatron_cfg.tensor_model_parallel_size=1."
-        )
+    # Any TP, provided generation uses the identical parallel layout (checked
+    # with the matching fields below). TP>=3 parity rests on NCCL's
+    # reduce-scatter giving a token the same bits at every batch size; measure
+    # it with research/thundersync_rl/scripts/bi_tp/nccl_tp_invariance.py
+    # (research/thundersync_rl/DESIGN.md section 14).
+    _validate_batch_invariant_tensor_parallel(config, out)
     if megatron_cfg.get("context_parallel_size") != 1:
         out.violations.append(
             "batch_invariant_mode=True currently requires training context "
@@ -147,6 +149,13 @@ def validate_batch_invariant_mode(config: PolicyConfig) -> ZeroTrainGenValidatio
     token_multiple = batch_invariant_token_multiple(
         megatron_cfg["tensor_model_parallel_size"]
     )
+    if megatron_cfg["tensor_model_parallel_size"] > 1:
+        # Under sequence parallelism each rank's RMSNorm sees tokens/TP rows,
+        # which must stay a multiple of 32 (TE native norm bit class):
+        # lcm(64, 32*TP), i.e. 64 at TP=2.
+        token_multiple = math.lcm(
+            token_multiple, 32 * megatron_cfg["tensor_model_parallel_size"]
+        )
     if config["make_sequence_length_divisible_by"] % token_multiple:
         out.violations.append(
             "batch_invariant_mode=True requires policy.make_sequence_length_divisible_by "
@@ -196,7 +205,12 @@ def validate_batch_invariant_mode(config: PolicyConfig) -> ZeroTrainGenValidatio
             "batch_invariant_mode=True requires policy.generation.backend='megatron'."
         )
     else:
-        inference_cfg = merged_inference_megatron_cfg(config)
+        try:
+            inference_cfg = merged_inference_megatron_cfg(config)
+        except ValueError as exc:
+            if str(exc) not in out.violations:  # the TP>1 checks may report it
+                out.violations.append(str(exc))
+            return out
         if (
             inference_cfg.get("transformer_impl") == "inference_optimized"
             and config.get("precision") != "bfloat16"
@@ -224,8 +238,14 @@ def validate_batch_invariant_mode(config: PolicyConfig) -> ZeroTrainGenValidatio
                 f"(got temperature={sampling.temperature}, top_p={sampling.top_p}, "
                 f"top_k={sampling.top_k})."
             )
+        # Batch invariance needs the identical parallel layout on both sides:
+        # a different TP changes the row-parallel GEMMs' K split, and PP/EP/
+        # expert TP change the collectives and expert GEMM shapes.
         matching_fields = (
             "tensor_model_parallel_size",
+            "pipeline_model_parallel_size",
+            "expert_model_parallel_size",
+            "expert_tensor_parallel_size",
             "context_parallel_size",
             "batch_invariant_mode",
             "batch_invariant_backend",
@@ -236,7 +256,7 @@ def validate_batch_invariant_mode(config: PolicyConfig) -> ZeroTrainGenValidatio
         mismatched_fields = [
             field
             for field in matching_fields
-            if inference_cfg.get(field) != megatron_cfg.get(field)
+            if _resolved(inference_cfg, field) != _resolved(megatron_cfg, field)
         ]
         if mismatched_fields:
             out.violations.append(
@@ -245,6 +265,63 @@ def validate_batch_invariant_mode(config: PolicyConfig) -> ZeroTrainGenValidatio
             )
 
     return out
+
+
+def _resolved(cfg: dict[str, Any], field: str) -> Any:
+    """Config value as Megatron resolves it (an unset expert TP means TP)."""
+    value = cfg.get(field)
+    if field == "expert_tensor_parallel_size" and value is None:
+        return cfg.get("tensor_model_parallel_size")
+    return value
+
+
+def _validate_batch_invariant_tensor_parallel(
+    config: PolicyConfig, out: ZeroTrainGenValidation
+) -> None:
+    """Training and generation must run the same tensor-parallel collectives.
+
+    Both sides reduce-scatter row-parallel outputs and all-gather norm outputs
+    with NCCL under sequence parallelism (``inference_optimized`` layers require
+    it at TP>1). Fused TP communication and TE userbuffer overlap swap those
+    collectives for other kernels. Layout equality (TP, PP, EP, expert TP)
+    between the two sides is checked with the other matching fields.
+    """
+    megatron_cfg = config["megatron_cfg"]
+    tp_size = megatron_cfg.get("tensor_model_parallel_size")
+    tensor_parallel = isinstance(tp_size, int) and tp_size > 1
+    prefix = f"batch_invariant_mode=True with tensor_model_parallel_size={tp_size}"
+    if tensor_parallel and not megatron_cfg.get("sequence_parallel"):
+        out.violations.append(
+            f"{prefix} requires policy.megatron_cfg.sequence_parallel=true "
+            "(generation's inference_optimized layers run sequence parallel; "
+            "training must use the same reduce-scatter/all-gather path and norm "
+            "row counts)."
+        )
+    sides = [("policy.megatron_cfg", megatron_cfg)]
+    generation_cfg = config.get("generation")
+    if generation_cfg is not None and generation_cfg.get("backend") == "megatron":
+        try:
+            inference_cfg = merged_inference_megatron_cfg(config)
+        except ValueError as exc:
+            # e.g. inference_optimized without sequence parallelism.
+            out.violations.append(str(exc))
+            inference_cfg = None
+        if inference_cfg is not None:
+            sides.append(("policy.generation.mcore_generation_config", inference_cfg))
+            if tensor_parallel and not inference_cfg.get("sequence_parallel"):
+                out.violations.append(
+                    f"{prefix} requires policy.generation.mcore_generation_config."
+                    "sequence_parallel=true (or unset, inheriting training's)."
+                )
+    for label, cfg in sides:
+        for key in ("inference_fuse_tp_communication", "tp_comm_overlap"):
+            if cfg.get(key):
+                out.violations.append(
+                    f"{prefix} requires {label}.{key}=false: it replaces the NCCL "
+                    "reduce-scatter/all-gather that training and generation share "
+                    "(fused TP inference also reads a stale symmetric buffer "
+                    "under batch-invariant mode)."
+                )
 
 
 def allow_installed_flash_attn_4() -> None:
@@ -267,8 +344,173 @@ def allow_installed_flash_attn_4() -> None:
     mcore_attention.HAVE_FA4 = True
 
 
-class _Tp1LocalLogprob:
-    """At TP size 1, use the log-softmax Megatron Inference uses (bitwise)."""
+# Upper bound on gathered tokens (batch x sequence chunk) per full-vocabulary
+# log-softmax when the caller passes no chunk size: bounds the [tokens, V]
+# fp32 temporaries of the TP>1 gathered path (~2.4 GB at V=151936).
+_GATHERED_LOGPROB_CHUNK_TOKENS = 4096
+
+
+def _seq_chunks(seq_len: int, chunk: int):
+    for start in range(0, seq_len, chunk):
+        yield start, min(seq_len, start + chunk)
+
+
+def _gathered_chunk_size(logits: torch.Tensor, chunk_size: int | None) -> int:
+    if chunk_size is not None:
+        return chunk_size
+    batch = max(1, int(logits.shape[0]))
+    return max(1, _GATHERED_LOGPROB_CHUNK_TOKENS // batch)
+
+
+def _gathered_target_logprobs(
+    gather_chunk: Any, target: torch.Tensor, chunk_size: int
+) -> torch.Tensor:
+    """Selected-token log-probs from full-vocabulary chunks.
+
+    ``gather_chunk(start, end)`` returns the full-vocabulary logits
+    ``[B, end - start, V]`` of a sequence slice. Each chunk takes exactly the
+    TP=1 path of ``model_utils._tp_target_logprobs`` (fp32 cast, one
+    full-row ``log_softmax``, gather), which is what Megatron inference runs
+    after its vocab all-gather; under batch-invariant kernels the row-wise
+    ``log_softmax`` does not depend on the chunking.
+    """
+    out = []
+    for start, end in _seq_chunks(int(target.shape[1]), chunk_size):
+        full = gather_chunk(start, end).to(torch.float32)
+        log_probs = torch.nn.functional.log_softmax(full, dim=-1)
+        out.append(log_probs.gather(-1, target[:, start:end, None]).squeeze(-1))
+        del full, log_probs
+    return (torch.cat(out, dim=1) if len(out) > 1 else out[0]).contiguous()
+
+
+def _gathered_logprob_grad(
+    gather_chunk: Any,
+    target: torch.Tensor,
+    grad_output: torch.Tensor,
+    *,
+    vocab_start_index: int,
+    vocab_end_index: int,
+    chunk_size: int,
+    grad_input: torch.Tensor,
+) -> torch.Tensor:
+    """Gradient of the selected log-probs w.r.t. this rank's vocab shard.
+
+    d logp(t) / d z_v = 1[v == t] - softmax(z)_v, so the local slice is
+    ``g * (onehot - p)[..., start:end]``; written as ``g - p * g`` at the
+    target (as ``log_softmax``'s own backward forms it) and ``-(p * g)``
+    elsewhere. Fills and returns ``grad_input`` ``[B, S, V_local]``.
+    """
+    for start, end in _seq_chunks(int(target.shape[1]), chunk_size):
+        full = gather_chunk(start, end).to(torch.float32)
+        probs = torch.nn.functional.log_softmax(full, dim=-1)[
+            ..., vocab_start_index:vocab_end_index
+        ].exp()
+        del full
+        g = grad_output[:, start:end].to(torch.float32)
+        chunk_grad = probs.mul_(g.unsqueeze(-1)).neg_()
+        chunk_target = target[:, start:end]
+        local = (chunk_target >= vocab_start_index) & (chunk_target < vocab_end_index)
+        index = (chunk_target - vocab_start_index).clamp_(
+            0, vocab_end_index - vocab_start_index - 1
+        )
+        chosen = chunk_grad.gather(-1, index.unsqueeze(-1)).squeeze(-1)
+        chunk_grad.scatter_(
+            -1,
+            index.unsqueeze(-1),
+            torch.where(local, g + chosen, chosen).unsqueeze(-1),
+        )
+        grad_input[:, start:end].copy_(chunk_grad)
+        del probs, chunk_grad
+    return grad_input
+
+
+def _all_gather_vocab(
+    local_chunk: torch.Tensor, group: torch.distributed.ProcessGroup
+) -> torch.Tensor:
+    """Concatenate the TP ranks' vocab shards in rank (= vocabulary) order."""
+    local_chunk = local_chunk.contiguous()
+    parts = [
+        torch.empty_like(local_chunk)
+        for _ in range(torch.distributed.get_world_size(group))
+    ]
+    torch.distributed.all_gather(parts, local_chunk, group=group)
+    return torch.cat(parts, dim=-1)
+
+
+class _GatheredVocabLogprob(torch.autograd.Function):
+    """TP>1 log-probs computed exactly as Megatron inference computes them.
+
+    Training's ``DistributedLogprob`` normalizes with MAX/SUM all-reduces of
+    partial statistics; inference all-gathers the logits and runs one
+    full-vocabulary ``log_softmax``. This function gathers the vocab shards
+    per sequence chunk and runs the TP=1 path, so training and inference
+    log-probs agree bitwise. Only the local bf16/fp32 shard is saved; backward
+    re-gathers per chunk and returns the gradient of the local shard.
+    """
+
+    @staticmethod
+    def forward(  # pyrefly: ignore[bad-override]
+        ctx: Any,
+        vocab_parallel_logits: torch.Tensor,
+        target: torch.Tensor,
+        vocab_start_index: int,
+        vocab_end_index: int,
+        chunk_size: int | None,
+        group: torch.distributed.ProcessGroup,
+        inference_only: bool = False,
+    ) -> torch.Tensor:
+        local_vocab = int(vocab_parallel_logits.shape[-1])
+        if vocab_end_index - vocab_start_index != local_vocab or (
+            vocab_start_index != torch.distributed.get_rank(group) * local_vocab
+        ):
+            raise ValueError(
+                "batch-invariant TP log-probs expect an even vocab split in rank "
+                f"order (rank {torch.distributed.get_rank(group)}, local vocab "
+                f"{local_vocab}, range [{vocab_start_index}, {vocab_end_index}))."
+            )
+        chunk = _gathered_chunk_size(vocab_parallel_logits, chunk_size)
+
+        def gather_chunk(start: int, end: int) -> torch.Tensor:
+            return _all_gather_vocab(vocab_parallel_logits[:, start:end], group)
+
+        log_probs = _gathered_target_logprobs(gather_chunk, target, chunk)
+        if not inference_only:
+            ctx.save_for_backward(vocab_parallel_logits, target)
+            ctx.vocab_range = (vocab_start_index, vocab_end_index)
+            ctx.chunk = chunk
+            ctx.group = group
+        return log_probs
+
+    @staticmethod
+    def backward(
+        ctx: Any, *grad_outputs: torch.Tensor
+    ) -> tuple[torch.Tensor, None, None, None, None, None, None]:
+        vocab_parallel_logits, target = ctx.saved_tensors
+        group = ctx.group
+
+        def gather_chunk(start: int, end: int) -> torch.Tensor:
+            return _all_gather_vocab(vocab_parallel_logits[:, start:end], group)
+
+        grad_input = _gathered_logprob_grad(
+            gather_chunk,
+            target,
+            grad_outputs[0],
+            vocab_start_index=ctx.vocab_range[0],
+            vocab_end_index=ctx.vocab_range[1],
+            chunk_size=ctx.chunk,
+            grad_input=torch.zeros_like(vocab_parallel_logits),
+        )
+        return grad_input, None, None, None, None, None, None
+
+
+class _BatchInvariantLogprob:
+    """Log-probs computed the way Megatron Inference computes them (bitwise).
+
+    Replaces ``model_utils.DistributedLogprob`` / ``ChunkedDistributedLogprob``
+    under batch-invariant mode. TP=1: the local full-vocabulary log-softmax.
+    TP>1: gather the vocab shards (chunked) and run the same log-softmax, as
+    inference does after its logits all-gather (``_GatheredVocabLogprob``).
+    """
 
     def __init__(self, original: Any, *, chunked: bool) -> None:
         self._original = original
@@ -283,20 +525,22 @@ class _Tp1LocalLogprob:
         else:
             logits, target, start, end, group, inference_only = args
             chunk_size = None
-        if group is None or torch.distributed.get_world_size(group) != 1:
-            return self._original.apply(*args)
-        return model_utils._tp_target_logprobs(
-            logits,
-            target,
-            vocab_start_index=start,
-            vocab_end_index=end,
-            tp_group=None,
-            chunk_size=chunk_size,
-            inference_only=inference_only,
+        if group is None or torch.distributed.get_world_size(group) == 1:
+            return model_utils._tp_target_logprobs(
+                logits,
+                target,
+                vocab_start_index=start,
+                vocab_end_index=end,
+                tp_group=None,
+                chunk_size=chunk_size,
+                inference_only=inference_only,
+            )
+        return _GatheredVocabLogprob.apply(
+            logits, target, start, end, chunk_size, group, inference_only
         )
 
 
-def _use_fused_log_softmax_at_tp1() -> None:
+def _use_inference_log_softmax() -> None:
     # Deferred: model_utils is heavy and only needed once the shim is installed.
     from nemo_rl.distributed import model_utils
 
@@ -305,8 +549,8 @@ def _use_fused_log_softmax_at_tp1() -> None:
         ("ChunkedDistributedLogprob", True),
     ):
         current = getattr(model_utils, name)
-        if not isinstance(current, _Tp1LocalLogprob):
-            setattr(model_utils, name, _Tp1LocalLogprob(current, chunked=chunked))
+        if not isinstance(current, _BatchInvariantLogprob):
+            setattr(model_utils, name, _BatchInvariantLogprob(current, chunked=chunked))
 
 
 def enable_batch_invariant_kernels(config: PolicyConfig) -> None:
@@ -327,7 +571,7 @@ def enable_batch_invariant_kernels(config: PolicyConfig) -> None:
     enable_mcore_batch_invariant_mode(
         backend=megatron_cfg["batch_invariant_backend"], collective=collective
     )
-    _use_fused_log_softmax_at_tp1()
+    _use_inference_log_softmax()
     print(
         "[zero_train_gen_mismatch] batch-invariant kernels enabled: "
         f"backend={megatron_cfg['batch_invariant_backend']} "

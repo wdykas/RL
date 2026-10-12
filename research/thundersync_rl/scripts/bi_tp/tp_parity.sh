@@ -1,0 +1,79 @@
+#!/bin/bash
+# Batch-invariant train/generation parity at tensor parallelism TP (DESIGN.md section 14).
+# Training TP == generation TP (sequence parallel on both when TP>1), BI flags from
+# thundersync_work/bi_flags.txt + inference_optimized generation, THUNDERSYNC_MISMATCH_CHECK=1,
+# no speculation. Pass: every step mismatch/max_abs_logprob_diff == 0 and
+# mismatch/exact_token_frac == 1 (exit 0; else exit 1).
+#
+#   TP=1|2 : 1 node, 2 generation + 2 training GPUs. Run inside the megatron-rl container on an
+#            interactive node (the driver starts a local Ray):
+#              TP=2 bash tp_parity.sh
+#   TP=4   : 2 nodes, 4 generation + 4 training GPUs; submit with tp_parity_submit.sh (ray.sub
+#            brings up the 2-node Ray cluster and runs this script on the head).
+#
+# Env: TP (2), STEPS (4), MODEL (Qwen/Qwen3-1.7B), PROMPTS (16), TAG, ARGS (extra Hydra
+# overrides, appended last), RL_ROOT_OVERRIDE (code checkout; default: the checkout holding
+# this script). Output: thundersync_work/runs_bi_tp/$TAG/{run.log,history.json}.
+set -uo pipefail
+W=/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/wdykas/code/on-olicy-rl/thundersync_work
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+TP=${TP:-2} STEPS=${STEPS:-4} MODEL=${MODEL:-Qwen/Qwen3-1.7B} PROMPTS=${PROMPTS:-16}
+TAG=${TAG:-bi-tp$TP-$(basename "$MODEL")}
+export RL_ROOT_OVERRIDE=${RL_ROOT_OVERRIDE:-$(cd "$HERE/../../../.." && pwd)}
+source $W/env_sbatch.sh bi
+cd "$RL_ROOT" || exit 2
+export NVIDIA_TF32_OVERRIDE=1 THUNDERSYNC_MISMATCH_CHECK=1
+
+case $TP in
+  1|2) RES=(cluster.num_nodes=1 cluster.gpus_per_node=4
+            policy.generation.colocated.resources.num_nodes=1
+            policy.generation.colocated.resources.gpus_per_node=2) ;;
+  4)   RES=(cluster.num_nodes=2 cluster.gpus_per_node=4
+            policy.generation.colocated.resources.num_nodes=1
+            policy.generation.colocated.resources.gpus_per_node=4) ;;
+  *)   echo "TP must be 1, 2 or 4 (4 GPUs per node)" >&2; exit 2 ;;
+esac
+SP=$([ "$TP" -gt 1 ] && echo true || echo false)
+PAR=(policy.megatron_cfg.tensor_model_parallel_size=$TP
+     policy.megatron_cfg.sequence_parallel=$SP
+     policy.megatron_cfg.expert_tensor_parallel_size=1
+     ++policy.generation.mcore_generation_config.tensor_model_parallel_size=$TP
+     policy.megatron_cfg.activation_checkpointing=false)
+read -r -a BIF < $W/bi_flags.txt
+BIF+=(++policy.generation.mcore_generation_config.transformer_impl=inference_optimized)
+read -r -a USER_ARGS <<< "${ARGS:-}"
+
+OUT=$W/runs_bi_tp/$TAG
+mkdir -p "$OUT"
+echo "[tp_parity] TP=$TP STEPS=$STEPS MODEL=$MODEL RL_ROOT=$RL_ROOT -> $OUT"
+timeout 2400 python research/thundersync_rl/run_thundersync_grpo.py \
+  --config research/thundersync_rl/configs/grpo_math_1.5b_thundersync_megatron.yaml \
+  --history-json "$OUT/history.json" thundersync.granularity=group logger.log_dir="$OUT/logs" \
+  logger.wandb_enabled=false logger.tensorboard_enabled=false \
+  policy.model_name=$MODEL grpo.max_num_steps=$STEPS \
+  grpo.num_prompts_per_step=$PROMPTS grpo.num_generations_per_prompt=8 \
+  policy.train_global_batch_size=$((PROMPTS * 8)) \
+  policy.max_total_sequence_length=2048 policy.make_sequence_length_divisible_by=128 \
+  loss_fn.skip_zero_advantage_rows=true ++thundersync.speculate=false \
+  "${RES[@]}" "${PAR[@]}" "${BIF[@]}" "${USER_ARGS[@]}" \
+  > "$OUT/run.log" 2>&1
+rc=$?
+echo "[tp_parity] run exit=$rc"
+grep -a "mismatch/" "$OUT/run.log" | tail -n $((STEPS * 4))
+python - "$OUT/history.json" "$STEPS" <<'EOF'
+import json, sys
+path, steps = sys.argv[1], int(sys.argv[2])
+try:
+    hist = json.load(open(path))
+except (OSError, ValueError) as exc:
+    sys.exit(f"[tp_parity] FAIL: no history ({exc})")
+ok = len(hist) >= steps
+for i, h in enumerate(hist):
+    d, e = h.get("mismatch/max_abs_logprob_diff"), h.get("mismatch/exact_token_frac")
+    good = d == 0 and e == 1
+    ok &= good
+    print(f"[tp_parity] step {i}: max_abs_logprob_diff={d} exact_token_frac={e} "
+          f"{'ok' if good else 'MISMATCH'}")
+print(f"[tp_parity] {'PASS' if ok else 'FAIL'} ({len(hist)}/{steps} steps)")
+sys.exit(0 if ok else 1)
+EOF

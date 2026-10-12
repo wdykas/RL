@@ -349,6 +349,7 @@ def _policy(**megatron):
     return {
         "megatron_cfg": {
             "batch_invariant_mode": True,
+            "tensor_model_parallel_size": 1,
             "pipeline_model_parallel_size": 1,
             "expert_model_parallel_size": 1,
             "use_fused_linear_logprobs": False,
@@ -389,6 +390,7 @@ def test_fused_config_valid():
         ({"fused_max_retained_tokens": 0}, _policy(), "fused_max_retained_tokens"),
         ({}, _policy(batch_invariant_mode=False), "batch_invariant_mode"),
         ({}, _policy(pipeline_model_parallel_size=2), "pipeline"),
+        ({}, _policy(tensor_model_parallel_size=2), "tensor_model_parallel_size"),
         ({}, _policy(expert_model_parallel_size=2), "expert_model_parallel"),
         ({}, _policy(use_fused_linear_logprobs=True), "use_fused_linear_logprobs"),
         ({}, {**_policy(), "generation": {"temperature": 0.7}}, "temperature"),
