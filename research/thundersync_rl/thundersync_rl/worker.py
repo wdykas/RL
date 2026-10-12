@@ -1768,6 +1768,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         vocab_limit: int,
         seed: int,
         keys: list[str],
+        batch_tokens: int = 0,
         **_: Any,
     ) -> list[tuple[int, dict[str, Any]]]:
         """Block verification with q from the engine and p from the training model.
@@ -1846,16 +1847,32 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         results = []
         n_rows = 0
         mine = self._my_rows(rows, keys)
-        lockstep = self._expert_parallel_lockstep([[] for _ in mine])
-        n_dummy = 0 if lockstep is None else len(lockstep) - len(mine)
-        for i in mine:
+        # Several drafts per training-shaped forward (padded as training pads a
+        # micro-batch): batch-invariant kernels give each row the same logits
+        # as a one-row forward, and per-call overhead dominates small rows.
+        batches = self._row_batches([rows[i] for i in mine], batch_tokens)
+        batches = [[mine[j] for j in b] for b in batches]
+        lockstep = self._expert_parallel_lockstep([[] for _ in batches])
+        n_dummy = 0 if lockstep is None else len(lockstep) - len(batches)
+
+        def row_logits():
+            for batch in batches:
+                t0 = time.perf_counter()
+                lb = (
+                    self._training_forward(rows[batch[0]])
+                    if len(batch) == 1
+                    else self._training_forward_rows([rows[i] for i in batch])
+                )
+                self._prof["forward"] = (
+                    self._prof.get("forward", 0.0) + time.perf_counter() - t0
+                )
+                for k, i in enumerate(batch):
+                    yield i, (None if lb is None else lb[k : k + 1])
+                del lb
+
+        for i, logits in row_logits():
             n, plen = rows[i].numel(), prompt_lens[i]
             g = n - plen
-            t0 = time.perf_counter()
-            logits = self._training_forward(rows[i])
-            self._prof["forward"] = (
-                self._prof.get("forward", 0.0) + time.perf_counter() - t0
-            )
             if logits is None:  # not the last pipeline stage
                 continue
             dev = logits.device
@@ -2007,8 +2024,38 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 "fused verification + training unsupported: " + "; ".join(problems)
             )
 
+    def _row_batches(
+        self, rows: list[torch.Tensor], batch_tokens: int
+    ) -> list[list[int]]:
+        """Consecutive groups of ``rows`` whose padded micro-batch fits ``batch_tokens``.
+
+        A group costs len(group) x its longest row padded to
+        ``make_sequence_length_divisible_by``; a row longer than the budget
+        forms its own group. ``batch_tokens <= 0`` gives one row per group.
+        """
+        m = self.cfg.get("make_sequence_length_divisible_by", 1)
+        out: list[list[int]] = []
+        longest = 0
+        for j, row in enumerate(rows):
+            padded = -(-row.numel() // m) * m
+            if (
+                out
+                and batch_tokens > 0
+                and (len(out[-1]) + 1) * max(longest, padded) <= batch_tokens
+            ):
+                out[-1].append(j)
+                longest = max(longest, padded)
+            else:
+                out.append([j])
+                longest = padded
+        return out
+
     def _training_forward(self, row: torch.Tensor) -> torch.Tensor | None:
-        """Logits [1, S, V] of one row, computed exactly as a training forward.
+        """Logits [1, S, V] of one row, computed exactly as a training forward."""
+        return self._training_forward_rows([row])
+
+    def _training_forward_rows(self, rows: list[torch.Tensor]) -> torch.Tensor | None:
+        """Logits [B, S, V] of ``rows`` in one micro-batch, exactly as a training forward.
 
         Same padding (``make_sequence_length_divisible_by``), micro-batch
         processing and ``model_forward`` call as ``train_microbatch``; autograd
@@ -2022,15 +2069,16 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         from megatron.core import parallel_state as ps
 
         m = self.cfg["make_sequence_length_divisible_by"]
-        n = row.numel()
-        ids = torch.zeros((1, -(-n // m) * m), dtype=torch.long)
-        ids[0, :n] = row
-        data = BatchedDataDict({"input_ids": ids, "input_lengths": torch.tensor([n])})
+        lens = [row.numel() for row in rows]
+        ids = torch.zeros((len(rows), -(-max(lens) // m) * m), dtype=torch.long)
+        for b, row in enumerate(rows):
+            ids[b, : lens[b]] = row
+        data = BatchedDataDict({"input_ids": ids, "input_lengths": torch.tensor(lens)})
         attach_media_token_validity_mask(data, self.media_placeholder_token_id)
         iterator, _, _, _, padded_seq_length = get_microbatch_iterator(
             data,
             self.cfg,
-            1,
+            len(rows),
             straggler_timer=self.mcore_state.straggler_timer,
             delegate_pack_to_model=self.delegate_pack_to_model,
             delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
@@ -2058,9 +2106,11 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
 
         if ps.get_pipeline_model_parallel_world_size() == 1:
             return forward(self.model)
-        return self._pipeline_forward_only(forward, padded_seq_length)
+        return self._pipeline_forward_only(forward, padded_seq_length, len(rows))
 
-    def _pipeline_forward_only(self, forward, seq_length: int) -> torch.Tensor | None:
+    def _pipeline_forward_only(
+        self, forward, seq_length: int, micro_batch_size: int = 1
+    ) -> torch.Tensor | None:
         """``forward(model)`` of one micro-batch through the pipeline schedule.
 
         Megatron's ``get_forward_backward_func`` with ``forward_only=True`` and
@@ -2097,7 +2147,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 model=self.model,
                 num_microbatches=1,
                 seq_length=seq_length,
-                micro_batch_size=1,
+                micro_batch_size=micro_batch_size,
                 decoder_seq_length=seq_length,
                 forward_only=True,
                 collect_non_loss_data=True,
