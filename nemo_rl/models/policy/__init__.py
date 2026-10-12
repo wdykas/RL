@@ -595,6 +595,11 @@ class MegatronConfig(TypedDict):
     # fp32_residual_connection=true; must match between training and generation.
     # Dense (non-MoE) models only.
     forward_gemm_precision: NotRequired[str | None]
+    # LM-head GEMM under forward_gemm_precision="fp16": "fp32" (default when
+    # unset) multiplies the fp32 final-norm output by the head weight upcast to
+    # fp32 in IEEE fp32 (TF32 off); "fp16" uses the fp16 GEMM. Must match
+    # between training and generation.
+    lm_head_precision: NotRequired[str | None]
 
 
 class TokenizerConfig(TypedDict):

@@ -102,13 +102,31 @@ def test_attention_grad_scaling_roundtrip():
     torch.testing.assert_close(q.grad, torch.full_like(q, 6e-9), rtol=1e-3, atol=0)
 
 
-def test_head_helpers(enabled):
+def test_head_helpers_fp32_head(enabled):
+    assert fg.head_precision() == "fp32"
+    assert fg.head_input_dtype(torch.bfloat16) == torch.float32
+    h = torch.randn(3, 16)
+    w = torch.randn(5, 16).to(torch.bfloat16)
+    ref = (h.double() @ w.double().t()).float()
+    torch.testing.assert_close(fg.head_matmul(h, w), ref, rtol=1e-6, atol=1e-6)
+    assert torch.equal(fg.head_matmul(h, w), fg.fp32_gemm(h, w))
+
+
+def test_head_helpers_fp16_head(enabled, monkeypatch):
+    monkeypatch.setitem(fg._STATE, "head", "fp16")
     assert fg.head_input_dtype(torch.bfloat16) == torch.float16
     h = torch.randn(3, 16)
     w = torch.randn(5, 16).to(torch.bfloat16)
     assert torch.equal(fg.head_matmul(h, w), fg.fp16_gemm(h, w))
     # The fp16 hidden copy gives the same logits as the fp32 head input.
     assert torch.equal(fg.head_matmul(h.to(torch.float16), w), fg.fp16_gemm(h, w))
+
+
+def test_fp32_head_linear_keeps_fp32_input():
+    x = torch.full((1, 4), 1.0 + 2.0**-20)  # not representable in fp16
+    w = torch.ones(1, 4, dtype=torch.bfloat16)
+    y = fg.fp16_linear(x, w, precision="fp32")
+    assert y.item() == 4 * (1.0 + 2.0**-20)
 
 
 def test_head_helpers_disabled():
@@ -142,6 +160,10 @@ def test_validate_config():
     )
     assert fg.validate_config(_cfg(gradient_accumulation_fusion=True))
     assert fg.validate_config(_cfg(fp8_cfg={"enabled": True}))
+    assert fg.validate_config(_cfg(lm_head_precision="bf16"))
+    assert fg.validate_config({"lm_head_precision": "fp32"})
+    assert fg.validate_config(_cfg(lm_head_precision="fp32"), _cfg()) != []
+    assert fg.validate_config(_cfg(lm_head_precision="fp32"), _cfg(lm_head_precision="fp32")) == []
 
 
 def test_validate_model_rejects_moe():

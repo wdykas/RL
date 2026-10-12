@@ -27,8 +27,10 @@ same functions in Megatron training and in the Megatron inference engine:
   fp32 fc1 output. The next GEMM rounds its input to fp16;
 - q / k / v are rounded to fp16 after the q/k norms, so RoPE, FlashAttention
   (fp16 probabilities in its PV product) and the engine's KV cache are fp16;
-- logits are the fp32 output of the head GEMM; the batch-invariant fp32
-  log-softmax is unchanged.
+- the LM head (``lm_head_precision``, default "fp32") multiplies the fp32
+  final-norm output by the head weight upcast to fp32 in IEEE fp32 (TF32 off;
+  "fp16" uses the fp16 GEMM instead); logits are fp32 and the batch-invariant
+  fp32 log-softmax is unchanged.
 
 Tensor parallelism (sequence parallel): a norm output is rounded to fp16 before
 its all-gather (same bytes as bf16 today); row-parallel GEMM outputs are
@@ -50,18 +52,30 @@ Dense models only: MoE grouped GEMMs are not built yet.
 
 from __future__ import annotations
 
+import os
 from typing import Any, Optional
 
 import torch
 
 FP16_GEMM = "fp16"
 SUPPORTED_PRECISIONS = (FP16_GEMM,)
+# LM-head GEMM under the fp16 forward (``lm_head_precision``): "fp32" (default)
+# multiplies the fp32 final-norm output by the bf16 head weight upcast to fp32
+# (exact) in IEEE fp32 (TF32 off); "fp16" uses the fp16 GEMM like every layer.
+FP32_HEAD = "fp32"
+HEAD_PRECISIONS = (FP32_HEAD, FP16_GEMM)
 
-_STATE: dict[str, Any] = {"enabled": False, "orig": {}}
+_STATE: dict[str, Any] = {"enabled": False, "head": FP32_HEAD, "orig": {}}
 
-# Target |amax| of an attention-output gradient after scaling into fp16
-# (2^8 leaves 2^8 headroom below fp16's max for FlashAttention's backward).
-_ATTN_GRAD_TARGET_LOG2 = 8.0
+# Target |amax| of an attention-output gradient dO after scaling into fp16: 2^0.
+# FlashAttention's dV = P^T dO sums dO over every query attending a key, so an
+# attention-sink key gets up to L * amax(dO) (L = sequence length); 2^0 keeps it
+# below fp16's max (65504) up to L = 64k, while gradients down to 2^-24 * amax
+# remain representable (subnormal below 2^-14). A larger target (2^8) saturated
+# dV of sink keys on Qwen3-1.7B at L = 2048 (grad norm 17 vs 0.4, then NaN).
+_ATTN_GRAD_TARGET_LOG2 = 0.0
+# NEMO_RL_FP16_GEMM_DEBUG=1: report fp16 attention gradients near fp16's max.
+_DEBUG = os.environ.get("NEMO_RL_FP16_GEMM_DEBUG") == "1"
 
 
 def enabled() -> bool:
@@ -112,20 +126,55 @@ def fp16_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return out.view(*x.shape[:-1], weight.shape[0])
 
 
+def fp32_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """``x @ weight.T`` in IEEE fp32 (TF32 off), fp32 output.
+
+    x [..., K] (upcast to fp32), weight [N, K] (bf16 upcast to fp32: exact).
+    TF32 is switched off for this call only, so the result does not depend on
+    the process's TF32 setting (``NVIDIA_TF32_OVERRIDE`` can only disable TF32).
+    """
+    k = x.shape[-1]
+    x2 = x.reshape(-1, k).float().contiguous()
+    w32 = weight.float()
+    if x2.is_cuda:
+        flags = torch.backends.cuda.matmul
+        prev = flags.allow_tf32
+        flags.allow_tf32 = False
+        try:
+            out = torch.mm(x2, w32.t())
+        finally:
+            flags.allow_tf32 = prev
+    else:
+        out = torch.mm(x2, w32.t())
+    return out.view(*x.shape[:-1], weight.shape[0])
+
+
+_GEMMS = {FP16_GEMM: fp16_gemm, FP32_HEAD: fp32_gemm}
+_OPERAND_DTYPE = {FP16_GEMM: torch.float16, FP32_HEAD: torch.float32}
+
+
+def head_precision() -> str:
+    """Operand precision of the LM-head GEMM under the fp16 forward."""
+    return _STATE["head"]
+
+
 def head_input_dtype(weight_dtype: torch.dtype) -> torch.dtype:
     """dtype that holds an LM-head input losslessly for the head GEMM.
 
-    fp16 under the fp16 GEMM forward (the GEMM rounds its input to fp16 first,
-    so storing that rounding loses nothing); otherwise the weight dtype, as
-    before.
+    Under the fp16 forward: fp32 with the fp32 head (the final-norm output as
+    is; twice the bytes of bf16), fp16 with the fp16 head (the GEMM rounds its
+    input to fp16 first, so storing that rounding loses nothing). Otherwise the
+    weight dtype, as before.
     """
-    return torch.float16 if _STATE["enabled"] else weight_dtype
+    if not _STATE["enabled"]:
+        return weight_dtype
+    return _OPERAND_DTYPE[_STATE["head"]]
 
 
 def head_matmul(h: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """fp32 logits ``h @ weight.T`` as the model's LM head computes them."""
+    """fp32 logits ``h @ weight.T`` exactly as the model's LM head computes them."""
     if _STATE["enabled"]:
-        return fp16_gemm(h, weight)
+        return _GEMMS[_STATE["head"]](h, weight)
     return h.float() @ weight.float().t()
 
 
@@ -159,7 +208,7 @@ def _all_reduce(x: torch.Tensor, group: Any) -> torch.Tensor:
 
 
 class Fp16Linear(torch.autograd.Function):
-    """y = fp16_gemm(x, w) (fp32), with an optional fused TP collective.
+    """y = fp16_gemm(x, w) (or fp32_gemm for the fp32 head), optional TP collective.
 
     Forward: x and w rounded to fp16 (x before its all-gather), fp32 GEMM
     output, fp32 reduce-scatter / all-reduce. Backward: dgrad and wgrad GEMMs on
@@ -168,11 +217,11 @@ class Fp16Linear(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x, weight, comm, group):  # noqa: D102
-        x16 = x.to(torch.float16)
+    def forward(ctx, x, weight, comm, group, precision=FP16_GEMM):  # noqa: D102
+        x16 = x.to(_OPERAND_DTYPE[precision])
         if comm == COMM_SP_GATHER:
             x16 = _gather_rows(x16, group)
-        out = fp16_gemm(x16, weight)
+        out = _GEMMS[precision](x16, weight)
         if comm == COMM_SP_SCATTER:
             out = _reduce_scatter_rows(out, group)
         elif comm == COMM_TP_ALLREDUCE:
@@ -204,7 +253,7 @@ class Fp16Linear(torch.autograd.Function):
         if ctx.needs_input_grad[1]:
             x2 = x16.reshape(-1, x16.shape[-1]).to(torch.bfloat16)
             wgrad = _mm(g2.t(), x2, torch.float32).to(weight.dtype)
-        return dgrad, wgrad, None, None
+        return dgrad, wgrad, None, None, None
 
 
 def fp16_linear(
@@ -212,9 +261,10 @@ def fp16_linear(
     weight: torch.Tensor,
     comm: Optional[str] = COMM_NONE,
     group: Any = None,
+    precision: str = FP16_GEMM,
 ) -> torch.Tensor:
     """Autograd-aware ``Fp16Linear``; plain forward under no_grad / inference."""
-    return Fp16Linear.apply(x, weight, comm, group)
+    return Fp16Linear.apply(x, weight, comm, group, precision)
 
 
 def rms_norm_fp32(
@@ -257,6 +307,10 @@ class ToFp16Scaled(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad):  # noqa: D102
+        if _DEBUG:
+            amax = grad.abs().amax().item()
+            if not amax < 32768:
+                print(f"[fp16_gemm debug] fp16 attention grad amax={amax}", flush=True)
         g = grad.float()
         if ctx.box.scale is not None:
             g = g / ctx.box.scale
@@ -266,8 +320,9 @@ class ToFp16Scaled(torch.autograd.Function):
 class FromFp16Scaled(torch.autograd.Function):
     """fp16 -> fp32 (exact, forward). Backward: grad * 2^e into fp16.
 
-    2^e brings the gradient's amax to about 2^8 so FlashAttention's fp16
-    backward neither underflows nor overflows; ``ToFp16Scaled`` divides it out.
+    2^e brings the gradient's amax to about 2^0 (see ``_ATTN_GRAD_TARGET_LOG2``)
+    so FlashAttention's fp16 backward neither underflows nor overflows;
+    ``ToFp16Scaled`` divides it out.
     """
 
     @staticmethod
@@ -381,7 +436,7 @@ def _make_output_layer_forward(cls: type):
             comm = COMM_TP_COPY
         else:
             comm = COMM_NONE
-        out = fp16_linear(input_, w, comm, group)
+        out = fp16_linear(input_, w, comm, group, _STATE["head"])
         if self.bias is not None and not self.skip_bias_add:
             out = out + self.bias.float()
         gather = self.gather_output if runtime_gather_output is None else runtime_gather_output
@@ -492,7 +547,7 @@ def _patch_inference_buffers() -> None:
     TextGenerationController.__init__ = __init__
 
 
-def install() -> None:
+def install(lm_head_precision: Optional[str] = None) -> None:
     """Install the fp16 GEMM forward for this process (idempotent).
 
     Call before the models are built and before the inference engine captures
@@ -500,6 +555,10 @@ def install() -> None:
     """
     if _STATE["enabled"]:
         return
+    head = FP32_HEAD if lm_head_precision is None else lm_head_precision
+    if head not in HEAD_PRECISIONS:
+        raise ValueError(f"lm_head_precision must be one of {HEAD_PRECISIONS} (got {head!r}).")
+    _STATE["head"] = head
     from megatron.core.extensions import transformer_engine as mte
     from megatron.core.tensor_parallel import inference_layers as il
     from megatron.core.tensor_parallel.layers import ColumnParallelLinear
@@ -522,7 +581,7 @@ def install() -> None:
     _STATE["enabled"] = True
     print(
         "[fp16_gemm] forward_gemm_precision=fp16: fp16 GEMM operands, fp32 GEMM "
-        "outputs / norms / residual, fp16 attention and KV cache",
+        f"outputs / norms / residual, fp16 attention and KV cache, {head} LM head",
         flush=True,
     )
 
@@ -531,6 +590,11 @@ def validate_config(megatron_cfg: dict[str, Any], inference_cfg: Optional[dict] 
     """Config violations of ``forward_gemm_precision`` (empty when unset)."""
     value = megatron_cfg.get("forward_gemm_precision")
     if value is None:
+        if megatron_cfg.get("lm_head_precision") is not None:
+            return [
+                "policy.megatron_cfg.lm_head_precision requires "
+                "forward_gemm_precision='fp16' (not built for the bf16 forward yet)."
+            ]
         return []
     errors = []
     if value not in SUPPORTED_PRECISIONS:
@@ -561,11 +625,20 @@ def validate_config(megatron_cfg: dict[str, Any], inference_cfg: Optional[dict] 
         )
         if enabled_flag:
             errors.append(f"forward_gemm_precision='fp16' does not support {key}.enabled=true.")
-    if inference_cfg is not None and inference_cfg.get("forward_gemm_precision") != value:
+    head = megatron_cfg.get("lm_head_precision")
+    if head is not None and head not in HEAD_PRECISIONS:
         errors.append(
-            "forward_gemm_precision must be the same in training and generation "
-            f"(generation: {inference_cfg.get('forward_gemm_precision')!r})."
+            f"policy.megatron_cfg.lm_head_precision must be one of {HEAD_PRECISIONS} "
+            f"or unset (got {head!r})."
         )
+    if inference_cfg is not None:
+        for key in ("forward_gemm_precision", "lm_head_precision"):
+            if inference_cfg.get(key) != megatron_cfg.get(key):
+                errors.append(
+                    f"{key} must be the same in training and generation "
+                    f"(training: {megatron_cfg.get(key)!r}, generation: "
+                    f"{inference_cfg.get(key)!r})."
+                )
     return errors
 
 
