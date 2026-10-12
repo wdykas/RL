@@ -1460,9 +1460,14 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         weight = layer.weight
         if weight is None:
             weight = model.shared_embedding_or_output_weight()
+        from nemo_rl.models.megatron.fp16_gemm import head_input_dtype
+
+        # The head input dtype: fp16 under forward_gemm_precision=fp16, where the
+        # head GEMM rounds its fp32 input to fp16 first (the copy rounds the same
+        # way, so q recomputed from these rows is exact); else the weight dtype.
         static = torch.empty(
             (int(context.max_requests), weight.shape[1]),
-            dtype=weight.dtype,
+            dtype=head_input_dtype(weight.dtype),
             device=weight.device,
         )
         filled = [False]
@@ -1518,6 +1523,8 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         """
         from megatron.core import parallel_state as ps
         from thundersync_rl.engine_q import HIDDEN_KEY_ATTR, HiddenLog
+
+        from nemo_rl.models.megatron.fp16_gemm import head_matmul
 
         engine = getattr(self, "dynamic_inference_engine", None)
         ctx = getattr(self, "inference_context", None)
@@ -1609,7 +1616,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 # Probe columns of this rank's vocabulary shard (any TP, any
                 # sampled token): a stale row disagrees on all of them.
                 cols = torch.linspace(0, w.shape[0] - 1, 16, device=w.device).long()
-                mine = static[rows_t].float() @ w[cols].float().t()
+                mine = head_matmul(static[rows_t], w[cols])
                 ref = lg[rows_t][:, lo + cols].float()
                 ok = ((mine - ref).abs().amax(-1) <= 1.0).tolist()
                 if not all(ok):
@@ -1741,8 +1748,10 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         from thundersync_rl.engine_q import gathered_log_softmax
 
         layer, _, scale = self._lm_head()
+        from nemo_rl.models.megatron.fp16_gemm import head_input_dtype
+
         w = self._head_stash[version]
-        h = hidden.to(device=w.device, dtype=w.dtype)
+        h = hidden.to(device=w.device, dtype=head_input_dtype(w.dtype))
         sp = getattr(layer, "sequence_parallel", False)
         if sp:
             # The rows are full (not sequence-sharded), as in the engine.
