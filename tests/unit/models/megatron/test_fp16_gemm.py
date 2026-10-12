@@ -183,6 +183,8 @@ def test_validate_config():
         for e in fg.validate_config(_cfg(), _cfg(forward_gemm_precision=None))
     )
     assert fg.validate_config(_cfg(gradient_accumulation_fusion=True))
+    assert fg.validate_config(_cfg(pipeline_model_parallel_size=2, pipeline_dtype="bfloat16"))
+    assert not fg.validate_config(_cfg(pipeline_model_parallel_size=2, pipeline_dtype="float32"))
     assert fg.validate_config(_cfg(fp8_cfg={"enabled": True}))
     assert fg.validate_config(_cfg(lm_head_precision="bf16"))
     assert fg.validate_config({"lm_head_precision": "fp32"})

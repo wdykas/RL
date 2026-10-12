@@ -640,6 +640,15 @@ def validate_config(megatron_cfg: dict[str, Any], inference_cfg: Optional[dict] 
             "forward_gemm_precision='fp16' requires "
             "policy.megatron_cfg.fp32_residual_connection=true (fp32 residual stream)."
         )
+    if (megatron_cfg.get("pipeline_model_parallel_size") or 1) > 1 and megatron_cfg.get(
+        "pipeline_dtype"
+    ) != "float32":
+        errors.append(
+            "forward_gemm_precision='fp16' with pipeline parallelism requires "
+            "policy.megatron_cfg.pipeline_dtype='float32': stages exchange the fp32 "
+            "residual stream, and Megatron's receive buffers use pipeline_dtype "
+            f"(got {megatron_cfg.get('pipeline_dtype')!r})."
+        )
     if megatron_cfg.get("gradient_accumulation_fusion"):
         errors.append(
             "forward_gemm_precision='fp16' requires "
