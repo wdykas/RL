@@ -131,7 +131,8 @@ def test_cohort_drafts_resume_and_track_versions():
             "start_drafts": lambda prompts, budgets, interval: started.append(
                 (prompts, budgets)
             ),
-            "collect_drafts": lambda: collected.pop(0),
+            "draft_request_ids": lambda: {},
+            "collect_drafts": lambda records=None: collected.pop(0),
         },
     )
     p0, p1 = torch.tensor([1, 1]), torch.tensor([3, 3])
@@ -330,7 +331,8 @@ def test_streamed_drafts_carry_engine_logprobs():
         {},
         base_handlers={
             "start_drafts": lambda prompts, budget, interval: None,
-            "collect_drafts": lambda: [
+            "draft_request_ids": lambda: {},
+            "collect_drafts": lambda records=None: [
                 ([4, EOD], True, [-0.5, -0.25]),
                 ([4, 5], False, [-0.5]),  # misaligned: dropped
                 ([6], False),  # engine without log-probs
@@ -342,6 +344,32 @@ def test_streamed_drafts_carry_engine_logprobs():
     (a,), (b,), (c,) = collect()
     assert a[2] == [4, EOD] and a[3] and a[6] == [-0.5, -0.25]
     assert b[6] is None and c[6] is None and c[2] == [6]
+
+
+def test_streamed_drafts_collect_with_engine_records():
+    seen = {}
+
+    def collect(records=None):
+        seen["records"] = records
+        return [([4, 5, 6], False, [-0.1, -0.2, -0.3]), ([7], True, [-0.4])]
+
+    s = _spec(
+        {},
+        base_handlers={
+            "start_drafts": lambda prompts, budget, interval: None,
+            "draft_request_ids": lambda: {0: 11},
+            "draft_records": lambda request_ids: {
+                r: ([4, 5, 6], [-0.1, -0.2, -0.3]) for r in request_ids
+            },
+            "collect_drafts": collect,
+        },
+    )
+    collect_fn = asyncio.run(s.draft_streaming([torch.tensor([1]), torch.tensor([2])]))
+    (a,), (b,) = collect_fn()
+    calls = s.base._policy.worker_group.calls
+    assert ("draft_records", {"request_ids": [11]}) in calls
+    assert seen["records"] == {11: ([4, 5, 6], [-0.1, -0.2, -0.3])}
+    assert a[2] == [4, 5, 6] and b[2] == [7]
 
 
 def test_cohort_drafts_keep_engine_logprobs_across_resumptions():
@@ -356,7 +384,8 @@ def test_cohort_drafts_keep_engine_logprobs_across_resumptions():
         {},
         base_handlers={
             "start_drafts": lambda prompts, budgets, interval: None,
-            "collect_drafts": lambda: collected.pop(0),
+            "draft_request_ids": lambda: {},
+            "collect_drafts": lambda records=None: collected.pop(0),
         },
     )
     p0, p1 = torch.tensor([1, 1]), torch.tensor([3, 3])

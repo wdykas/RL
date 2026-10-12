@@ -39,6 +39,7 @@ import collections
 import itertools
 import os
 import time
+import warnings
 from types import SimpleNamespace
 from typing import Any, Callable, Literal, Optional
 
@@ -126,6 +127,11 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # removes activation-rounding noise from p/q; 4 B/param per shard) or
     # "model" (the training dtypes; half the memory, ~90% kept).
     verify_precision: Literal["model", "fp32"] = "fp32"
+    # Lazy, logit-free block verification: residual masses only where the
+    # backward scan needs them, and final hidden states [T, d] instead of
+    # [T, V] logits (rows recomputed on demand). Same decisions as the eager
+    # rule given the same logits; off until validated on GPU.
+    verify_lazy: bool = False
     # Iterations drafted concurrently. A draft cut off at one deadline resumes
     # from its prefix, under the newer weights, in the next iteration.
     draft_lookahead: int = 3
@@ -284,6 +290,11 @@ def validate_fused_verify_train(
             "thundersync.verify_precision must be 'model' so p and q use the "
             f"training numerics (got {ts_cfg.verify_precision!r})"
         )
+    if ts_cfg.verify_lazy:
+        problems.append(
+            "thundersync.verify_lazy must be false (lazy verification is not "
+            "implemented for the fused verify+train path)"
+        )
     if ts_cfg.fused_max_retained_tokens <= 0:
         problems.append("thundersync.fused_max_retained_tokens must be positive")
     if not megatron_cfg.get("batch_invariant_mode"):
@@ -344,19 +355,24 @@ def validate_speculation(ts_cfg: ThunderSyncConfig, policy_cfg: PolicyConfig) ->
         inference["tensor_model_parallel_size"] > 1
         or inference["pipeline_model_parallel_size"] > 1
     ):
-        # The scorer's collectives would share the engine's TP/PP communicators
-        # with the running engine, which nothing pauses (as under EP).
-        problems.append(
-            "thundersync.verify_on must be 'learner' with inference TP or PP > 1"
+        # Untested: the scorer's TP/PP collectives share communicators with the
+        # running engine. Under inference EP this deadlocked (observed); at TP/PP
+        # it has not been run. Warn rather than reject until it is measured.
+        warnings.warn(
+            "thundersync: inference-side verification with inference TP or PP > 1 is "
+            "untested (the analogous EP case deadlocked); verify_on='learner' is the "
+            "tested setting"
         )
     megatron_cfg = policy_cfg["megatron_cfg"]
     if ts_cfg.verify_mode == "keyed" and (
         megatron_cfg["tensor_model_parallel_size"] > 1
         or megatron_cfg["pipeline_model_parallel_size"] > 1
     ):
-        # Keyed verification calls the training model directly: vocab-sharded
-        # logits under TP, no pipeline schedule under PP.
-        problems.append("thundersync.verify_mode='keyed' requires learner TP=PP=1")
+        # Not implemented: keyed verification calls the training model directly,
+        # which returns vocab-sharded logits under TP and has no pipeline schedule.
+        problems.append(
+            "thundersync.verify_mode='keyed' is not implemented for learner TP or PP > 1"
+        )
     if problems:
         raise ValueError("thundersync.speculate=true: " + "; ".join(problems) + ".")
 
@@ -809,6 +825,7 @@ def thundersync_grpo_train(
             variant_eps=ts_cfg.variant_eps,
             verify_mode=ts_cfg.verify_mode,
             verify_precision=ts_cfg.verify_precision,
+            verify_lazy=ts_cfg.verify_lazy,
             verify_batch_tokens=ts_cfg.verify_batch_tokens,
             longest_first=ts_cfg.verify_longest_first,
             verify_on=ts_cfg.verify_on,

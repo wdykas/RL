@@ -387,6 +387,7 @@ def test_fused_config_valid():
         ({"verify_on": "both"}, _policy(), "verify_on"),
         ({"verify_precision": "fp32"}, _policy(), "verify_precision"),
         ({"fused_max_retained_tokens": 0}, _policy(), "fused_max_retained_tokens"),
+        ({"verify_lazy": True}, _policy(), "verify_lazy"),
         ({}, _policy(batch_invariant_mode=False), "batch_invariant_mode"),
         ({}, _policy(pipeline_model_parallel_size=2), "pipeline"),
         ({}, _policy(expert_model_parallel_size=2), "expert_model_parallel"),

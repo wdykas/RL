@@ -456,7 +456,7 @@ def test_speculation_rejects_unreproduced_sampling(gen, ok):
     "ts_kw,train_tp,gen_tp,ok",
     [
         ({"verify_on": "both"}, 1, 1, True),
-        ({"verify_on": "both"}, 1, 2, False),
+        ({"verify_on": "both"}, 1, 2, True),  # untested: warns, not rejected
         ({"verify_on": "learner"}, 2, 2, True),
         ({"verify_on": "learner", "verify_mode": "keyed"}, 2, 2, False),
     ],

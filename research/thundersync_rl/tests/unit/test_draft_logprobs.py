@@ -16,7 +16,12 @@
 from types import SimpleNamespace
 
 import torch
-from thundersync_rl.worker import apply_draft_frame, snapshot_drafts
+from thundersync_rl.worker import (
+    apply_draft_frame,
+    apply_draft_records,
+    engine_draft_records,
+    snapshot_drafts,
+)
 
 
 def _partial(toks, lps=None):
@@ -64,3 +69,47 @@ def test_final_frame_replaces_tokens_and_logprobs():
     tokens, logprobs = [[]], [[]]
     apply_draft_frame({"final": {"generated_tokens": [7, 2]}}, tokens[0], logprobs, 0)
     assert logprobs[0] is None
+
+
+class _Record:
+    """Megatron request record: one request per (re)admission, merged on read."""
+
+    def __init__(self, *reqs):
+        self.requests = list(reqs)
+
+    def merge(self):
+        return SimpleNamespace(
+            generated_tokens=[t for r in self.requests for t in r.generated_tokens],
+            generated_log_probs=[
+                v for r in self.requests for v in r.generated_log_probs
+            ],
+        )
+
+
+def test_collect_uses_merged_engine_record_after_eviction():
+    # Request 7 generated [4, 5] before an eviction and [6, 8, 9] after it. The
+    # resumed record's generated tokens restart at 0 while the emitted-length
+    # counter stays at 2, so the frames skipped its first two tokens.
+    pre = SimpleNamespace(generated_tokens=[4, 5], generated_log_probs=[-0.1, -0.2])
+    post = SimpleNamespace(
+        generated_tokens=[6, 8, 9], generated_log_probs=[-0.3, -0.4, -0.5]
+    )
+    engine = SimpleNamespace(requests={7: SimpleNamespace(record=_Record(pre, post))})
+    records = engine_draft_records(engine, [7, 99])  # 99: held by another engine
+    assert records == {7: ([4, 5, 6, 8, 9], [-0.1, -0.2, -0.3, -0.4, -0.5])}
+
+    # Frames delivered [4, 5] then [9]: 6 and 8 were skipped.
+    tokens, logprobs, done = [[], [1, 2]], [[], [-0.6, -0.7]], [False, True]
+    apply_draft_frame(_partial([4, 5], [-0.1, -0.2]), tokens[0], logprobs, 0)
+    apply_draft_frame(_partial([9], [-0.5]), tokens[0], logprobs, 0)
+    streams = {0: SimpleNamespace(request_id=7), 1: SimpleNamespace(request_id=8)}
+    stats = apply_draft_records(tokens, logprobs, done, streams, records)
+    assert stats == {"from_record": 1, "fallback": 0, "differed": 1}
+    assert snapshot_drafts(tokens, logprobs, done) == [
+        ([4, 5, 6, 8, 9], False, [-0.1, -0.2, -0.3, -0.4, -0.5]),
+        ([1, 2], True, [-0.6, -0.7]),  # finished: final reply already merged
+    ]
+    # No record: frames kept.
+    tokens2, lps2 = [[4, 5, 9]], [[-0.1, -0.2, -0.5]]
+    stats = apply_draft_records(tokens2, lps2, [False], {0: streams[0]}, {})
+    assert stats["fallback"] == 1 and tokens2 == [[4, 5, 9]]

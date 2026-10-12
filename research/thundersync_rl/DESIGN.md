@@ -183,6 +183,58 @@ materialized. It shares `acceptance_weights`, `stop_probabilities` and
 `emit_distribution` with the reference and rounds the same way (fp32 log-probs,
 exponentiated in fp64); it is draw-for-draw identical to the reference in tests.
 
+**Lazy verification** (`verify_lazy=true`, off by default until the GPU A/B).
+`lazy_stop_index` uses two facts: h_g = b_g, and h_i ≤ b_i (because r_i ≤ b_i). It
+draws the same η = `rand(g+1)` as the eager rule, then:
+
+- **Whole draft.** If η_g ≤ b_g, τ = g and no r_i is computed. b needs only
+  log p(x_i) and log q(x_i).
+- **Backward scan.** Otherwise it scans i = g−1, g−2, …, skipping any position with
+  η_i > b_i(1 + slack_i). Those positions can never satisfy η_i ≤ h_i.
+- **Candidates.** The remaining positions are evaluated from the top, in batches of
+  4, 8, …. Each uses the eager r_i (the same Triton program per row, so a row's r is
+  bitwise the same in any batch) and the eager h_i formula. The first hit is τ.
+- **Emission.** The emitted token is sampled from the row at τ exactly as before.
+
+The generator calls (one `rand`, one `multinomial`), their order and every comparison
+outcome are unchanged. So (τ, y), the log-probs and the generator state afterwards are
+bitwise those of `block_verify_logits` given the same logits. The scan neither stops
+early at b_i = 1 nor trusts h_i ≤ b_i exactly, because both can fail in floating point:
+h = r/((r+1)−b) with tiny r, and Σp > 1 by the fp32 logsumexp rounding. The slack
+slack_i = 1e-4 + 2^-20·|lse_p,i| covers that rounding; an adversarial test at
+|logits| up to 3000 measured an excess under 2^-20·|lse|.
+
+Tests compare lazy against eager on random, exhaustive and fp32/bf16 GPU cases, checking
+equal (τ, y), bitwise logp and equal RNG state. Measured on a shared GPU, the per-draft
+cost is about the same, since the two logsumexps dominate. The gain is skipping the
+residual pass on the about 98% of drafts that are whole-accepted, and making the
+logit-free inputs below possible.
+
+**Logit-free inputs** (`verify_lazy=true` when the scorer supports position selection;
+`THUNDERSYNC_LAZY_LOGITS=1` keeps logits and makes only the scan lazy; on `thundersync-rl-bi`
+the batch-invariant bf16 scorer keeps logits too, since it scores full rows for training
+parity; `fused_verify_train` rejects `verify_lazy`).
+
+- **Capture.** `capture_head_input` stores the LM head's input, the final hidden states
+  [T, d], at the selected positions instead of logits.
+- **Statistics.** `ChunkedHead` computes per-position (logsumexp, draft-token logit) in
+  fixed row chunks of `THUNDERSYNC_LAZY_CHUNK` rows (default 512), using the forward's
+  own head call. Under TP it all-gathers one chunk at a time.
+- **Pinned rows.** It keeps only the bonus row of every draft.
+- **Recompute.** Rows the scan visits are recomputed as part of their own chunk, so
+  each is bitwise the row its statistics came from. q rows of version v use stash v's
+  head weight.
+- **Memory.** Per scorer batch, about 2·T·V·4 B of p+q logits (about 19 GB at 16k
+  tokens and V = 152k) becomes T·d·4 B of hidden states per forward, plus one
+  [512, V] chunk.
+- **What is unchanged.** LM-head FLOPs are the same, and the vocab-parallel
+  all-gather is still done, now per chunk.
+- **Identity.** Decisions are pathwise those of the eager rule applied to these
+  chunk-computed logits. They match the logits path exactly in the unit test (exact
+  arithmetic). On real models the chunk GEMM and logsumexp shapes differ from the
+  full-batch ones, so expect last-ulp differences and an extremely rare flipped
+  decision, not bitwise equality.
+
 **Keyed sampling (alternative mode).** `verify_mode=keyed` makes every token a
 Gumbel-max sample whose noise is a hash of (seed, absolute position, token id), computed
 in a Triton kernel inside the engine's sampler. Two policies emit the same token wherever
@@ -268,6 +320,18 @@ at equal weights). The output law is linear in the engine's q': out = p + Kᵀ(q
 and with ~98% acceptance K ≈ I, so an accepted draft token x is distributed as about
 p(x)·q'(x)/q(x), not p(x).
 
+**Draft content from engine records.** An unfinished draft cut at the deadline is read
+from the engine's request record (`record.merge()`, as the engine's final reply is), not
+from its streamed partial frames: after an eviction Megatron resumes the request as a new
+record whose generated tokens restart at 0 while its per-request emitted-length counter
+does not (`DynamicInferenceEngine._try_send_streaming_partials`), so the frames silently
+skip tokens. Collection asks every generation engine for the merged records of the
+unfinished draft requests it holds (`draft_request_ids`, `draft_records`) and rank 0
+snapshots from those before aborting (`collect_drafts(records=...)`; frames remain the
+fallback for a request no engine holds). Before this fix, on GPU 24/24 record-rebuilt
+drafts differed from their frames, so cut drafts (tokens and engine log-probs) were not
+the sequences the engine sampled. Finished drafts were unaffected.
+
 **Behavior log-probs.** Generation log-probs feed the importance-sampling correction
 (`loss_fn.use_importance_sampling_correction`, TIS), so they must describe that law.
 Every draft carries the engine's own log q'(x) of each sampled token (`start_drafts`
@@ -304,8 +368,9 @@ or stop strings. Streaming computes advantages per group as each group closes, s
 requires `grpo.adv_estimator.name=grpo` and no `seq_logprob_error_in_loss`. A streamed
 draft stopped by `draft_budget` below `max_new_tokens` is not a finished rollout.
 Inference-side verification
-requires inference TP = PP = 1 (the scorer and the running engine would share
-communicators); keyed verification requires learner TP = PP = 1. Streaming rejects reward
+with inference TP or PP > 1 is untested and warns (under inference EP it deadlocked against
+the running engine; TP/PP have not been run); keyed verification is not implemented for
+learner TP or PP > 1. Streaming rejects reward
 penalties and per-sample advantage overrides, and MoE settings that are not
 advantage-weighted or depend on micro-batch composition (load-balancing or z-loss, expert-
 bias updates, capacity token dropping). Generation workers stay in eval mode after
@@ -424,6 +489,7 @@ policy.make_sequence_length_divisible_by=128
 | `draft_lookahead` | Future iterations drafted concurrently; unfinished drafts resume across iterations |
 | `draft_start_frac` | Fraction of this iteration's rollouts finished before drafting starts (0: from the start) |
 | `verify_precision` | `fp32` scorer (TF32 GEMMs under the env flag) or `model` (training dtypes) |
+| `verify_lazy` | Lazy, logit-free block verification (section 4); default `false` until GPU-validated |
 | `verify_on` | `learner`, `inference` or `both` worker groups run verification |
 | `verify_chunks` | Verification pieces; plans publish as each finishes |
 | `verify_batch_tokens` | Tokens per scorer forward batch (bounds logits memory), default 16384 |
@@ -436,7 +502,10 @@ outcomes and continuation timing), `THUNDERSYNC_LEARNER_PROF` and
 `THUNDERSYNC_LEARNER_TORCHPROF` (training chunks), `THUNDERSYNC_SCORER_ATTN_BF16`
 (experiment: bf16 attention in the scorer), `THUNDERSYNC_SPEC_SELFTEST` (keyed mode:
 re-draft with the same seeds and verify on unchanged weights before training),
-`THUNDERSYNC_MISMATCH_CHECK` (rollout vs learner log-probs before each optimizer step).
+`THUNDERSYNC_MISMATCH_CHECK` (rollout vs learner log-probs before each optimizer step),
+`THUNDERSYNC_LAZY_LOGITS` (with `verify_lazy`: keep logits, lazy scan only),
+`THUNDERSYNC_LAZY_CHUNK` (logit-free row chunk, default 512), `THUNDERSYNC_LAZY_CHECK` (with
+`verify_lazy`: rerun the eager logits path on the same seed and print decision mismatches).
 
 ## 13. Code map
 
@@ -447,7 +516,8 @@ re-draft with the same seeds and verify on unchanged weights before training),
 | `thundersync_rl/speculative.py` | SpeculativeGeneration: cohorts and segments, stash calls, chunked verification, plans, continuations |
 | `thundersync_rl/worker.py` | Megatron worker extension: streaming train calls, scorer build and refresh, weight stashes, stashed block verification, draft streams |
 | `thundersync_rl/block_verification.py` | Reference block verification, shared acceptance helpers, exact output law |
-| `thundersync_rl/block_verification_fused.py` | Block verification from raw logits with a Triton residual-mass kernel |
+| `thundersync_rl/block_verification_fused.py` | Block verification from raw logits with a Triton residual-mass kernel; lazy variant from per-position statistics |
+| `thundersync_rl/logit_free.py` | `ChunkedHead`: LM-head statistics from hidden states in fixed row chunks, rows recomputed on demand |
 | `thundersync_rl/scorer_kernels.py` | SDPA core attention, Triton SwiGLU, selective LM head |
 | `thundersync_rl/keyed_sampling.py` | Position-keyed Gumbel-max sampling kernel (keyed mode) |
 | `thundersync_rl/fused_train.py` | Fused verification + training (BI, experimental): retained graphs, logit stitching, forward substitution |
@@ -458,6 +528,14 @@ draw-for-draw, scorer kernels on GPU, streaming equivalence, speculative driver 
 cohorts and ramp, chunked pools, error surfacing, fused verification + training: routing,
 claims, config checks and gradient equality on a tiny causal model), 7 core zero-advantage tests, and GPU
 functional checks for scorer and refit parallelism.
+
+**Precision of an exact policy (offline measurement).** With q the exact sampling law and
+p the same numeric function at the next weights (Qwen2.5-Math-1.5B, one Adam step at lr
+1e-6, 128 MATH-500 drafts up to 3072 tokens; `thundersync_work/fp16_acceptance.py`):
+bf16 keeps 57.0% of draft tokens (46.3% of drafts whole), fp16 90.0% (85.7%), fp32 96.0%
+(94.5%); per-token TV 3.3e-3 / 6.6e-4 / 2.4e-4. bf16's rounding noise between consecutive
+versions is the policy's own, so exact bf16 speculation is inherently ~50%; an fp16
+(batch-invariant) policy would allow exact speculation without the fp32 scorer or stashes.
 
 ## 14. Batch invariance (NeMo-RL PR 3208)
 
