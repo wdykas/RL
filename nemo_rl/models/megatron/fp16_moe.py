@@ -52,13 +52,28 @@ try:
 except ImportError:  # pragma: no cover
     HAVE_TRITON = False
 
-BLOCK_M = 64
-BLOCK_N = 128
-BLOCK_K = 64
-NUM_WARPS = 4
-NUM_STAGES = 3
+# Tile shapes do not change a row's bits: tl.dot accumulates the K dimension in
+# order into one fp32 accumulator, and products of fp16 operands are exact, so the
+# result depends only on the row, its expert's weight and K order. Measured bitwise
+# identical over BLOCK_M 16-128, BLOCK_N 32-256, BLOCK_K 32-128, 2-8 warps and 2-4
+# stages (research/thundersync_rl/DESIGN.md section 14b). The configuration is picked
+# per call from the expected rows per expert: small tiles for decode, large for
+# prefill and training.
+TileConfig = tuple  # (BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages)
+_CONFIGS: tuple[tuple[int, TileConfig], ...] = (
+    (32, (16, 64, 64, 4, 3)),  # decode: up to ~32 rows per expert
+    (192, (128, 64, 128, 8, 3)),
+    (1 << 62, (128, 64, 64, 4, 3)),
+)
+BLOCK_M = 16  # row alignment of the engine's decode buckets (smallest tile)
 
-_TL_DTYPES: dict = {}
+
+def select_config(rows_per_expert: float) -> TileConfig:
+    """Tile configuration for an expected number of rows per expert."""
+    for bound, cfg in _CONFIGS:
+        if rows_per_expert <= bound:
+            return cfg
+    return _CONFIGS[-1][1]
 
 
 if HAVE_TRITON:
@@ -68,23 +83,28 @@ if HAVE_TRITON:
         x_ptr,  # [M_pad, K] fp16, rows grouped by expert, segments BLOCK_M-aligned
         w_ptr,  # base pointer of the first expert's [N, K] weight
         w_off_ptr,  # [E] int64 element offset of each expert's weight from w_ptr
-        tile_expert_ptr,  # [M_pad / BLOCK_M] int64 expert of each row tile, -1 unused
+        offs_ptr,  # [E] inclusive BLOCK_M-aligned row offsets of the expert segments
         out_ptr,  # [M_pad, N] fp32
         N,
         K,
         stride_xm,
         stride_om,
+        E,
+        E_POW2: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
     ):
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
-        expert = tl.load(tile_expert_ptr + pid_m)
-        if expert < 0:
+        start = pid_m * BLOCK_M
+        idx = tl.arange(0, E_POW2)
+        ends = tl.load(offs_ptr + idx, mask=idx < E, other=2147483647).to(tl.int64)
+        expert = tl.sum((ends <= start).to(tl.int32), axis=0)
+        if expert >= E:
             return
         w_base = w_ptr + tl.load(w_off_ptr + expert)
-        rm = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
+        rm = (start + tl.arange(0, BLOCK_M)).to(tl.int64)
         rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
         rk = tl.arange(0, BLOCK_K)
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
@@ -106,6 +126,23 @@ if HAVE_TRITON:
             acc,
             mask=rn[None, :] < N,
         )
+
+    @triton.jit
+    def _swiglu_probs_kernel(
+        h_ptr,  # [rows, 2F] fp32 (gate | up)
+        p_ptr,  # [rows] fp32
+        out_ptr,  # [rows, F] fp32 or fp16
+        F,
+        BLOCK: tl.constexpr,
+    ):
+        row = tl.program_id(0).to(tl.int64)
+        cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        mask = cols < F
+        gate = tl.load(h_ptr + row * 2 * F + cols, mask=mask, other=0.0)
+        up = tl.load(h_ptr + row * 2 * F + F + cols, mask=mask, other=0.0)
+        p = tl.load(p_ptr + row)
+        value = (gate / (1.0 + tl.exp(-gate))) * up * p
+        tl.store(out_ptr + row * F + cols, value.to(out_ptr.dtype.element_ty), mask=mask)
 
     @triton.jit
     def _unpermute_fp64_kernel(
@@ -135,36 +172,6 @@ if HAVE_TRITON:
             tl.store(output_ptr + tok_i64 * hidden_dim + offsets, acc.to(tl.float32), mask=mask_h)
 
 
-def _launch_grouped_gemm(
-    x16: torch.Tensor,
-    w_base: torch.Tensor,
-    w_offsets: torch.Tensor,
-    tile_expert: torch.Tensor,
-    n: int,
-) -> torch.Tensor:
-    m_pad, k = x16.shape
-    assert m_pad % BLOCK_M == 0 and x16.dtype == torch.float16 and x16.is_contiguous()
-    out = torch.empty((m_pad, n), dtype=torch.float32, device=x16.device)
-    grid = (m_pad // BLOCK_M, triton.cdiv(n, BLOCK_N))
-    _grouped_gemm_kernel[grid](
-        x16,
-        w_base,
-        w_offsets,
-        tile_expert,
-        out,
-        n,
-        k,
-        x16.stride(0),
-        out.stride(0),
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K,
-        num_warps=NUM_WARPS,
-        num_stages=NUM_STAGES,
-    )
-    return out
-
-
 def _weight_table(weights: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
     """(base weight, int64 element offsets of every expert weight from it)."""
     base = weights[0]
@@ -175,59 +182,110 @@ def _weight_table(weights: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tens
     return base, torch.tensor(offs, dtype=torch.int64, device=base.device)
 
 
-def tile_experts_from_offsets(inclusive_offsets: torch.Tensor, num_tiles: int) -> torch.Tensor:
-    """Expert of each BLOCK_M row tile from BLOCK_M-aligned inclusive offsets (on device)."""
-    starts = torch.arange(num_tiles, device=inclusive_offsets.device, dtype=torch.int64) * BLOCK_M
-    expert = torch.searchsorted(inclusive_offsets.to(torch.int64), starts, right=True)
-    n = inclusive_offsets.numel()
-    return torch.where(expert < n, expert, torch.full_like(expert, -1))
-
-
 def grouped_gemm(
     x16: torch.Tensor,
     weights: list[torch.Tensor] | None,
-    tile_expert: torch.Tensor,
+    offsets: torch.Tensor,
+    config: TileConfig,
     *,
     stacked: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Batch-invariant grouped GEMM: x16 [M_pad, K] fp16 @ W_e.T -> fp32 [M_pad, N].
 
+    ``offsets``: [E] inclusive row offsets of the expert segments, each a
+    multiple of ``config``'s BLOCK_M (rows past the last offset are skipped).
     Weights: ``weights`` (one [N, K] tensor per expert, any addresses) or
-    ``stacked`` ([E, N, K] contiguous; CUDA-graph safe: its offset table is
-    built on device).
+    ``stacked`` ([E, N, K] contiguous; its offset table is built on device, so
+    the call is CUDA-graph safe).
     """
+    ws = list(weights) if weights is not None else list(stacked)
     if not x16.is_cuda:
-        return _grouped_gemm_reference(
-            x16, list(weights) if weights is not None else list(stacked), tile_expert
-        )
+        return _grouped_gemm_reference(x16, ws, offsets)
+    bm, bn, bk, warps, stages = config
+    m_pad, k = x16.shape
+    assert m_pad % bm == 0 and x16.dtype == torch.float16 and x16.is_contiguous()
     if stacked is not None:
-        e, n, k = stacked.shape
-        offs = torch.arange(e, device=stacked.device, dtype=torch.int64) * (n * k)
+        e, n, _ = stacked.shape
+        w_offs = torch.arange(e, device=stacked.device, dtype=torch.int64) * (n * k)
         base = stacked
     else:
-        base, offs = _weight_table(weights)
-        n = base.shape[0]
-    return _launch_grouped_gemm(x16, base, offs, tile_expert, n)
-
-
-def _grouped_gemm_reference(x16, weights, tile_expert):
-    """CPU stand-in for tests: the same per-row products, fp32 accumulation."""
-    n = weights[0].shape[0]
-    out = torch.zeros((x16.shape[0], n), dtype=torch.float32)
-    for t, e in enumerate(tile_expert.tolist()):
-        if e < 0:
-            continue
-        w = weights[e].to(torch.float16).float()
-        rows = slice(t * BLOCK_M, (t + 1) * BLOCK_M)
-        out[rows] = x16[rows].float() @ w.t()
+        base, w_offs = _weight_table(ws)
+        e, n = len(ws), base.shape[0]
+    out = torch.empty((m_pad, n), dtype=torch.float32, device=x16.device)
+    grid = (m_pad // bm, triton.cdiv(n, bn))
+    _grouped_gemm_kernel[grid](
+        x16,
+        base,
+        w_offs,
+        offsets,
+        out,
+        n,
+        k,
+        x16.stride(0),
+        out.stride(0),
+        e,
+        E_POW2=triton.next_power_of_2(e),
+        BLOCK_M=bm,
+        BLOCK_N=bn,
+        BLOCK_K=bk,
+        num_warps=warps,
+        num_stages=stages,
+    )
     return out
 
 
-def swiglu_probs(h: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
-    """SiLU(gate) * up * prob in fp32. h [rows, 2F] (gate | up), probs [rows]."""
-    h = h.float()
-    gate, up = torch.chunk(h, 2, dim=-1)
+def _grouped_gemm_reference(x16, weights, offsets):
+    """CPU stand-in for tests: the same per-row products, fp32 accumulation."""
+    n = weights[0].shape[0]
+    out = torch.zeros((x16.shape[0], n), dtype=torch.float32)
+    start = 0
+    for w, end in zip(weights, offsets.tolist()):
+        out[start:end] = x16[start:end].float() @ w.to(torch.float16).float().t()
+        start = end
+    return out
+
+
+def _swiglu_eager(h: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
+    gate, up = torch.chunk(h.float(), 2, dim=-1)
     return (gate / (1.0 + torch.exp(-gate))) * up * probs.float().unsqueeze(-1)
+
+
+def swiglu_probs_fwd(h: torch.Tensor, probs: torch.Tensor, out_dtype=torch.float32):
+    """SiLU(gate) * up * prob in fp32 (one Triton kernel on CUDA), cast to out_dtype."""
+    if not h.is_cuda:
+        return _swiglu_eager(h, probs).to(out_dtype)
+    rows, two_f = h.shape
+    f = two_f // 2
+    out = torch.empty((rows, f), dtype=out_dtype, device=h.device)
+    block = min(triton.next_power_of_2(f), 1024)
+    _swiglu_probs_kernel[(rows, triton.cdiv(f, block))](
+        h.contiguous(), probs.float().contiguous(), out, f, BLOCK=block
+    )
+    return out
+
+
+class SwigluProbs(torch.autograd.Function):
+    """Training: the engine's kernel forward (fp32 out), eager fp32 backward."""
+
+    @staticmethod
+    def forward(ctx, h, probs):  # noqa: D102
+        ctx.save_for_backward(h, probs)
+        return swiglu_probs_fwd(h, probs, torch.float32)
+
+    @staticmethod
+    def backward(ctx, grad):  # noqa: D102
+        h, probs = ctx.saved_tensors
+        with torch.enable_grad():
+            h_ = h.detach().float().requires_grad_()
+            p_ = probs.detach().float().requires_grad_()
+            y = _swiglu_eager(h_, p_)
+            dh, dp = torch.autograd.grad(y, (h_, p_), grad.float())
+        return dh.to(h.dtype), dp.to(probs.dtype)
+
+
+def swiglu_probs(h: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
+    """Autograd-aware SiLU(gate) * up * prob, fp32 output."""
+    return SwigluProbs.apply(h, probs.reshape(-1))
 
 
 def unpermute_fp64(
@@ -260,19 +318,17 @@ def unpermute_fp64(
 # ---------------------------------------------------------------------------
 
 
-def _aligned_rows(m_splits: list[int], device) -> tuple[torch.Tensor, torch.Tensor, int]:
-    """(destination row of every input row, tile experts, padded row count)."""
-    dest, tiles = [], []
+def _aligned_rows(m_splits: list[int], block_m: int, device) -> tuple:
+    """(destination row of every input row, inclusive aligned offsets, padded rows)."""
+    dest, offs = [], []
     start = 0
-    for e, m in enumerate(m_splits):
+    for m in m_splits:
         dest.append(torch.arange(start, start + m, dtype=torch.int64))
-        n_tiles = -(-m // BLOCK_M)
-        tiles += [e] * n_tiles
-        start += n_tiles * BLOCK_M
+        start += -(-m // block_m) * block_m
+        offs.append(start)
     dest_t = torch.cat(dest) if dest else torch.zeros(0, dtype=torch.int64)
-    tiles_t = torch.tensor(tiles if tiles else [-1], dtype=torch.int64)
-    m_pad = max(start, BLOCK_M)
-    return dest_t.to(device), tiles_t.to(device), m_pad
+    m_pad = max(start, block_m)
+    return dest_t.to(device), torch.tensor(offs, dtype=torch.int64).to(device), m_pad
 
 
 class GroupedFp16Linear(torch.autograd.Function):
@@ -286,12 +342,14 @@ class GroupedFp16Linear(torch.autograd.Function):
     def forward(ctx, x, m_splits, *weights):  # noqa: D102
         k = x.shape[-1]
         x16 = x.reshape(-1, k).to(torch.float16)
-        dest, tiles, m_pad = _aligned_rows(list(m_splits), x.device)
+        splits = list(m_splits)
+        cfg = select_config(sum(splits) / max(len(splits), 1))
+        dest, offs, m_pad = _aligned_rows(splits, cfg[0], x.device)
         x_pad = torch.zeros((m_pad, k), dtype=torch.float16, device=x.device)
         x_pad.index_copy_(0, dest, x16)
-        out = grouped_gemm(x_pad, list(weights), tiles).index_select(0, dest)
+        out = grouped_gemm(x_pad, list(weights), offs, cfg).index_select(0, dest)
         ctx.save_for_backward(x16, *weights)
-        ctx.m_splits = list(m_splits)
+        ctx.m_splits = splits
         ctx.x_dtype = x.dtype
         ctx.x_shape = x.shape
         return out
@@ -361,6 +419,10 @@ def inference_experts_forward(module: Any, hidden_states, permuted_probs, routin
     )
     valid_tokens = InferenceAllGatherDispatcherBase._valid_tokens()
     local_expert_start = module.ep_group.rank() * module.num_local_experts
+    # Expected rows per local expert: tokens x top-k spread over every expert.
+    topk = routing_map.shape[1]
+    rows_per_expert = x16.shape[0] * topk / (module.num_local_experts * module.ep_group.size())
+    cfg = select_config(rows_per_expert)
     xp, pp, _pmap, offs, inverse_map = permute_tokens(
         x16,
         permuted_probs,
@@ -368,14 +430,13 @@ def inference_experts_forward(module: Any, hidden_states, permuted_probs, routin
         local_expert_start,
         module.num_local_experts,
         valid_tokens,
-        alignment=BLOCK_M,
+        alignment=cfg[0],
         return_batch_invariant_inverse_map=True,
-        row_alignment=BLOCK_M,
+        row_alignment=cfg[0],
     )
-    tiles = tile_experts_from_offsets(offs, xp.shape[0] // BLOCK_M)
-    h = grouped_gemm(xp, None, tiles, stacked=module._fc1_weight)
-    a = swiglu_probs(h, pp)
-    y = grouped_gemm(a.to(torch.float16), None, tiles, stacked=module._fc2_weight)
+    h = grouped_gemm(xp, None, offs, cfg, stacked=module._fc1_weight)
+    a = swiglu_probs_fwd(h, pp, torch.float16)
+    y = grouped_gemm(a, None, offs, cfg, stacked=module._fc2_weight)
     out = None
     if module._nvls_dispatcher:
         out = NVLSAllGatherVDispatcher._get_rsv_tensor()

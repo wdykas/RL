@@ -23,19 +23,16 @@ def _experts(e, n, k, seed=0):
     return [(torch.randn(n, k) * 0.05).to(torch.bfloat16) for _ in range(e)]
 
 
-def test_tile_experts_from_offsets():
-    b = fm.BLOCK_M
-    offs = torch.tensor([b, b, 3 * b, 4 * b], dtype=torch.int32)  # expert 1 empty
-    tiles = fm.tile_experts_from_offsets(offs, 6)
-    assert tiles.tolist() == [0, 2, 2, 3, -1, -1]
+def test_select_config_small_tiles_for_decode():
+    assert fm.select_config(4)[0] == 16
+    assert fm.select_config(1000)[0] == 128
 
 
 def test_aligned_rows():
-    dest, tiles, m_pad = fm._aligned_rows([3, 0, fm.BLOCK_M + 1], "cpu")
-    b = fm.BLOCK_M
-    assert m_pad == 3 * b
-    assert tiles.tolist() == [0, 2, 2]
-    assert dest.tolist() == [0, 1, 2] + list(range(b, 2 * b + 1))
+    dest, offs, m_pad = fm._aligned_rows([3, 0, 17], 16, "cpu")
+    assert m_pad == 48
+    assert offs.tolist() == [16, 16, 48]
+    assert dest.tolist() == [0, 1, 2] + list(range(16, 33))
 
 
 def test_grouped_linear_matches_per_expert_fp16_reference():
@@ -66,9 +63,12 @@ def test_grouped_linear_backward_bf16():
 
 
 def test_swiglu_probs():
-    h = torch.randn(4, 6)
+    h = torch.randn(4, 6, requires_grad=True)
     p = torch.rand(4)
     out = fm.swiglu_probs(h, p)
+    out.sum().backward()
+    assert h.grad is not None and torch.isfinite(h.grad).all()
+    h = h.detach()
     gate, up = h[:, :3], h[:, 3:]
     torch.testing.assert_close(out, torch.nn.functional.silu(gate) * up * p[:, None])
 
