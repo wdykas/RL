@@ -729,8 +729,8 @@ distribution, and p can be the training model's forward at θ_{k+1}:
   sampled (`HiddenLog`, d × 2 B per drafted token). Rows are keyed by (draft, generated
   index t = last position + 1 − prompt length), so an intermediate prefill chunk records
   nothing and an engine eviction's re-prefill overwrites the same t. At the deadline the
-  driver collects each draft's rows from the engine that ran it (`pop_draft_hidden`) and
-  ships them with the draft (tuple index 7; cohort drafts concatenate per segment). The
+  engine that ran each draft puts its rows into the Ray object store and the draft carries
+  only handles (tuple index 7, `HiddenRefs`; see "Hidden-state data movement" below). The
   learner keeps only the LM-head weight per pending version (`stash_head`, V × d × 2 B) and
   rebuilds a q row as `log_softmax(output_layer(h, weight=W_head^(v)))`. It uses the
   training model's own output layer and logit scaling, and the version v that drafted that
@@ -836,8 +836,66 @@ The head stash is V/TP x d x 2 B per version per GPU: 2.1 GB / 8 ≈ 0.26 GB at 
 Transient GPU memory per verified row at TP=1 is the training forward's logits plus fp32
 log-probs, (g+1) x V x 4 B each (about 2.5 GB each for a 4k-token draft at V = 152k), and a
 few q rows. At TP>1 it is the local logits shard, (g+1) x V/TP x 4 B, plus one chunk of at
-most 4096 gathered fp32 rows. Hidden states move engine → driver → learner through Ray (CPU)
-once per draft, and only the rows the scan visits go to the GPU (on every TP rank).
+most 4096 gathered fp32 rows. Only the hidden-state rows the scan visits go to the GPU (on
+every TP rank).
+
+**Hidden-state data movement** (`thundersync.hidden_transport`, default `object_store`;
+`HiddenRefs`/`HiddenRows`/`free_hidden` in `engine_q.py`). A step logs d x 2 B per drafted
+token (8 KB at 8B, 14 KB at d = 7168), but only drafts the lazy scan does not accept whole
+read any q row, and those read only the rows the scan visits (the candidates
+η_i ≤ b_i(1 + slack) from the top down to τ, plus τ). So the rows never pass through the
+driver:
+
+1. *Put once, where they were produced.* At the deadline `pop_draft_hidden(as_refs=True)`
+   on the generation worker that ran the draft (TP rank 0) puts its rows into the Ray object
+   store in blocks of `HIDDEN_BLOCK_ROWS` = 256 rows (2 MB at d = 4096, 3.7 MB at
+   d = 7168) and returns `[(ObjectRef, rows, bytes)]`. The driver wraps them in
+   `HiddenRefs`; a cohort draft chains the blocks of its drafting rounds (no copy). The
+   driver holds handles only (unit-tested: no tensor at index 7).
+2. *Phase 1 without rows.* The learner computes p, log p(x_i), b_i and the whole-draft test
+   η_g ≤ b_g from the training forward and the engine's log q (shipped with the draft).
+   A fully accepted draft never touches its handles.
+3. *Phase 2 on demand.* `HiddenRows` fetches a block (`ray.get`, generation node →
+   learner node through the object store, never via the driver) the first time the scan
+   asks for a row in it, and caches it for that draft. All TP ranks of a replica run the
+   same scan, so they fetch the same objects in the same order (immutable, hence identical
+   bytes; ranks on one node share the node's copy). Unit-tested at TP=2 with thread ranks.
+   No extra driver round trip: phase 2 happens inside the same verification call, in the
+   scan's `q_rows` callback.
+4. *Freed after verification.* When a verification chunk returns, the driver releases its
+   rows' handles and deletes their objects (`free_hidden` → Ray's `internal_api.free`), as
+   it does for drafts dropped before verification and for a cohort draft that loses a
+   segment. Unverified cohort drafts keep their blocks across steps, as their tokens. An
+   explicit free rather than reference counting alone: in one local-Ray probe (fake
+   generation/learner actors, before this design was final) the owner still counted a
+   local reference after the driver had dropped its own, cause not identified; the explicit
+   free makes the lifetime independent of stray Python references. Untested on a real
+   cluster; `internal_api.free` is a Ray-internal API.
+
+Bytes per step through the driver: O(drafted tokens) small fields (token ids and the
+engine log q, today about 8 + 9 B per token as int64 rows and pickled Python floats; float32
+log q would make the latter 4 B), plus a ~100 B handle per 256-row block. Hidden rows
+move O(non-whole drafts × visited blocks × 256 × d × 2 B) directly generation → learner.
+Metrics: `spec/hidden_bytes_logged` (put this step), `spec/hidden_bytes_fetched` (pulled
+by learners, per replica, as reported by each verified draft), `spec/hidden_bytes_freed`,
+`spec/hidden_bytes_pending` (held by unverified cohort drafts after this step's drafting:
+the host-memory high-water mark of the object stores, on the generation nodes). Estimates,
+~1.5M drafted tokens per step (128 rollouts x 3 cohorts x 4k, ~384 drafts), not measured:
+
+| | logged | driver path (`hidden_transport=driver`) | object store path, fetched |
+|---|---|---|---|
+| 8B (d = 4096) | 12.3 GB | 12.3 GB in to the driver, and 12.3 GB out to every learner node (every learner worker receives every draft's rows) | 5% non-whole drafts, 2 blocks each: ~40 MB (bound: those drafts' full rows, ~0.6 GB); bf16-exact acceptance, ~54% non-whole: ~0.4 GB (bound ~6.6 GB) |
+| 500B MoE (d = 7168) | 21.5 GB | 21.5 GB in, 21.5 GB out per learner node | 5%: ~70 MB (bound ~1.1 GB); 54%: ~0.75 GB (bound ~11.6 GB) |
+
+At larger batches the logged bytes grow linearly (e.g. 1024 rollouts x 3 cohorts x 8k
+tokens at d = 7168: ~360 GB per step, all of which the driver path would funnel through one
+process) while the fetched bytes follow the non-whole drafts. "Visited blocks" is an
+estimate: the scan visits few positions near the top and τ, but its candidates can be
+spread over the draft; `spec/hidden_bytes_fetched` measures it. Object-store capacity on
+the generation nodes must hold `spec/hidden_bytes_pending` plus the step's logged bytes;
+Ray spills to disk beyond that (untested here). The `driver` transport stays selectable for
+A/B: it moves more bytes but makes no on-demand `ray.get` inside the scan, whose latency per
+rejected draft is not measured yet.
 
 Requirements, enforced by `validate_engine_verify_source` and on the worker: `speculate`,
 `verify_mode=block`, `verify_on=learner`, `batch_invariant_mode`, PP = EP = 1, generation TP
@@ -853,6 +911,13 @@ baseline). It sets `THUNDERSYNC_ENGINE_Q_CHECK=1 THUNDERSYNC_MISMATCH_CHECK=1`. 
 mismatch check reads 0 on every token of every step, every `[engine q check]` line has
 `exact == tok` and `max|dlogq|=0`, and there is no fallback to the scorer. Also expect
 `spec/engine_q_dropped` near 0 and the same kept fraction as `verify_precision=model`.
+For the hidden-state transport: run the same script with
+`ARGS="++thundersync.hidden_transport=driver"` and with the default (same seed); plans (kept fraction,
+mismatch, `[engine q check]`) must agree, `spec/hidden_bytes_fetched` should be a small
+fraction of `spec/hidden_bytes_logged` under `object_store`, `spec/hidden_bytes_freed`
+should track logged bytes with a lag of the pending cohorts, and `ray memory --stats-only`
+(or the dashboard's object store usage) on the generation nodes should stay flat across
+steps.
 
 **Keyed verification under BI** (`verify_mode=keyed`). With bitwise parity the learner's
 logits for a draft are the ones the engine sampled from, so keyed verification needs no

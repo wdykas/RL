@@ -42,6 +42,13 @@ import ray
 import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from thundersync_rl.engine_q import (
+    HiddenRefs,
+    cat_hidden,
+    free_hidden,
+    hidden_nbytes,
+    hidden_num_rows,
+)
 from thundersync_rl.fused_train import FusedRef
 
 
@@ -80,7 +87,8 @@ def cohort_draft(d: dict[str, Any]) -> tuple:
     """Draft tuple of a cohort draft, as ``verify``/``verify_chunked`` take them.
 
     (prompt, seed, tokens, finished, key, segments, engine log-probs or None,
-    engine hidden states [len(tokens), d] or None)
+    engine hidden states or None: a [len(tokens), d] tensor or, with
+    ``hidden_transport="object_store"``, ``HiddenRefs`` handles)
     """
     hidden = d.get("hidden")
     return (
@@ -93,12 +101,6 @@ def cohort_draft(d: dict[str, Any]) -> tuple:
         d.get("logprobs"),
         None if hidden is None else cat_hidden(hidden),
     )
-
-
-def cat_hidden(parts: list[torch.Tensor]) -> torch.Tensor:
-    """Concatenate per-segment hidden states, skipping empty segments."""
-    parts = [h for h in parts if h.numel()]
-    return torch.cat(parts) if parts else torch.empty(0, 0)
 
 
 def engine_q_ready(d: tuple) -> bool:
@@ -116,7 +118,7 @@ def engine_q_ready(d: tuple) -> bool:
         lps is not None
         and len(lps) == n
         and hid is not None
-        and (n == 0 or hid.shape[0] == n)
+        and (n == 0 or hidden_num_rows(hid) == n)
     )
 
 
@@ -182,6 +184,7 @@ class SpeculativeGeneration:
         fused_max_retained_tokens: int,
         verify_lazy: bool = False,
         verify_source: str = "scorer",
+        hidden_transport: str = "object_store",
     ):
         self.base = base
         self.learner_policy = learner_policy
@@ -201,6 +204,17 @@ class SpeculativeGeneration:
         # logged hidden states with an LM-head-only stash, p from the training
         # model (engine_q.py).
         self.verify_source = verify_source
+        # How the engine's hidden states reach the learner (engine source):
+        # "object_store": the generation worker puts each draft's rows into the
+        # Ray object store (blocks of HIDDEN_BLOCK_ROWS) and the driver passes
+        # only handles; the learner fetches a block when its lazy scan first
+        # needs a q row in it (fully accepted drafts fetch nothing). "driver": the rows travel
+        # generation worker -> driver -> every learner worker (A/B baseline).
+        if hidden_transport not in ("object_store", "driver"):
+            raise ValueError(f"unknown hidden_transport {hidden_transport!r}")
+        self.hidden_transport = hidden_transport
+        # Deletes freed hidden-state objects (None: ray_free; tests replace it).
+        self._free_refs = None
         self._hidden_nonce = itertools.count()
         self.verify_batch_tokens = verify_batch_tokens
         self.longest_first = longest_first
@@ -396,23 +410,69 @@ class SpeculativeGeneration:
         nonce = next(self._hidden_nonce)
         return [f"{nonce}|{k}" for k in keys]
 
-    def _pop_hidden(
-        self, hkeys: list[str] | None, lengths: list[int]
-    ) -> list[torch.Tensor | None]:
-        """Each draft's logged engine hidden states, or None where missing."""
+    def _pop_hidden(self, hkeys: list[str] | None, lengths: list[int]) -> list[Any]:
+        """Each draft's logged engine hidden states, or None where missing.
+
+        ``hidden_transport="object_store"``: ``HiddenRefs`` block handles
+        (the generation worker put the rows into the object store; the
+        driver never receives them). ``"driver"``: [n, d] CPU tensors.
+        """
         if hkeys is None:
             return [None] * len(lengths)
-        merged: dict[str, torch.Tensor] = {}
+        refs = self.hidden_transport == "object_store"
+        merged: dict[str, Any] = {}
         for r in ray.get(
             self.base._policy.worker_group.run_all_workers_single_data(
-                "pop_draft_hidden", keys=hkeys, lengths=lengths
+                "pop_draft_hidden",
+                keys=hkeys,
+                lengths=lengths,
+                **({"as_refs": True} if refs else {}),
             )
         ):
             merged.update(r)
-        return [
-            torch.empty(0, 0) if n == 0 else merged.get(k)
-            for k, n in zip(hkeys, lengths)
-        ]
+        out: list[Any] = []
+        for k, n in zip(hkeys, lengths):
+            if n == 0:
+                out.append(HiddenRefs() if refs else torch.empty(0, 0))
+            elif k not in merged:
+                out.append(None)
+            elif refs:
+                out.append(HiddenRefs.from_blocks(merged[k]))
+            else:
+                out.append(merged[k])
+        self._count_hidden("spec/hidden_bytes_logged", sum(map(hidden_nbytes, out)))
+        return out
+
+    def _count_hidden(self, name: str, nbytes: int) -> None:
+        if self.verify_source == "engine":
+            self.stats[name] = self.stats.get(name, 0.0) + float(nbytes)
+
+    def _pending_hidden_bytes(self) -> int:
+        """Bytes of hidden states that pending cohort drafts hold."""
+        segs = {}
+        for cohort in self.cohorts.values():
+            for d in cohort:
+                for p in d.get("hidden") or []:
+                    for seg in p.segs if isinstance(p, HiddenRefs) else ():
+                        if seg.ref is not None:
+                            segs[id(seg)] = seg.nbytes
+                    if isinstance(p, torch.Tensor):
+                        segs[id(p)] = hidden_nbytes(p)
+        return sum(segs.values())
+
+    def _release_hidden(self, drafts) -> None:
+        """Free these drafts' hidden states (verified or discarded).
+
+        Drops the driver's handles and deletes the objects from the object
+        stores at once (``free_hidden``), so no reference held elsewhere can
+        keep them across steps. Only called after every learner call that
+        could read them has returned.
+        """
+        self._free_hidden([d[7] if len(d) > 7 else None for d in drafts])
+
+    def _free_hidden(self, hiddens) -> None:
+        n = free_hidden(hiddens, self._free_refs)
+        self._count_hidden("spec/hidden_bytes_freed", n)
 
     async def draft_cohorts(self, step: int, new: dict[int, list[torch.Tensor]]):
         """Resume unfinished drafts of future steps and start new cohorts.
@@ -470,6 +530,8 @@ class SpeculativeGeneration:
                 if d.get("hidden") is not None and h is not None:
                     d["hidden"].append(h)
                 else:
+                    # Unverifiable with engine q from now on: free what it has.
+                    self._free_hidden((d.get("hidden") or []) + [h])
                     d["hidden"] = None
                 start = len(d["tokens"])
                 d["tokens"].extend(toks)
@@ -479,6 +541,12 @@ class SpeculativeGeneration:
                     d["logprobs"] = None
                 d["finished"] = done
                 d["segments"].append((step, start, len(d["tokens"])))
+            if hkeys is not None:
+                # Host memory the pending drafts' hidden states occupy (object
+                # stores of the generation nodes, or the driver's).
+                self.stats["spec/hidden_bytes_pending"] = float(
+                    self._pending_hidden_bytes()
+                )
             return CohortDrafts(live)
 
         return collect
@@ -534,17 +602,37 @@ class SpeculativeGeneration:
         if self.verify_source != "engine":
             return drafts, 0
         kept = [[d for d in variants if engine_q_ready(d)] for variants in drafts]
+        self._release_hidden(
+            d for variants in drafts for d in variants if not engine_q_ready(d)
+        )
         dropped = sum(len(v) for v in drafts) - sum(len(v) for v in kept)
         return [v for v in kept if v], dropped
 
     def _verify_method(self, flat) -> tuple[str, dict[str, Any]]:
         """Worker method and its extra arguments for block verification."""
         if self.verify_source == "engine":
+            hidden = [d[7] for _, d in flat]
+            if self.hidden_transport == "driver":
+                # Every row's hidden states pass through the driver.
+                self._count_hidden(
+                    "spec/hidden_bytes_fetched", sum(map(hidden_nbytes, hidden))
+                )
             return "verify_drafts_block_engine", {
                 "engine_logq": [d[6] for _, d in flat],
-                "hidden": [d[7] for _, d in flat],
+                "hidden": hidden,
             }
         return "verify_drafts_block_stashed", {}
+
+    def _verified_hidden(self, flat, by_row: dict[int, Any], a: int = 0) -> None:
+        """Count fetched hidden bytes of verified rows a + j and free their handles."""
+        if self.verify_source != "engine":
+            return
+        if self.hidden_transport == "object_store":
+            self._count_hidden(
+                "spec/hidden_bytes_fetched",
+                sum(r.get("hidden_bytes_fetched", 0) for r in by_row.values()),
+            )
+        self._release_hidden(flat[a + j][1] for j in by_row)
 
     def verify(self, drafts: list[list[tuple[torch.Tensor, int, list[int]]]]) -> None:
         if self.fused_verify_train:
@@ -597,6 +685,8 @@ class SpeculativeGeneration:
                 )
             )
         by_row = dict(x for rank_res in res for x in rank_res)
+        if self.verify_mode == "block":
+            self._verified_hidden(flat, by_row)
         # Every verified prefix is a prefix of the same keyed target sequence, so
         # the longest one per trajectory is kept.
         best: dict[int, tuple[tuple[torch.Tensor, int, list[int]], dict[str, Any]]] = {}
@@ -615,12 +705,14 @@ class SpeculativeGeneration:
             kept += r["accepted"]
             total += len(d[2])
             self.plans[_key(d[0])].append(plan)
-        self.stats = {
-            "spec/draft_tokens": float(total),
-            "spec/accepted_frac": kept / max(total, 1),
-            "spec/full_accept": full / max(len(drafts), 1),
-            "spec/variant_wins": float(variant_wins),
-        }
+        self.stats.update(
+            {
+                "spec/draft_tokens": float(total),
+                "spec/accepted_frac": kept / max(total, 1),
+                "spec/full_accept": full / max(len(drafts), 1),
+                "spec/variant_wins": float(variant_wins),
+            }
+        )
         if self.verify_source == "engine":
             self.stats["spec/engine_q_dropped"] = float(dropped)
 
@@ -783,6 +875,7 @@ class SpeculativeGeneration:
                     f"verification returned {len(by_row)} of {chunk_rows} rows "
                     f"(per-rank counts {[len(x) for x in res]}): row ownership mismatch"
                 )
+            self._verified_hidden(flat, by_row, a)
             log_path = os.environ.get("THUNDERSYNC_REJECT_LOG")
             if log_path:
                 import json
@@ -813,11 +906,13 @@ class SpeculativeGeneration:
                     self.plans[_key(d[0])].append(plan)
                     self._pending[_key(d[0])] -= 1
                 self._plan_cv.notify_all()
-        self.stats = {
-            "spec/draft_tokens": float(total),
-            "spec/accepted_frac": kept / max(total, 1),
-            "spec/full_accept": full / max(n, 1),
-        }
+        self.stats.update(
+            {
+                "spec/draft_tokens": float(total),
+                "spec/accepted_frac": kept / max(total, 1),
+                "spec/full_accept": full / max(n, 1),
+            }
+        )
         if self.fused_verify_train:
             self.stats["fused/retained"] = float(fused)
         if self.verify_source == "engine":
