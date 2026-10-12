@@ -1184,6 +1184,43 @@ bf16 keeps 57.0% of draft tokens (46.3% of drafts whole), fp16 90.0% (85.7%), fp
 versions is the policy's own, so exact bf16 speculation is inherently ~50%; an fp16
 (batch-invariant) policy would allow exact speculation without the fp32 scorer or stashes.
 
+## 14b. fp16 GEMM forward (`forward_gemm_precision: fp16`, "V8b")
+
+Exact acceptance is limited by forward rounding noise, not by the verification rule. The
+fp16 GEMM forward (`nemo_rl/models/megatron/fp16_gemm.py`) runs the same functions in
+training and in the Megatron engine: every linear casts its input and its bf16 weight to
+fp16 (exact for |w| in [6.1e-5, 65504]) and emits fp32 from one cuBLAS GEMM (batch
+invariant at every M tested, workspace 0); fp32 residual stream (`fp32_residual_connection`,
+required); RMSNorm in fp32 on the fp32 residual (batch-invariant row mean, our own backward);
+SwiGLU on fp32; q/k/v rounded to fp16 after the q/k norms, so RoPE, FlashAttention (fp16
+probabilities), its fp16 output into `linear_proj`, and the engine KV cache are fp16; LM head
+`lm_head_precision: fp32` (default): the fp32 final-norm output times the head weight with
+every product exact (two fp16 GEMMs on a hi/lo split of the input; IEEE fp32 cuBLAS is not
+row-invariant at M = 1-8 and `NVIDIA_TF32_OVERRIDE=1` forces TF32). Weights, checkpoints and
+optimizer are unchanged. Backward runs dgrad/wgrad on bf16 casts; FlashAttention's fp16
+backward gets its incoming gradient scaled by 2^e (amax to 2^0) and unscaled on q/k/v.
+TP/SP: norm outputs all-gathered in fp16, row-parallel outputs reduce-scattered in fp32 (2x
+today's bytes). PP: `pipeline_dtype: float32` required (stages exchange the fp32 residual).
+The engine-q hidden log holds the head input in the head dtype (fp32: 2x bf16 bytes).
+
+Measured (Qwen3-1.7B, 2048-token drafts, 4 steps, checks on; control: 39-52% kept, 15-25%
+whole): every step mismatch 0 / exact_token_frac 1, engine-q checks exact, 0 dropped,
+0 truncated.
+
+| layout | kept (steps 1-3) | whole (steps 1-3) |
+|---|---|---|
+| TP1 | 97.7 / 97.9 / 95.0 | 95.3 / 95.3 / 93.8 |
+| TP2 (SP) | 96.2 / 96.1 / 92.8 | 93.0 / 94.5 / 89.8 |
+| train PP2 / engine PP1 | 96.0 / 95.6 / 90.9 | 93.8 / 93.0 / 88.3 |
+| control bf16, PP2 | 46.2 / 43.0 / 41.8 | 30.5 / 18.0 / 26.6 |
+
+Bug found on the way: MCore `BatchInvariantRMSNormFn.backward` multiplies its second dx
+term by the norm weight once more (exact only for w = 1); with Qwen3's q/k norm weights the
+gradient norm was ~100x too large (RL grad_norm 15-28, then NaN). Not built yet: MoE expert
+GEMMs (training TE grouped GEMM and the engine's fused-MoE Triton path need a shared
+fp16-in / fp32-out batch-invariant grouped GEMM, fp32 activation-with-probs and fp32
+combine); models with MoE are rejected.
+
 ## 15. Open work
 
 - **Stragglers.** About one rejected draft per step decodes its remainder at about 3 ms
