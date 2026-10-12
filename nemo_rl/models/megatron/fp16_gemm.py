@@ -267,24 +267,54 @@ def fp16_linear(
     return Fp16Linear.apply(x, weight, comm, group, precision)
 
 
+class RMSNormFp32(torch.autograd.Function):
+    """y = x * rsqrt(mean(x^2) + eps) * w in fp32 (fp32 output).
+
+    Forward on CUDA: the row mean is Megatron-Core's batch-invariant Triton
+    ``mean_dim`` (one program per row, fixed reduction order), the same op
+    sequence as MCore's ``BatchInvariantRMSNormFn``. Backward (fp32):
+    dx = r * w * g - r^3 * x * sum(w * g * x) / D, dw = sum(g * x * r).
+    (``BatchInvariantRMSNormFn.backward`` multiplies its second dx term by w
+    once more, which is exact only for w == 1; measured on Qwen3-1.7B, whose
+    q/k norm weights are far from 1, as a 100x wrong gradient norm.)
+    """
+
+    @staticmethod
+    def forward(ctx, x, weight, eps, zero_centered_gamma):  # noqa: D102
+        x32 = x.float()
+        w32 = weight.float() + 1.0 if zero_centered_gamma else weight.float()
+        sq = x32 * x32
+        if x32.is_cuda:
+            from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+                mean_dim,
+            )
+
+            ms = mean_dim(sq, dim=-1, keepdim=True)
+        else:
+            ms = sq.mean(-1, keepdim=True)
+        rsigma = torch.rsqrt(ms + eps)
+        ctx.save_for_backward(x, weight, rsigma)
+        ctx.zero_centered_gamma = zero_centered_gamma
+        return (x32 * rsigma) * w32
+
+    @staticmethod
+    def backward(ctx, grad):  # noqa: D102
+        x, weight, r = ctx.saved_tensors
+        g = grad.float()
+        x32 = x.float()
+        w32 = weight.float() + 1.0 if ctx.zero_centered_gamma else weight.float()
+        d = x32.shape[-1]
+        s = (g * w32 * x32).sum(-1, keepdim=True)
+        dx = g * (w32 * r) - (r * r * r) * x32 * (s / d)
+        dw = (g * x32 * r).reshape(-1, d).sum(0).to(weight.dtype)
+        return dx.to(x.dtype), dw, None, None
+
+
 def rms_norm_fp32(
     x: torch.Tensor, weight: torch.Tensor, eps: float, zero_centered_gamma: bool = False
 ) -> torch.Tensor:
-    """RMSNorm of x in fp32 (fp32 output), weight upcast to fp32.
-
-    CUDA: Megatron-Core's batch-invariant RMSNorm (one program per row, fixed
-    reduction order; fp32 backward). CPU (tests): the same formula in torch.
-    """
-    x32 = x.float()
-    if x32.is_cuda:
-        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
-            BatchInvariantRMSNormFn,
-        )
-
-        return BatchInvariantRMSNormFn.apply(x32, weight, eps, zero_centered_gamma)
-    w = weight.float() + 1.0 if zero_centered_gamma else weight.float()
-    rsigma = torch.rsqrt((x32 * x32).mean(-1, keepdim=True) + eps)
-    return (x32 * rsigma) * w
+    """RMSNorm of x in fp32 (fp32 output), weight upcast to fp32 (``RMSNormFp32``)."""
+    return RMSNormFp32.apply(x, weight, eps, zero_centered_gamma)
 
 
 class _GradScaleBox:

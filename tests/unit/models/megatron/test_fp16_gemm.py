@@ -87,6 +87,20 @@ def test_rms_norm_fp32():
     torch.testing.assert_close(y, (ref * w.double()).float(), rtol=1e-5, atol=1e-6)
 
 
+def test_rms_norm_fp32_backward_matches_autograd():
+    torch.manual_seed(4)
+    x = (torch.randn(6, 32) * 5).requires_grad_()
+    w = (torch.rand(32) * 3 + 0.1).to(torch.bfloat16).requires_grad_()  # far from 1
+    g = torch.randn(6, 32)
+    fg.rms_norm_fp32(x, w, 1e-6).backward(g)
+    x2 = x.detach().double().requires_grad_()
+    w2 = w.detach().double().requires_grad_()
+    y = x2 * torch.rsqrt(x2.pow(2).mean(-1, keepdim=True) + 1e-6) * w2
+    y.backward(g.double())
+    torch.testing.assert_close(x.grad.double(), x2.grad, rtol=1e-4, atol=1e-6)
+    torch.testing.assert_close(w.grad.double(), w2.grad.to(torch.bfloat16).double())
+
+
 def test_attention_grad_scaling_roundtrip():
     """fp16 region boundary: forward exact, backward scaled into fp16 and back."""
     box = fg._GradScaleBox()
