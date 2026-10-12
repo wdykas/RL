@@ -685,7 +685,6 @@ class SpeculativeGeneration:
             # Contiguous row slices per verifier pool, verified concurrently.
             k = len(self.verifiers)
             cuts = [round(j * len(flat) / k) for j in range(k + 1)]
-            seed = next(self._verify_seeds)
             futs = []
             for g, a, b in zip(self.verifiers, cuts, cuts[1:]):
                 method, extra = self._verify_method(flat[a:b])
@@ -699,7 +698,13 @@ class SpeculativeGeneration:
                             prompt_lens=[d[0].numel() for _, d in flat[a:b]],
                             segments=[d[5] for _, d in flat[a:b]],
                             vocab_limit=self.vocab_limit,
-                            seed=seed * 7 + a,
+                            # A fresh counter value per call: verification
+                            # randomness is never reused across calls or steps
+                            # (``seed * 7 + a`` collided between consecutive
+                            # calls, e.g. (s, a=7) and (s+1, a=0), so a later
+                            # decision could reuse a stream that shaped the
+                            # update producing the policy it verifies against).
+                            seed=next(self._verify_seeds),
                             keys=[d[4] for _, d in flat[a:b]],
                             precision=self.verify_precision,
                             batch_tokens=self.verify_batch_tokens,
@@ -971,6 +976,47 @@ class SpeculativeGeneration:
         for fut in asyncio.as_completed(tasks):
             yield await fut
 
+    async def _keyed_replay_check(self, prompt, seed, gen, datum) -> None:
+        """Debug: a keyed speculative rollout must equal plain keyed decoding.
+
+        With batch invariance and the same random stream (noise_seed, keyed by
+        position), speculation reproduces exactly the rollout ordinary decoding
+        produces at the current weights: decode the prompt from scratch with the
+        same seed and compare token for token (``spec/keyed_replay_*``).
+        """
+        data = BatchedDataDict(
+            {
+                "input_ids": prompt.view(1, -1),
+                "input_lengths": torch.tensor([prompt.numel()]),
+                "max_new_tokens": torch.tensor([self.max_new_tokens]),
+                "noise_seed": torch.tensor([seed]),
+            }
+        )
+        if "stop_strings" in datum:
+            data["stop_strings"] = datum["stop_strings"]
+        ref: list[int] = []
+        async for _, res in self.base.generate_async(data):
+            glen = int(res["generation_lengths"][0])
+            c0 = prompt.numel()
+            ref += res["output_ids"][0, c0 : c0 + glen].tolist()
+        same = ref == gen
+        self.stats["spec/keyed_replay_checked"] = (
+            self.stats.get("spec/keyed_replay_checked", 0.0) + 1
+        )
+        self.stats["spec/keyed_replay_match"] = self.stats.get(
+            "spec/keyed_replay_match", 0.0
+        ) + float(same)
+        if not same:
+            first = next(
+                (i for i, (x, y) in enumerate(zip(ref, gen)) if x != y),
+                min(len(ref), len(gen)),
+            )
+            print(
+                f"[keyed replay] MISMATCH seed={seed} first_diff={first} "
+                f"len spec={len(gen)} plain={len(ref)}",
+                flush=True,
+            )
+
     async def _one(self, index: int, datum: BatchedDataDict):
         if any(datum.get("stop_strings") or []):
             # Drafts run without stop strings, so a plan could pass one.
@@ -1036,6 +1082,13 @@ class SpeculativeGeneration:
                         )
                         + "\n"
                     )
+        if (
+            os.environ.get("THUNDERSYNC_KEYED_REPLAY")
+            and self.verify_mode == "keyed"
+            and plan.seed >= 0
+            and plan.prefix
+        ):
+            await self._keyed_replay_check(prompt, plan.seed, gen, datum)
         n = plen + len(gen)
         out = BatchedDataDict(
             {

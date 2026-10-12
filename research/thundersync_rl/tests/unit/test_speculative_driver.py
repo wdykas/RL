@@ -389,3 +389,25 @@ def test_truncate_draft_to_logged_rows():
         False,
         [-0.1, -0.2],
     )
+
+
+def test_verification_seeds_never_repeat_across_calls_and_steps():
+    """Fresh randomness per verification call: a stream that shaped one update
+    must never be reused for a later decision (pools, calls and steps)."""
+    seeds = []
+
+    def verify(rows, prompt_lens, segments, keys, seed, **_):
+        seeds.append(seed)
+        return [
+            (j, {"accepted": 1, "next": 0, "logprobs": [-0.1, -0.1]})
+            for j in range(len(rows))
+        ]
+
+    s = _spec({"verify_drafts_block_stashed": verify})
+    for _ in range(5):  # steps, synchronous verification
+        s.verify(_drafts(16))
+    pools = [_RefGroup({"verify_drafts_block_stashed": verify}) for _ in range(2)]
+    s.verifiers = s._chunk_pools = pools
+    for _ in range(5):  # steps, chunked verification on two pools
+        asyncio.run(s.verify_chunked(_drafts(16), chunks=4))
+    assert len(seeds) == len(set(seeds)) > 10
