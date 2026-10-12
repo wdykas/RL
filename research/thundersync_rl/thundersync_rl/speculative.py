@@ -394,7 +394,7 @@ class SpeculativeGeneration:
         )
 
         def collect():
-            res = [_drafted(x) for x in ray.get(rank0.collect_drafts.remote())]
+            res = [_drafted(x) for x in self._collect_drafts(rank0)]
             hid = self._pop_hidden(hkeys, [len(x[0]) for x in res])
             res = [_truncate_to_rows(x, h) for x, h in zip(res, hid)]
             return [
@@ -421,6 +421,27 @@ class SpeculativeGeneration:
             ]
 
         return collect
+
+    def _collect_drafts(self, rank0) -> list:
+        """Snapshot and abort the drafts, content from the engines' request records.
+
+        The engines (one per generation data-parallel rank) are asked for the
+        record contents of the unfinished draft requests they hold; rank 0, which
+        holds the streams, then aborts them and uses those contents instead of
+        its streamed frames (which skip tokens after an eviction). Tokens decoded
+        between the two calls are discarded: the cut is a time, not a function
+        of the tokens, and any prefix of a draft is a valid draft.
+        """
+        ids = ray.get(rank0.draft_request_ids.remote())
+        records: dict[int, tuple] = {}
+        if ids:
+            for r in ray.get(
+                self.base._policy.worker_group.run_all_workers_single_data(
+                    "draft_records", request_ids=sorted(ids.values())
+                )
+            ):
+                records.update(r)
+        return ray.get(rank0.collect_drafts.remote(records=records))
 
     def _hidden_keys(self, keys: list[str]) -> list[str] | None:
         """Engine hidden-log keys of one drafting round (None: not logging)."""
@@ -542,7 +563,7 @@ class SpeculativeGeneration:
             )
 
         def collect():
-            res = ray.get(rank0.collect_drafts.remote()) if live else []
+            res = self._collect_drafts(rank0) if live else []
             hid = self._pop_hidden(hkeys, [len(_drafted(x)[0]) for x in res])
             for d, x, h in zip(live, res, hid):
                 toks, done, lps = _truncate_to_rows(_drafted(x), h)

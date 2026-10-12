@@ -763,7 +763,8 @@ def test_engine_source_drafts_stash_and_verify_driver_transport(_no_ray):
         {
             "install_draft_hidden_log": lambda: True,
             "start_drafts": start,
-            "collect_drafts": lambda: [
+            "draft_request_ids": lambda: {},
+            "collect_drafts": lambda records=None: [
                 ([4, spec_mod_eod()], True, [-0.5, -0.25]),
                 ([4, 5], False, [-0.5, -0.5]),
             ],
@@ -801,7 +802,8 @@ def test_cohort_hidden_states_follow_segments_driver_transport(_no_ray):
         {
             "install_draft_hidden_log": lambda: True,
             "start_drafts": lambda prompts, budgets, interval, hidden_keys: None,
-            "collect_drafts": lambda: collected.pop(0),
+            "draft_request_ids": lambda: {},
+            "collect_drafts": lambda records=None: collected.pop(0),
             "pop_draft_hidden": lambda keys, lengths: {keys[0]: hids.pop(0)},
         },
         hidden_transport="driver",

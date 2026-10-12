@@ -749,7 +749,48 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             asyncio.run_coroutine_threadsafe(run_one(i, list(p)), self._inference_loop)
         return True
 
-    def collect_drafts(self) -> list[tuple[list[int], bool, list[float] | None]]:
+    def draft_request_ids(self) -> dict[int, int]:
+        """Engine request id of each unfinished draft (rank 0 holds the streams)."""
+        done = getattr(self, "_draft_done", None) or []
+        return {
+            i: int(st.request_id)
+            for i, st in (getattr(self, "_draft_streams", None) or {}).items()
+            if not done[i]
+        }
+
+    def draft_records(self, request_ids: list[int]) -> dict[int, tuple]:
+        """(tokens, engine log-probs) of the listed requests this engine holds.
+
+        Read from the engine's request records (``record.merge()``, as its final
+        reply does), not from streamed partial frames: after an eviction the
+        engine resumes a request as a new record whose generated tokens restart
+        at 0 while its partial-frame counter does not, so the frames silently
+        skip tokens (Megatron DynamicInferenceEngine._try_send_streaming_partials).
+        """
+        import asyncio
+
+        engine = getattr(self, "dynamic_inference_engine", None)
+        loop = getattr(self, "_inference_loop", None)
+        if engine is None or loop is None:
+            return {}
+
+        async def read():
+            out = {}
+            for rid in request_ids:
+                entry = engine.requests.get(rid)
+                if entry is not None:
+                    merged = entry.record.merge()
+                    out[rid] = (
+                        list(merged.generated_tokens),
+                        _plain_floats(merged.generated_log_probs),
+                    )
+            return out
+
+        return asyncio.run_coroutine_threadsafe(read(), loop).result()
+
+    def collect_drafts(
+        self, records: dict[int, tuple] | None = None
+    ) -> list[tuple[list[int], bool, list[float] | None]]:
         """Abort unfinished drafts; return (tokens, finished, engine logprobs) per draft.
 
         The log-probs are None when the engine did not report one per token.
@@ -765,9 +806,27 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
 
         async def abort_and_snapshot():
             # Snapshot on the loop thread so no frame is half-applied.
+            stats = {"from_record": 0, "fallback": 0, "differed": 0}
             for i, stream in list(streams.items()):
-                if not done[i]:
-                    self.inference_client.abort_request(stream.request_id)
+                if done[i]:
+                    continue
+                rec = (records or {}).get(int(stream.request_id))
+                if rec is None:
+                    stats["fallback"] += 1
+                else:
+                    toks, lps = rec
+                    stats["from_record"] += 1
+                    stats["differed"] += int(list(toks) != tokens[i])
+                    tokens[i][:] = list(toks)
+                    if logprobs[i] is not None or lps is not None:
+                        logprobs[i] = (
+                            lps
+                            if lps is not None and len(lps) == len(tokens[i])
+                            else None
+                        )
+                self.inference_client.abort_request(stream.request_id)
+            if os.environ.get("THUNDERSYNC_HIDDEN_DEBUG"):
+                print(f"[collect dbg] {stats}", flush=True)
             return snapshot_drafts(tokens, logprobs, done)
 
         return asyncio.run_coroutine_threadsafe(
