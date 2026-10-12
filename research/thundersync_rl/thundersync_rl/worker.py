@@ -1343,6 +1343,79 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
     # the engine's logged final hidden states and an LM-head-only stash per
     # pending version (engine_q.py). p is the training model's own forward.
 
+    def _initialize_inference_engine(self, mcore_generation_config: dict) -> None:
+        """Build the inference engine with the draft hidden-state copy installed.
+
+        The engine captures its CUDA graphs in its constructor; the LM-head copy
+        pre-hook must exist by then on every rank (the captures run TP/EP
+        collectives, so all ranks capture the same graphs), or graph replays
+        skip it. The constructor is wrapped for the duration of the build.
+        """
+        from megatron.core.inference.engines import dynamic_engine as de
+
+        orig = de.DynamicInferenceEngine
+        worker = self
+
+        class _Engine(orig):  # type: ignore[misc, valid-type]
+            def __init__(self, controller, context, *args, **kwargs):
+                worker._install_hidden_copy(context)
+                super().__init__(controller, context, *args, **kwargs)
+
+        de.DynamicInferenceEngine = _Engine
+        try:
+            super()._initialize_inference_engine(mcore_generation_config)
+        finally:
+            de.DynamicInferenceEngine = orig
+
+    def _install_hidden_copy(self, context) -> None:
+        """Copy each forward's LM-head input rows into a static buffer.
+
+        One [max_requests, d] buffer per engine (bf16: 14 MB at d=7168 and
+        1024 requests), written by a pre-hook on the output layer; the copy is
+        captured into the CUDA graphs. Only the last pipeline stage has an
+        output layer. Rows are read by ``install_draft_hidden_log``'s sampler.
+        """
+        model = _unwrap(self._gen_model())
+        layer = getattr(model, "output_layer", None)
+        if layer is None or getattr(self, "_hidden_copy", None) is not None:
+            return
+        try:
+            from megatron.core.inference.utils import InferenceMode
+        except ImportError:  # pragma: no cover
+            InferenceMode = None
+        materialized = bool(context.config.materialize_only_last_token_logits)
+        # Tied embeddings: the output layer holds no weight of its own.
+        weight = layer.weight
+        if weight is None:
+            weight = model.shared_embedding_or_output_weight()
+        static = torch.empty(
+            (int(context.max_requests), weight.shape[1]),
+            dtype=weight.dtype,
+            device=weight.device,
+        )
+        filled = [False]
+
+        def hook(module, args, kwargs):
+            if InferenceMode is not None and not InferenceMode.is_active():
+                return  # not an engine forward
+            h = args[0] if args else kwargs["input_"]
+            rows = h.reshape(-1, h.shape[-1])
+            if not materialized:
+                if torch.cuda.is_current_stream_capturing():
+                    return  # per-token rows: only copied on eager forwards
+                rows = context.last_token_logits(rows.unsqueeze(0))
+            k = min(rows.shape[0], static.shape[0])
+            static[:k].copy_(rows[:k])
+            filled[0] = True
+
+        layer.register_forward_pre_hook(hook, with_kwargs=True)
+        self._hidden_copy = {
+            "static": static,
+            "filled": filled,
+            "weight": weight,
+            "materialized": materialized,
+        }
+
     def install_draft_hidden_log(self) -> bool | None:
         """Log the engine's LM-head input for tagged draft requests.
 
@@ -1390,10 +1463,6 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         layer = _unwrap(self._gen_model()).output_layer
         if getattr(layer, "sequence_parallel", False) and not materialized:
             return False
-        try:
-            from megatron.core.inference.utils import InferenceMode
-        except ImportError:  # pragma: no cover
-            InferenceMode = None
         log = HiddenLog()
 
         def lookup(rid, engine):
@@ -1406,38 +1475,16 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             key = getattr(req.sampling_params, HIDDEN_KEY_ATTR, None)
             return None if key is None else (key, len(req.prompt_tokens))
 
-        # Decode steps replay CUDA graphs, which never run Python hooks. So the
-        # pre-hook only *copies* the LM-head input rows into a static buffer
-        # allocated here, before any capture; that copy is part of the captured
-        # graph and runs on every replay. The rows are read and logged after the
-        # forward, in the sampler (Python, runs every step, outside the graph).
-        # Tied embeddings: the output layer holds no weight of its own (it is
-        # passed in at forward time); use the shared embedding/output weight.
-        weight = layer.weight
-        if weight is None:
-            weight = _unwrap(self._gen_model()).shared_embedding_or_output_weight()
-        d = weight.shape[1]
-        static = torch.empty(
-            (int(ctx.max_requests), d), dtype=weight.dtype, device=weight.device
-        )
-        filled = [False]
-
-        dbg = {"hook": 0, "kernel": 0, "rows": 0, "rejected": 0}
+        # The LM-head input rows are copied into a static buffer by a pre-hook
+        # installed on every rank when the engine was built, before it captured
+        # its CUDA graphs (``_install_hidden_copy``), so the copy replays with
+        # every graph. Here only the logging (sampler side) is added.
+        copy = getattr(self, "_hidden_copy", None)
+        if copy is None:
+            return False
+        static, filled, weight = copy["static"], copy["filled"], copy["weight"]
+        dbg = {"kernel": 0, "rows": 0, "rejected": 0}
         debug = bool(os.environ.get("THUNDERSYNC_HIDDEN_DEBUG"))
-
-        def hook(module, args, kwargs):
-            if InferenceMode is not None and not InferenceMode.is_active():
-                return  # not an engine forward
-            dbg["hook"] += 1
-            h = args[0] if args else kwargs["input_"]
-            rows = h.reshape(-1, h.shape[-1])
-            if not materialized:
-                if torch.cuda.is_current_stream_capturing():
-                    return  # per-token rows: only logged on eager forwards
-                rows = self.inference_context.last_token_logits(rows.unsqueeze(0))
-            k = min(rows.shape[0], static.shape[0])
-            static[:k].copy_(rows[:k])
-            filled[0] = True
 
         sampling = engine.controller._sampling
         inner = sampling.sample_kernel
@@ -1505,36 +1552,6 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             return out
 
         sampling.sample_kernel = logging_kernel
-        # Register the copy before recapturing, so the captures include it.
-        layer.register_forward_pre_hook(hook, with_kwargs=True)
-        # The engine captured its CUDA graphs when it was built, before this
-        # hook existed, so replays would not copy the rows. Recapture them now
-        # (the engine is idle: drafting has not started) so every captured graph
-        # contains the copy into ``static``.
-        if getattr(engine, "cuda_graph_impl", None) == "local":
-            from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
-
-            def recapture():
-                torch.cuda.synchronize()
-                delete_cuda_graphs()
-                engine.create_cuda_graphs()
-                torch.cuda.synchronize()
-
-            loop = getattr(self, "_inference_loop", None)
-            if loop is not None and loop.is_running():
-                import asyncio
-
-                async def _run():
-                    recapture()
-
-                asyncio.run_coroutine_threadsafe(_run(), loop).result()
-            else:
-                recapture()
-        if debug:
-            print(
-                f"[hidden dbg] installed on {type(layer).__name__} id={id(layer)} sampling={id(sampling)}",
-                flush=True,
-            )
         self._hidden_log = log
         return True
 

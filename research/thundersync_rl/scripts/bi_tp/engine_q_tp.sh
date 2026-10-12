@@ -90,7 +90,7 @@ for i, h in enumerate(hist):
     print(f"[engine_q] step {i}: max_abs_logprob_diff={d} exact_token_frac={e} "
           f"kept={h.get('spec/accepted_frac')} dropped={h.get('spec/engine_q_dropped')} "
           f"{'ok' if good else 'MISMATCH'}")
-text = open(log, errors="replace").read()
+text = re.sub(r"\x1b\[[0-9;]*m", "", open(log, errors="replace").read())  # Ray colors
 checks = re.findall(r"\[engine q check\].*tok=(\d+) exact=(\d+) max\|dlogq\|=(\S+)", text)
 bad = [c for c in checks if c[0] != c[1] or float(c[2]) != 0.0]
 ok &= bool(checks) and not bad and "falling back to verify_source=scorer" not in text

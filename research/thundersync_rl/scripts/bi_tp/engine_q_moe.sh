@@ -14,4 +14,7 @@ W=/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/wdykas/cod
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 export EP=${EP:-2} TP=${TP:-1} PP=${PP:-1} MAXLEN=${MAXLEN:-1024}
 export MODEL=${MODEL:-$W/models/tiny-qwen3-moe} RUNS=${RUNS:-runs_engine_q_moe}
+# inference_optimized requires an fp32 router (Megatron: avoids dtype conversions in decode);
+# training uses the same dtype so both sides route identically.
+export ARGS="${ARGS:-} policy.megatron_cfg.moe_router_dtype=fp32"
 exec bash "$HERE/engine_q_tp.sh"

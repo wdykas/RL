@@ -362,6 +362,7 @@ def test_hidden_log_is_installed_on_the_engine_last_stage_only(monkeypatch):
         w._gen_model = lambda: SimpleNamespace(
             module=SimpleNamespace(output_layer=head)
         )
+        w._install_hidden_copy(w.inference_context)  # every rank, at engine build
         assert w.install_draft_hidden_log() is expected
         # The sampler wrapper (logs rows after CUDA-graph replays too) is
         # installed on the last stage only.

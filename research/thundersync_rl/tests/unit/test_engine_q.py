@@ -129,6 +129,7 @@ def test_hidden_log_hook_on_a_fake_engine(monkeypatch):
     w.inference_context = ctx
     w._gen_model = lambda: model
     w.inference_model = None
+    w._install_hidden_copy(ctx)  # at engine construction, every rank
     assert w.install_draft_hidden_log() is True
     head = model.module.output_layer
     steps = []
@@ -189,6 +190,7 @@ def test_hidden_log_install_under_tensor_parallelism(
         num_speculative_tokens=0,
     )
     w._gen_model = lambda: SimpleNamespace(module=SimpleNamespace(output_layer=head))
+    w._install_hidden_copy(w.inference_context)
     assert w.install_draft_hidden_log() is expected
 
 
