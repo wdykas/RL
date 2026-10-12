@@ -622,6 +622,17 @@ class MegatronPolicyWorkerImpl(
         os.environ["LOCAL_RANK"] = str(local_rank)
         # Batch-invariant / zero-KL kernels must be enabled before CUDA init.
         enable_batch_invariant_mode(config)
+        hysteresis_tau = config["megatron_cfg"].get("param_hysteresis_tau")
+        if hysteresis_tau is not None:
+            from nemo_rl.models.megatron import param_hysteresis
+
+            if config["megatron_cfg"]["optimizer"].get("use_precision_aware_optimizer"):
+                raise ValueError(
+                    "policy.megatron_cfg.param_hysteresis_tau requires "
+                    "policy.megatron_cfg.optimizer.use_precision_aware_optimizer=false "
+                    "(fp32 masters stored apart from the bf16 weights)."
+                )
+            param_hysteresis.install(float(hysteresis_tau))
         torch.cuda.set_device(local_rank)
 
         # Apply patch from https://github.com/NVIDIA/TransformerEngine/pull/2286/files
