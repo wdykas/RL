@@ -11,7 +11,7 @@
 #   TP*PP <= 2 : 1 node, 2 generation + 2 training GPUs (interactive node, megatron-rl container):
 #              TP=2 MODEL=Qwen/Qwen3-1.7B bash engine_q_tp.sh
 #              (EP: engine_q_moe.sh; PP: engine_q_pp.sh, thin wrappers around this script)
-#   TP*PP == 4 : 2 nodes (4 + 4 GPUs); run on the head of a 2-node Ray cluster (as
+#   >=4 GPUs per side (GPUS_PER_SIDE, default max(TP*PP, EP)): 2*GPS/4 nodes; run on the head of a Ray cluster (as
 #              tp_parity_submit.sh).
 #
 # Env: TP (2), PP (1), EP (1), STEPS (4), MODEL (Qwen/Qwen3-1.7B), PROMPTS (16), MAXLEN (2048),
@@ -35,14 +35,17 @@ if [ "${PERF:-0}" != 1 ]; then
   export THUNDERSYNC_SPEC_PROF=1 THUNDERSYNC_MEM_LOG=1
 fi
 
-case $((TP * PP)) in
+# GPUs per side (training and generation each): GPUS_PER_SIDE, default max(TP*PP, EP),
+# with 4 GPUs per node. 1-2 per side share one node; 4 or more use whole nodes per side.
+GPS=${GPUS_PER_SIDE:-$(( TP * PP > EP ? TP * PP : EP ))}
+case $GPS in
   1|2) RES=(cluster.num_nodes=1 cluster.gpus_per_node=4
             policy.generation.colocated.resources.num_nodes=1
             policy.generation.colocated.resources.gpus_per_node=2) ;;
-  4)   RES=(cluster.num_nodes=2 cluster.gpus_per_node=4
-            policy.generation.colocated.resources.num_nodes=1
+  *)   if (( GPS % 4 )); then echo "GPUS_PER_SIDE must be 1, 2 or a multiple of 4 (got $GPS)" >&2; exit 2; fi
+       RES=(cluster.num_nodes=$(( 2 * GPS / 4 )) cluster.gpus_per_node=4
+            policy.generation.colocated.resources.num_nodes=$(( GPS / 4 ))
             policy.generation.colocated.resources.gpus_per_node=4) ;;
-  *)   echo "TP*PP must be 1, 2 or 4 (4 GPUs per node)" >&2; exit 2 ;;
 esac
 SP=$([ "$TP" -gt 1 ] && echo true || echo false)
 PAR=(policy.megatron_cfg.tensor_model_parallel_size=$TP
