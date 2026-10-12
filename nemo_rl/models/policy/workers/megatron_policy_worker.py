@@ -629,7 +629,10 @@ class MegatronPolicyWorkerImpl(
         if config["megatron_cfg"].get("forward_gemm_precision") is not None:
             from nemo_rl.models.megatron import fp16_gemm
 
-            fp16_gemm.install(config["megatron_cfg"].get("lm_head_precision"))
+            fp16_gemm.install(
+                config["megatron_cfg"].get("lm_head_precision"),
+                config["megatron_cfg"].get("down_proj_prescale_log2") or 0,
+            )
         torch.cuda.set_device(local_rank)
 
         # Apply patch from https://github.com/NVIDIA/TransformerEngine/pull/2286/files

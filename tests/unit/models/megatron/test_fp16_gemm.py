@@ -265,3 +265,28 @@ def test_engine_pipeline_logits_stay_fp32(monkeypatch):
     finally:
         fg._STATE["orig"].clear()
         fg._STATE["orig"].update(saved)
+
+
+def test_down_proj_prescale_is_exact_and_widens_range():
+    """Power-of-two prescale: same bits in range, finite where fp16 would overflow."""
+    torch.manual_seed(5)
+    w = (torch.randn(16, 64) * 0.05).to(torch.bfloat16)
+    x = torch.randn(8, 64) * 30
+    g = torch.randn(8, 16)
+    outs, grads = [], []
+    for s in (0, 3):
+        xi = x.clone().requires_grad_()
+        wi = w.clone().requires_grad_()
+        y = fg.fp16_linear(xi, wi, fg.COMM_NONE, None, scale_log2=s)
+        y.backward(g)
+        outs.append(y.detach())
+        grads.append((xi.grad, wi.grad))
+    assert torch.equal(outs[0], outs[1])
+    assert torch.equal(grads[0][0], grads[1][0]) and torch.equal(
+        grads[0][1], grads[1][1]
+    )
+    big = torch.full((2, 64), 1.0e5)  # beyond fp16's 65504
+    assert not torch.isfinite(fg.fp16_linear(big, w, fg.COMM_NONE, None)).all()
+    assert torch.isfinite(
+        fg.fp16_linear(big, w, fg.COMM_NONE, None, scale_log2=2)
+    ).all()

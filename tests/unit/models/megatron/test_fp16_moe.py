@@ -94,3 +94,36 @@ def test_validate_model():
     assert fm.validate_model(Cfg()) == []
     Cfg.moe_shared_expert_intermediate_size = 64
     assert fm.validate_model(Cfg()) == ["shared experts"]
+
+
+def test_expert_down_proj_prescale_matches(monkeypatch):
+    """Training expert forward: the prescale (via routing probs) only perturbs subnormals.
+
+    x * 2^-s rounds to fp16 exactly as x does unless it lands in fp16's subnormal
+    range (|x| < 6.1e-5 * 2^s), so outputs agree to within those tiny inputs.
+    """
+    from types import SimpleNamespace
+
+    from nemo_rl.models.megatron import fp16_gemm
+
+    torch.manual_seed(7)
+    k, f, experts = 32, 24, 3
+
+    def linear(rows, cols):
+        ws = {
+            f"weight{i}": (torch.randn(rows, cols) * 0.1).to(torch.bfloat16)
+            for i in range(experts)
+        }
+        return SimpleNamespace(num_gemms=experts, **ws)
+
+    module = SimpleNamespace(linear_fc1=linear(2 * f, k), linear_fc2=linear(k, f))
+    x = torch.randn(10, k) * 3
+    tokens = torch.tensor([4, 0, 6])
+    probs = torch.rand(10)
+    outs = []
+    for s in (0, 4):
+        monkeypatch.setitem(fp16_gemm._STATE, "down_scale", s)
+        outs.append(fm.training_experts_forward(module, x, tokens, probs)[0])
+    diff = (outs[0] - outs[1]).abs().max().item()
+    print(f"prescale 2^-4 max |diff| {diff:.3e}")
+    torch.testing.assert_close(outs[0], outs[1], rtol=0, atol=1e-4)

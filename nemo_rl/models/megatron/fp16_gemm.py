@@ -66,7 +66,12 @@ SUPPORTED_PRECISIONS = (FP16_GEMM,)
 FP32_HEAD = "fp32"
 HEAD_PRECISIONS = (FP32_HEAD, FP16_GEMM)
 
-_STATE: dict[str, Any] = {"enabled": False, "head": FP32_HEAD, "orig": {}}
+_STATE: dict[str, Any] = {
+    "enabled": False,
+    "head": FP32_HEAD,
+    "orig": {},
+    "down_scale": 0,
+}
 
 # Target |amax| of an attention-output gradient dO after scaling into fp16: 2^0.
 # FlashAttention's dV = P^T dO sums dO over every query attending a key, so an
@@ -220,11 +225,19 @@ class Fp16Linear(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x, weight, comm, group, precision=FP16_GEMM):  # noqa: D102
+    def forward(ctx, x, weight, comm, group, precision=FP16_GEMM, scale_log2=0):  # noqa: D102
+        # Down-projection prescale (``down_proj_prescale_log2``): x * 2^-s before
+        # the fp16 cast and the fp32 output * 2^s; power-of-two scaling only
+        # shifts exponents, so it widens fp16's range without changing rounding
+        # (except for values that become fp16 subnormals).
+        if scale_log2:
+            x = x * (2.0**-scale_log2)
         x16 = x.to(_OPERAND_DTYPE[precision])
         if comm == COMM_SP_GATHER:
             x16 = _gather_rows(x16, group)
         out = _GEMMS[precision](x16, weight)
+        if scale_log2:
+            out = out * (2.0**scale_log2)
         if comm == COMM_SP_SCATTER:
             out = _reduce_scatter_rows(out, group)
         elif comm == COMM_TP_ALLREDUCE:
@@ -234,6 +247,7 @@ class Fp16Linear(torch.autograd.Function):
         ctx.x_dtype = x.dtype
         ctx.comm = comm
         ctx.group = group
+        ctx.scale_log2 = scale_log2
         return out
 
     @staticmethod
@@ -255,8 +269,11 @@ class Fp16Linear(torch.autograd.Function):
             dgrad = dgrad.to(ctx.x_dtype)
         if ctx.needs_input_grad[1]:
             x2 = x16.reshape(-1, x16.shape[-1]).to(torch.bfloat16)
-            wgrad = _mm(g2.t(), x2, torch.float32).to(weight.dtype)
-        return dgrad, wgrad, None, None, None
+            wgrad = _mm(g2.t(), x2, torch.float32)
+            if ctx.scale_log2:  # x16 holds x * 2^-s
+                wgrad = wgrad * (2.0**ctx.scale_log2)
+            wgrad = wgrad.to(weight.dtype)
+        return dgrad, wgrad, None, None, None, None
 
 
 def fp16_linear(
@@ -265,9 +282,10 @@ def fp16_linear(
     comm: Optional[str] = COMM_NONE,
     group: Any = None,
     precision: str = FP16_GEMM,
+    scale_log2: int = 0,
 ) -> torch.Tensor:
     """Autograd-aware ``Fp16Linear``; plain forward under no_grad / inference."""
-    return Fp16Linear.apply(x, weight, comm, group, precision)
+    return Fp16Linear.apply(x, weight, comm, group, precision, scale_log2)
 
 
 class RMSNormFp32(torch.autograd.Function):
@@ -429,7 +447,8 @@ def _te_linear_forward(module: Any, x: torch.Tensor, norm: bool):
         )
     else:
         comm = COMM_NONE
-    out = fp16_linear(x, weight, comm, group)
+    scale = _STATE["down_scale"] if getattr(module, "_fp16_down_proj", False) else 0
+    out = fp16_linear(x, weight, comm, group, scale_log2=scale)
     bias = getattr(module, "bias", None)
     has_bias = (
         bool(getattr(module, "use_bias", False)) and bias is not None and bias.numel()
@@ -816,7 +835,25 @@ def _nccl_token_combine_fp32(self, hidden_states):
     return scattered[: tokens_per_rank[ep_rank]]
 
 
-def install(lm_head_precision: Optional[str] = None) -> None:
+def _tag_down_projections() -> None:
+    """Mark every MLP's ``linear_fc2`` (dense down-projection) for the prescale."""
+    from megatron.core.transformer.mlp import MLP
+
+    orig = MLP.__init__
+    _STATE["orig"][(MLP, "init")] = orig
+
+    def __init__(self, *args, **kwargs):
+        orig(self, *args, **kwargs)
+        fc2 = getattr(self, "linear_fc2", None)
+        if fc2 is not None:
+            fc2._fp16_down_proj = True
+
+    MLP.__init__ = __init__
+
+
+def install(
+    lm_head_precision: Optional[str] = None, down_proj_prescale_log2: int = 0
+) -> None:
     """Install the fp16 GEMM forward for this process (idempotent).
 
     Call before the models are built and before the inference engine captures
@@ -830,6 +867,9 @@ def install(lm_head_precision: Optional[str] = None) -> None:
             f"lm_head_precision must be one of {HEAD_PRECISIONS} (got {head!r})."
         )
     _STATE["head"] = head
+    if not 0 <= int(down_proj_prescale_log2) <= 8:
+        raise ValueError("down_proj_prescale_log2 must be in [0, 8].")
+    _STATE["down_scale"] = int(down_proj_prescale_log2)
     from megatron.core.extensions import transformer_engine as mte
     from megatron.core.tensor_parallel import inference_layers as il
     from megatron.core.tensor_parallel.layers import ColumnParallelLinear
@@ -851,6 +891,7 @@ def install(lm_head_precision: Optional[str] = None) -> None:
     _patch_inference_buffers()
     _patch_inference_pp_logits()
     _patch_moe()
+    _tag_down_projections()
     _STATE["enabled"] = True
     print(
         "[fp16_gemm] forward_gemm_precision=fp16: fp16 GEMM operands, fp32 GEMM "

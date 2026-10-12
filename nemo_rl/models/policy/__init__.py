@@ -597,6 +597,11 @@ class MegatronConfig(TypedDict):
     # hi/lo split of the input); "fp16" uses the fp16 GEMM. Must match
     # between training and generation.
     lm_head_precision: NotRequired[str | None]
+    # forward_gemm_precision="fp16": power-of-two prescale s of the MLP / expert
+    # down-projection input (x * 2^-s cast to fp16, output * 2^s), widening fp16's
+    # range there 2^s-fold for models whose SwiGLU outputs approach 65504. 0 = off.
+    # Must match between training and generation.
+    down_proj_prescale_log2: NotRequired[int | None]
 
 
 class TokenizerConfig(TypedDict):

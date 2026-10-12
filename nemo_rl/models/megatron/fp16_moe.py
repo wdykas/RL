@@ -401,6 +401,12 @@ def _expert_weights(linear: Any) -> list[torch.Tensor]:
 # ---------------------------------------------------------------------------
 
 
+def _down_scale() -> int:
+    from nemo_rl.models.megatron import fp16_gemm
+
+    return fp16_gemm._STATE["down_scale"]
+
+
 def training_experts_forward(
     module: Any, x, tokens_per_expert, permuted_probs
 ) -> tuple:
@@ -408,9 +414,15 @@ def training_experts_forward(
     if isinstance(tokens_per_expert, torch.Tensor):
         tokens_per_expert = tokens_per_expert.tolist()
     m_splits = [int(m) for m in tokens_per_expert]
+    s = _down_scale()
+    probs = permuted_probs.reshape(-1)
+    if s:  # down-projection prescale: a * 2^-s via the routing probabilities
+        probs = probs * (2.0**-s)
     h = grouped_linear(x, m_splits, _expert_weights(module.linear_fc1))
-    a = swiglu_probs(h, permuted_probs.reshape(-1))
+    a = swiglu_probs(h, probs)
     y = grouped_linear(a, m_splits, _expert_weights(module.linear_fc2))
+    if s:
+        y = y * (2.0**s)
     return y, None
 
 
@@ -451,9 +463,14 @@ def inference_experts_forward(
         return_batch_invariant_inverse_map=True,
         row_alignment=cfg[0],
     )
+    s = _down_scale()
+    if s:  # same prescale as training_experts_forward
+        pp = pp * (2.0**-s)
     h = grouped_gemm(xp, None, offs, cfg, stacked=module._fc1_weight)
     a = swiglu_probs_fwd(h, pp, torch.float16)
     y = grouped_gemm(a, None, offs, cfg, stacked=module._fc2_weight)
+    if s:
+        y = y * (2.0**s)
     out = None
     if module._nvls_dispatcher:
         out = NVLSAllGatherVDispatcher._get_rsv_tensor()
