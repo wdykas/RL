@@ -1351,11 +1351,14 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         # allocated here, before any capture; that copy is part of the captured
         # graph and runs on every replay. The rows are read and logged after the
         # forward, in the sampler (Python, runs every step, outside the graph).
-        d = layer.weight.shape[1]
+        # Tied embeddings: the output layer holds no weight of its own (it is
+        # passed in at forward time); use the shared embedding/output weight.
+        weight = layer.weight
+        if weight is None:
+            weight = _unwrap(self._gen_model()).shared_embedding_or_output_weight()
+        d = weight.shape[1]
         static = torch.empty(
-            (int(ctx.max_requests), d),
-            dtype=layer.weight.dtype,
-            device=layer.weight.device,
+            (int(ctx.max_requests), d), dtype=weight.dtype, device=weight.device
         )
         filled = [False]
 
