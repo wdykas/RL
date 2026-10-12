@@ -582,6 +582,153 @@ def _patch_inference_buffers() -> None:
     TextGenerationController.__init__ = __init__
 
 
+def _patch_moe() -> None:
+    """MoE: fp32 router logits, fp16 expert GEMMs with fp32 output, fp32 combine."""
+    from megatron.core.inference.utils import InferenceMode
+    from megatron.core.transformer.moe import router as moe_router
+    from megatron.core.transformer.moe import token_dispatcher_inference as tdi
+    from megatron.core.transformer.moe.experts import InferenceGroupedMLP, TEGroupedMLP
+    from megatron.core.transformer.moe.moe_layer import MoELayer
+
+    from nemo_rl.models.megatron import fp16_moe
+
+    # Router: fp32 logits from the fp32 hidden state, every product exact.
+    orig_gating = moe_router.router_gating_linear
+    _STATE["orig"][(moe_router, "router_gating_linear")] = orig_gating
+
+    def router_gating_linear(inp, weight, bias, router_dtype):
+        if not _active(weight):
+            return orig_gating(inp, weight, bias, router_dtype)
+        logits = fp16_linear(inp, weight, COMM_NONE, None, FP32_HEAD)
+        if bias is not None:
+            logits = logits + bias.float()
+        return logits.to(router_dtype)
+
+    moe_router.router_gating_linear = router_gating_linear
+
+    # Engine dispatch: fp16 rows, bit-cast to bf16 for MCore's 16-bit all-gather
+    # buffers (a copy, no arithmetic); training keeps fp32 rows (fp32 gradients).
+    orig_preprocess = MoELayer.preprocess
+    _STATE["orig"][(MoELayer, "preprocess")] = orig_preprocess
+
+    def preprocess(self, hidden_states, probs, routing_map):
+        if (
+            _active(getattr(self.router, "weight", None))
+            and InferenceMode.is_active()
+            and hidden_states.dtype == torch.float32
+        ):
+            hidden_states = hidden_states.to(torch.float16).view(torch.bfloat16)
+        return orig_preprocess(self, hidden_states, probs, routing_map)
+
+    MoELayer.preprocess = preprocess
+
+    orig_te_experts = TEGroupedMLP.forward
+    _STATE["orig"][(TEGroupedMLP, "forward")] = orig_te_experts
+
+    def te_experts_forward(self, x, tokens_per_expert, permuted_probs, *args, **kwargs):
+        if not _active(getattr(self.linear_fc1, "weight0", None)) or args or kwargs:
+            return orig_te_experts(self, x, tokens_per_expert, permuted_probs, *args, **kwargs)
+        return fp16_moe.training_experts_forward(self, x, tokens_per_expert, permuted_probs)
+
+    TEGroupedMLP.forward = te_experts_forward
+
+    orig_inf_experts = InferenceGroupedMLP.forward
+    _STATE["orig"][(InferenceGroupedMLP, "forward")] = orig_inf_experts
+
+    def inf_experts_forward(
+        self, x, tokens_per_expert, permuted_probs, routing_map=None, **kwargs
+    ):
+        if not InferenceMode.is_active() or not _active(
+            getattr(self.linear_fc1, "weight0", None)
+        ):
+            return orig_inf_experts(
+                self, x, tokens_per_expert, permuted_probs, routing_map=routing_map, **kwargs
+            )
+        return fp16_moe.inference_experts_forward(self, x, permuted_probs, routing_map)
+
+    InferenceGroupedMLP.forward = inf_experts_forward
+
+    # Engine combine: keep the fp32 rank-ordered sum (MCore casts it to bf16).
+    for cls, combine in (
+        (tdi.NVLSAllGatherVDispatcher, _nvls_token_combine_fp32),
+        (tdi.NCCLAllGatherDispatcher, _nccl_token_combine_fp32),
+    ):
+        orig = cls.token_combine
+        _STATE["orig"][(cls, "token_combine")] = orig
+
+        def token_combine(self, hidden_states, _orig=orig, _fp32=combine):
+            if hidden_states.dtype != torch.float32:
+                return _orig(self, hidden_states)
+            return _fp32(self, hidden_states)
+
+        cls.token_combine = token_combine
+
+
+def _nvls_token_combine_fp32(self, hidden_states):
+    """``NVLSAllGatherVDispatcher.token_combine`` without the final bf16 cast."""
+    from megatron.core.inference.communication.torch_symm_triton import (
+        multimem_reduce_scatter_v,
+    )
+    from megatron.core.inference.moe import batch_invariant
+    from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+        get_batch_invariant_collective,
+    )
+
+    if self.ep_size == 1:
+        return hidden_states
+    rsv = self.__class__._symm_rsv
+    if hidden_states is not rsv["tensor"]:
+        rsv["tensor"].copy_(hidden_states)
+    output = torch.empty(
+        self._local_tokens,
+        hidden_states.shape[1],
+        dtype=rsv["tensor"].dtype,
+        device=hidden_states.device,
+    )
+    use_ordered = batch_invariant.enabled() and get_batch_invariant_collective() == "ordered"
+    reduce_scatter_v = (
+        batch_invariant.ordered_reduce_scatter_v if use_ordered else multimem_reduce_scatter_v
+    )
+    reduce_scatter_v(
+        output,
+        rsv["tensor"],
+        rsv["handle"],
+        rank_token_offset=self._rank_token_offset(),
+        ep_max_tokens=self._ep_max_tokens(),
+        per_rank_max_tokens=self._per_rank_worst_case_token_count,
+    )
+    return output
+
+
+def _nccl_token_combine_fp32(self, hidden_states):
+    """``NCCLAllGatherDispatcher.token_combine`` without the final bf16 cast.
+
+    Its NCCL reduce-scatter sums EP partials in NCCL's order: rank-order (as in
+    training) only up to EP=2; use the NVLS dispatcher (ordered) beyond that.
+    """
+    import torch.distributed as dist
+    from megatron.core.tensor_parallel.mappings import reduce_scatter_to_sequence_parallel_region
+    from megatron.core.utils import get_pg_rank
+
+    if self.ep_size == 1:
+        return hidden_states
+    if not self.__class__._use_allgather_v:
+        return reduce_scatter_to_sequence_parallel_region(hidden_states, group=self.tp_ep_group)
+    tokens_per_rank = self.__class__._local_tokens_per_rank
+    max_tokens = max(tokens_per_rank)
+    ep_rank = get_pg_rank(self.ep_group)
+    padded = hidden_states.new_zeros(self.ep_size * max_tokens, hidden_states.shape[1])
+    offset = 0
+    for dst_rank, n_tokens in enumerate(tokens_per_rank):
+        padded[dst_rank * max_tokens : dst_rank * max_tokens + n_tokens] = hidden_states[
+            offset : offset + n_tokens
+        ]
+        offset += n_tokens
+    scattered = padded.new_empty(max_tokens, hidden_states.shape[1])
+    dist.reduce_scatter_tensor(scattered, padded, group=self.ep_group)
+    return scattered[: tokens_per_rank[ep_rank]]
+
+
 def install(lm_head_precision: Optional[str] = None) -> None:
     """Install the fp16 GEMM forward for this process (idempotent).
 
@@ -613,6 +760,7 @@ def install(lm_head_precision: Optional[str] = None) -> None:
     _patch_te_rmsnorm()
     _patch_attention()
     _patch_inference_buffers()
+    _patch_moe()
     _STATE["enabled"] = True
     print(
         "[fp16_gemm] forward_gemm_precision=fp16: fp16 GEMM operands, fp32 GEMM "
@@ -690,7 +838,9 @@ def validate_model(model_cfg: Any) -> None:
     """Reject model architectures the fp16 GEMM forward does not cover yet."""
     unsupported = []
     if getattr(model_cfg, "num_moe_experts", None):
-        unsupported.append("MoE (num_moe_experts; grouped expert GEMMs not built yet)")
+        from nemo_rl.models.megatron import fp16_moe
+
+        unsupported += [f"MoE {x}" for x in fp16_moe.validate_model(model_cfg)]
     if getattr(model_cfg, "multi_latent_attention", False):
         unsupported.append("multi_latent_attention")
     if getattr(model_cfg, "normalization", "RMSNorm") != "RMSNorm":
