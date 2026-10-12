@@ -22,6 +22,17 @@ accumulator. We report the relative parameter gap
     Delta_k = ||theta_k^stream - theta_k^sync|| / ||theta_k^sync - theta_0||
 
 after every update, and fail if it exceeds ``--tol``.
+
+Pipeline parallelism (``policy.megatron_cfg.pipeline_model_parallel_size>1``):
+the streamed policy runs each dispatch's chunks as one pipeline schedule call
+(``thundersync.merge_pipeline_calls``, default on; ``false`` is the per-chunk
+control) and the planner holds closed-group rows until they make
+``thundersync.min_pipeline_microbatches`` micro-batches per rank (default
+2 * PP), flushing after the last arrival. Parameters and (DP=1) gradients are
+gathered from every pipeline stage. ``--trim-seq`` cuts each chunk to its
+longest row (rounded up to ``policy.make_sequence_length_divisible_by``), as
+the real learner's chunks are, so micro-batches of one call differ in sequence
+length as well as row count (exercises ``config.variable_seq_lengths``).
 """
 
 import argparse
@@ -30,7 +41,11 @@ import random
 import ray
 import torch
 from omegaconf import OmegaConf
-from thundersync_rl.grpo_loop import ThunderSyncMasterConfig, make_group_advantage_fn
+from thundersync_rl.grpo_loop import (
+    ThunderSyncMasterConfig,
+    make_group_advantage_fn,
+    resolve_min_pipeline_microbatches,
+)
 from thundersync_rl.streaming import (
     StreamingLearner,
     StreamPlanner,
@@ -94,13 +109,29 @@ def rows(data: BatchedDataDict, idx: list[int]) -> BatchedDataDict:
 
 
 def get_params(policy: Policy) -> dict[str, torch.Tensor]:
-    return ray.get(policy.worker_group.run_all_workers_single_data("get_flat_params"))[
-        0
-    ]
+    """Every worker's parameters (all pipeline stages), keyed by worker."""
+    per_worker = ray.get(
+        policy.worker_group.run_all_workers_single_data("get_flat_params")
+    )
+    return {
+        f"{w}:{k}": v for w, params in enumerate(per_worker) for k, v in params.items()
+    }
 
 
 def get_grads(policy: Policy) -> torch.Tensor:
-    return ray.get(policy.worker_group.run_all_workers_single_data("get_flat_grads"))[0]
+    """Every worker's gradient buffers (all pipeline stages), concatenated."""
+    return torch.cat(
+        ray.get(policy.worker_group.run_all_workers_single_data("get_flat_grads"))
+    )
+
+
+def trim_to_length(data: BatchedDataDict, multiple: int) -> BatchedDataDict:
+    """Drop columns past the longest row (rounded up to ``multiple``)."""
+    seq = int(data["input_lengths"].max())
+    seq = min(data["input_ids"].shape[1], -(-seq // multiple) * multiple)
+    return BatchedDataDict(
+        {k: v[:, :seq].clone() if v.dim() == 2 else v for k, v in data.items()}
+    )
 
 
 def flat_diff_norm(a, b):
@@ -134,6 +165,12 @@ def main():
         action="store_true",
         help="stream group 0's trajectories, then discard them as a retried "
         "rollout would, before the normal stream; the update must not change",
+    )
+    p.add_argument(
+        "--trim-seq",
+        action="store_true",
+        help="cut each streamed chunk to its longest row (pipeline calls then "
+        "mix sequence lengths)",
     )
     args, overrides = p.parse_known_args()
 
@@ -178,12 +215,17 @@ def main():
     ts = cfg.thundersync
     compare_grads = learner.dp_size == 1
     expert_parallel = pcfg["megatron_cfg"]["expert_model_parallel_size"] > 1
+    pp = pcfg["megatron_cfg"].get("pipeline_model_parallel_size", 1) or 1
+    min_pipeline_microbatches = resolve_min_pipeline_microbatches(ts, pp)
+    seq_multiple = pcfg.get("make_sequence_length_divisible_by", 1) or 1
+    pipeline_stats = {"dispatches": 0, "calls": 0, "items": 0}
     if expert_parallel and ts.max_open_groups > 0:
         # Mirrors grpo_loop.validate_config: open-group buckets are not exact
         # under expert parallelism (expert grads mix rows of other EP ranks).
         raise SystemExit("expert parallelism: pass thundersync.max_open_groups=0")
 
     def run_streamed(data, rewards, rng):
+        pipeline_stats.update(dispatches=0, calls=0, items=0)
         planner = StreamPlanner(
             adv_fn,
             dp_size=learner.dp_size,
@@ -191,6 +233,7 @@ def main():
             max_open_groups=ts.max_open_groups,
             micro_batch_size=mbs,
             equal_rank_microbatches=expert_parallel,
+            min_pipeline_microbatches=min_pipeline_microbatches,
         )
         for gi in range(args.num_groups):
             planner.register_group(gi, G)
@@ -201,10 +244,11 @@ def main():
             storage_device=ts.storage_device,
             max_buckets_per_group=ts.max_buckets_per_group,
             max_open_groups=ts.max_open_groups,
+            merge_pipeline_calls=ts.merge_pipeline_calls,
         )
 
-        def dispatch():
-            d = planner.next_dispatch()
+        def dispatch(flush=True):
+            d = planner.next_dispatch(flush=flush)
             per_rank = []
             for chunks in d.per_rank:
                 items = []
@@ -221,6 +265,8 @@ def main():
                     if c.padding:
                         for k in ("sample_mask", "token_mask", "advantages"):
                             cd[k] = torch.zeros_like(cd[k])
+                    if args.trim_seq:
+                        cd = trim_to_length(cd, seq_multiple)
                     items.append(
                         {
                             "data": pad_batch_to_multiple(cd, mbs),
@@ -229,7 +275,10 @@ def main():
                         }
                     )
                 per_rank.append(items)
-            ray.get(learner.submit(per_rank, d.closes))
+            results = ray.get(learner.submit(per_rank, d.closes))
+            pipeline_stats["dispatches"] += 1
+            pipeline_stats["calls"] += max(r["num_calls"] for r in results)
+            pipeline_stats["items"] += max(r["num_items"] for r in results)
 
         if args.simulate_retry:
             idx = list(range(G))
@@ -261,7 +310,8 @@ def main():
                 )
             )
             if rng.random() < 0.3:
-                dispatch()
+                while planner.has_work(flush=False):
+                    dispatch(flush=False)
         while planner.has_work():
             dispatch()
         assert planner.all_done()
@@ -311,6 +361,9 @@ def main():
             f"b={float(torch.as_tensor(res_b['grad_norm']).mean()):.6e} "
             f"grad_rel_err={grad_err:.3e} Delta={delta:.3e} "
             f"peak_open_buffers={res_b.get('stream_peak_open_buffers')} "
+            f"dispatches={pipeline_stats['dispatches']} "
+            f"pipeline_calls(max rank)={pipeline_stats['calls']} "
+            f"chunks(max rank)={pipeline_stats['items']} "
             f"trained_toks={res_b.get('all_mb_metrics', {}).get('trained_valid_toks', ['all'])[0]}",
             flush=True,
         )
@@ -319,7 +372,9 @@ def main():
     grad_msg = f"{worst['grad']:.3e}" if compare_grads else "n/a (multi-GPU)"
     print(
         f"EQUIVALENCE {status} ({args.mode}): max grad rel err = {grad_msg}, "
-        f"max Delta_k = {worst['delta']:.3e} (tol {args.tol})",
+        f"max Delta_k = {worst['delta']:.3e} (tol {args.tol}); PP={pp} "
+        f"merge_pipeline_calls={ts.merge_pipeline_calls} "
+        f"min_pipeline_microbatches={min_pipeline_microbatches}",
         flush=True,
     )
     if not passed:

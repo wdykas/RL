@@ -112,6 +112,115 @@ Scheduling:
   peers' engine all-to-all (observed). End to end on the tiny MoE (EP=2 learner and
   inference, `verify_on=learner`): block and keyed speculation run without hangs.
 
+### Streaming under pipeline parallelism
+
+Branch `thundersync-streaming-pp`, for ~500B MoE training at PP = 4..16. Unit-tested on
+CPU with a fake schedule; the GPU equivalence check at PP=2 is written but not run yet.
+
+**Before.** The worker ran every chunk as its own `train_microbatch`, i.e. its own
+`forward_backward_func` call with `m = ceil(rows / mbs)` micro-batches (a chunk of at
+most `mbs` rows is one micro-batch of exactly its rows). A rank given `k` chunks in a
+dispatch ran `k` pipeline schedules. A 1F1B call of `m` micro-batches takes `m + P - 1`
+micro-batch slots, so it idles `(P - 1) / (m + P - 1)` and the dispatch idles
+`k (P - 1)` slots out of `M + k (P - 1)` (`M` = the rank's micro-batches). With equal
+chunks the bubble depends only on `m`, not on `k`: `max_chunk_trajectories=8`, mbs=1
+gives 27% (PP4), 47% (PP8), 65% (PP16); mbs=4 (m = 2) gives 60%, 78%, 88%. Each EP padding
+chunk was a separate one-micro-batch call ((P-1)/P idle). Under EP x PP the per-call
+micro-batch counts could also differ between EP peers (the planner equalized only the
+total), so peers could run different forward/backward sequences against the same
+all-to-all. That case was never run.
+
+**After: one call per dispatch and gradient destination.** `stream_accumulate` groups a
+dispatch's items with `group_pipeline_calls` and runs each group with the new core
+method `MegatronPolicyWorkerImpl.train_microbatches(datas, stream_bucket,
+micro_batch_sizes)`. All final chunks (group granularity: the whole dispatch) form one
+call. Their gradient accumulates in place in the grad buffers (or is captured into
+`batch_acc` once). The chunks of one open-group bucket `(group, reward)` form one call,
+captured once into that bucket. A fused chunk (PP=1 only) runs alone. Calls are ordered
+by first item, and items keep dispatch order within a call. `train_microbatch(data)` is
+now `train_microbatches([data])`.
+
+- *Per slice, unchanged:* normalization counts (`local_valid_*` over all rows),
+  zero-advantage skipping (`_drop_zero_advantage_rows` with the slice's own micro-batch
+  size), the per-chunk micro-batch size `min(rows, mbs)`, MTP masks and media masks.
+  `num_chunks` still counts slices. New: `num_pipeline_calls`. A call's iterator chains
+  the slices' micro-batch iterators. `LossPostProcessor` gets the call's total `M`, which
+  cancels mcore's `1/M` loss scaling exactly as before. One change: an all-zero slice
+  is dropped without a forward whenever another slice of the same call is live (that
+  call reports the step's metrics). Before, this happened only after the worker's first
+  metrics.
+- *Shapes.* Pipeline stages receive into buffers of the call's fixed
+  `(seq, mbs, hidden)` unless `config.variable_seq_lengths`. When PP > 1 and the slices'
+  `(micro-batch size, padded length)` differ, `train_microbatches` sets
+  `variable_seq_lengths=True` for that call only. Every send then exchanges a 3-int
+  shape first: one small extra P2P per send, which is negligible against MoE micro-batch
+  times but not measured. This keeps each micro-batch's computation identical to the
+  per-chunk path with no padding. Megatron's `TransformerConfig` rejects
+  `variable_seq_lengths` with the `allgather` MoE token dispatcher, so in that case the
+  slices fall back to one call each, with a warning. With uniform shapes or PP=1 nothing
+  changes. The variable-shape path warns "untested end to end" until the GPU check
+  passes.
+- *Exactness.* The same micro-batches run in the same order. The gradient differs from
+  the per-chunk path only in fp32 rounding: the order of `batch_acc` sums in bucket mode,
+  and `M/M` vs `m/m` loss scaling. CPU tests check this against per-chunk calls and an
+  fp64 reference.
+- *EP.* EP requires group granularity, so a rank's whole dispatch is one call. The
+  planner's padding makes every rank's `M` equal, so EP peers run identical 1F1B
+  sequences. The test checks one call per rank with equal counts.
+- *Not covered:* interleaved (virtual) PP. Megatron's interleaved schedule needs at least
+  PP micro-batches per call, and the remainder group must be 0 or at least PP. A merged
+  call meets this more often than per-chunk calls, but tail dispatches can still violate
+  it (Megatron raises). Padding micro-batches for VPP is not implemented.
+
+**Planner: `thundersync.min_pipeline_microbatches`** (default `null` = 2·PP when PP > 1,
+else 0). While rollouts run (`has_work(flush=False)`), rows of closed groups are held
+until they make at least `min_pipeline_microbatches x DP` micro-batches. They are counted
+as the worker will run them: chunks of `max_chunk_trajectories`, `ceil(rows/mbs)` each,
+and skipped all-zero chunks count 0. Bucket work and pending closes are not held, so
+idle time still streams open groups. Once the rollouts are done, `learner_loop` flushes
+(`flush=True`), so the tail never waits for the threshold.
+`thundersync.merge_pipeline_calls=false` restores per-chunk calls (A/B and control).
+
+**Bubble: analytic** (`pipeline_bubble_fraction`, `k` equal chunks of `m` micro-batches
+per rank, per-chunk calls → one call):
+
+| PP | k=4, m=8 | k=8, m=8 | k=8, m=2 (mbs 4) | held m = 2P | held m = 4P |
+|---|---|---|---|---|---|
+| 4 | 27.3% → 8.6% | 27.3% → 4.5% | 60.0% → 15.8% | 27.3% | 15.8% |
+| 8 | 46.7% → 17.9% | 46.7% → 9.9% | 77.8% → 30.4% | 30.4% | 17.9% |
+| 16 | 65.2% → 31.9% | 65.2% → 19.0% | 88.2% → 48.4% | 31.9% | 19.0% |
+
+**Step time: modeled** (`scripts/pp_streaming_sim.py`: real planner, 512 rollouts,
+G=16, DP=8, mbs=1, chunk 8, lognormal arrivals with `spread` = arrival scale relative to
+the learner's work, 8 seeds; step time in micro-batch slots):
+
+| spread (regime) | PP | per-chunk | merged | merged + hold 2P | merged + hold 4P |
+|---|---|---|---|---|---|
+| 0.2 (learner-bound) | 4 | 126.4 | 112.1 | 110.0 | 115.0 |
+| 0.2 | 8 | 164.9 | 123.0 | 122.8 | 120.8 |
+| 0.2 | 16 | 247.7 | 147.4 | 134.7 | 156.4 |
+| 0.5 | 8 | 226.0 | 213.6 | 217.0 | 232.6 |
+| 0.5 | 16 | 285.5 | 228.1 | 240.6 | 272.6 |
+| 0.8 | 16 | 356.2 | 339.7 | 356.7 | 388.7 |
+| 1.5 (rollout-bound) | 8 | 596.0 | 596.0 | 607.7 | 619.7 |
+
+Merging never hurts in this model, and it cuts learner-bound steps by 11% (PP4), 25%
+(PP8) and 40% (PP16): bubbles that sit on the critical path shrink. When rollouts
+dominate, small dispatches fall in idle time and their bubbles cost nothing. The hold
+lowers the bubble fraction everywhere, but held rows run after the last arrival. The
+model shows it helping only when the learner is the bottleneck at PP16 (−9%), and
+lengthening the tail elsewhere (up to +5% at 2P, +9% at 4P). The default 2·PP is the
+requested setting; this model says to A/B it against `min_pipeline_microbatches=0` on
+the real workload before relying on it.
+
+**GPU check (written, not run):** `tests/functional/equivalence_pp.sh` runs
+`check_equivalence.py` with Qwen2.5-0.5B, fp32, PP=2, TP=1, 2+2 GPUs,
+`thundersync.max_open_groups=0`, mbs 4, `--trim-seq` (chunks cut to their longest row
+rounded up to 16, so one call mixes row counts and sequence lengths), and the default
+hold (4 micro-batches). It runs once merged and once with `merge_pipeline_calls=false`
+as the control, and gathers parameters and gradients from both stages. It passes when
+the gradient relative error is ≤ 1e-4 vs `Policy.train`.
+
 ## 3. Layer 2: cross-iteration speculation
 
 Zero staleness forces a drain at every update: iteration k+1 cannot sample until θ_{k+1}
@@ -443,7 +552,8 @@ speculation when the rollout phase ends in a latency-bound tail on mostly idle G
 | q storage | bf16 weight stash per pending version; memory O(parameters + batch x vocabulary) |
 | Scorer memory | fp32 adds 4 bytes per parameter per shard; `verify_precision=model` keeps training dtypes (about 90% kept vs 99%); under BI, `verify_source=engine` needs no scorer and only an LM-head stash per version (section 14) |
 | Tensor parallelism | Vocab-parallel logits gathered per batch; validated at TP=2 (99.9% kept) |
-| Pipeline parallelism | Forward-only pipeline schedule, last stage verifies; scorer log-probs at PP=2 bitwise equal PP=1. Inference must be pinned to PP=1 (`mcore_generation_config.pipeline_model_parallel_size=1`) for inference-side scorers; under BI `verify_source=engine` runs PP>1 on both sides (unit-tested, section 14) |
+| Pipeline parallelism (training) | Streamed chunks of a dispatch run as one pipeline call per gradient destination (one per dispatch in group mode); `min_pipeline_microbatches` holds rows of closed groups to fill the pipeline (section 2). CPU-tested; PP=2 GPU check written, not run. Interleaved PP not implemented for streaming |
+| Pipeline parallelism (verification) | Forward-only pipeline schedule, last stage verifies; scorer log-probs at PP=2 bitwise equal PP=1. Inference must be pinned to PP=1 (`mcore_generation_config.pipeline_model_parallel_size=1`) for inference-side scorers; under BI `verify_source=engine` runs PP>1 on both sides (unit-tested, section 14) |
 | Context parallelism | Not implemented; the scorer raises. Needs packed (THD) scoring |
 | MoE / expert parallelism | Streaming exact on GPU with EP=2 (group granularity; tiny random MoE); verification on the learner in EP lockstep (inference-side verification rejected under EP); under BI `verify_source=engine` at EP>1 pads training forwards to the EP group's count (unit-tested, section 14); no real-model run yet |
 | Large models on few learner GPUs | At 4B with one learner GPU: verify on the inference pool, or `verify_batch_tokens=4096` and the bf16 scorer to fit |
@@ -480,6 +590,8 @@ policy.make_sequence_length_divisible_by=128
 | `verify_chunks` | Verification pieces; plans publish as each finishes |
 | `verify_batch_tokens` | Tokens per scorer forward batch (bounds logits memory), default 16384 |
 | `draft_budget` | Maximum new tokens per draft |
+| `merge_pipeline_calls` | One pipeline schedule call per dispatch and gradient destination (default `true`; section 2) |
+| `min_pipeline_microbatches` | Hold closed-group rows until this many micro-batches per learner rank are queued; flushed when rollouts end (`null`: 2·PP if PP > 1, else 0) |
 
 Debug switches: `THUNDERSYNC_SPEC_PROF` (verification timing), `THUNDERSYNC_SPEC_CHECK`
 (cross-pool scorer check), `THUNDERSYNC_SELECT_CHECK` (selective vs full logits, PP=1),
@@ -500,7 +612,8 @@ hidden states and print how many drafted tokens' log q match the engine bitwise)
 | File | Role |
 |---|---|
 | `thundersync_rl/grpo_loop.py` | GRPO loop: per-sample rollouts, learner loop, drafter and verification tasks, config, cohort ramp |
-| `thundersync_rl/streaming.py` | StreamPlanner: arrivals to dispatches, bucket vs final chunks, zero-advantage chunks, DP balancing |
+| `thundersync_rl/streaming.py` | StreamPlanner: arrivals to dispatches, bucket vs final chunks, zero-advantage chunks, DP balancing, pipeline hold (`min_pipeline_microbatches`), bubble model |
+| `scripts/pp_streaming_sim.py` | Step-time model of streaming under PP (real planner, no GPU) |
 | `thundersync_rl/speculative.py` | SpeculativeGeneration: cohorts and segments, stash calls, chunked verification, plans, continuations |
 | `thundersync_rl/worker.py` | Megatron worker extension: streaming train calls, scorer build and refresh, weight stashes, stashed block verification, draft streams |
 | `thundersync_rl/block_verification.py` | Reference block verification, shared acceptance helpers, exact output law |
@@ -1053,6 +1166,10 @@ versions is the policy's own, so exact bf16 speculation is inherently ~50%; an f
   or stepped in lockstep with the scorer); open-group buckets under EP.
 - **Scaling gaps.** Context parallelism in the scorer, zero-advantage
   skip with sequence packing.
+- **Streaming under PP on GPU.** Run `tests/functional/equivalence_pp.sh` (PP=2). Then
+  measure learner busy time per step with `merge_pipeline_calls` on vs off and
+  `min_pipeline_microbatches` 0 vs 2·PP at PP≥4 on a real model. Interleaved PP needs
+  padding micro-batches up to Megatron's group constraint (not implemented).
 - **Upstream.** Default `make_sequence_length_divisible_by` to 64–128 for Megatron
   training.
 - **Engine-sourced q on GPU.** Run the `verify_source=engine` A/B against

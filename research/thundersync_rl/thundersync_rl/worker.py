@@ -98,6 +98,44 @@ def _plain_floats(x: Any) -> list[float] | None:
     return [float(v) for v in x]
 
 
+def group_pipeline_calls(
+    items: list[dict[str, Any]], *, merge: bool
+) -> list[list[int]]:
+    """Group a dispatch's items into pipeline schedule calls (lists of indices).
+
+    Under pipeline parallelism each ``forward_backward_func`` call pays a
+    fill/drain bubble of ``P - 1`` micro-batch slots, so a rank's items run as
+    few calls as their gradient destinations allow:
+
+    - all final items (``group=None``: advantages in the loss) share one call;
+      their gradient accumulates in the grad buffers (or is captured into the
+      batch accumulator once, after the call);
+    - the items of one open-group bucket ``(group, reward)`` share one call,
+      captured into that bucket once;
+    - an item with a ``fused_key`` (retained verification forward, PP = 1
+      only) runs alone.
+
+    Calls are ordered by their first item, and items keep their order within
+    a call, so micro-batches run in dispatch order per destination. Only the
+    order in which gradients are summed changes (fp32 rounding).
+    ``merge=False`` returns one call per item (the previous behavior).
+    """
+    if not merge:
+        return [[i] for i in range(len(items))]
+    calls: list[list[int]] = []
+    by_key: dict[Any, list[int]] = {}
+    for i, item in enumerate(items):
+        if item.get("fused_key") is not None:
+            calls.append([i])
+            continue
+        key = (item["group"], None if item["group"] is None else item["reward"])
+        if key not in by_key:
+            by_key[key] = []
+            calls.append(by_key[key])
+        by_key[key].append(i)
+    return calls
+
+
 def apply_draft_frame(
     frame: dict[str, Any],
     tokens: list[int],
@@ -162,8 +200,14 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         storage_device: str,
         max_buckets_per_group: int,
         max_open_groups: int,
+        merge_pipeline_calls: bool = True,
     ) -> None:
-        """Open an optimizer step whose gradient arrives in streamed chunks."""
+        """Open an optimizer step whose gradient arrives in streamed chunks.
+
+        ``merge_pipeline_calls``: run all chunks of a dispatch that share a
+        gradient destination as one pipeline schedule call (see
+        :func:`group_pipeline_calls`); ``False`` runs one call per chunk.
+        """
         # Retained verification forwards of this step (fused_verify_train).
         self._fused_graphs = FusedGraphStore()
         self.begin_train_step(
@@ -177,6 +221,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             ),
         )
         self._stream_busy_s = 0.0
+        self._stream_merge_calls = merge_pipeline_calls
 
     def _log_mem(self, where: str) -> None:
         if os.environ.get("THUNDERSYNC_MEM_LOG"):
@@ -200,32 +245,45 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         carry final advantages. An item with a ``fused_key`` is one row whose
         model forward is the retained verification forward of that key
         (fused_train.py); everything else about its training is unchanged.
+
+        Items with the same gradient destination (all final items; the items
+        of one (group, reward) bucket) run as one pipeline schedule call with
+        all their micro-batches (:func:`group_pipeline_calls`), so under
+        pipeline parallelism a dispatch pays one fill/drain bubble per
+        destination instead of one per chunk.
         """
         t0 = time.perf_counter()
         fused_trained = fused_tokens = fused_fallback = 0
-        for item in items:
+        state = self._train_step_state
+        calls = group_pipeline_calls(
+            items, merge=getattr(self, "_stream_merge_calls", True)
+        )
+        prof = os.environ.get("THUNDERSYNC_LEARNER_PROF")
+        tprof = os.environ.get("THUNDERSYNC_LEARNER_TORCHPROF")
+        for call in calls:
+            call_items = [items[i] for i in call]
+            first = call_items[0]
             bucket = (
                 None
-                if item["group"] is None
-                else StreamBucket(group=item["group"], reward=item["reward"])
+                if first["group"] is None
+                else StreamBucket(group=first["group"], reward=first["reward"])
             )
             # Chunks smaller than a micro-batch run as one micro-batch of exactly
             # their rows (no dummy rows); larger chunks arrive padded to a
             # multiple of the configured size and use it. Keeping the configured
             # size bounds memory and matches the synchronous trainer's numerics
             # (Megatron fp32 gradients shift ~1e-4 with micro-batch size).
-            state = self._train_step_state
             step_mbs = state["mbs"]
-            state["mbs"] = min(item["data"].size, step_mbs)
-            prof = os.environ.get("THUNDERSYNC_LEARNER_PROF")
+            mbs_per_item = [min(it["data"].size, step_mbs) for it in call_items]
             if prof:
                 torch.cuda.synchronize()
-                t_item = time.perf_counter()
-            tprof = os.environ.get("THUNDERSYNC_LEARNER_TORCHPROF")
-            adv0 = item["data"].get("advantages")
-            if adv0 is None or bool((adv0 != 0).any()):
-                self._n_items = getattr(self, "_n_items", 0) + 1
-            fused_key = item.get("fused_key")
+                t_call = time.perf_counter()
+            for it in call_items:
+                adv0 = it["data"].get("advantages")
+                if adv0 is None or bool((adv0 != 0).any()):
+                    self._n_items = getattr(self, "_n_items", 0) + 1
+            fused_key = first.get("fused_key")
+            assert fused_key is None or len(call_items) == 1
             graph = None if fused_key is None else self._fused_graphs.pop(fused_key)
             graph_tokens = 0 if graph is None else graph.num_tokens
             # A key without a graph (over the budget, or dropped) trains normally.
@@ -248,9 +306,8 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             del graph  # only the substitute forward holds it now
             try:
                 with substitute:
-                    self._stream_train_item(item, bucket, tprof)
+                    self._stream_train_call(call_items, mbs_per_item, bucket, tprof)
             finally:
-                state["mbs"] = step_mbs
                 # Frees the graph's activations also when no forward ran (a
                 # zero-advantage row skipped by the worker).
                 del substitute
@@ -259,12 +316,16 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             fused_fallback += outcome.fallback
             if prof:
                 torch.cuda.synchronize()
-                d = item["data"]
-                adv = d.get("advantages")
-                nz = int((adv.abs().sum(-1) > 0).sum()) if adv is not None else -1
+                rows = sum(it["data"].size for it in call_items)
+                nz = 0
+                for it in call_items:
+                    adv = it["data"].get("advantages")
+                    nz += int((adv.abs().sum(-1) > 0).sum()) if adv is not None else 0
+                shapes = [tuple(it["data"]["input_ids"].shape) for it in call_items]
                 print(
-                    f"[learner prof] rank={self.rank} rows={d.size} nonzero={nz} "
-                    f"len={tuple(d['input_ids'].shape)} secs={time.perf_counter() - t_item:.4f}",
+                    f"[learner prof] rank={self.rank} chunks={len(call_items)} "
+                    f"rows={rows} nonzero={nz} shapes={shapes} "
+                    f"secs={time.perf_counter() - t_call:.4f}",
                     flush=True,
                 )
         if closes:
@@ -275,19 +336,25 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         acc = self._train_step_state["grad_stream"]
         return {
             "num_items": len(items),
+            "num_calls": len(calls),
             "open_buffers": acc.num_open_buffers(),
             "fused_trained": fused_trained,
             "fused_tokens": fused_tokens,
             "fused_fallback": fused_fallback,
         }
 
-    def _stream_train_item(
-        self, item: dict[str, Any], bucket: StreamBucket | None, tprof: str | None
+    def _stream_train_call(
+        self,
+        call_items: list[dict[str, Any]],
+        mbs_per_item: list[int],
+        bucket: StreamBucket | None,
+        tprof: str | None,
     ) -> None:
-        """``train_microbatch`` on one streamed item (optionally under the profiler)."""
+        """``train_microbatches`` on one call's items (optionally under the profiler)."""
+        datas = [it["data"] for it in call_items]
         if (
             tprof
-            and getattr(self, "_n_items", 0) == int(tprof)
+            and getattr(self, "_n_items", 0) >= int(tprof)
             and not getattr(self, "_tprof_done", False)
         ):
             self._tprof_done = True
@@ -296,10 +363,13 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             with profile(
                 activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]
             ) as tp:
-                self.train_microbatch(item["data"], stream_bucket=bucket)
+                self.train_microbatches(
+                    datas, stream_bucket=bucket, micro_batch_sizes=mbs_per_item
+                )
                 torch.cuda.synchronize()
             print(
-                f"[learner torchprof] shape={tuple(item['data']['input_ids'].shape)}\n"
+                f"[learner torchprof] shapes="
+                f"{[tuple(d['input_ids'].shape) for d in datas]}\n"
                 + tp.key_averages().table(
                     sort_by="cpu_time_total",
                     row_limit=30,
@@ -308,7 +378,9 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 flush=True,
             )
         else:
-            self.train_microbatch(item["data"], stream_bucket=bucket)
+            self.train_microbatches(
+                datas, stream_bucket=bucket, micro_batch_sizes=mbs_per_item
+            )
 
     def stream_finish_step(self) -> dict[str, Any]:
         """Barrier: write back, normalize, DP-reduce, clip, step."""

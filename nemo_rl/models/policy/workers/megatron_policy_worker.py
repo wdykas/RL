@@ -13,6 +13,7 @@
 # limitations under the License.
 import copy
 import gc
+import itertools
 import logging
 import os
 import re
@@ -173,6 +174,17 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
 )
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
+
+
+@dataclass
+class _TrainPiece:
+    """One DP slice prepared for a pipeline call (see ``train_microbatches``)."""
+
+    data_iterator: Iterator[Any]
+    num_microbatches: int
+    micro_batch_size: int
+    padded_seq_length: int
+    use_router_replay: bool
 
 
 def _should_use_router_replay(
@@ -1627,6 +1639,11 @@ class MegatronPolicyWorkerImpl(
             # streaming chunks the controller has fed into this optimizer step
             # so far.
             "num_chunks": 0,
+            # ``forward_backward_func`` invocations this step. Equals
+            # num_chunks unless train_microbatches runs several slices per
+            # call (pipeline-parallel streaming); each call pays one pipeline
+            # fill/drain bubble.
+            "num_pipeline_calls": 0,
             "draft_step_state": DraftStepState(),
             # Trajectory-level gradient streaming (see grad_streaming.py);
             # None unless begin_train_step was given a GradStreamingSpec.
@@ -1812,12 +1829,52 @@ class MegatronPolicyWorkerImpl(
         Multimodal validity-mask and model-owned packing/CP behavior match the
         regular ``train`` path.
         """
+        self.train_microbatches([data], stream_bucket=stream_bucket)
+
+    @wrap_with_nvtx_name("megatron_policy_worker/train_microbatches")
+    def train_microbatches(
+        self,
+        datas: list[BatchedDataDict[Any]],
+        stream_bucket: Optional[StreamBucket] = None,
+        micro_batch_sizes: Optional[list[int]] = None,
+    ) -> None:
+        """Several DP slices → ONE ``forward_backward_func`` invocation.
+
+        Equivalent to ``train_microbatch`` on each slice in order (same
+        micro-batches, same normalization counts, same zero-advantage
+        skipping per slice), except that all their micro-batches run in a
+        single pipeline schedule call. Under pipeline parallelism every call
+        pays a fill/drain bubble of ``P - 1`` micro-batch slots, so k calls of
+        m micro-batches each idle for ``k (P - 1)`` slots and one call of
+        ``k m`` micro-batches for ``P - 1``. The gradient differs from k
+        separate calls only in fp32 rounding (Megatron scales each
+        micro-batch's loss by ``M / M`` with M the call's micro-batch count).
+
+        All slices share one gradient destination: ``stream_bucket`` (one
+        open-group bucket) or the batch gradient (final advantages). The
+        gradient is captured once, after the call.
+
+        Micro-batches of different shapes (row count, padded sequence length)
+        share a call only under ``config.variable_seq_lengths``, which this
+        method switches on for the call when PP > 1 and the shapes differ
+        (each pipeline send then exchanges its shape first).
+
+        Args:
+            datas: DP slices, each as ``train_microbatch`` takes it.
+            stream_bucket: see ``train_microbatch``.
+            micro_batch_sizes: micro-batch size per slice (default: the
+                step's ``mbs`` for every slice).
+        """
         state = self._assert_step_open()
         grad_stream: Optional[StreamingGroupAccumulator] = state["grad_stream"]
         if stream_bucket is not None and grad_stream is None:
             raise ValueError(
                 "train_microbatch got a stream_bucket but the step was opened "
                 "without grad_streaming"
+            )
+        if micro_batch_sizes is not None and len(micro_batch_sizes) != len(datas):
+            raise ValueError(
+                f"{len(micro_batch_sizes)} micro_batch_sizes for {len(datas)} slices"
             )
         if grad_stream is not None:
             # Reject before backward: in the in-place mode (max_open_groups=0)
@@ -1829,7 +1886,26 @@ class MegatronPolicyWorkerImpl(
             if stream_bucket is not None:
                 seqs_before = state["local_valid_seqs"].clone()
                 toks_before = state["local_valid_toks"].clone()
-            self._train_microbatch_body(state, data)
+            # With zero-advantage skipping, an all-zero slice is dropped
+            # without a forward when another slice of the call runs (the call
+            # reports this step's metrics); see _drop_zero_advantage_rows.
+            call_has_live = state["skip_zero_advantage_rows"] and any(
+                bool(self._live_rows(d).any()) for d in datas
+            )
+            pieces = [
+                self._prepare_train_piece(
+                    state,
+                    data,
+                    state["mbs"] if micro_batch_sizes is None else micro_batch_sizes[i],
+                    call_has_live=call_has_live,
+                )
+                for i, data in enumerate(datas)
+            ]
+            pieces = [p for p in pieces if p is not None]
+            for call, variable_shapes in (
+                self._pipeline_call_groups(pieces) if pieces else []
+            ):
+                self._run_train_pieces(state, call, variable_shapes)
             if stream_bucket is not None:
                 counts = state["grad_stream_group_counts"]
                 prev_seqs, prev_toks = counts.get(stream_bucket.group, (0.0, 0.0))
@@ -1863,25 +1939,42 @@ class MegatronPolicyWorkerImpl(
                 )
             raise
 
+    @staticmethod
+    def _live_rows(data: BatchedDataDict[Any]) -> torch.Tensor:
+        """Rows with a nonzero advantage on some valid token (bool per row)."""
+        sample_mask = data["sample_mask"]
+        token_mask = data["token_mask"][:, 1:] * sample_mask.unsqueeze(-1)
+        return (data["advantages"][:, 1:] * token_mask).ne(0).any(dim=-1)
+
     def _drop_zero_advantage_rows(
-        self, data: BatchedDataDict[Any]
+        self,
+        data: BatchedDataDict[Any],
+        mbs: Optional[int] = None,
+        call_has_live: bool = False,
     ) -> tuple[Optional[BatchedDataDict[Any]], torch.Tensor, torch.Tensor]:
         """Keep only rows with a nonzero advantage on some valid token.
 
         Returns the kept rows (``None`` if there are none) and their valid
         sequence/token counts. The kept set is topped up with dropped rows to
-        a multiple of the microbatch size: fixed-size microbatching would
-        otherwise discard the remainder, and a zero-advantage row adds exactly
-        zero gradient.
+        a multiple of the microbatch size (``mbs``, default the step's): fixed-
+        size microbatching would otherwise discard the remainder, and a
+        zero-advantage row adds exactly zero gradient.
+
+        ``call_has_live``: another slice of the same pipeline call has live
+        rows, so the call reports metrics and an all-zero slice is dropped
+        outright.
 
         Only reached with expert parallelism off (``skip_zero_advantage_rows``
         is forced off under EP), so ranks may run different forward counts.
         """
         sample_mask = data["sample_mask"]
         token_mask = data["token_mask"][:, 1:] * sample_mask.unsqueeze(-1)
-        live = (data["advantages"][:, 1:] * token_mask).ne(0).any(dim=-1)
+        live = self._live_rows(data)
         keep = torch.nonzero(live).flatten().tolist()
         state = self._train_step_state
+        if not keep and call_has_live:
+            zero = torch.zeros((), dtype=torch.float64, device="cuda")
+            return None, zero, zero
         if not keep:
             # Every rank reports at least one per-microbatch metric entry per
             # step, so the step's metric schema does not depend on how chunks
@@ -1895,7 +1988,7 @@ class MegatronPolicyWorkerImpl(
                     state["all_mb_metrics"].append(filler)
                 zero = torch.zeros((), dtype=torch.float64, device="cuda")
                 return None, zero, zero
-        mbs = state["mbs"]
+        mbs = state["mbs"] if mbs is None else mbs
         pad = -len(keep) % mbs if keep else min(mbs, data.size)
         if pad:
             dropped = torch.nonzero(~live).flatten().tolist()
@@ -1924,9 +2017,25 @@ class MegatronPolicyWorkerImpl(
         state: dict[str, Any],
         data: BatchedDataDict[Any],
     ) -> None:
+        """One slice, one ``forward_backward_func`` call (no capture)."""
+        piece = self._prepare_train_piece(state, data, state["mbs"])
+        if piece is not None:
+            self._run_train_pieces(state, [piece])
+
+    def _prepare_train_piece(
+        self,
+        state: dict[str, Any],
+        data: BatchedDataDict[Any],
+        mbs: int,
+        call_has_live: bool = False,
+    ) -> Optional["_TrainPiece"]:
+        """Count one slice for normalization and build its micro-batch iterator.
+
+        Returns ``None`` when zero-advantage skipping drops the whole slice
+        (its tokens are still counted).
+        """
         state["num_chunks"] += 1
         self._log_gpu_mem("chunk_enter")
-        loss_fn = state["loss_fn"]
 
         # Accumulate local mask sums for the finish-time all_reduce.
         # Inlined from process_global_batch (data.py:319-332) — we can't
@@ -1951,10 +2060,10 @@ class MegatronPolicyWorkerImpl(
         # their tokens in the normalization counted above.
         if state["skip_zero_advantage_rows"]:
             data, call_local_seqs, call_local_toks = self._drop_zero_advantage_rows(
-                data
+                data, mbs, call_has_live
             )
             if data is None:
-                return
+                return None
         state["trained_valid_seqs"] = state["trained_valid_seqs"] + call_local_seqs
         state["trained_valid_toks"] = state["trained_valid_toks"] + call_local_toks
 
@@ -1988,27 +2097,121 @@ class MegatronPolicyWorkerImpl(
                 state["local_valid_toks"].item(),
             )
 
-        # Build the per-call iterator. Each ``train_microbatches_from_meta``
-        # call carries one DP slice; the iterator subdivides into pipeline
-        # microbatches.
+        # Build the per-slice iterator. Each slice is subdivided into pipeline
+        # microbatches; ``_run_train_pieces`` chains the slices of one call.
         attach_media_token_validity_mask(data, self.media_placeholder_token_id)
         (
             data_iterator,
             num_microbatches,
             micro_batch_size,
-            seq_length,
+            _seq_length,
             padded_seq_length,
         ) = get_microbatch_iterator(
             data,
             self.cfg,
-            state["mbs"],
+            mbs,
             straggler_timer=self.mcore_state.straggler_timer,
             delegate_pack_to_model=self.delegate_pack_to_model,
             delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
             model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
             mtp_enabled=self.mtp_enabled,
         )
-        state["total_num_microbatches"] += int(num_microbatches)
+        use_router_replay = _should_use_router_replay(
+            enabled=self._router_replay_enabled,
+            data=data,
+            stage="train",
+            require=True,
+        )
+        return _TrainPiece(
+            data_iterator=data_iterator,
+            num_microbatches=int(num_microbatches),
+            micro_batch_size=int(micro_batch_size),
+            padded_seq_length=int(padded_seq_length),
+            use_router_replay=bool(use_router_replay),
+        )
+
+    def _pipeline_call_groups(
+        self, pieces: list["_TrainPiece"]
+    ) -> list[tuple[list["_TrainPiece"], bool]]:
+        """Split ``pieces`` into pipeline calls: ``[(pieces, variable_shapes)]``.
+
+        Pipeline stages receive activations into buffers of the call's fixed
+        shape ``(seq_length, micro_batch_size, hidden)`` unless
+        ``config.variable_seq_lengths`` is set, in which case every send first
+        exchanges its shape. Pieces of one shape (or any pieces at PP = 1,
+        which sends nothing) form one call. Pieces of different shapes under
+        PP > 1 form one call with ``variable_seq_lengths`` switched on for it,
+        except with the ``allgather`` MoE token dispatcher, which Megatron's
+        TransformerConfig rejects together with ``variable_seq_lengths``: those
+        fall back to one call per piece (the previous behavior).
+        """
+        shapes = {(p.micro_batch_size, p.padded_seq_length) for p in pieces}
+        pp = self.cfg["megatron_cfg"].get("pipeline_model_parallel_size", 1) or 1
+        model_config = getattr(self.model, "config", None)
+        if len(shapes) == 1 or pp == 1:
+            return [(pieces, False)]
+        if model_config is not None and getattr(
+            model_config, "variable_seq_lengths", False
+        ):
+            return [(pieces, False)]  # already exchanging shapes
+        if (
+            model_config is None
+            or getattr(model_config, "moe_token_dispatcher_type", None) == "allgather"
+        ):
+            if not getattr(self, "_warned_split_shapes", False):
+                self._warned_split_shapes = True
+                warnings.warn(
+                    "train_microbatches: micro-batches of different shapes run as "
+                    "separate pipeline calls (variable_seq_lengths is not "
+                    "available with this model config); each call pays a "
+                    "pipeline bubble"
+                )
+            return [([p], False) for p in pieces]
+        if not getattr(self, "_warned_variable_shapes", False):
+            self._warned_variable_shapes = True
+            warnings.warn(
+                "train_microbatches: micro-batches of different shapes share one "
+                "pipeline call via config.variable_seq_lengths; untested end to "
+                "end on GPU (see research/thundersync_rl/tests/functional/"
+                "check_equivalence.py at PP=2)"
+            )
+        return [(pieces, True)]
+
+    @contextmanager
+    def _variable_seq_lengths(self, enabled: bool) -> Iterator[None]:
+        """Set ``config.variable_seq_lengths`` for one pipeline call."""
+        model_config = getattr(self.model, "config", None)
+        if not enabled or model_config is None:
+            yield
+            return
+        model_config.variable_seq_lengths = True
+        try:
+            yield
+        finally:
+            model_config.variable_seq_lengths = False
+
+    def _run_train_pieces(
+        self,
+        state: dict[str, Any],
+        pieces: list["_TrainPiece"],
+        variable_shapes: bool = False,
+    ) -> None:
+        """Run every micro-batch of ``pieces`` in one ``forward_backward_func`` call."""
+        loss_fn = state["loss_fn"]
+        num_microbatches = sum(p.num_microbatches for p in pieces)
+        state["total_num_microbatches"] += num_microbatches
+        state["num_pipeline_calls"] += 1
+        use_router_replay = pieces[0].use_router_replay
+        if any(p.use_router_replay != use_router_replay for p in pieces):
+            raise ValueError(
+                "slices of one train_microbatches call disagree on router replay"
+            )
+        if len(pieces) == 1:
+            data_iterator = pieces[0].data_iterator
+        else:
+            data_iterator = itertools.chain.from_iterable(
+                p.data_iterator for p in pieces
+            )
 
         loss_post_processor = LossPostProcessor(
             loss_fn=loss_fn,
@@ -2026,18 +2229,13 @@ class MegatronPolicyWorkerImpl(
         placeholder_n = torch.tensor(1.0, device="cuda")
 
         draft_enabled = "draft" in self.cfg and self.cfg["draft"].enabled
-        use_router_replay = _should_use_router_replay(
-            enabled=self._router_replay_enabled,
-            data=data,
-            stage="train",
-            require=True,
-        )
 
         # The critical wrap: hooks fire (accumulate main_grad) but the
         # per-call reduce dispatch is gated off.
         with (
             maybe_r3_trace_stage("train", enabled=use_router_replay),
             self.model.no_sync(),
+            self._variable_seq_lengths(variable_shapes),
         ):
             rerun_state_machine = get_rerun_state_machine()
             while rerun_state_machine.should_run_forward_backward(data_iterator):
@@ -2045,8 +2243,8 @@ class MegatronPolicyWorkerImpl(
                     model=self.model,
                     data_iterator=data_iterator,
                     num_microbatches=num_microbatches,
-                    seq_length=padded_seq_length,
-                    mbs=micro_batch_size,
+                    seq_length=max(p.padded_seq_length for p in pieces),
+                    mbs=max(p.micro_batch_size for p in pieces),
                     post_processing_fn=loss_post_processor,
                     forward_only=False,
                     defer_fp32_logits=self.defer_fp32_logits,
