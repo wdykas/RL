@@ -1563,6 +1563,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             return False
         static, filled, weight = copy["static"], copy["filled"], copy["weight"]
         dbg = {"kernel": 0, "rows": 0, "rejected": 0}
+        probe = os.environ.get("THUNDERSYNC_ENGINE_Q_CHECK") == "1"
         debug = bool(os.environ.get("THUNDERSYNC_HIDDEN_DEBUG"))
 
         sampling = engine.controller._sampling
@@ -1599,12 +1600,14 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             out = inner(logits, n, context, **kw)
             if not entries:
                 return out
-            # Source check: a logged row must reproduce the logit of the token
-            # the engine sampled from it (one dot product per row). In ~2% of
-            # decode graph replays one row of the buffer is stale (measured);
-            # such rows are not recorded, so their drafts are truncated there
-            # (HiddenLog.pop returns the longest logged prefix).
-            if logits is not None and torch.is_tensor(logits):
+            # Source check (THUNDERSYNC_ENGINE_Q_CHECK=1 only: its .tolist() is
+            # a GPU->CPU sync per decode step): a logged row must reproduce
+            # 16 probe logits of the row the engine sampled from. Rows follow
+            # the controller's async-schedule compaction (compact() below), so
+            # the check should never reject; rejected rows are not recorded and
+            # their drafts are truncated there (HiddenLog.pop returns the
+            # longest logged prefix).
+            if probe and logits is not None and torch.is_tensor(logits):
                 rows_t = torch.tensor([r for r, _, _ in entries], device=static.device)
                 lg = logits.reshape(-1, logits.shape[-1])
                 w = weight
@@ -1630,6 +1633,25 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             return out
 
         sampling.sample_kernel = logging_kernel
+
+        # Under async scheduling the controller launches the next forward
+        # before finished requests are resolved, then compacts the surviving
+        # rows and reorders the pending logits to match
+        # (``_compact_async_sched_logits``). Apply the same permutation to the
+        # hidden-copy buffer, on the same stream, so row i of the buffer stays
+        # the hidden state of logits row i.
+        controller = engine.controller
+        orig_compact = controller._compact_async_sched_logits
+
+        def compact(survivor_idxs, *args, **kwargs):
+            n = survivor_idxs.numel()
+            if n and not torch.equal(
+                survivor_idxs, torch.arange(n, device=survivor_idxs.device)
+            ):
+                static[:n].copy_(static[survivor_idxs.to(static.device)])
+            return orig_compact(survivor_idxs, *args, **kwargs)
+
+        controller._compact_async_sched_logits = compact
         self._hidden_log = log
         return True
 
