@@ -1293,11 +1293,15 @@ plain forward. Drafts are single-version (`draft_lookahead=1`), so every drafted
 anchor is exactly the drafter's logged route.
 
 **Engine (drafter) side** (`worker.py`, `routes.py`). With sticky routing every MoE router's
-MCore `RouterReplay` is in RECORD with a static [max_tokens, L, K] int16 buffer, armed before
-the engine captures its CUDA graphs (the copy is part of the captured router), recording only
-in inference forwards. `install_draft_route_log` wraps the controller's
-`_dynamic_step_forward_logits` (Python on every forward, graphed or eager, legacy or async
-scheduling): it snapshots the step's token layout from the context's CPU bookkeeping at launch
+MCore `RouterReplay` is in RECORD, armed before the engine captures its CUDA graphs, recording
+only in inference forwards. The model's `moe_enable_routing_replay` makes MCore's dynamic
+context bind each router's record buffer per step: its `routing_indices_buffer` on CUDA-graph
+steps (the copy is part of the captured router), none on eager steps (the top-k stays in
+`recorded_topk_idx`); the route log reads each forward's routes from that binding
+(`_step_routes`). The engine runs with legacy scheduling (MCore rejects routing replay under
+async scheduling). `install_draft_route_log` wraps the controller's
+`_dynamic_step_forward_logits` (Python on every forward, graphed or eager): it snapshots the
+step's token layout from the context's CPU bookkeeping at launch
 (slot and absolute position of each token, i.e. the forward being launched) and, after the
 launch, enqueues one asynchronous copy of the tagged tokens' route rows to pinned memory
 (`RouteLog`, keyed by draft key and absolute position, so eviction re-prefills overwrite the
@@ -1306,7 +1310,8 @@ be off). Pipeline stages log their layers, sequence-parallel TP ranks their toke
 `pop_draft_routes` returns (layer numbers, positions, rows) and the driver merges them into a
 dense [P+g, L, K] anchor tensor (`merge_route_parts`), draft tuple index 8. Drafts are cut to
 the tokens whose anchors are all logged (`anchored_draft_length`: g tokens need positions
-0..P+g−2). Cost: L·K·2 B per token (768 B at 48 layers × top-8) through the driver.
+0..P+g−2), before their hidden states are popped, so hidden rows always match the kept tokens
+(`_pop_logs`). Cost: L·K·2 B per token (768 B at 48 layers × top-8) through the driver.
 
 **Learner side.** Every forward that defines p_k applies the rule with the same anchors:
 the verification forward (`_training_forward_rows(..., anchors=...)`, through NeMo RL's
@@ -1339,6 +1344,17 @@ is biased.
 verify_source=engine (BI), draft_lookahead=1, max_rollout_turns=1, no tail_lookup, no
 engine prefix caching, no R3 router replay, an MoE model (the engine must report a route
 log, else the driver raises).
+
+**Checks** (`scripts/bi_tp/sticky_moe.sh`, `THUNDERSYNC_ENGINE_Q_CHECK=1`
+`THUNDERSYNC_MISMATCH_CHECK=1`). Mismatch 0 compares the learner with itself under the same
+anchors, so the launcher also asserts that the checks are not vacuous: drafts are accepted
+every step after the first; the weights change every step (`mismatch/param_checksum`;
+expert-gradient noise on every model, since zero-reward runs do not update); the anchors of
+every draft equal a fresh engine prefill of the same rows at the drafting weights
+(`[route check]`, `spec/route_check_exact == spec/route_check_tokens > 0`: catches a route
+log mapped to the wrong slot or position); and the rule changed routes against plain top-k
+(`[sticky check]` `differs_from_plain > 0`). These prove numerics; the output law of the
+scheme rests on the enumeration tests (`test_routes.py`).
 
 **Cost and open issues.** No extra learner FLOPs beyond the verification forwards of
 continuation rounds. The engine refit waits for the continuation rounds, so rollouts no
