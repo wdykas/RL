@@ -611,6 +611,7 @@ policy.make_sequence_length_divisible_by=128
 | `draft_budget` | Maximum new tokens per draft |
 | `merge_pipeline_calls` | One pipeline schedule call per dispatch and gradient destination (default `true`; section 2) |
 | `sticky_routing` / `sticky_routing_delta` | MoE: sticky routing anchored to the drafter (section 14c); off by default, δ 0.03 router-logit units |
+| `null_bv` / `null_bv_drafts_per_output` / `null_bv_logratio_var` / `null_bv_fixed_m` | Pooled null-augmented block verification (section 14d): K·G drafts per group, first G non-⊥ outputs in drafting order; off by default, K 1.5, DP envelope at v 8e-7 unless a fixed M is given |
 | `min_pipeline_microbatches` | Hold closed-group rows until this many micro-batches per learner rank are queued; flushed when rollouts end (`null`: 2·PP if PP > 1, else 0) |
 
 Debug switches: `THUNDERSYNC_SPEC_PROF` (verification timing), `THUNDERSYNC_SPEC_CHECK`
@@ -638,6 +639,7 @@ hidden states and print how many drafted tokens' log q match the engine bitwise)
 | `thundersync_rl/worker.py` | Megatron worker extension: streaming train calls, scorer build and refresh, weight stashes, stashed block verification, draft streams |
 | `thundersync_rl/block_verification.py` | Reference block verification, shared acceptance helpers, exact output law |
 | `thundersync_rl/block_verification_fused.py` | Block verification from raw logits with a Triton residual-mass kernel; lazy variant from per-position statistics |
+| `thundersync_rl/null_bv.py` | Pooled ⊥-BV: envelope policy (DP over drafts/slots left, Brownian tail-decode model), per-prompt slot state (section 14d) |
 | `thundersync_rl/routes.py` | Sticky routing: engine route log, per-rank route merge, anchors (section 14c); rule in `nemo_rl/models/megatron/sticky_routing.py` |
 | `thundersync_rl/engine_q.py` | Engine-sourced q under BI: engine hidden-state log, per-step row mapping, verification from engine log q + rows on demand |
 | `thundersync_rl/logit_free.py` | `ChunkedHead`: LM-head statistics from hidden states in fixed row chunks, rows recomputed on demand |
@@ -1346,6 +1348,99 @@ weight delta toggled per chunk, would restore the overlap; not built yet). Multi
 the engine: sticky replay in engine prefill, not built yet) and a horizon c below the rollout
 cap (same engine feature) are not built yet.
 
+## 14d. Pooled null-augmented block verification (`thundersync.null_bv`)
+
+*Opt-in, off by default. Unit-tested (exact enumeration, CPU + GPU worker path); the 4-GPU
+exactness run is `scripts/bi_tp/null_bv_moe.sh` (status: see the implementation notes).*
+Scheme and measurements: `thundersync_work/research/agent_multi_draft.md`; implementation notes:
+`thundersync_work/research/agent_null_bv_impl.md`.
+
+**Why.** The step waits on the earliest rejection among the ~40 longest drafts. Any exact
+single-draft verifier has P(reject before t) ≥ TV(prefix_t), and block verification puts ~30% of
+its rejections in the first 10% of a draft (`agent_multi_draft.md` §2.4). ⊥-BV lets a draft be
+*discarded at the root* instead: with K ≈ 1.5–2 drafts per output, outputs needing a tail decode
+drop from .12 to 8e-4 (M = 1.5) at 32k on real Qwen3-30B-A3B L16 rows, and none of the measured
+ones rejects in the first half of the draft [measured offline, `agent_multi_draft.md`].
+
+**Rule.** Draft j of a prompt is block-verified (section 4) against the augmented target
+
+    p̂ = p/M ⊕ (1 − 1/M)·⊥        (⊥ = "no output", only possible at the first position; q(⊥) = 0)
+
+In section 4's notation: the first log-ratio gets −log M, so b_i = w_i / max(M, max_{u≤i} w_u)
+(w = prefix ratio p/q); r_i (i ≥ 1) is unchanged in form; the root residual is
+(p_1/M − q_1)₊ plus the ⊥ atom 1 − 1/M (so h_0 = 1). Outcomes: τ = g (whole draft), τ ≥ 1 with a
+residual token (prefix + token + a p tail, as today), τ = 0 with a vocabulary token (rare: a
+fresh-tail output), or ⊥ (nothing sampled, draft discarded). Since block verification is exact for
+any pair of autoregressive laws, the outcome is ⊥ with probability exactly 1 − 1/M and otherwise
+an exact p-sample [derived]. M = 1 is block verification bit for bit (`null_m` defaults to 1;
+the existing tests pass unchanged).
+
+**Pooling (fixed G).** The engine drafts N = max(G, round(K·G)) drafts per GRPO group
+(`null_bv_drafts_per_output` = K). Each prompt's drafts are decided in their drafting order (a
+fixed index order, chosen before verification); M_j = policy(drafts left d, slots left s) depends
+on counts only; the first G non-⊥ outputs fill the group's G slots; once the slots are full the
+remaining drafts are not decided; slots still empty when the drafts run out decode fresh from p.
+Exactness [derived; enumerated]: given the past, a decided draft's non-⊥ output is p-distributed,
+independent of the past, with success probability 1/M_j; M_j and the stopping rule are functions
+of the past counts, so the successes in index order are iid p (optional sampling) and the G slots
+are G iid p-samples. Forbidden (and not done): reordering drafts or choosing M_j by content
+(length, reward, acceptance). Group size G is unchanged (variable G is not built: it changes the
+GRPO recipe and needs the user's approval).
+
+**Envelope policy** (`null_bv.py`). A DP over (d, s) minimising the expected critical-path cost
+Σ P(tail decode)·E[tail/cap] + one full fresh decode per unfilled slot, with the per-success
+tail-decode probability from the Brownian model of log w (drift a²/2, variance a² = L·v, L = the
+rollout cap, v = `null_bv_logratio_var`, default 8e-7; validated against real rows in
+`agent_multi_draft.md` §2.3). M = 1 whenever d ≤ s. At v = 8e-7, cap 32k, G = 16, N = 24 it starts
+at M = 1.3 and falls to 1.1–1.0 as slots fill [derived]. `null_bv_fixed_m` replaces the DP by a
+constant (still 1 when d ≤ s).
+
+**Implementation.**
+- Samplers (`block_verification.py`, `block_verification_fused.py`, `engine_q.verify_engine_q`):
+  a `null_m` argument; the emitted id `NULL_TOKEN` (−1) is ⊥. Same generator calls (one
+  `rand(g+1)`, one `multinomial`, over V + 1 entries at a ⊥-capable root residual); eager, lazy and
+  engine-q paths are draw-for-draw identical (tested). Empty drafts are rejected by the sampler
+  and dropped from pools by the driver (⊥ lives at the first drafted position; emptiness is a
+  deadline fact, not a function of the tokens).
+- Worker (`verify_drafts_block_engine(null_groups, null_slots, null_policy)`): a prompt's rows
+  are owned by one data-parallel rank (hash of the group name; TP ranks of the replica decide in
+  lockstep as before) and decided in drafting order with a `NullGroup` state; rows after the
+  slots fill return `"null": "unused"`. All rows are still forwarded (EP lockstep counts are
+  fixed up front); skipping forwards of unused rows is not built yet.
+- Driver (`speculative.py`): `draft_streaming(prompts, null_slots)` records the slots of the next
+  step (the drafting order is the verification order); `verify` builds the pools and plans only
+  for outputs (in drafting order); rollouts without a plan decode fresh (exact). Sticky routing
+  composes unchanged: anchors stay per draft, and outputs with a rejection are completed by the
+  θ_{k−1} continuation rounds of section 14c.
+- Loop (`grpo_loop.py`): K·G drafts per group; ⊥-BV verification is one call before the rollouts
+  (chunked/overlapped publication of pools is not built yet).
+- Requirements (`validate_null_bv`): speculate, verify_mode=block, verify_source=engine,
+  verify_on=learner, draft_lookahead=1, no fused_verify_train, no tail_lookup.
+
+**Metrics** (per step): `spec/null_bot_frac` (⊥ / decided drafts), `spec/null_tail_frac`
+(outputs with a rejection, i.e. a tail decode / outputs), `spec/null_longest_min_reject_pos` and
+`_frac` (earliest rejection among the longest decile of decided drafts; −1 / 1.0 if none),
+`spec/null_drafts_per_output` (decided drafts / outputs), `spec/null_fresh_slots`,
+`spec/null_unused_drafts`, `spec/null_mean_m`, `spec/null_empty_dropped`, plus `spec/null_slots`,
+`spec/null_outputs`, `spec/null_drafts`; `spec/accepted_frac` and `spec/full_accept` are over
+outputs.
+
+**Tests** (`tests/unit/test_null_bv.py`, 25): per-draft law = p/M ⊕ (1−1/M)⊥ by exact enumeration
+(V = 3, L = 3, TV < 1e-12); joint law of the G = 2 slots from N = 5 drafts = p⊗p by exact
+enumeration for the DP, a fixed M = 2.5 and a count-adaptive d/s policy (TV < 1e-9), with a
+content-dependent-M control biased (TV > 1e-3); Monte Carlo through the worker's sampler and
+`NullGroup` (chi-square z = +0.2 on 63 dof, 12k groups) against the outcome-selection control
+(z = +164); eager/lazy/engine-q identity with ⊥; DP policy and the Brownian model against the
+report's numbers; config rejections; driver pools/plans/metrics/fresh slots; worker decisions on
+GPU against a reference loop [measured: all pass; full research suite 404 passed, the 7
+`test_streaming_pipeline.py` import errors are pre-existing].
+
+**Costs and open items.** K× engine draft decode and K× verification forwards (unused rows are
+forwarded too); no extra training work. Not built yet: chunked publication of pools, skipping
+forwards of unused drafts, multi-version (cohort) pools, the scorer path, variable G (needs
+approval). Not measured yet: acceptance/step time on a real MoE with K drafts (engine capacity is
+the price: `agent_multi_draft.md` §3).
+
 ## 15. Open work
 
 - **Stragglers.** About one rejected draft per step decodes its remainder at about 3 ms
@@ -1376,6 +1471,9 @@ cap (same engine feature) are not built yet.
 - **Sticky MoE routing on GPU** (section 14c). `scripts/bi_tp/sticky_moe.sh` on the tiny MoE
   (EP=2, expert-gradient noise) and on `qwen3-30b-a3b-L4`, A/B against `STICKY=0`; then the
   sparse-delta θ_{k−1} toggle so rollouts overlap verification again, and lookahead > 1.
+- **Pooled ⊥-BV on GPU** (section 14d). `scripts/bi_tp/null_bv_moe.sh` (tiny MoE, EP=2, K = 1.5,
+  M = 2) must read mismatch 0; then K/M sweeps on `qwen3-30b-a3b-L4` for ⊥ fraction, tail-decode
+  fraction and earliest rejection among the longest drafts.
 - **Fused verification + training on GPU.** Validate `fused_verify_train` end to end
   (`THUNDERSYNC_FUSED_CHECK=1`, gradient against the unfused path) and measure the saved
   learner time on short-output tasks (section 14).
