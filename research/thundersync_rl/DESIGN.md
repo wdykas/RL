@@ -1208,12 +1208,17 @@ Bug found on the way: MCore `BatchInvariantRMSNormFn.backward` multiplies its se
 term by the norm weight once more (exact only for w = 1); with Qwen3's q/k norm weights the
 gradient norm was ~100x too large (RL grad_norm 15-28, then NaN).
 
-**MoE** (`nemo_rl/models/megatron/fp16_moe.py`). Training `TEGroupedMLP` and the engine's
-`InferenceGroupedMLP` run one Triton grouped GEMM: rows grouped by expert, each expert's
-rows padded to 64, fixed 64x128x64 tiles, fp16 x fp16 products accumulated and emitted in
-fp32, the bf16 expert weights read in place (converted to fp16 in registers). A row's result
-depends only on the row and its expert (batch invariant; checked bitwise across batch
-layouts, and under CUDA-graph replay). SwiGLU-with-probs in fp32 (same eager ops on both
+**MoE** (`nemo_rl/models/megatron/fp16_moe.py`). Expert GEMMs form fp16 x fp16 products and
+accumulate K serially in fp32, emitted in fp32, so a row's result depends only on the row and
+its expert (batch invariant). Two implementations give identical bits (measured at 500B-MoE
+expert shapes, 1-1024 rows per expert): the engine's `InferenceGroupedMLP` runs a Triton grouped
+GEMM (rows grouped by expert and padded to the tile's BLOCK_M, bf16 weights converted to fp16 in
+registers, CUDA-graph safe; tiles tuned per rows-per-expert bucket), and training's
+`TEGroupedMLP` runs one cuBLAS GEMM per expert without split-K on cached fp16 weight copies
+(invalidated after every optimizer step), about 4x faster than the Triton kernel at training
+shapes. Speeds at hidden 7168 / expert FFN 2048 (8 local experts): engine decode 1.4-1.5x the
+bf16 cuBLAS grouped GEMM at <=16 rows per expert, 2.7-3.8x at 128-256 rows (TE's device-metadata
+grouped GEMM gives the same bits ~1.9x faster there; not wired yet). SwiGLU-with-probs in fp32 (same eager ops on both
 sides). Router logits fp32 through the exact fp32 GEMM. Combine: the engine sums a token's
 local experts in fp64 in ascending expert order and rounds the rank partial to fp32 (as
 Megatron's batch-invariant training unpermute), then MCore's `ordered_reduce_scatter_v`
@@ -1222,9 +1227,8 @@ rows bit-cast through MCore's bf16 NVLS buffers (a copy); training dispatches fp
 Backward per expert on bf16 casts. Tiny Qwen3-MoE (8 experts, top-2): grad norm 0.177897
 vs fp32 reference 0.177899 (bf16 baseline 0.178224). EP=2, 4 steps, checks on: mismatch 0,
 engine-q exact, 0 dropped; the random tiny model gets reward 0, so no weight changes and
-both this run and the bf16 control keep 100% (acceptance is not measurable on it). The
-engine's MoE step is 2-4x slower than the bf16 vLLM kernel at decode (64-row expert
-padding, untuned kernel, fp64 combine): drafts are shorter within the same window.
+both this run and the bf16 control keep 100% (acceptance is not measurable on it). Training cuBLAS
++ engine Triton at EP=2, 4 steps: mismatch 0, engine-q exact, 0 dropped.
 Qwen3-30B-A3B at EP=2 on 2 + 2 GPUs does not fit (about 15B parameters per training GPU
 with bf16 weights, fp32 grads, masters and Adam state: ~270 GB).
 
