@@ -1284,8 +1284,28 @@ p_k = F(θ_k; A): at each token and MoE layer, with router scores s (θ_k) and a
 keep A if min_{e∈A} s_e ≥ max_{e∉A} s_e − δ, else plain top-k
 (`nemo_rl/models/megatron/sticky_routing.py`; δ in router-logit units for softmax routers,
 default 0.03, which measured the same as 0.1 and pure replay on Qwen3-30B-A3B). Kept anchors
-are ordered by the current scores, so F(θ; plain_topk(θ)) is bitwise the plain forward.
+are ordered by the current scores; an anchor set equal to the plain set is returned in the
+plain top-k's own order, so F(θ; plain_topk(θ)) is bitwise the plain forward also where
+MCore's top-k is unsorted (no-grad forwards without BI) or has exact ties (the normalization
+sums over k in index order; a reordered set changed probability bits before this rule).
 An anchor row with a negative or repeated id means "self" (plain top-k).
+
+**Sigmoid routers with an expert bias (Nemotron-H, DeepSeek-V3 class).** MCore selects on
+sigmoid(logits) + expert_bias and gathers the unbiased sigmoid at the selected experts, then
+normalizes over top-k and scales. The rule runs on the biased selection scores (δ in
+sigmoid-score units), MCore computes the probabilities itself. Group-limited top-k: the plain
+set is MCore's group-limited one and the keep test compares against every expert outside the
+anchor set (conservative). The expert bias is part of θ (frozen under NeMo-RL's GRPO default
+`moe_router_bias_update_rate: 0`; if updated between steps it is simply part of θ_k). The fused
+TE router (`moe_router_fusion`) bypasses RouterReplay and is rejected with sticky routing.
+Unit test `tests/unit/test_sticky_hybrid.py` (Nano router: 128 experts, top-6, scale 2.5; with
+and without groups; sparse and dense paths; sorted/unsorted; ties): anchors = plain top-k is
+bitwise plain. **Hybrid models** (HybridModel pattern strings): MoE layers are the 'E'
+positions of the main pattern (`router_replay._global_moe_layer_numbers`; before, moe_layer_freq
+was assumed and Nano counted 52 MoE layers instead of 23, so learner anchors and engine route
+logs disagreed in shape). Non-gated squared-ReLU experts run on the fp16 expert path
+(`fp16_moe.relu2_probs`, same eager fp32 function in training and engine); shared experts are
+dense TE MLPs on the fp16 GEMM path. Engine side for hybrids untested on GPU.
 
 **Anchor schedule (exogenous).** A at position t = the plain θ_{k−1} forward's top-k on the
 rollout's own prefix, for every position up to the rollout cap c = prompt + min(max_new_tokens,

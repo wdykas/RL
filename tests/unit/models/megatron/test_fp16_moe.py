@@ -93,8 +93,20 @@ def test_validate_model():
         activation_func = torch.nn.functional.silu
 
     assert fm.validate_model(Cfg()) == []
+    # shared experts (dense MLP on the fp16 GEMM path) are allowed
     Cfg.moe_shared_expert_intermediate_size = 64
-    assert fm.validate_model(Cfg()) == ["shared experts"]
+    assert fm.validate_model(Cfg()) == []
+    # non-gated squared-ReLU experts (Nemotron-H) are built; gated squared ReLU is not
+    from megatron.core.activations import squared_relu
+
+    Cfg.activation_func = staticmethod(squared_relu)
+    Cfg.gated_linear_unit = False
+    assert fm.validate_model(Cfg()) == []
+    Cfg.gated_linear_unit = True
+    assert len(fm.validate_model(Cfg())) == 1
+    Cfg.gated_linear_unit = False
+    Cfg.moe_latent_size = 1024
+    assert fm.validate_model(Cfg()) == ["moe_latent_size"]
 
 
 def test_expert_down_proj_prescale_matches(monkeypatch):

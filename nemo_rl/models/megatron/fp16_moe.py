@@ -23,7 +23,9 @@ expert output with the same functions:
   its expert's weight (batch invariant), and the launch shape is static (CUDA
   graph safe). The bf16 expert weights are read in place and converted to fp16
   in registers (exact in fp16's normal range); no weight copies.
-- ``swiglu_probs``: SiLU(gate) * up * prob in fp32 (eager elementwise ops).
+- ``swiglu_probs``: SiLU(gate) * up * prob in fp32 (one Triton kernel); non-gated
+  squared-ReLU experts (Nemotron-H) use ``relu2_probs``: ReLU(h)^2 * prob in fp32
+  (eager elementwise ops). ``expert_activation`` picks one from the model config.
 - combine: the engine sums a token's local-expert outputs in fp64 in ascending
   expert order and rounds the rank partial to fp32, exactly as Megatron's
   batch-invariant training unpermute (``transformer/moe/batch_invariant.py``)
@@ -436,6 +438,68 @@ def swiglu_probs(h: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
     return SwigluProbs.apply(h, probs.reshape(-1))
 
 
+def _relu2_eager(h: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
+    r = torch.relu(h.float())
+    return (r * r) * probs.float().unsqueeze(-1)
+
+
+def relu2_probs_fwd(h: torch.Tensor, probs: torch.Tensor, out_dtype=torch.float32):
+    """ReLU(h)^2 * prob in fp32 (non-gated squared-ReLU experts, Nemotron-H), cast to out_dtype.
+
+    Eager elementwise ops: a row's value depends only on that row (batch
+    invariant) and the ops are CUDA-graph capturable. Training and the engine
+    call this same function.
+    """
+    return _relu2_eager(h, probs).to(out_dtype)
+
+
+class Relu2Probs(torch.autograd.Function):
+    """Training: the engine's forward (fp32 out), eager fp32 backward."""
+
+    @staticmethod
+    def forward(ctx, h, probs):  # noqa: D102
+        ctx.save_for_backward(h, probs)
+        return relu2_probs_fwd(h, probs, torch.float32)
+
+    @staticmethod
+    def backward(ctx, grad):  # noqa: D102
+        h, probs = ctx.saved_tensors
+        with torch.enable_grad():
+            h_ = h.detach().float().requires_grad_()
+            p_ = probs.detach().float().requires_grad_()
+            y = _relu2_eager(h_, p_)
+            dh, dp = torch.autograd.grad(y, (h_, p_), grad.float())
+        return dh.to(h.dtype), dp.to(probs.dtype)
+
+
+def relu2_probs(h: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
+    """Autograd-aware ReLU(h)^2 * prob, fp32 output."""
+    return Relu2Probs.apply(h, probs.reshape(-1))
+
+
+def expert_activation(config: Any) -> str:
+    """'swiglu' (gated SiLU) or 'relu2' (non-gated squared ReLU); ValueError otherwise."""
+    act = getattr(getattr(config, "activation_func", None), "__name__", "silu")
+    gated = bool(getattr(config, "gated_linear_unit", False))
+    if gated and act == "silu":
+        return "swiglu"
+    if not gated and act == "squared_relu":
+        return "relu2"
+    raise ValueError(
+        f"fp16 MoE experts: activation_func={act} gated_linear_unit={gated} not built yet"
+    )
+
+
+def _act_probs(module: Any, h, probs, out_dtype=None):
+    """The expert activation times the routing probability (fp32 math)."""
+    cfg = getattr(module, "config", None)
+    kind = "swiglu" if cfg is None else expert_activation(cfg)
+    if out_dtype is None:  # training: autograd
+        return swiglu_probs(h, probs) if kind == "swiglu" else relu2_probs(h, probs)
+    fwd = swiglu_probs_fwd if kind == "swiglu" else relu2_probs_fwd
+    return fwd(h, probs, out_dtype)
+
+
 def unpermute_fp64(
     expert_output: torch.Tensor,
     inverse_map: torch.Tensor,
@@ -637,7 +701,7 @@ def training_experts_forward(
     if s:  # down-projection prescale: a * 2^-s via the routing probabilities
         probs = probs * (2.0**-s)
     h = grouped_linear(x, m_splits, _expert_weights(module.linear_fc1))
-    a = swiglu_probs(h, probs)
+    a = _act_probs(module, h, probs)
     if _HOOKS["fc2_input"] is not None:
         a = _HOOKS["fc2_input"](module, a, m_splits)
     y = grouped_linear(a, m_splits, _expert_weights(module.linear_fc2))
@@ -685,7 +749,7 @@ def inference_experts_forward(
     if s:  # same prescale as training_experts_forward
         pp = pp * (2.0**-s)
     h = grouped_gemm_fp16w(xp, module._fc1_weight, offs, cfg)
-    a = swiglu_probs_fwd(h, pp, torch.float16)
+    a = _act_probs(module, h, pp, torch.float16)
     y = grouped_gemm_fp16w(a, module._fc2_weight, offs, cfg)
     if s:
         y = y * (2.0**s)
@@ -700,14 +764,20 @@ def validate_model(model_cfg: Any) -> list[str]:
     bad = []
     if not getattr(model_cfg, "moe_grouped_gemm", False):
         bad.append("moe_grouped_gemm=False")
-    if not getattr(model_cfg, "gated_linear_unit", False):
-        bad.append("non-gated expert MLP")
+    try:
+        expert_activation(model_cfg)
+    except ValueError:
+        act = getattr(model_cfg, "activation_func", None)
+        bad.append(
+            f"expert activation {getattr(act, '__name__', act)} with "
+            f"gated_linear_unit={getattr(model_cfg, 'gated_linear_unit', False)}"
+        )
     if getattr(model_cfg, "moe_mlp_glu_interleave_size", None):
         bad.append("moe_mlp_glu_interleave_size")
     if getattr(model_cfg, "add_bias_linear", False):
         bad.append("expert biases")
-    if getattr(model_cfg, "moe_shared_expert_intermediate_size", None):
-        bad.append("shared experts")
+    # Shared experts (Nemotron-H) are a dense MLP on the fp16 GEMM path (TE linears),
+    # added to the routed output in fp32: allowed; engine exactness not measured yet.
     if getattr(model_cfg, "moe_apply_probs_on_input", False):
         bad.append("moe_apply_probs_on_input")
     if getattr(model_cfg, "moe_latent_size", None):
@@ -718,7 +788,4 @@ def validate_model(model_cfg: Any) -> list[str]:
         bad.append("expert_tensor_parallel_size>1")
     if getattr(model_cfg, "moe_token_dispatcher_type", "alltoall") != "alltoall":
         bad.append(f"moe_token_dispatcher_type={model_cfg.moe_token_dispatcher_type}")
-    act = getattr(model_cfg, "activation_func", None)
-    if act is not None and getattr(act, "__name__", "") != "silu":
-        bad.append(f"activation_func={getattr(act, '__name__', act)}")
     return bad

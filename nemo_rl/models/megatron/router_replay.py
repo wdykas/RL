@@ -124,7 +124,28 @@ def _unwrap_model_config(model: Any) -> Optional[Any]:
     return None
 
 
+def _hybrid_main_pattern(model_config: Any) -> Optional[str]:
+    """Main-decoder layer pattern of a hybrid (Mamba/attention/MoE) model, else None.
+
+    Hybrid models (MCore ``HybridModel``, e.g. Nemotron-H) declare their layers
+    with a pattern string ('M' Mamba, '*' attention, 'E' MoE, '-' MLP, ...),
+    optionally with '|' pipeline-stage separators and '/'-separated MTP
+    patterns; ``moe_layer_freq`` does not apply to them.
+    """
+    pattern = getattr(model_config, "hybrid_layer_pattern", None) or getattr(
+        model_config, "hybrid_override_pattern", None
+    )
+    if not isinstance(pattern, str) or not pattern:
+        return None
+    return pattern.split("/")[0].replace("|", "")
+
+
 def _global_moe_layer_numbers(model_config: Any) -> list[int]:
+    hybrid = _hybrid_main_pattern(model_config)
+    if hybrid is not None:
+        # Global 1-based layer numbers of the 'E' (MoE) layers: HybridStack numbers
+        # its layers by position in the main pattern (layer_number = i + 1 + offset).
+        return [i + 1 for i, symbol in enumerate(hybrid) if symbol == "E"]
     num_layers = int(getattr(model_config, "num_layers"))
     moe_layer_freq = getattr(model_config, "moe_layer_freq", 1)
 

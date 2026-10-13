@@ -1431,6 +1431,11 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
     model_cfg.moe_enable_routing_replay = router_replay_enabled(
         config
     ) or sticky_routing_enabled(config)
+    if sticky_routing_enabled(config) and getattr(model_cfg, "moe_router_fusion", False):
+        raise ValueError(
+            "sticky routing requires moe_router_fusion=False: the fused TE top-k "
+            "bypasses MCore's RouterReplay, so the sticky rule would not run."
+        )
 
 
 def _apply_mtp_config(model_cfg: Any, config: PolicyConfig) -> None:

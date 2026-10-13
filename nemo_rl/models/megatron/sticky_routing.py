@@ -21,9 +21,19 @@ without pre-softmax) and anchor set ``A`` (top-k expert ids) by
     else plain top-k of s.
 
 An anchor row with a negative id or a repeated id (padding, "no anchor") means
-"anchor = self": the plain top-k. Kept anchors are returned ordered by the
-current scores (descending, stable), the order plain top-k returns, so
-F(theta; plain_topk(theta)) is bitwise the plain forward.
+"anchor = self": the plain top-k. A kept anchor set that equals the plain set
+is returned in the plain top-k's order (so F(theta; plain_topk(theta)) is
+bitwise the plain forward, sorted or unsorted top-k, ties included); a kept set
+that differs is ordered by the current scores (descending, stable).
+
+Score functions: ``s`` is whatever MCore's top-k selects on. Softmax routers
+without pre-softmax: the router logits. Sigmoid routers with an expert bias
+(DeepSeek-V3 / Nemotron-H, ``moe_router_enable_expert_bias``): the biased
+selection scores sigmoid(logits) + expert_bias; MCore gathers the unbiased
+sigmoid scores at the returned indices itself, so delta is in sigmoid-score
+units there. Group-limited routing (``group_topk``): the plain set comes from
+MCore's group-limited top-k and the keep test compares against every expert
+outside the anchor set (conservative: it can only fall back to plain more often).
 
 Everything here is elementwise or a fixed-shape reduction over the expert
 axis: no host synchronization, CUDA-graph capturable, and the same arithmetic
@@ -107,7 +117,15 @@ def sticky_select(
     keep = valid & (min_in >= max_out - delta)
     s_sorted, order = s_in.sort(dim=1, descending=True, stable=True)
     a_sorted = a.gather(1, order)
-    k = keep.unsqueeze(1)
+    # A kept anchor set equal to the plain set is returned in the plain order, so
+    # F(theta; plain_topk(theta)) is bitwise plain even where the plain top-k is
+    # unsorted (MCore's no-grad top-k without batch invariance) or has exact ties:
+    # the probability normalization sums over k in index order.
+    same = (
+        a.sort(dim=1).values == plain_idx.to(torch.long).sort(dim=1).values
+    ).all(dim=1)
+    keep_anchor_order = keep & ~same
+    k = keep_anchor_order.unsqueeze(1)
     idx = torch.where(k, a_sorted, plain_idx.to(torch.long))
     vals = torch.where(k, s_sorted, plain_vals)
     return vals, idx, keep
