@@ -572,7 +572,7 @@ match on both sides).
 | Scorer memory | fp32 adds 4 bytes per parameter per shard; `verify_precision=model` keeps training dtypes (about 90% kept vs 99%); under BI, `verify_source=engine` needs no scorer and only an LM-head stash per version (section 14) |
 | Tensor parallelism | Vocab-parallel logits gathered per batch; validated at TP=2 (99.9% kept) |
 | Pipeline parallelism (training) | Streamed chunks of a dispatch run as one pipeline call per gradient destination (one per dispatch in group mode); `min_pipeline_microbatches` holds rows of closed groups to fill the pipeline (section 2). CPU-tested; PP=2 GPU check written, not run. Interleaved PP not implemented for streaming |
-| Pipeline parallelism (verification) | Forward-only pipeline schedule, last stage verifies; scorer log-probs at PP=2 bitwise equal PP=1. Inference must be pinned to PP=1 (`mcore_generation_config.pipeline_model_parallel_size=1`) for inference-side scorers; under BI `verify_source=engine` runs PP>1 on both sides (unit-tested, section 14) |
+| Pipeline parallelism (verification) | Forward-only pipeline schedule, last stage verifies; scorer log-probs at PP=2 bitwise equal PP=1. Inference must be pinned to PP=1 (`mcore_generation_config.pipeline_model_parallel_size=1`) for inference-side scorers; under BI `verify_source=engine` runs PP>1 on both sides (measured exact at training PP=2 / inference PP=2, section 14b) |
 | Context parallelism | Not implemented; the scorer raises. Needs packed (THD) scoring |
 | MoE / expert parallelism | Streaming exact on GPU with EP=2 (group granularity; tiny random MoE); verification on the learner in EP lockstep (inference-side verification rejected under EP); under BI `verify_source=engine` at EP>1 pads training forwards to the EP group's count (unit-tested, section 14); no real-model run yet |
 | Large models on few learner GPUs | At 4B with one learner GPU: verify on the inference pool, or `verify_batch_tokens=4096` and the bf16 scorer to fit |
@@ -733,7 +733,7 @@ learner recomputes the batch's log-probs and compares them with the rollout log-
 | Qwen3-1.7B, BI | 0 on every token (4 steps) |
 | Qwen3-1.7B, BI, TP=2 (train and inference) | 0 on every token (4 steps) |
 | Qwen3-1.7B, BI, training PP=2, inference PP=1 | 0 on every token (2 steps) |
-| Qwen3-1.7B, BI, training PP=2, inference PP=2 | broken generation: reward 0.05, ~43-nat gap (Megatron inference at PP>1 under BI); use inference PP=1 |
+| Qwen3-1.7B, BI, training PP=2, inference PP=2 | 0 on every token (4 steps, fp16 GEMM forward) after the block-scope CUDA graph fix (section 14b); before it ~43-nat gap |
 | Nemotron-Nano-9B-v2 (hybrid Mamba), BI, validator's hybrid exclusion relaxed | 0 on every token (3 steps) |
 
 The PR's exclusion of hybrid Mamba models is an untested-scope limit: MCore's
@@ -1022,9 +1022,7 @@ BI requires the same PP and EP on both sides, so the layouts match as for TP.
   hidden-state pre-hook and sampler wrapper (`install_draft_hidden_log`) are installed there
   (other stages return None); the dynamic engine broadcasts each request with its
   serialized sampling params to every model-parallel rank, so the last stage sees the draft
-  tags. Whether batch-invariant generation is exact at inference PP=2 is not yet measured
-  (`engine_q_pp.sh` checks it: with `ARGS=++thundersync.speculate=false` the mismatch check
-  isolates the BI/PP part).
+  tags. Measured exact at inference PP=2 (section 14b, `engine_q_pp.sh` with `GEN_PP=2`).
 - *Tests* (`test_engine_q_ep_pp.py`, CPU; ranks are threads, process groups fakes, the
   expert all-to-all and the pipeline send/receive modeled as barriers per forward): for
   (TP, PP, EP) in {(1,1,2), (2,1,2), (1,2,1), (2,2,1), (1,2,2), (2,2,2)} with replicas owning
@@ -1232,7 +1230,17 @@ with bf16 weights, fp32 grads, masters and Adam state: ~270 GB).
 
 Engine PP>1: Megatron's inference wrapper casts last-stage logits to params_dtype and the
 controller broadcasts them in params_dtype; under the fp16 GEMM forward both are patched to fp32
-(`_patch_inference_pp_logits`, unit-tested; no engine-PP>1 GPU run yet). Known gaps: MoE with
+(`_patch_inference_pp_logits`). Separately, Megatron's block-scope inference CUDA graphs (the
+default, `inference_cuda_graph_scope: block`, which graph the whole `GPTModel` forward) replayed a
+stale input on non-first stages: the graph manager refreshes only the call's tensor arguments,
+but a non-first stage gets its input through `set_input_tensor` (`decoder_input=None`,
+`TransformerBlock` reads `self.input_tensor`), so every replay read the receive buffer captured at
+warmup. Qwen3-1.7B at inference PP=2 decoded garbage (~45-nat gap, reward ~0.02); graphs off or
+layer scope were exact. `nemo_rl/models/megatron/inference_pp_cuda_graph.py` (installed when the
+engine's PP > 1) passes the received tensor as `decoder_input` on the graphed path so it becomes a
+graph input. Measured, training PP=2 / inference PP=2, block graphs, 4 steps: mismatch 0, engine-q
+exact, 0 dropped, kept 96.7 / 97.2 / 96.5%. Same code on Megatron main d715782 (upstream bug).
+Hybrid (Mamba) models have the same block-graph path in `HybridModel` and are not patched yet. Known gaps: MoE with
 shared experts, expert TP, latent MoE (rejected at config time); the NCCL inference dispatcher at
 EP>=3 is untested (the default NVLS dispatcher is used); TP=4 training forward measured
 batch-invariant (0/16 sequences differ), TP=4 engine not yet run.

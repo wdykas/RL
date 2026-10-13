@@ -658,6 +658,10 @@ class MegatronGenerationMixin:
         inference_config = InferenceConfig(**inference_config_kwargs)
 
         _apply_inference_cuda_graph_scope(engine_model, mcore_generation_config)
+        if engine_model.config.pipeline_model_parallel_size > 1:
+            from nemo_rl.models.megatron import inference_pp_cuda_graph
+
+            inference_pp_cuda_graph.install()
 
         self.inference_context = DynamicInferenceContext(
             engine_model.config, inference_config

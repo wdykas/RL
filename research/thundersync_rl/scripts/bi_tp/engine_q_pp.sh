@@ -6,9 +6,10 @@
 # verification forward through the forward-only pipeline schedule and its last stage verifies;
 # the engine logs hidden states on its last stage. Same pass criteria as engine_q_tp.sh.
 #
-# Generation with PP=2 under batch invariance has not been run yet: if the engine side fails
-# (build, refit or a nonzero mismatch with speculation off: ARGS=++thundersync.speculate=false),
-# that is a BI / inference PP issue, not engine-q's.
+# Inference PP>1 depends on nemo_rl/models/megatron/inference_pp_cuda_graph.py: Megatron's
+# block-scope inference CUDA graphs otherwise replay a stale stage input on non-first stages
+# (~45-nat train/generation gap). GEN_PP=1 runs training PP=2 against a PP=1 engine. Note
+# verify_source=engine requires thundersync.speculate=true.
 #
 #   bash research/thundersync_rl/scripts/bi_tp/engine_q_pp.sh
 #
