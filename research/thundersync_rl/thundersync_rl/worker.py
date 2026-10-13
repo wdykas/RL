@@ -28,7 +28,7 @@ import functools
 import os
 import time
 from contextlib import nullcontext
-from typing import Any
+from typing import Any, Optional
 
 import ray
 import torch
@@ -2031,9 +2031,22 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         keys: list[str],
         batch_tokens: int = 0,
         anchors: list[Any] | None = None,
+        null_groups: list[Optional[str]] | None = None,
+        null_slots: dict[str, int] | None = None,
+        null_policy: dict[str, Any] | None = None,
         **_: Any,
     ) -> list[tuple[int, dict[str, Any]]]:
         """Block verification with q from the engine and p from the training model.
+
+        Pooled ⊥-BV (``null_bv.py``): ``null_groups[i]`` names row i's prompt
+        group (None: plain block verification). The rows of one group are
+        owned by one data-parallel rank (hash of the group name) and decided in
+        their order in ``rows`` (the drafting order, fixed before
+        verification): each with envelope M = policy(drafts left, slots left)
+        until ``null_slots[group]`` outputs exist; later rows of the group are
+        returned as ``"null": "unused"`` (forwarded but not decided). Every
+        decided row reports ``"null_m"`` and ``"null"`` = "out" or "bot"
+        (BOT: no output). ``null_policy``: ``NullPolicy`` keyword arguments.
 
         ``anchors[i]`` (sticky MoE routing): the drafter's routes of row i,
         [positions, L, K] int16 (-1: self); p is then F(theta; anchors), the
@@ -2112,7 +2125,36 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         chk_max, chk_tok, chk_exact = 0.0, 0, 0
         results = []
         n_rows = 0
-        mine = self._my_rows(rows, keys)
+        null_state: dict[str, Any] = {}
+        if null_groups is not None:
+            from thundersync_rl.null_bv import NullGroup, NullPolicy
+
+            # A group's rows all on one rank, decided in index order.
+            own = [g if g is not None else k for g, k in zip(null_groups, keys)]
+            mine = self._my_rows(rows, own)
+            policy = NullPolicy(**(null_policy or {}))
+            longest: dict[str, int] = {}
+            count: dict[str, int] = {}
+            for i in mine:
+                grp = null_groups[i]
+                if grp is not None:
+                    longest[grp] = max(longest.get(grp, 0), rows[i].numel())
+                    count[grp] = count.get(grp, 0) + 1
+            # Groups ordered by their longest row (padding of the batched
+            # forwards), rows of a group consecutive in index order.
+            mine.sort(
+                key=lambda i: (
+                    longest.get(null_groups[i], rows[i].numel()),
+                    null_groups[i] or "",
+                    i,
+                )
+            )
+            null_state = {
+                grp: NullGroup(n, int((null_slots or {})[grp]), policy)
+                for grp, n in count.items()
+            }
+        else:
+            mine = self._my_rows(rows, keys)
         # Several drafts per training-shaped forward (padded as training pads a
         # micro-batch): batch-invariant kernels give each row the same logits
         # as a one-row forward, and per-call overhead dominates small rows.
@@ -2150,6 +2192,28 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 gen = torch.Generator(device=dev).manual_seed(
                     seed * 1_000_003 + ps.get_data_parallel_rank()
                 )
+            null_m, grp = 1.0, None if null_groups is None else null_groups[i]
+            if grp is not None:
+                m = null_state[grp].next_m()
+                if m is None:
+                    # Slots filled: never decided (the stopping rule depends on
+                    # counts only, so dropping it biases nothing).
+                    del logits
+                    results.append(
+                        (
+                            i,
+                            {
+                                "accepted": 0,
+                                "next": -1,
+                                "logprobs": [],
+                                "draft_logq": [],
+                                "hidden_bytes_fetched": 0,
+                                "null": "unused",
+                            },
+                        )
+                    )
+                    continue
+                null_m = m
             if tp == 1:
                 # Log-probs exactly as training computes them (fp32 log-softmax).
                 p_lp = torch.log_softmax(
@@ -2182,7 +2246,13 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                         out[j] = lp[k]
                 return torch.stack(out)
 
-            tau, y, logp, n_eval = verify_engine_q(p_lp, draft, lq, q_rows, gen)
+            tau, y, logp, n_eval = verify_engine_q(
+                p_lp, draft, lq, q_rows, gen, null_m
+            )
+            null_info: dict[str, Any] = {}
+            if grp is not None:
+                null_state[grp].record(y >= 0)
+                null_info = {"null": "out" if y >= 0 else "bot", "null_m": null_m}
             n_rows += n_eval + (tau < g)
             fetched = h.fetched_bytes  # what the scan needed (not the check)
             if check:
@@ -2215,6 +2285,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                         "logprobs": logp.tolist(),
                         "draft_logq": lq[:tau].tolist(),
                         "hidden_bytes_fetched": fetched,
+                        **null_info,
                     },
                 )
             )

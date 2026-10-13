@@ -34,9 +34,12 @@ import triton.language as tl
 
 from thundersync_rl.block_verification import (
     acceptance_weights,
+    check_null_m,
     emit_distribution,
+    emitted_token,
     lazy_slack,
     lazy_stop_index,
+    null_root_residual,
     stop_probabilities,
 )
 
@@ -106,11 +109,13 @@ def _probs(row: torch.Tensor, lse: torch.Tensor) -> torch.Tensor:
     return (row.float() - lse).double().exp()
 
 
-def _emit(p_row, q_row, lse_p_tau, lse_q_tau, b_tau, generator):
-    """Sample the emitted token (bonus if ``q_row`` is None, else the residual)."""
+def _emit(p_row, q_row, lse_p_tau, lse_q_tau, b_tau, generator, null_m=1.0):
+    """Sample the emitted token (bonus if ``q_row`` is None, else the residual;
+    ``null_m`` > 1 only for the ⊥-BV root residual: ``NULL_TOKEN`` = BOT)."""
     q = None if q_row is None else _probs(q_row, lse_q_tau)
-    dist = emit_distribution(_probs(p_row, lse_p_tau), q, b_tau)
-    return int(torch.multinomial((dist / dist.sum()).float(), 1, generator=generator))
+    dist = emit_distribution(_probs(p_row, lse_p_tau), q, b_tau, null_m)
+    y = int(torch.multinomial((dist / dist.sum()).float(), 1, generator=generator))
+    return emitted_token(y, p_row.shape[-1])
 
 
 def block_verify_logits(
@@ -163,6 +168,7 @@ def block_verify_stats_lazy(
     p_rows,
     q_rows,
     generator: torch.Generator | None = None,
+    null_m: float = 1.0,
 ) -> tuple[int, int, torch.Tensor, int]:
     """Lazy block verification from per-position statistics and on-demand rows.
 
@@ -177,21 +183,32 @@ def block_verify_stats_lazy(
     program per row) and h_i (same formula) wherever ``lazy_stop_index`` needs
     them. Full rows are read only at positions where eta_i <= b_i (1 + slack)
     above tau, and at tau itself. Returns (tau, y, logp, rows evaluated).
+
+    ``null_m`` = M > 1: ⊥-BV (see ``block_verification``). y = ``NULL_TOKEN``
+    means BOT (the draft yields no output); logp is then log p of the kept
+    prefix only (empty, since BOT happens only at tau = 0). M = 1 takes exactly
+    the plain path.
     """
     g = lpx.numel()
+    check_null_m(null_m, g)
     dev = lse_p.device
-    b = acceptance_weights(lpx - lqx)
+    b = acceptance_weights(lpx - lqx, null_m)
 
-    def residual_mass(idx):
-        return residual_masses(p_rows(idx), q_rows(idx), lse_p[idx], lse_q[idx], b[idx])
+    def mass(idx, bi):
+        return residual_masses(p_rows(idx), q_rows(idx), lse_p[idx], lse_q[idx], bi)
 
     eta = torch.rand(g + 1, generator=generator, dtype=torch.float64, device=dev)
-    tau, n_eval = lazy_stop_index(b, eta, residual_mass, lazy_slack(lse_p[:g]))
+    tau, n_eval = lazy_stop_index(
+        b, eta, null_root_residual(mass, b, null_m), lazy_slack(lse_p[:g])
+    )
     at = torch.tensor([tau], device=dev)
     p_row = p_rows(at)[0]
     q_row = None if tau == g else q_rows(at)[0]
     lse_q_tau = None if tau == g else lse_q[tau]
-    y = _emit(p_row, q_row, lse_p[tau], lse_q_tau, b[tau], generator)
+    m = null_m if tau == 0 and tau < g else 1.0
+    y = _emit(p_row, q_row, lse_p[tau], lse_q_tau, b[tau], generator, m)
+    if y < 0:
+        return tau, y, lpx[:tau], n_eval
     logp = torch.cat([lpx[:tau], (p_row[y].float() - lse_p[tau]).view(1)])
     return tau, y, logp, n_eval
 

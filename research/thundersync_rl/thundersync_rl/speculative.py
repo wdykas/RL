@@ -219,6 +219,8 @@ class SpeculativeGeneration:
         verify_source: str = "scorer",
         hidden_transport: str = "object_store",
         sticky_delta: Optional[float] = None,
+        null_bv: bool = False,
+        null_bv_policy: Optional[dict[str, Any]] = None,
     ):
         self.base = base
         self.learner_policy = learner_policy
@@ -331,6 +333,19 @@ class SpeculativeGeneration:
                     f"({ok}); is policy.megatron_cfg.sticky_routing_delta set on "
                     "the generation workers (RouterReplay RECORD)?"
                 )
+        # Pooled null-augmented block verification (null_bv.py): the engine
+        # drafts K G drafts per prompt; verification fills the G slots of each
+        # prompt with the first non-BOT outcomes in drafting order. Target
+        # step -> {prompt key: slots} of the drafts made for that step.
+        self.null_bv = null_bv
+        self.null_bv_policy = dict(null_bv_policy or {})
+        self._null_slots: dict[int, dict[tuple[int, ...], int]] = {}
+        if null_bv and (self.verify_source != "engine" or verify_mode != "block"):
+            raise ValueError(
+                "null_bv needs verify_mode='block' with verify_source='engine' "
+                f"(got {verify_mode!r}/{self.verify_source!r}; the scorer path is "
+                "not built yet)"
+            )
         self._seeds = itertools.count(1)
         self._verify_seeds = itertools.count(1)
         self.plans: dict[tuple[int, ...], list[Plan]] = defaultdict(list)
@@ -417,16 +432,28 @@ class SpeculativeGeneration:
             ]
         return out
 
-    async def draft_streaming(self, prompts: list[torch.Tensor]):
+    async def draft_streaming(
+        self,
+        prompts: list[torch.Tensor],
+        null_slots: Optional[dict[tuple[int, ...], int]] = None,
+    ):
         """Start drafts on the engine without waiting; return a collector.
 
         The collector, called at the deadline (right before the optimizer step),
         aborts unfinished drafts and returns every draft's tokens so far. Any
         prefix of a draft is a valid draft for verification.
+
+        ``null_slots`` (⊥-BV): rollouts the next step will request per prompt
+        key; ``prompts`` then holds K G drafts per GRPO group, and their
+        order here is the fixed verification order of each prompt's pool.
         """
         rank0 = self.base._policy.worker_group.workers[0]
         budget = min(self.draft_budget, self.max_new_tokens)
         step = self.current_step
+        if null_slots is not None:
+            for t in [t for t in self._null_slots if t <= step]:
+                del self._null_slots[t]  # never verified (no drafts reached it)
+            self._null_slots[step + 1] = dict(null_slots)
         hkeys = self._hidden_keys([f"{step + 1}:{i}" for i in range(len(prompts))])
         ray.get(
             rank0.start_drafts.remote(
@@ -769,6 +796,36 @@ class SpeculativeGeneration:
         dropped = sum(len(v) for v in drafts) - sum(len(v) for v in kept)
         return [v for v in kept if v], dropped
 
+    def _null_prepare(self, drafts):
+        """⊥-BV for this step's drafts: (drafts, per-row group names, slots by
+        group, empty drafts dropped), or None when the drafts are not pooled.
+
+        Empty drafts (cut before their first token) are dropped: BOT lives at
+        the first drafted position. Whether a draft is empty is a deadline
+        (timing) fact, not a function of its tokens, as for any dropped draft.
+        """
+        slots_by_key = self._null_slots.pop(self.current_step, None)
+        if not self.null_bv or slots_by_key is None:
+            return None
+        kept, empty = [], []
+        for variants in drafts:
+            v = [d for d in variants if len(d[2]) > 0]
+            empty += [d for d in variants if len(d[2]) == 0]
+            if v:
+                kept.append(v)
+        self._release_hidden(empty)
+        names: dict[tuple[int, ...], str] = {}
+        for variants in kept:
+            for d in variants:
+                names.setdefault(_key(d[0]), f"{self.current_step}:{len(names)}")
+        slots = {names[k]: int(slots_by_key.get(k, 0)) for k in names}
+        missing = [n for n, s in slots.items() if s <= 0]
+        if missing:
+            raise RuntimeError(f"null_bv: drafts for prompts without slots {missing}")
+        self._null_names = names
+        self._null_all_slots = slots_by_key
+        return kept, names, slots, len(empty)
+
     def _verify_method(self, flat) -> tuple[str, dict[str, Any]]:
         """Worker method and its extra arguments for block verification."""
         if self.verify_source == "engine":
@@ -801,6 +858,23 @@ class SpeculativeGeneration:
                 "fused_verify_train runs through chunked verification only"
             )
         drafts, dropped = self._engine_q_filter(drafts)
+        null = self._null_prepare(drafts)
+        if null is not None:
+            drafts, names, slots, n_empty = null
+            flat, rows = self._flat_rows(drafts)
+            self._record_siblings(flat)
+            groups = [names[_key(d[0])] for _, d in flat]
+            by_row = self._verify_block(
+                flat,
+                rows,
+                null={
+                    "null_groups": groups,
+                    "null_slots": slots,
+                    "null_policy": self.null_bv_policy,
+                },
+            )
+            self._finish_verify_null(flat, by_row, groups, slots, dropped, n_empty)
+            return
         flat, rows = self._flat_rows(drafts)
         self._record_siblings(flat)
         if self.verify_mode == "block":
@@ -820,8 +894,15 @@ class SpeculativeGeneration:
             by_row = dict(x for rank_res in res for x in rank_res)
         self._finish_verify(drafts, flat, by_row, dropped)
 
-    def _verify_block(self, flat, rows) -> dict[int, dict[str, Any]]:
-        """Block-verify ``flat`` drafts on every verifier pool; results by row."""
+    def _verify_block(self, flat, rows, null=None) -> dict[int, dict[str, Any]]:
+        """Block-verify ``flat`` drafts on every verifier pool; results by row.
+
+        ``null``: ⊥-BV arguments for the worker (``null_groups`` per row,
+        ``null_slots``, ``null_policy``); a prompt's pool must be decided by
+        one worker, so it needs a single verifier pool.
+        """
+        if null is not None and len(self.verifiers) != 1:
+            raise RuntimeError("null_bv needs a single verifier pool (verify_on=learner)")
         if True:
             # Contiguous row slices per verifier pool, verified concurrently.
             k = len(self.verifiers)
@@ -829,6 +910,13 @@ class SpeculativeGeneration:
             futs = []
             for g, a, b in zip(self.verifiers, cuts, cuts[1:]):
                 method, extra = self._verify_method(flat[a:b])
+                if null is not None:
+                    extra = {
+                        **extra,
+                        "null_groups": null["null_groups"][a:b],
+                        "null_slots": null["null_slots"],
+                        "null_policy": null["null_policy"],
+                    }
                 futs.append(
                     (
                         a,
@@ -893,6 +981,91 @@ class SpeculativeGeneration:
                 "spec/accepted_frac": kept / max(total, 1),
                 "spec/full_accept": full / max(len(drafts), 1),
                 "spec/variant_wins": float(variant_wins),
+            }
+        )
+        self._age_stats(age_tok, age_kept)
+        if self.verify_source == "engine":
+            self.stats["spec/engine_q_dropped"] = float(dropped)
+
+    def _finish_verify_null(self, flat, by_row, groups, slots, dropped, n_empty):
+        """Plans and ⊥-BV statistics: each prompt's outputs in drafting order.
+
+        Slots left empty (drafts ran out) get no plan: those rollouts decode
+        fresh from the current policy, an exact p-sample.
+        """
+        self.plans.clear()
+        kept = total = full = 0
+        n_out = n_bot = n_unused = n_tail = 0
+        m_sum = 0.0
+        outs_by_group: dict[str, int] = defaultdict(int)
+        age_tok: dict[int, int] = {}
+        age_kept: dict[int, int] = {}
+        decided_len: list[int] = []
+        rejected: list[tuple[int, int]] = []  # (draft length, tau) of tail decodes
+        for r, (_, d) in enumerate(flat):
+            res = by_row[r]
+            state = res.get("null")
+            if state is None:
+                raise RuntimeError(f"null_bv: row {r} was verified without its group")
+            if state == "unused":
+                n_unused += 1
+                continue
+            m_sum += float(res["null_m"])
+            g = len(d[2])
+            decided_len.append(g)
+            if state == "bot":
+                n_bot += 1
+                continue
+            n_out += 1
+            outs_by_group[groups[r]] += 1
+            plan = self._plan(d, res)
+            full += plan.complete and res["accepted"] == g
+            kept += res["accepted"]
+            total += g
+            if res["accepted"] < g:
+                n_tail += 1
+                rejected.append((g, res["accepted"]))
+            self._count_ages(d, res["accepted"], age_tok, age_kept)
+            self.plans[_key(d[0])].append(plan)
+        # Earliest rejection among the longest decided drafts (top decile by
+        # length): the step waits on these continuations.
+        n_dec = len(decided_len)
+        if n_dec:
+            cut = sorted(decided_len, reverse=True)[max(1, n_dec // 10) - 1]
+            long_rej = [(g, t) for g, t in rejected if g >= cut]
+        else:
+            cut, long_rej = 0, []
+        fresh = sum(max(0, s - outs_by_group[grp]) for grp, s in slots.items())
+        # Prompts with slots but no verifiable draft at all decode fresh too.
+        named = set(getattr(self, "_null_names", {}))
+        fresh += sum(
+            s for k, s in getattr(self, "_null_all_slots", {}).items() if k not in named
+        )
+        n_slots = sum(getattr(self, "_null_all_slots", {}).values())
+        decided = n_out + n_bot
+        self.stats.update(
+            {
+                "spec/draft_tokens": float(total),
+                "spec/accepted_frac": kept / max(total, 1),
+                "spec/full_accept": full / max(n_out, 1),
+                "spec/null_drafts": float(len(flat)),
+                "spec/null_slots": float(n_slots),
+                "spec/null_outputs": float(n_out),
+                "spec/null_bot_frac": n_bot / max(decided, 1),
+                "spec/null_tail_frac": n_tail / max(n_out, 1),
+                "spec/null_fresh_slots": float(fresh),
+                "spec/null_unused_drafts": float(n_unused),
+                "spec/null_empty_dropped": float(n_empty),
+                "spec/null_drafts_per_output": decided / max(n_out, 1),
+                "spec/null_mean_m": m_sum / max(decided, 1),
+                "spec/null_longest_len_cut": float(cut),
+                "spec/null_longest_rejections": float(len(long_rej)),
+                "spec/null_longest_min_reject_pos": float(
+                    min((t for _, t in long_rej), default=-1)
+                ),
+                "spec/null_longest_min_reject_frac": min(
+                    (t / max(g, 1) for g, t in long_rej), default=1.0
+                ),
             }
         )
         self._age_stats(age_tok, age_kept)
@@ -1047,6 +1220,13 @@ class SpeculativeGeneration:
         ``longest_first``; chunks go round-robin over the verifier pools, and
         every chunk call is queued at once (each pool runs its calls in order).
         """
+        if self.null_bv and self.current_step in self._null_slots:
+            # Rollouts run concurrently with chunked verification and would
+            # take an empty plan (fresh decode) before their pool is decided.
+            raise RuntimeError(
+                "null_bv: chunked/overlapped verification of ⊥-BV pools is not "
+                "built yet (the loop calls verify() before the rollouts)"
+            )
         drafts, dropped = self._engine_q_filter(drafts)
         flat, rows = self._flat_rows(drafts)
         self._record_siblings(flat)

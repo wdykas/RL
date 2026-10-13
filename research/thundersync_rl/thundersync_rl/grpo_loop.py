@@ -65,6 +65,7 @@ from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.logger import Logger
 from thundersync_rl.fused_train import FusedRef
+from thundersync_rl.null_bv import drafts_per_prompt
 from thundersync_rl.speculative import SpeculativeGeneration, cohort_draft
 from thundersync_rl.streaming import (
     Chunk,
@@ -222,6 +223,23 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # per-token variance as 0.1 and pure replay; 0.003 keeps 66% vs 73% of
     # 32k drafts; ACCEPTANCE_LEDGER section T). None disables sticky routing.
     sticky_routing_delta: Optional[float] = 0.03
+    # Pooled null-augmented block verification (⊥-BV; null_bv.py, DESIGN.md
+    # section 14d). The engine drafts N = max(G, round(K G)) drafts per GRPO
+    # group (K = ``null_bv_drafts_per_output``); each is block-verified
+    # against p/M (+) (1 - 1/M) BOT (BOT only at the first position), in
+    # drafting order, until the group's G slots hold the first non-BOT outputs;
+    # leftover slots decode fresh. The G outputs are iid samples of the
+    # current policy (exact); rejections in the first half of long drafts
+    # practically vanish at M >= 1.25, at K x the engine draft work. G stays
+    # fixed. M_j = DP over (drafts left, slots left) with the Brownian
+    # tail-decode model at ``null_bv_logratio_var`` (per-token Var log p/q)
+    # and drafts of the rollout cap, or ``null_bv_fixed_m``. Requires
+    # speculate, verify_mode=block, verify_source=engine, verify_on=learner,
+    # draft_lookahead=1, no fused_verify_train.
+    null_bv: bool = False
+    null_bv_drafts_per_output: float = 1.5
+    null_bv_logratio_var: float = 8e-7
+    null_bv_fixed_m: Optional[float] = None
 
 
 def resolve_min_pipeline_microbatches(ts_cfg: ThunderSyncConfig, pp: int) -> int:
@@ -324,6 +342,7 @@ def validate_config(master_config: ThunderSyncMasterConfig) -> None:
     validate_fused_verify_train(master_config.thundersync, master_config.policy)
     validate_engine_verify_source(master_config.thundersync, master_config.policy)
     validate_sticky_routing(master_config)
+    validate_null_bv(master_config)
 
 
 def sticky_delta(ts_cfg: ThunderSyncConfig) -> Optional[float]:
@@ -390,6 +409,50 @@ def validate_sticky_routing(master_config: ThunderSyncMasterConfig) -> None:
         problems.append("policy.router_replay.enabled (R3) must be false")
     if problems:
         raise ValueError("thundersync.sticky_routing: " + "; ".join(problems) + ".")
+
+
+def validate_null_bv(master_config: ThunderSyncMasterConfig) -> None:
+    """Reject settings under which pooled ⊥-BV is not built (or not exact)."""
+    ts_cfg = master_config.thundersync
+    if not ts_cfg.null_bv:
+        return
+    problems = []
+    if not ts_cfg.speculate:
+        problems.append("thundersync.speculate must be true")
+    if ts_cfg.verify_mode != "block" or ts_cfg.verify_source != "engine":
+        problems.append(
+            "thundersync.verify_mode='block' and verify_source='engine' are required "
+            "(the scorer path is not built yet)"
+        )
+    if ts_cfg.verify_on != "learner":
+        problems.append("thundersync.verify_on must be 'learner' (one worker decides a pool)")
+    if ts_cfg.draft_lookahead != 1:
+        problems.append(
+            "thundersync.draft_lookahead must be 1 (multi-step cohort pools are not "
+            "built yet)"
+        )
+    if ts_cfg.fused_verify_train:
+        problems.append("thundersync.fused_verify_train must be false (not built yet)")
+    if ts_cfg.tail_lookup:
+        problems.append("thundersync.tail_lookup must be false (not built yet)")
+    if not ts_cfg.null_bv_drafts_per_output >= 1.0:
+        problems.append("thundersync.null_bv_drafts_per_output must be >= 1")
+    if ts_cfg.null_bv_fixed_m is not None and not ts_cfg.null_bv_fixed_m >= 1.0:
+        problems.append("thundersync.null_bv_fixed_m must be >= 1")
+    if not ts_cfg.null_bv_logratio_var >= 0:
+        problems.append("thundersync.null_bv_logratio_var must be >= 0")
+    if problems:
+        raise ValueError("thundersync.null_bv: " + "; ".join(problems) + ".")
+
+
+def null_bv_policy(master_config: Any) -> dict[str, Any]:
+    """``NullPolicy`` arguments: the DP's cost model uses drafts of the rollout cap."""
+    ts_cfg = master_config.thundersync
+    return {
+        "logratio_var": float(ts_cfg.null_bv_logratio_var),
+        "ref_len": int(master_config.policy["generation"]["max_new_tokens"]),
+        "fixed_m": ts_cfg.null_bv_fixed_m,
+    }
 
 
 def configure_sticky_policy(master_config: Any) -> None:
@@ -1120,6 +1183,8 @@ def thundersync_grpo_train(
             verify_source=ts_cfg.verify_source,
             hidden_transport=ts_cfg.hidden_transport,
             sticky_delta=sticky_delta(ts_cfg),
+            null_bv=ts_cfg.null_bv,
+            null_bv_policy=null_bv_policy(master_config) if ts_cfg.null_bv else None,
         )
     sticky = spec is not None and spec.sticky_delta is not None
     G = master_config.grpo.num_generations_per_prompt
@@ -1175,6 +1240,8 @@ def thundersync_grpo_train(
             spec is not None
             and ts_cfg.verify_mode == "block"
             and (ts_cfg.verify_on == "learner" or ts_cfg.verify_overlap)
+            # ⊥-BV pools are decided in one call before the rollouts start.
+            and not ts_cfg.null_bv
         )
         if cohort_mode and chunked:
             cohort = spec.cohorts.pop(step, None)
@@ -1210,13 +1277,29 @@ def thundersync_grpo_train(
             new = {t: _prompts(ahead[t - step - 1]) for t in targets}
             drafter = lambda new=new, step=step: spec.draft_cohorts(step, new)  # noqa: E731
         elif spec is not None and next_batch is not None and step + 1 < max_steps:
-            nxt = next_batch.repeat_interleave(G)
+            null_slots = None
+            if ts_cfg.null_bv:
+                # K G drafts per group, in a fixed (drafting) order; the next
+                # step requests G rollouts per batch entry.
+                n_drafts = drafts_per_prompt(ts_cfg.null_bv_drafts_per_output, G)
+                nxt = next_batch.repeat_interleave(n_drafts)
+                null_slots = collections.Counter()
+                for i in range(next_batch.size):
+                    p = torch.cat([m["token_ids"] for m in next_batch["message_log"][i]])
+                    null_slots[tuple(int(t) for t in p.tolist())] += G
+                null_slots = dict(null_slots)
+            else:
+                nxt = next_batch.repeat_interleave(G)
             next_prompts = [
                 torch.cat([m["token_ids"] for m in nxt["message_log"][i]])
                 for i in range(nxt.size)
             ]
             drafter = (  # noqa: E731
-                (lambda prompts=next_prompts: spec.draft_streaming(prompts))
+                (
+                    lambda prompts=next_prompts, slots=null_slots: spec.draft_streaming(
+                        prompts, null_slots=slots
+                    )
+                )
                 if ts_cfg.verify_mode == "block"
                 else (lambda prompts=next_prompts: spec.draft(prompts))
             )
