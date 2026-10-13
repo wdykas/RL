@@ -23,7 +23,7 @@ therefore captures the address of the receive buffer that existed at capture
 time, and every replay reads that stale buffer instead of the activations just
 received. Measured on Qwen3-1.7B with inference PP=2: ~45-nat log-prob gap to
 training and reward ~0; with layer-scope graphs or eager mode the same run is
-exact.
+exact. ``HybridModel`` / ``HybridStack`` have the same structure.
 
 ``install()`` routes the stage input through the graph: on the graphed path of
 a non-first stage the received tensor is passed as ``decoder_input`` (so the
@@ -39,16 +39,33 @@ _INSTALLED = False
 
 
 def install() -> None:
-    """Patch ``GPTModel`` / ``TransformerBlock`` so block-scope graphs read the stage input."""
+    """Patch the block-graphed model classes so their graphs read the stage input.
+
+    Covers ``GPTModel`` / ``TransformerBlock`` and ``HybridModel`` / ``HybridStack``,
+    the two model classes with block-scope inference graphs.
+    """
     global _INSTALLED
     if _INSTALLED:
         return
     from megatron.core.models.gpt.gpt_model import GPTModel
     from megatron.core.transformer.transformer_block import TransformerBlock
+
+    _patch(GPTModel, TransformerBlock)
+    try:
+        from megatron.core.models.hybrid.hybrid_block import HybridStack
+        from megatron.core.models.hybrid.hybrid_model import HybridModel
+    except ImportError:
+        pass
+    else:
+        _patch(HybridModel, HybridStack)
+    _INSTALLED = True
+
+
+def _patch(model_cls: type, block_cls: type) -> None:
     from megatron.core.utils import WrappedTensor
 
-    orig_call = GPTModel.__call__
-    orig_block_forward = TransformerBlock.forward
+    orig_call = model_cls.__call__
+    orig_block_forward = block_cls.forward
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         decoder = getattr(self, "decoder", None)
@@ -70,7 +87,7 @@ def install() -> None:
     def block_forward(self, *args: Any, **kwargs: Any) -> Any:
         if not getattr(self, "_graph_stage_input", False):
             return orig_block_forward(self, *args, **kwargs)
-        # Inside the graphed GPTModel forward: hidden_states is the graph's static input.
+        # Inside the graphed model forward: hidden_states is the graph's static input.
         hidden_states = (
             kwargs["hidden_states"] if "hidden_states" in kwargs else args[0]
         )
@@ -87,6 +104,5 @@ def install() -> None:
         finally:
             self.input_tensor = received
 
-    GPTModel.__call__ = __call__
-    TransformerBlock.forward = block_forward
-    _INSTALLED = True
+    model_cls.__call__ = __call__
+    block_cls.forward = block_forward

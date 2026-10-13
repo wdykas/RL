@@ -1240,7 +1240,7 @@ layer scope were exact. `nemo_rl/models/megatron/inference_pp_cuda_graph.py` (in
 engine's PP > 1) passes the received tensor as `decoder_input` on the graphed path so it becomes a
 graph input. Measured, training PP=2 / inference PP=2, block graphs, 4 steps: mismatch 0, engine-q
 exact, 0 dropped, kept 96.7 / 97.2 / 96.5%. Same code on Megatron main d715782 (upstream bug).
-Hybrid (Mamba) models have the same block-graph path in `HybridModel` and are not patched yet. Known gaps: MoE with
+`HybridModel` / `HybridStack` have the same block-graph path and are patched the same way (unit-tested; no hybrid inference-PP>1 GPU run yet). Known gaps: MoE with
 shared experts, expert TP, latent MoE (rejected at config time); the NCCL inference dispatcher at
 EP>=3 is untested (the default NVLS dispatcher is used); TP=4 training forward measured
 batch-invariant (0/16 sequences differ), TP=4 engine not yet run.
