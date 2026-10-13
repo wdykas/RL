@@ -4,9 +4,9 @@
 # generation layout (sequence parallel on both when TP>1), BI flags from
 # thundersync_work/bi_flags.txt + inference_optimized generation, learner-side block
 # verification, THUNDERSYNC_ENGINE_Q_CHECK=1 THUNDERSYNC_MISMATCH_CHECK=1.
-# Pass (exit 0): every step mismatch/max_abs_logprob_diff == 0 and exact_token_frac == 1, every
-# "[engine q check]" line exact == tok with max|dlogq| = 0, and the run did not fall back to
-# the scorer.
+# Pass (exit 0): the run exits 0, every step mismatch/max_abs_logprob_diff == 0 and
+# exact_token_frac == 1, every "[engine q check]" line exact == tok with max|dlogq| = 0, and
+# the run did not fall back to the scorer.
 #
 #   TP*PP <= 2 : 1 node, 2 generation + 2 training GPUs (interactive node, megatron-rl container):
 #              TP=2 MODEL=Qwen/Qwen3-1.7B bash engine_q_tp.sh
@@ -68,6 +68,7 @@ read -r -a USER_ARGS <<< "${ARGS:-}"
 
 OUT=$W/$RUNS/$TAG
 mkdir -p "$OUT"
+rm -f "$OUT/history.json"  # written at the end of training: never check a previous run's
 echo "[engine_q] TP=$TP PP=$PP EP=$EP STEPS=$STEPS MODEL=$MODEL RL_ROOT=$RL_ROOT -> $OUT"
 timeout 2400 python research/thundersync_rl/run_thundersync_grpo.py \
   --config research/thundersync_rl/configs/grpo_math_1.5b_thundersync_megatron.yaml \
@@ -83,14 +84,14 @@ timeout 2400 python research/thundersync_rl/run_thundersync_grpo.py \
 rc=$?
 echo "[engine_q] run exit=$rc"
 grep -a "\[engine q check\]\|falling back\|stash_head\|ep_dummy_forwards" "$OUT/run.log" | tail -n 20
-python - "$OUT/history.json" "$OUT/run.log" "$STEPS" <<'EOF'
+python - "$OUT/history.json" "$OUT/run.log" "$STEPS" "$rc" <<'EOF'
 import json, re, sys
-path, log, steps = sys.argv[1], sys.argv[2], int(sys.argv[3])
+path, log, steps, rc = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
 try:
     hist = json.load(open(path))
 except (OSError, ValueError) as exc:
     sys.exit(f"[engine_q] FAIL: no history ({exc})")
-ok = len(hist) >= steps
+ok = rc == 0 and len(hist) >= steps
 for i, h in enumerate(hist):
     d, e = h.get("mismatch/max_abs_logprob_diff"), h.get("mismatch/exact_token_frac")
     good = d == 0 and e == 1
