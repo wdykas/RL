@@ -15,10 +15,12 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from nemo_rl.models.generation.megatron.utils import (
     build_image_preprocessing_config,
     build_video_preprocessing_config,
+    resolve_mamba_conv_states_dtype,
 )
 
 pytestmark = pytest.mark.mcore
@@ -192,3 +194,21 @@ def test_pinned_megatron_core_has_the_token_capture_hooks() -> None:
     assert hasattr(inference_request, "RequestPromptPreparer")
     assert hasattr(DynamicInferenceEngine, "payload_stager")
     assert hasattr(DynamicInferenceEngine, "prompt_preparer")
+
+
+@pytest.mark.parametrize(
+    "mcore_cfg,megatron_cfg,expected",
+    [
+        ({}, {}, None),
+        ({}, {"forward_gemm_precision": None}, None),
+        ({}, {"forward_gemm_precision": "fp16"}, torch.float32),
+        (
+            {"mamba_inference_conv_states_dtype": "bfloat16"},
+            {"forward_gemm_precision": "fp16"},
+            torch.bfloat16,
+        ),
+        ({"mamba_inference_conv_states_dtype": "float16"}, {}, torch.float16),
+    ],
+)
+def test_mamba_conv_states_dtype(mcore_cfg, megatron_cfg, expected):
+    assert resolve_mamba_conv_states_dtype(mcore_cfg, megatron_cfg) == expected

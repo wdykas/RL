@@ -1305,7 +1305,10 @@ positions of the main pattern (`router_replay._global_moe_layer_numbers`; before
 was assumed and Nano counted 52 MoE layers instead of 23, so learner anchors and engine route
 logs disagreed in shape). Non-gated squared-ReLU experts run on the fp16 expert path
 (`fp16_moe.relu2_probs`, same eager fp32 function in training and engine); shared experts are
-dense TE MLPs on the fp16 GEMM path. Engine side for hybrids untested on GPU.
+dense TE MLPs on the fp16 GEMM path. Under the fp16 GEMM forward the engine's Mamba conv
+state defaults to fp32 (`resolve_mamba_conv_states_dtype`; in_proj emits fp32 and MCore casts
+the engine's conv input to the conv-state dtype, params_dtype by default, which rounds it).
+Engine side for hybrids untested on GPU; 4-GPU check `scripts/bi_tp/nano_hybrid_fp16.sh`.
 
 **Anchor schedule (exogenous).** A at position t = the plain θ_{k−1} forward's top-k on the
 rollout's own prefix, for every position up to the rollout cap c = prompt + min(max_new_tokens,

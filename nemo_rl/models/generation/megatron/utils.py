@@ -262,6 +262,25 @@ def resolve_torch_dtype(val):
     )
 
 
+def resolve_mamba_conv_states_dtype(
+    mcore_generation_config: dict[str, Any], megatron_cfg: dict[str, Any]
+) -> torch.dtype | None:
+    """Engine Mamba conv-state dtype; None keeps MCore's default (params_dtype).
+
+    MCore casts the engine's conv input to the conv-state dtype. Under the fp16
+    GEMM forward (``forward_gemm_precision='fp16'``) in_proj emits fp32 and the
+    training conv runs on fp32 inputs, so the default would round the engine's
+    conv input: the conv state is fp32 unless set explicitly.
+    """
+    if mcore_generation_config.get("mamba_inference_conv_states_dtype") is not None:
+        return resolve_torch_dtype(
+            mcore_generation_config["mamba_inference_conv_states_dtype"]
+        )
+    if megatron_cfg.get("forward_gemm_precision") == "fp16":
+        return torch.float32
+    return None
+
+
 def log_gpu_memory(tag: str) -> None:
     """Print a one-line GPU-memory summary for the calling rank."""
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0

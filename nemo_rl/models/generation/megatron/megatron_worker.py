@@ -92,6 +92,7 @@ from nemo_rl.models.generation.megatron.utils import (
     build_prompt_and_multimodal_data,
     build_video_preprocessing_config,
     log_gpu_memory,
+    resolve_mamba_conv_states_dtype,
     resolve_torch_dtype,
     sample_vision_tensors,
 )
@@ -581,13 +582,11 @@ class MegatronGenerationMixin:
                 mamba_inference_state_config.ssm_states_dtype = resolve_torch_dtype(
                     mcore_generation_config["mamba_inference_ssm_states_dtype"]
                 )
-            if (
-                mcore_generation_config.get("mamba_inference_conv_states_dtype")
-                is not None
-            ):
-                mamba_inference_state_config.conv_states_dtype = resolve_torch_dtype(
-                    mcore_generation_config["mamba_inference_conv_states_dtype"]
-                )
+            conv_states_dtype = resolve_mamba_conv_states_dtype(
+                mcore_generation_config, self.cfg["megatron_cfg"]
+            )
+            if conv_states_dtype is not None:
+                mamba_inference_state_config.conv_states_dtype = conv_states_dtype
 
         # flashinfer's fused-RoPE kernel only dispatches fp16/bf16 q/k.
         use_flashinfer_fused_rope = model_config.params_dtype in (
