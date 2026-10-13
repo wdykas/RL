@@ -2119,7 +2119,10 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
 
         ``THUNDERSYNC_ENGINE_Q_CHECK=1``: also rebuild every q row of each draft
         and print how many drafted tokens' log q match the engine bitwise and
-        the largest difference (expected: all, 0).
+        the largest difference (expected: all, 0); with anchors, also the
+        sticky rule's counters over these forwards (``[sticky check]``: token
+        layers, fraction that kept the anchor, fraction whose experts differ
+        from plain top-k).
         """
         from megatron.core import parallel_state as ps
         from thundersync_rl.engine_q import (
@@ -2128,6 +2131,8 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             hidden_num_rows,
             verify_engine_q,
         )
+
+        from nemo_rl.models.megatron import sticky_routing
 
         if not self.cfg["megatron_cfg"].get("batch_invariant_mode"):
             raise RuntimeError(
@@ -2184,6 +2189,9 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         batches = [[mine[j] for j in b] for b in batches]
         lockstep = self._expert_parallel_lockstep([[] for _ in batches])
         n_dummy = 0 if lockstep is None else len(lockstep) - len(batches)
+        sticky_check = check and anchors is not None
+        if sticky_check:
+            sticky_routing.start_stats()
 
         def row_logits():
             for batch in batches:
@@ -2322,6 +2330,14 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             print(
                 f"[engine q check] rank={self.rank} rows={len(results)} tok={chk_tok} "
                 f"exact={chk_exact} max|dlogq|={chk_max:.3e}",
+                flush=True,
+            )
+        if sticky_check:
+            st = sticky_routing.pop_stats()
+            print(
+                f"[sticky check] rank={self.rank} token_layers={int(st['token_layers'])} "
+                f"anchor_kept={st['anchor_kept']:.6f} "
+                f"differs_from_plain={st['differs_from_plain']:.6f}",
                 flush=True,
             )
         if os.environ.get("THUNDERSYNC_SPEC_PROF"):
