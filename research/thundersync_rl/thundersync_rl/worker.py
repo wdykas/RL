@@ -223,6 +223,47 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         self._stream_busy_s = 0.0
         self._stream_merge_calls = merge_pipeline_calls
 
+    def finish_train_step(self) -> dict[str, Any]:
+        """Finish the train step; optionally perturb expert gradients (test only).
+
+        ``THUNDERSYNC_DEBUG_EXPERT_GRAD_NOISE=<scale>`` adds seeded noise to the MoE
+        expert gradients before each optimizer step, so expert weights change even when
+        every reward is 0 (random tiny models). Exercises refit into the engine's expert
+        weights: any stale engine weight shows up in the mismatch check.
+        """
+        scale = os.environ.get("THUNDERSYNC_DEBUG_EXPERT_GRAD_NOISE")
+        if not scale:
+            return super().finish_train_step()
+        step = self.optimizer.step
+        n_done = getattr(self, "_debug_noise_steps", 0)
+
+        def noisy_step(*args, **kwargs):
+            # Same seed and parameter order on every rank: replicas of an expert agree.
+            g = torch.Generator(device="cuda").manual_seed(1234 + n_done)
+            chunks = self.model if isinstance(self.model, list) else [self.model]
+            for chunk in chunks:
+                for name, p in chunk.named_parameters():
+                    if (
+                        ".experts." in name
+                        and getattr(p, "main_grad", None) is not None
+                    ):
+                        p.main_grad.add_(
+                            torch.randn(
+                                p.main_grad.shape,
+                                generator=g,
+                                device=p.main_grad.device,
+                            )
+                            * float(scale)
+                        )
+            return step(*args, **kwargs)
+
+        self.optimizer.step = noisy_step
+        try:
+            return super().finish_train_step()
+        finally:
+            self.optimizer.step = step
+            self._debug_noise_steps = n_done + 1
+
     def _log_mem(self, where: str) -> None:
         if os.environ.get("THUNDERSYNC_MEM_LOG"):
             print(

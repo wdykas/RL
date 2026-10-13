@@ -1212,13 +1212,15 @@ gradient norm was ~100x too large (RL grad_norm 15-28, then NaN).
 accumulate K serially in fp32, emitted in fp32, so a row's result depends only on the row and
 its expert (batch invariant). Two implementations give identical bits (measured at 500B-MoE
 expert shapes, 1-1024 rows per expert): the engine's `InferenceGroupedMLP` runs a Triton grouped
-GEMM (rows grouped by expert and padded to the tile's BLOCK_M, bf16 weights converted to fp16 in
-registers, CUDA-graph safe; tiles tuned per rows-per-expert bucket), and training's
+GEMM with both operands fed through TMA descriptors (rows grouped by expert and padded to the
+tile's BLOCK_M, CUDA-graph safe; tiles tuned per rows-per-expert bucket) on fp16 expert weights:
+the engine's contiguous per-expert weight buffers are built in fp16 instead of bf16 (same bytes;
+refit's `copy_` into each parameter lands there, bf16 -> fp16 exact in range), and training's
 `TEGroupedMLP` runs one cuBLAS GEMM per expert without split-K on cached fp16 weight copies
 (invalidated after every optimizer step), about 4x faster than the Triton kernel at training
-shapes. Speeds at hidden 7168 / expert FFN 2048 (8 local experts): engine decode 1.4-1.5x the
-bf16 cuBLAS grouped GEMM at <=16 rows per expert, 2.7-3.8x at 128-256 rows (TE's device-metadata
-grouped GEMM gives the same bits ~1.9x faster there; not wired yet). SwiGLU-with-probs in fp32 (same eager ops on both
+shapes. Speeds at hidden 7168 / expert FFN 2048 (8 local experts), engine kernel vs the (inexact) bf16
+cuBLAS grouped GEMM: fc1 76 vs 110 us and fc2 47 vs 58 us at 4 rows per expert, fc1 135 vs 107 us
+and fc2 85 vs 58 us at 256 rows. SwiGLU-with-probs in fp32 (same eager ops on both
 sides). Router logits fp32 through the exact fp32 GEMM. Combine: the engine sums a token's
 local experts in fp64 in ascending expert order and rounds the rank partial to fp32 (as
 Megatron's batch-invariant training unpermute), then MCore's `ordered_reduce_scatter_v`
@@ -1228,7 +1230,10 @@ Backward per expert on bf16 casts. Tiny Qwen3-MoE (8 experts, top-2): grad norm 
 vs fp32 reference 0.177899 (bf16 baseline 0.178224). EP=2, 4 steps, checks on: mismatch 0,
 engine-q exact, 0 dropped; the random tiny model gets reward 0, so no weight changes and
 both this run and the bf16 control keep 100% (acceptance is not measurable on it). Training cuBLAS
-+ engine Triton at EP=2, 4 steps: mismatch 0, engine-q exact, 0 dropped.
++ engine TMA kernel at EP=2, 4 steps: mismatch 0, engine-q exact, 0 dropped; with
+`THUNDERSYNC_DEBUG_EXPERT_GRAD_NOISE=1` (seeded noise on expert gradients, so expert weights change
+every step even at reward 0) still mismatch 0 with 95-97% kept, i.e. refit into the fp16 engine
+expert weights is exact.
 Qwen3-30B-A3B at EP=2 on 2 + 2 GPUs does not fit (about 15B parameters per training GPU
 with bf16 weights, fp32 grads, masters and Adam state: ~270 GB).
 

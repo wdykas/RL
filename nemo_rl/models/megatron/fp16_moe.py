@@ -81,6 +81,46 @@ def select_config(rows_per_expert: float) -> TileConfig:
 if HAVE_TRITON:
 
     @triton.jit
+    def _grouped_gemm_fp16w_kernel(
+        x_ptr,  # [M_pad, K] fp16, rows grouped by expert, segments BLOCK_M-aligned
+        w_ptr,  # [E, N, K] fp16 expert weights
+        offs_ptr,  # [E] inclusive BLOCK_M-aligned row offsets of the expert segments
+        out_ptr,  # [M_pad, N] fp32
+        M,
+        N,
+        K,
+        E,
+        E_POW2: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        # Same per-row math as _grouped_gemm_kernel (exact fp16 products, K accumulated
+        # in order in fp32), with both operands fed through TMA descriptors.
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+        start = pid_m * BLOCK_M
+        idx = tl.arange(0, E_POW2)
+        ends = tl.load(offs_ptr + idx, mask=idx < E, other=2147483647).to(tl.int64)
+        expert = tl.sum((ends <= start).to(tl.int32), axis=0)
+        if expert >= E:
+            return
+        xd = tl.make_tensor_descriptor(
+            x_ptr, shape=[M, K], strides=[K, 1], block_shape=[BLOCK_M, BLOCK_K]
+        )
+        wd = tl.make_tensor_descriptor(
+            w_ptr, shape=[E * N, K], strides=[K, 1], block_shape=[BLOCK_N, BLOCK_K]
+        )
+        od = tl.make_tensor_descriptor(
+            out_ptr, shape=[M, N], strides=[N, 1], block_shape=[BLOCK_M, BLOCK_N]
+        )
+        w_row = expert * N + pid_n * BLOCK_N
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for k0 in range(0, K, BLOCK_K):
+            acc = tl.dot(xd.load([start, k0]), wd.load([w_row, k0]).T, acc)
+        od.store([start, pid_n * BLOCK_N], acc)
+
+    @triton.jit
     def _grouped_gemm_kernel(
         x_ptr,  # [M_pad, K] fp16, rows grouped by expert, segments BLOCK_M-aligned
         w_ptr,  # base pointer of the first expert's [N, K] weight
@@ -241,6 +281,104 @@ def grouped_gemm(
         num_stages=stages,
     )
     return out
+
+
+# Engine tiles for grouped_gemm_fp16w, tuned at 500B-MoE expert shapes (8 local
+# experts, hidden 7168, expert FFN 2048; thundersync_work/runs/moe_tma_sweep.json):
+# fc1 / fc2 at 4 rows per expert 76 / 47 us, at 256 rows 135 / 85 us (bf16 cuBLAS
+# grouped GEMM: 110 / 58 and 107 / 58 us). Every tile measured bitwise equal to cuBLAS.
+_ENGINE_CONFIGS: tuple[tuple[int, TileConfig], ...] = (
+    (16, (16, 256, 128, 4, 4)),  # decode
+    (64, (64, 128, 64, 4, 4)),
+    (1 << 62, (128, 256, 64, 8, 4)),
+)
+
+
+def select_engine_config(rows_per_expert: float) -> TileConfig:
+    """Engine tile configuration for an expected number of rows per expert."""
+    for bound, cfg in _ENGINE_CONFIGS:
+        if rows_per_expert <= bound:
+            return cfg
+    return _ENGINE_CONFIGS[-1][1]
+
+
+_ALLOCATOR_SET = False
+
+
+def grouped_gemm_fp16w(
+    x16: torch.Tensor, w16: torch.Tensor, offsets: torch.Tensor, config: TileConfig
+) -> torch.Tensor:
+    """Batch-invariant grouped GEMM on fp16 expert weights: x16 [M_pad, K] @ W_e.T -> fp32.
+
+    ``w16``: [E, N, K] fp16 contiguous. ``offsets``: [E] inclusive row offsets, each a
+    multiple of ``config``'s BLOCK_M. Bitwise equal to ``grouped_gemm`` and to cuBLAS
+    without split-K; TMA-fed, CUDA-graph safe.
+    """
+    global _ALLOCATOR_SET
+    if not _ALLOCATOR_SET:  # on-device TMA descriptors need scratch memory
+        triton.set_allocator(
+            lambda size, align, stream: torch.empty(
+                size, dtype=torch.int8, device="cuda"
+            )
+        )
+        _ALLOCATOR_SET = True
+    bm, bn, bk, warps, stages = config
+    m_pad, k = x16.shape
+    e, n, _ = w16.shape
+    assert m_pad % bm == 0 and x16.dtype == torch.float16 and x16.is_contiguous()
+    assert w16.dtype == torch.float16 and w16.is_contiguous()
+    out = torch.empty((m_pad, n), dtype=torch.float32, device=x16.device)
+    _grouped_gemm_fp16w_kernel[(m_pad // bm, triton.cdiv(n, bn))](
+        x16,
+        w16,
+        offsets,
+        out,
+        m_pad,
+        n,
+        k,
+        e,
+        E_POW2=triton.next_power_of_2(e),
+        BLOCK_M=bm,
+        BLOCK_N=bn,
+        BLOCK_K=bk,
+        num_warps=warps,
+        num_stages=stages,
+    )
+    return out
+
+
+def _ensure_fp16_expert_weights(module: Any) -> None:
+    """Hold the engine's expert weights as fp16 [E, N, K] buffers.
+
+    Like MCore's ``_build_concatenated_weights`` (each expert parameter's ``.data``
+    becomes a view into one contiguous buffer, so refit's ``copy_`` into the
+    parameter lands there), but the buffer is fp16: same bytes as bf16, and
+    bf16 -> fp16 is exact in fp16's normal range, the same conversion the training
+    path and the register-converting kernel apply.
+    """
+    if getattr(module, "_fp16_expert_weights", False):
+        return
+    for name, linear in (
+        ("_fc1_weight", module.linear_fc1),
+        ("_fc2_weight", module.linear_fc2),
+    ):
+        params = [
+            getattr(linear, f"weight{i}") for i in range(module.num_local_experts)
+        ]
+        buf = torch.empty(
+            (len(params), *params[0].shape),
+            dtype=torch.float16,
+            device=params[0].device,
+        )
+        for i, p in enumerate(params):
+            buf[i].copy_(p.data)
+            p.data = buf[i]
+        if name in module._buffers:
+            module._buffers[name] = buf
+        else:
+            module.register_buffer(name, buf, persistent=False)
+    module._concatenated_weights_built = True
+    module._fp16_expert_weights = True
 
 
 def _grouped_gemm_reference(x16, weights, offsets):
@@ -493,9 +631,7 @@ def inference_experts_forward(
         NVLSAllGatherVDispatcher,
     )
 
-    if not module._concatenated_weights_built:
-        module._build_concatenated_weights()
-        module._concatenated_weights_built = True
+    _ensure_fp16_expert_weights(module)
     x16 = (
         hidden_states.view(torch.float16)
         if hidden_states.dtype == torch.bfloat16
@@ -508,7 +644,7 @@ def inference_experts_forward(
     rows_per_expert = (
         x16.shape[0] * topk / (module.num_local_experts * module.ep_group.size())
     )
-    cfg = select_config(rows_per_expert)
+    cfg = select_engine_config(rows_per_expert)
     xp, pp, _pmap, offs, inverse_map = permute_tokens(
         x16,
         permuted_probs,
@@ -523,9 +659,9 @@ def inference_experts_forward(
     s = _down_scale()
     if s:  # same prescale as training_experts_forward
         pp = pp * (2.0**-s)
-    h = grouped_gemm(xp, None, offs, cfg, stacked=module._fc1_weight)
+    h = grouped_gemm_fp16w(xp, module._fc1_weight, offs, cfg)
     a = swiglu_probs_fwd(h, pp, torch.float16)
-    y = grouped_gemm(a, None, offs, cfg, stacked=module._fc2_weight)
+    y = grouped_gemm_fp16w(a, module._fc2_weight, offs, cfg)
     if s:
         y = y * (2.0**s)
     out = None

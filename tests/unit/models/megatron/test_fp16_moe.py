@@ -168,3 +168,70 @@ def test_fp16_weight_cache_invalidation():
     fm.invalidate_weight_cache()
     torch.testing.assert_close(fm.grouped_linear(x, [8], [w]), 2 * y0)
     fm.invalidate_weight_cache()
+
+
+@needs_cuda
+def test_fp16w_engine_kernel_bitwise_equals_cublas_and_triton():
+    torch.manual_seed(0)
+    dev = torch.device("cuda")
+    e, n, k = 4, 256, 512
+    w = (torch.randn(e, n, k, device=dev) * 0.02).to(torch.bfloat16)
+    w16 = w.to(torch.float16)
+    for _, cfg in fm._ENGINE_CONFIGS:
+        bm = cfg[0]
+        per = 2 * bm
+        x = (torch.randn(per * e, k, device=dev) * 0.5).half()
+        offs = torch.arange(1, e + 1, device=dev, dtype=torch.int32) * per
+        y = fm.grouped_gemm_fp16w(x, w16, offs, cfg)
+        ref = torch.cat(
+            [
+                torch.mm(
+                    x[i * per : (i + 1) * per], w16[i].t(), out_dtype=torch.float32
+                )
+                for i in range(e)
+            ]
+        )
+        assert torch.equal(y, ref), cfg
+        assert torch.equal(
+            y,
+            fm.grouped_gemm(
+                x,
+                None,
+                offs,
+                fm._CONFIGS[0][1] if bm == 16 else (bm, 64, 64, 4, 3),
+                stacked=w,
+            ),
+        ), cfg
+
+
+@needs_cuda
+def test_engine_expert_weights_become_fp16_views():
+    class Linear(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            for i in range(3):
+                self.register_parameter(
+                    f"weight{i}",
+                    torch.nn.Parameter(
+                        torch.randn(8, 16, device="cuda").to(torch.bfloat16)
+                    ),
+                )
+
+    class Experts(torch.nn.Module):
+        num_local_experts = 3
+
+        def __init__(self):
+            super().__init__()
+            self.linear_fc1, self.linear_fc2 = Linear(), Linear()
+            self._concatenated_weights_built = False
+
+    m = Experts()
+    before = m.linear_fc1.weight1.detach().clone()
+    fm._ensure_fp16_expert_weights(m)
+    assert m._fc1_weight.dtype == torch.float16 and m._fc1_weight.shape == (3, 8, 16)
+    assert torch.equal(m._fc1_weight[1], before.to(torch.float16))
+    # A refit-style copy into the parameter lands in the fp16 buffer.
+    new = torch.randn(8, 16, device="cuda").to(torch.bfloat16)
+    with torch.no_grad():
+        m.linear_fc1.weight1.copy_(new)
+    assert torch.equal(m._fc1_weight[1], new.to(torch.float16))
