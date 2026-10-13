@@ -7,26 +7,25 @@
 #   MODEL=$W/models/qwen3-30b-a3b-L4 EP=2 bash .../sticky_moe.sh                  # real 30B-A3B layers
 #   STICKY=0 bash .../sticky_moe.sh                                                # A/B: same run, plain routing
 #
-# The tiny model is random: THUNDERSYNC_DEBUG_EXPERT_GRAD_NOISE (default 1 for it) perturbs
-# expert gradients so weights (and routes) change every step.
+# THUNDERSYNC_DEBUG_EXPERT_GRAD_NOISE (NOISE, default 1) perturbs expert gradients so weights
+# (and routes) change every step even when every reward is 0 (truncated or random models).
 # Pass (exit 0), as engine_q_tp.sh: every step mismatch/max_abs_logprob_diff == 0 and
 # exact_token_frac == 1 (rollout log-probs == the learner's training forward with the same
-# anchors), every "[engine q check]" exact, no scorer fallback; plus, with STICKY=1, every step
-# that verified drafts reports spec/sticky_rounds (continuations completed at theta_{k-1}), and
-# every step after the first accepts draft tokens (no vacuous pass with every draft dropped).
+# anchors), every "[engine q check]" exact, no scorer fallback; plus non-vacuity: the learner's
+# parameter checksum changes every step and every step after the first accepts draft tokens;
+# with STICKY=1, every step that verified drafts reports spec/sticky_rounds (continuations
+# completed at theta_{k-1}), its anchors equal a fresh engine prefill of the same rows
+# ("[route check]", spec/route_check_exact == spec/route_check_tokens > 0), and the sticky rule
+# changed some route against plain top-k ("[sticky check]" differs_from_plain > 0).
 # Compare spec/accepted_frac and spec/full_accept against STICKY=0.
 #
 # Env: MODEL, EP (2), TP (1), STEPS (4), PROMPTS (16), MAXLEN (1024), DELTA (0.03), STICKY (1),
-# NOISE (expert-grad noise; default 1 for the tiny model, 0 otherwise), ARGS (extra overrides).
+# NOISE (expert-grad noise, 1), ARGS (extra overrides).
 W=/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/wdykas/code/on-olicy-rl/thundersync_work
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 export MODEL=${MODEL:-$W/models/tiny-qwen3-moe-d2048}
 export EP=${EP:-2} TP=${TP:-1} PP=${PP:-1} MAXLEN=${MAXLEN:-1024} STEPS=${STEPS:-4}
-STICKY=${STICKY:-1} DELTA=${DELTA:-0.03}
-case "$MODEL" in
-  *tiny*) NOISE=${NOISE:-1} ;;
-  *) NOISE=${NOISE:-0} ;;
-esac
+STICKY=${STICKY:-1} DELTA=${DELTA:-0.03} NOISE=${NOISE:-1}
 if [ "$NOISE" != 0 ]; then export THUNDERSYNC_DEBUG_EXPERT_GRAD_NOISE=$NOISE; fi
 export RUNS=${RUNS:-runs_sticky_moe}
 export TAG=${TAG:-sticky$STICKY-d$DELTA-ep$EP-tp$TP-$(basename "$MODEL")}
@@ -40,9 +39,9 @@ export ARGS="policy.megatron_cfg.moe_router_dtype=fp32 policy.generation.mcore_g
 bash "$HERE/engine_q_tp.sh"
 rc=$?
 OUT=$W/$RUNS/$TAG
-python - "$OUT/history.json" "$STICKY" <<'EOF'
-import json, sys
-path, sticky = sys.argv[1], sys.argv[2] == "1"
+python - "$OUT/history.json" "$OUT/run.log" "$STICKY" <<'EOF'
+import json, re, sys
+path, log, sticky = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
 try:
     hist = json.load(open(path))
 except (OSError, ValueError) as exc:
@@ -52,12 +51,26 @@ for i, h in enumerate(hist):
     keys = ("spec/draft_tokens", "spec/accepted_frac", "spec/full_accept", "spec/sticky_rounds",
             "spec/sticky_cont_draft_tokens", "spec/sticky_cont_accepted_frac",
             "spec/sticky_cont_retries", "spec/route_truncated_drafts", "spec/engine_q_dropped",
+            "spec/route_check_tokens", "spec/route_check_exact", "mismatch/param_checksum",
             "time/verify", "time/iteration")
     print(f"[sticky] step {i}: " + " ".join(f"{k.split('/')[-1]}={h.get(k)}" for k in keys))
     if sticky and h.get("spec/draft_tokens") and h.get("spec/sticky_rounds") is None:
         why.append(f"step {i}: no sticky stats")
     if i >= 1 and not (h.get("spec/draft_tokens") or 0) * (h.get("spec/accepted_frac") or 0) > 0:
         why.append(f"step {i}: no accepted draft tokens")
+    if i >= 1 and h.get("mismatch/param_checksum") == hist[i - 1].get("mismatch/param_checksum"):
+        why.append(f"step {i}: weights unchanged")
+    tok, exact = h.get("spec/route_check_tokens"), h.get("spec/route_check_exact")
+    if sticky and i >= 1 and not (tok and exact == tok):
+        why.append(f"step {i}: route check {exact}/{tok}")
+text = re.sub(r"\x1b\[[0-9;]*m", "", open(log, errors="replace").read())  # Ray colors
+checks = [(int(n), float(d)) for n, d in re.findall(
+    r"\[sticky check\].*token_layers=(\d+) .*differs_from_plain=(\S+)", text)]
+if sticky:
+    print(f"[sticky] sticky checks: {len(checks)} lines, token_layers={sum(n for n, _ in checks)}, "
+          f"max differs_from_plain={max((d for _, d in checks), default=None)}")
+    if not any(n > 0 and d > 0 for n, d in checks):
+        why.append("the sticky rule never changed a route against plain top-k")
 ok = not why
 print(f"[sticky] {'OK' if ok else 'FAIL: ' + '; '.join(why)}")
 sys.exit(0 if ok else 1)
