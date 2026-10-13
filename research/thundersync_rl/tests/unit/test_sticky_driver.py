@@ -430,3 +430,96 @@ def test_engine_route_log_on_a_fake_engine(monkeypatch):
     assert layers == [1, 3] and pos.tolist() == [0, 1, 2, 3, 4]
     assert routes[:, 0, 0].tolist() == [0, 1, 2, 100, 200]
     assert routes[:, 1, 1].tolist() == [10, 11, 12, 110, 210]
+
+
+# --------------------------------------------------------------------------
+# Route truncation: hidden rows follow the kept tokens
+# --------------------------------------------------------------------------
+
+
+class _LoggingEngine(_Engine):
+    """Hidden log like ``HiddenLog.pop``: rows 0..min(n, logged)-1 of a draft."""
+
+    def __init__(self, rounds, hidden_rows):
+        super().__init__(rounds)
+        self.hidden_rows = list(hidden_rows)  # per round: logged rows per draft
+        self.popped = []
+
+    def pop_hidden(self, keys, lengths):
+        logged = self.hidden_rows.pop(0)
+        self.popped.append(list(lengths))
+        return {
+            k: torch.ones(min(n, m), 4)
+            for k, n, m in zip(keys, lengths, logged)
+            if min(n, m)
+        }
+
+
+def test_route_truncated_drafts_keep_hidden_rows_matching_tokens():
+    from thundersync_rl.engine_q import hidden_num_rows
+
+    engine = _LoggingEngine(
+        [
+            # prompt [1, 2]: routes of positions 0..2 only -> m = 2 of 4 tokens;
+            # prompt [3]: no decode route -> m = 1 of 3; prompt [8, 9]: prompt
+            # routes incomplete (position 0 only) -> m = 0 of 2.
+            [
+                ([4, 5, 6, 7], False, [-0.1] * 4, 3),
+                ([7, 8, 9], False, [-0.2] * 3, 1),
+                ([5, 6], False, [-0.3] * 2, 1),
+            ],
+            # continuation round 1 from [1,2,4,5], [3,7], [8,9]:
+            # routes 0..4 -> m = 2 of 3; complete; routes 0..1 -> m = 1 of 2
+            [
+                ([10, 11, 12], False, [-0.4] * 3, 5),
+                ([9, EOD], True, [-0.5] * 2, 3),
+                ([4, EOD], True, [-0.5] * 2, 2),
+            ],
+            # round 2 from [1,2,4,5,10,11] and [8,9,4]
+            [([EOD], True, [-0.6], 6), ([EOD], True, [-0.6], 3)],
+        ],
+        hidden_rows=[[4, 3, 2], [3, 2, 2], [1, 1]],  # every hidden row was logged
+    )
+    seen = []
+
+    def verify(rows, prompt_lens, engine_logq, hidden, anchors, **_):
+        out = []
+        for i, (r, plen) in enumerate(zip(rows, prompt_lens)):
+            g = r.numel() - plen
+            # what verify_drafts_block_engine asserts
+            assert len(engine_logq[i]) == g
+            assert hidden_num_rows(hidden[i]) == g, (hidden_num_rows(hidden[i]), g)
+            seen.append(r.tolist())
+            res = {"accepted": g, "next": 99, "logprobs": [-1.0] * (g + 1)}
+            out.append((i, {**res, "draft_logq": engine_logq[i]}))
+        return out
+
+    s = make_spec(
+        {"verify_drafts_block_engine": verify, "stash_head": lambda **kw: 1},
+        base_handlers=engine.handlers(),
+        verify_source="engine",
+        hidden_transport="driver",
+        sticky_delta=0.03,
+    )
+    s.current_step = 0
+    prompts = [torch.tensor([1, 2]), torch.tensor([3]), torch.tensor([8, 9])]
+    drafts = asyncio.run(s.draft_streaming(prompts))()
+    toks = [d[0][2] for d in drafts]
+    assert toks == [[4, 5], [7], []]
+    # hidden popped only for the anchored tokens, and rows == tokens
+    assert engine.popped[0] == [2, 1, 0]
+    assert [hidden_num_rows(d[0][7]) for d in drafts] == [2, 1, 0]
+    assert [len(d[0][6]) for d in drafts] == [2, 1, 0]
+    assert s.stats["spec/route_truncated_drafts"] == 3.0
+    assert s.stats["spec/route_truncated_tokens"] == 2.0 + 2.0 + 2.0
+    # Verification of the cut drafts, then continuation rounds (cut by routes
+    # too): hidden rows must match the tokens everywhere.
+    s.current_step = 1
+    asyncio.run(s.verify_sticky(drafts))
+    assert engine.popped[1:] == [[2, 2, 1], [1, 1]]
+    assert seen[:3] == [[1, 2, 4, 5], [3, 7], [8, 9]]
+    assert seen[3:6] == [[1, 2, 4, 5, 10, 11], [3, 7, 9, EOD], [8, 9, 4]]
+    plans = {k: v[0] for k, v in s.plans.items()}
+    assert plans[(1, 2)].complete and plans[(1, 2)].prefix == [4, 5, 10, 11, EOD]
+    assert plans[(8, 9)].complete and plans[(8, 9)].prefix == [4, EOD]
+    assert plans[(3,)].prefix == [7, 9, EOD]

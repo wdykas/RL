@@ -466,15 +466,9 @@ class SpeculativeGeneration:
 
         def collect():
             res = [_drafted(x) for x in self._collect_drafts(rank0)]
-            hid = self._pop_hidden(hkeys, [len(x[0]) for x in res])
-            res = [self._truncate(x, h) for x, h in zip(res, hid)]
-            anchors = self._pop_routes(
-                hkeys, [p.numel() for p in prompts], [len(x[0]) for x in res]
+            res, hid, anchors = self._pop_logs(
+                hkeys, [p.numel() for p in prompts], res
             )
-            res = [
-                self._truncate_to_anchors(x, a, p.numel())
-                for x, a, p in zip(res, anchors, prompts)
-            ]
             return [
                 [
                     (
@@ -605,6 +599,29 @@ class SpeculativeGeneration:
             "spec/route_bytes_logged", 0.0
         ) + float(sum(map(route_bytes, out)))
         return out
+
+    def _pop_logs(self, hkeys, prompt_lens: list[int], res: list, prior=None):
+        """A drafting round's engine logs: (drafts, hidden states, anchors).
+
+        Routes first: each draft is cut to its anchored length
+        (``_truncate_to_anchors``; ``prior``: earlier anchors of the same
+        rows, spliced under the new log). Hidden states are then popped for
+        the kept tokens only and the draft cut to the logged rows
+        (``_truncate``), so its hidden rows always match its token count, as
+        verification requires.
+        """
+        anchors = self._pop_routes(hkeys, prompt_lens, [len(x[0]) for x in res])
+        if prior is not None:
+            anchors = [
+                a if a is None else splice(b, a) for a, b in zip(anchors, prior)
+            ]
+        res = [
+            self._truncate_to_anchors(x, a, plen)
+            for x, a, plen in zip(res, anchors, prompt_lens)
+        ]
+        hid = self._pop_hidden(hkeys, [len(x[0]) for x in res])
+        res = [self._truncate(x, h) for x, h in zip(res, hid)]
+        return res, hid, anchors
 
     def _truncate_to_anchors(self, drafted, anchors, prompt_len: int):
         """Cut a draft to the tokens whose anchors were all logged (sticky routing).
@@ -1415,19 +1432,17 @@ class SpeculativeGeneration:
         while not all(ray.get(rank0.drafts_done.remote())):
             await asyncio.sleep(0.02)
         res = [_drafted(x) for x in self._collect_drafts(rank0)]
-        hid = self._pop_hidden(hkeys, [len(x[0]) for x in res])
-        res = [self._truncate(x, h) for x, h in zip(res, hid)]
-        routes = self._pop_routes(
-            hkeys, [p.numel() for p in prompts], [len(x[0]) for x in res]
+        res, hid, routes = self._pop_logs(
+            hkeys,
+            [p.numel() for p in prompts],
+            res,
+            prior=[plan.anchors for _, plan in pending],
         )
         version = self.current_step - 1
         flat, rows, owners, retry = [], [], [], 0
-        for j, ((key, plan), p, x, h, a) in enumerate(
+        for j, ((key, plan), p, (toks, done, lps), h, a) in enumerate(
             zip(pending, prompts, res, hid, routes)
         ):
-            if a is not None:
-                a = splice(plan.anchors, a)
-            toks, done, lps = self._truncate_to_anchors(x, a, p.numel())
             d = (
                 p,
                 -1,
