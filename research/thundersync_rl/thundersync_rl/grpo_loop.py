@@ -37,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import itertools
+import math
 import os
 import time
 import warnings
@@ -240,6 +241,20 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     null_bv_drafts_per_output: float = 1.5
     null_bv_logratio_var: float = 8e-7
     null_bv_fixed_m: Optional[float] = None
+    # Banded importance sampling (block_verification.py, DESIGN.md section
+    # 14e). None (default): off, every row is an exact sample of the current
+    # policy. b > 0: a draft is verified against q while its prefix log-ratio
+    # S_t = log p/q stays inside |S_t| < b and against p after the exit T; the
+    # row is trained with loss weight w = exp(S_T) (|log w| < b + one token's
+    # |log p/q|). Rows are then exact in expectation (E[w f(Y)] = E_p f), not
+    # in law: the gradient stays unbiased, rejections before T vanish, the
+    # weights cost 1/ESS in gradient variance (``spec/band_ess``). With
+    # grpo.normalize_rewards the leave-one-out std makes each prompt's scale
+    # an expectation over its other rows, which the weights do not reproduce
+    # (same per-prompt direction, scale off by O(TV(p, q)); see DESIGN).
+    # Requires speculate, verify_mode=block, verify_source=engine, no
+    # fused_verify_train. Composes with null_bv.
+    banded_is_band: Optional[float] = None
 
 
 def resolve_min_pipeline_microbatches(ts_cfg: ThunderSyncConfig, pp: int) -> int:
@@ -343,6 +358,7 @@ def validate_config(master_config: ThunderSyncMasterConfig) -> None:
     validate_engine_verify_source(master_config.thundersync, master_config.policy)
     validate_sticky_routing(master_config)
     validate_null_bv(master_config)
+    validate_banded_is(master_config)
 
 
 def sticky_delta(ts_cfg: ThunderSyncConfig) -> Optional[float]:
@@ -443,6 +459,28 @@ def validate_null_bv(master_config: ThunderSyncMasterConfig) -> None:
         problems.append("thundersync.null_bv_logratio_var must be >= 0")
     if problems:
         raise ValueError("thundersync.null_bv: " + "; ".join(problems) + ".")
+
+
+def validate_banded_is(master_config: ThunderSyncMasterConfig) -> None:
+    """Reject settings under which banded importance sampling is not built."""
+    ts_cfg = master_config.thundersync
+    band = ts_cfg.banded_is_band
+    if band is None:
+        return
+    problems = []
+    if not (0 < band < math.inf):
+        problems.append(f"the band must be finite and > 0 (got {band})")
+    if not ts_cfg.speculate:
+        problems.append("thundersync.speculate must be true")
+    if ts_cfg.verify_mode != "block" or ts_cfg.verify_source != "engine":
+        problems.append(
+            "thundersync.verify_mode='block' and verify_source='engine' are required "
+            "(the scorer path is not built yet)"
+        )
+    if ts_cfg.fused_verify_train:
+        problems.append("thundersync.fused_verify_train must be false (not built yet)")
+    if problems:
+        raise ValueError("thundersync.banded_is_band: " + "; ".join(problems) + ".")
 
 
 def null_bv_policy(master_config: Any) -> dict[str, Any]:
@@ -755,6 +793,9 @@ def build_chunk_data(
     A padding chunk keeps its template's tokens but is fully masked out
     (``sample_mask = token_mask = advantages = 0``): it runs a forward/backward
     that adds neither gradient nor normalization count.
+
+    Banded IS: a row's loss weight ``payload["is_weight"]`` multiplies its
+    advantage (a detached per-row constant, so open-group buckets stay exact).
     """
     message_logs = [t.payload["message_log"] for t in chunk.trajectories]
     add_grpo_token_loss_masks_and_generation_logprobs(message_logs)
@@ -770,6 +811,9 @@ def build_chunk_data(
         adv = torch.tensor(chunk.advantages, dtype=torch.float32)
     else:
         adv = torch.ones(n, dtype=torch.float32)
+    adv = adv * torch.tensor(
+        [float(t.payload.get("is_weight", 1.0)) for t in chunk.trajectories]
+    )
     data = BatchedDataDict(
         {
             "input_ids": flat["token_ids"],
@@ -867,6 +911,7 @@ async def _run_one_step(
     claim_anchors: Optional[
         Callable[[torch.Tensor, torch.Tensor], Optional[torch.Tensor]]
     ] = None,
+    claim_log_weight: Optional[Callable[[torch.Tensor, torch.Tensor], float]] = None,
 ) -> dict[str, Any]:
     G = master_config.grpo.num_generations_per_prompt
     repeated = batch.repeat_interleave(G)
@@ -918,6 +963,7 @@ async def _run_one_step(
     wake = asyncio.Event()
     rollouts_done = False
     rewards = [0.0] * n
+    is_weights = [1.0] * n  # banded IS loss weights
     sample_metrics: list[dict[str, Any]] = [None] * n  # type: ignore[list-item]
     learner_busy = 0.0
     # Pipeline schedule calls of the busiest rank, summed over dispatches.
@@ -1057,6 +1103,14 @@ async def _run_one_step(
                     torch.cat([m["token_ids"] for m in repeated["message_log"][i]]),
                     torch.cat([m["token_ids"] for m in state["message_log"]]),
                 )
+            if claim_log_weight is not None:
+                is_weights[i] = math.exp(
+                    claim_log_weight(
+                        torch.cat([m["token_ids"] for m in repeated["message_log"][i]]),
+                        torch.cat([m["token_ids"] for m in state["message_log"]]),
+                    )
+                )
+                payload["is_weight"] = is_weights[i]
             traj = Trajectory(
                 group=(step, i // G),
                 index=i,
@@ -1133,6 +1187,10 @@ async def _run_one_step(
         "_drafts": drafts,
         **mismatch,
     }
+    if claim_log_weight is not None:
+        # Unbiased for the policy's mean reward (plain "reward" is the mean
+        # under the rows' own law p / w).
+        out["reward_is"] = float(np.mean(np.multiply(is_weights, rewards)))
     if claim_fused is not None:
         # Trajectories trained from their verification forward; each saved
         # one training forward of its row (fused/forward_tokens_saved tokens).
@@ -1191,6 +1249,7 @@ def thundersync_grpo_train(
             sticky_delta=sticky_delta(ts_cfg),
             null_bv=ts_cfg.null_bv,
             null_bv_policy=null_bv_policy(master_config) if ts_cfg.null_bv else None,
+            banded_is_band=ts_cfg.banded_is_band,
         )
     sticky = spec is not None and spec.sticky_delta is not None
     G = master_config.grpo.num_generations_per_prompt
@@ -1329,6 +1388,9 @@ def thundersync_grpo_train(
                 if spec is not None and ts_cfg.fused_verify_train
                 else None,
                 claim_anchors=spec.claim_anchors if sticky else None,
+                claim_log_weight=spec.claim_log_weight
+                if spec is not None and ts_cfg.banded_is_band is not None
+                else None,
             )
         )
         drafts = metrics.pop("_drafts")

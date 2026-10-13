@@ -2056,6 +2056,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         null_groups: list[Optional[str]] | None = None,
         null_slots: dict[str, int] | None = None,
         null_policy: dict[str, Any] | None = None,
+        band: float | None = None,
         **_: Any,
     ) -> list[tuple[int, dict[str, Any]]]:
         """Block verification with q from the engine and p from the training model.
@@ -2069,6 +2070,10 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         returned as ``"null": "unused"`` (forwarded but not decided). Every
         decided row reports ``"null_m"`` and ``"null"`` = "out" or "bot"
         (BOT: no output). ``null_policy``: ``NullPolicy`` keyword arguments.
+
+        ``band``: banded importance sampling (``block_verification``); every
+        output row then reports ``"band_log_weight"`` (log w = S_T, the row's
+        loss weight) and ``"band_exited"`` (its prefix left the band).
 
         ``anchors[i]`` (sticky MoE routing): the drafter's routes of row i,
         [positions, L, K] int16 (-1: self); p is then F(theta; anchors), the
@@ -2125,6 +2130,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         from plain top-k).
         """
         from megatron.core import parallel_state as ps
+        from thundersync_rl.block_verification import banded_log_weight
         from thundersync_rl.engine_q import (
             GatheredLogprobRows,
             HiddenRows,
@@ -2277,12 +2283,17 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 return torch.stack(out)
 
             tau, y, logp, n_eval = verify_engine_q(
-                p_lp, draft, lq, q_rows, gen, null_m
+                p_lp, draft, lq, q_rows, gen, null_m, band
             )
-            null_info: dict[str, Any] = {}
+            extra: dict[str, Any] = {}
             if grp is not None:
                 null_state[grp].record(y >= 0)
-                null_info = {"null": "out" if y >= 0 else "bot", "null_m": null_m}
+                extra = {"null": "out" if y >= 0 else "bot", "null_m": null_m}
+            if band is not None and y >= 0:
+                # logp[:tau] are the log p of the kept draft tokens the scan used.
+                log_w, exited = banded_log_weight(logp[:tau] - lq[:tau], band)
+                extra["band_log_weight"] = log_w
+                extra["band_exited"] = exited
             n_rows += n_eval + (tau < g)
             fetched = h.fetched_bytes  # what the scan needed (not the check)
             if check:
@@ -2315,7 +2326,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                         "logprobs": logp.tolist(),
                         "draft_logq": lq[:tau].tolist(),
                         "hidden_bytes_fetched": fetched,
-                        **null_info,
+                        **extra,
                     },
                 )
             )

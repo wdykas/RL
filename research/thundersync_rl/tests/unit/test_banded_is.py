@@ -289,3 +289,144 @@ def test_no_band_is_bitwise_the_plain_path():
     # A band no prefix leaves: whole draft accepted, tau = g always.
     c = output_distribution_given_draft(lp, lq, draft, band=1e9)
     assert float(c[-1][1].sum()) == 1.0
+
+
+# --------------------------------------------------------------------------
+# Config, loss weight, driver
+# --------------------------------------------------------------------------
+
+
+def _master(**ts):
+    from thundersync_rl.grpo_loop import ThunderSyncConfig
+
+    base = dict(
+        speculate=True,
+        verify_mode="block",
+        verify_source="engine",
+        banded_is_band=0.5,
+    )
+    base.update(ts)
+    return SimpleNamespace(thundersync=ThunderSyncConfig(**base))
+
+
+def test_band_config_default_off_and_validation():
+    from thundersync_rl.grpo_loop import ThunderSyncConfig, validate_banded_is
+
+    assert ThunderSyncConfig().banded_is_band is None
+    validate_banded_is(_master())
+    validate_banded_is(_master(banded_is_band=None, verify_source="scorer"))
+    for ts, match in [
+        ({"banded_is_band": 0.0}, "finite and > 0"),
+        ({"banded_is_band": math.inf}, "finite and > 0"),
+        ({"speculate": False}, "speculate"),
+        ({"verify_source": "scorer"}, "verify_source"),
+        ({"fused_verify_train": True}, "fused_verify_train"),
+    ]:
+        with pytest.raises(ValueError, match=match):
+            validate_banded_is(_master(**ts))
+
+
+def test_chunk_advantages_carry_the_row_weight():
+    from thundersync_rl.grpo_loop import build_chunk_data
+
+    tok = SimpleNamespace(pad_token_id=0)
+    cfg = SimpleNamespace(policy={"make_sequence_length_divisible_by": 4})
+
+    def traj(ids, **extra):
+        return SimpleNamespace(
+            payload={
+                "message_log": [
+                    {"role": "user", "token_ids": torch.tensor(ids[:2])},
+                    {
+                        "role": "assistant",
+                        "token_ids": torch.tensor(ids[2:]),
+                        "generation_logprobs": torch.zeros(len(ids) - 2),
+                    },
+                ],
+                "loss_multiplier": 1.0,
+                **extra,
+            }
+        )
+
+    rows = [traj([1, 2, 3, 4], is_weight=1.25), traj([1, 2, 7])]
+    final = SimpleNamespace(trajectories=rows, group=None, advantages=[2.0, -1.0], padding=False)
+    adv = build_chunk_data(final, tok, cfg, 1)["advantages"]
+    assert torch.equal(adv[:, 0], torch.tensor([2.5, -1.0]))
+    # Open-group bucket chunk: advantage 1 times the weight, scaled later.
+    bucket = SimpleNamespace(trajectories=rows, group=(0, 0), advantages=None, padding=False)
+    adv = build_chunk_data(bucket, tok, cfg, 1)["advantages"]
+    assert torch.equal(adv[:, 0], torch.tensor([1.25, 1.0]))
+
+
+def test_driver_plans_claims_and_stats(monkeypatch):
+    from test_speculative_driver import EOD, _spec as make_spec
+
+    monkeypatch.setattr(spec_mod.ray, "get", lambda x: x)
+    calls = []
+
+    def verify(rows, prompt_lens, keys, engine_logq, **kw):
+        calls.append(kw)
+        # Row 0: whole draft, never left the band; row 1: exit, then rejected.
+        res = [
+            {"accepted": 2, "next": 5, "logprobs": [-1.0] * 3, "draft_logq": [-1.0] * 2,
+             "band_log_weight": 0.1, "band_exited": False},
+            {"accepted": 1, "next": 9, "logprobs": [-1.0] * 2, "draft_logq": [-1.0],
+             "band_log_weight": -0.7, "band_exited": True},
+        ]
+        return list(enumerate(res[: len(rows)]))
+
+    s = make_spec(
+        {"verify_drafts_block_engine": verify, "stash_head": lambda **kw: 1},
+        base_handlers={"install_draft_hidden_log": lambda: True},
+        verify_source="engine",
+        hidden_transport="driver",
+        banded_is_band=0.5,
+    )
+    prompt = torch.tensor([1, 2])
+    lq = [-1.0, -1.0]
+    hid = torch.ones(2, 4)
+    drafts = [
+        [(prompt, -1, [6, EOD], True, "k0", [(0, 0, 2)], lq, hid)],
+        [(prompt, -1, [7, 8], False, "k1", [(0, 0, 2)], lq, hid)],
+    ]
+    s.verify(drafts)
+    assert calls[0]["band"] == 0.5
+    plans = s.plans[tuple(prompt.tolist())]
+    assert [p.log_weight for p in plans] == [0.1, -0.7]
+    st = s.stats
+    w = [math.exp(0.1), math.exp(-0.7)]
+    assert st["spec/band_exit_frac"] == 0.5
+    assert st["spec/band_ess"] == pytest.approx(sum(w) ** 2 / (2 * sum(x * x for x in w)))
+    # Rollouts: complete plan, then continuation of [7, 9]; claims by prefix.
+    from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+    datum = BatchedDataDict({"input_ids": prompt.view(1, -1), "input_lengths": torch.tensor([2])})
+    _, o1 = asyncio.run(s._one(0, datum))
+    _, o2 = asyncio.run(s._one(1, datum))
+    assert s.claim_log_weight(prompt, o2["output_ids"][0]) == -0.7
+    assert s.claim_log_weight(prompt, o1["output_ids"][0]) == 0.1
+    assert s.claim_log_weight(prompt, o1["output_ids"][0]) == 0.0  # claimed once
+    # Continuation rounds (sticky) are verified without the band.
+    s._verify_block([(0, drafts[0][0])], [torch.tensor([1, 2, 6, EOD])])
+    assert "band" not in calls[-1]
+
+
+def test_worker_reports_band_weights(monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    from test_engine_q import _engine_drafts, _engine_worker
+
+    w, emb, heads = _engine_worker(monkeypatch)
+    rows, plens, segs, lqs, hids, keys = _engine_drafts(emb, heads, n=12, seed=3)
+    kw = dict(rows=rows, prompt_lens=plens, segments=segs, engine_logq=lqs, hidden=hids,
+              vocab_limit=1 << 30, seed=7, keys=keys, batch_tokens=64)
+    plain = dict(w.verify_drafts_block_engine(**kw))
+    banded = dict(w.verify_drafts_block_engine(**kw, band=1e9))
+    for i in range(12):
+        assert "band_log_weight" not in plain[i]
+        g = rows[i].numel() - plens[i]
+        r = banded[i]
+        # A band no prefix leaves: whole drafts, w = W_g.
+        assert r["accepted"] == g and not r["band_exited"]
+        lr = torch.tensor(r["logprobs"][:g]) - torch.tensor(lqs[i])
+        assert r["band_log_weight"] == pytest.approx(float(lr.double().sum()), abs=1e-12)
