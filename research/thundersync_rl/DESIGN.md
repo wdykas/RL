@@ -1351,7 +1351,7 @@ cap (same engine feature) are not built yet.
 ## 14d. Pooled null-augmented block verification (`thundersync.null_bv`)
 
 *Opt-in, off by default. Unit-tested (exact enumeration, CPU + GPU worker path); the 4-GPU
-exactness run is `scripts/bi_tp/null_bv_moe.sh` (status: see the implementation notes).*
+exactness run `scripts/bi_tp/null_bv_moe.sh` is written but not run yet (end to end untested).*
 Scheme and measurements: `thundersync_work/research/agent_multi_draft.md`; implementation notes:
 `thundersync_work/research/agent_null_bv_impl.md`.
 
