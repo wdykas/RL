@@ -14,7 +14,8 @@
 # exactness check exercises it; the DP would pick M ~ 1 on this short-cap toy run.
 # Pass (exit 0): engine_q_tp.sh's checks (every step mismatch/max_abs_logprob_diff == 0 and
 # exact_token_frac == 1, engine q exact, no scorer fallback), sticky_moe.sh's checks, and every
-# step that verified drafts reports the ⊥-BV statistics with outputs <= slots.
+# step that verified drafts reports the ⊥-BV statistics with outputs <= slots, and every step
+# after the first has null_drafts > 0 and null_outputs > 0 (no vacuous all-fresh pass).
 #
 # Env: K (1.5), FIXED_M (2.0 | dp), STICKY (1), plus everything sticky_moe.sh takes
 # (MODEL, EP, TP, STEPS, PROMPTS, MAXLEN, DELTA, NOISE, ARGS).
@@ -47,6 +48,8 @@ for i, h in enumerate(hist):
         seen += 1
         ok &= h["spec/null_outputs"] <= h["spec/null_slots"]
         ok &= h["spec/null_outputs"] + h["spec/null_fresh_slots"] == h["spec/null_slots"]
+    if i >= 1:  # drafts reach the pools and fill slots (no vacuous all-fresh pass)
+        ok &= (h.get("spec/null_drafts") or 0) > 0 and (h.get("spec/null_outputs") or 0) > 0
 ok &= seen >= max(1, len(hist) - 1)  # every step after the first verifies drafts
 print(f"[null_bv] {'OK' if ok else 'FAIL'} ({seen} steps with ⊥-BV pools)")
 sys.exit(0 if ok else 1)
