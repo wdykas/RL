@@ -78,6 +78,25 @@ def _model_in_eval(method):
     return wrapper
 
 
+def _step_routes(replays, n: int) -> Optional[torch.Tensor]:
+    """Routes [n, L_local, K] of the engine forward that just ran (sticky routing).
+
+    Read where each router recorded them this step (``_install_route_record``):
+    the static buffer MCore bound for a CUDA-graph step, else the eager
+    forward's ``recorded_topk_idx`` (on a graph replay no Python runs, so that
+    attribute is stale and the bound buffer is the only source). None if a
+    layer recorded nothing: those positions stay unanchored and truncate their
+    drafts (engine bookkeeping, not token content).
+    """
+    cols = []
+    for r in replays:
+        src = r.static_buffer if r.static_buffer is not None else r.recorded_topk_idx
+        if src is None or int(src.shape[0]) < n:
+            return None
+        cols.append(src[:n])
+    return torch.stack(cols, 1)
+
+
 def _unwrap(model: torch.nn.Module) -> torch.nn.Module:
     """The innermost module under DDP / Float16Module wrappers."""
     while hasattr(model, "module"):
@@ -1586,16 +1605,18 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
     # ---- Sticky MoE routing: the drafter's routes (anchors), engine side ----
 
     def _install_route_record(self, context) -> None:
-        """Record every engine token's plain top-k into one static buffer.
+        """Arm MCore ``RouterReplay`` RECORD on the engine's MoE layers.
 
         Sticky routing only (``policy.megatron_cfg.sticky_routing_delta``).
-        MCore ``RouterReplay`` RECORD with a static buffer per MoE layer (a
-        [max_tokens, L_local, K] int16 tensor, one column per local layer):
-        the copy is part of each router's forward, so it is captured into the
-        engine's CUDA graphs, which is why it is armed here, before the engine
-        constructor captures them. Recording is restricted to inference
-        forwards (``sticky_routing``'s wrapper), so a training-shaped forward
-        in this process neither records nor overruns the buffer.
+        The model config has ``moe_enable_routing_replay`` (sticky routing sets
+        it), so MCore's dynamic context binds each router's record buffer per
+        step: its ``routing_indices_buffer`` on CUDA-graph steps (the buffer
+        the graphs are captured with), none on eager steps, where the router
+        keeps the forward's top-k in ``recorded_topk_idx``. The route log
+        reads them from there (``_step_routes``). Armed here, before the
+        engine constructor captures its CUDA graphs, because recording is
+        restricted to inference forwards (``sticky_routing``'s wrapper) and
+        that flag must be set when the graphs are captured.
         """
         from megatron.core.transformer.moe.router_replay import RouterReplayAction
 
@@ -1606,6 +1627,11 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
 
         if sticky_routing.get_delta() is None or getattr(self, "_route_record", None):
             return
+        if not getattr(context, "moe_enable_routing_replay", False):
+            raise RuntimeError(
+                "sticky routing: the inference context does not record routes "
+                "(model config needs moe_enable_routing_replay)"
+            )
         sticky_routing.install()
         insts = sorted(
             _router_replay_instances_for_model(self._gen_model()), key=lambda x: x[1]
@@ -1615,17 +1641,11 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         from megatron.core.utils import get_model_config
 
         cfg = get_model_config(self._gen_model())
-        k = int(cfg.moe_router_topk)
-        dev = torch.device("cuda", torch.cuda.current_device())
-        buf = torch.full(
-            (int(context.max_tokens), len(insts), k), -1, dtype=torch.int16, device=dev
-        )
-        for j, (replay, _) in enumerate(insts):
-            replay.set_static_buffer(buf[:, j, :])
+        for replay, _ in insts:
             replay._nrl_record_inference_only = True
             replay.set_router_replay_action(RouterReplayAction.RECORD)
         self._route_record = {
-            "buf": buf,
+            "replays": [replay for replay, _ in insts],
             "layers": [ln for _, ln in insts],
             "sequence_parallel": bool(getattr(cfg, "sequence_parallel", False)),
         }
@@ -1665,7 +1685,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         if tp_rank != 0 and not sp:
             return None
         log = RouteLog()
-        buf = rec["buf"]
+        replays = rec["replays"]
         controller = engine.controller
         orig = controller._dynamic_step_forward_logits
 
@@ -1696,7 +1716,9 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             entries = snapshot()
             out = orig(*args, **kwargs)
             if entries:
-                log.record(entries, buf[: max(r for r, _, _ in entries) + 1])
+                rows = _step_routes(replays, max(r for r, _, _ in entries) + 1)
+                if rows is not None:
+                    log.record(entries, rows)
             return out
 
         controller._dynamic_step_forward_logits = forward_logits

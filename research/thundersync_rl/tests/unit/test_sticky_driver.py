@@ -366,7 +366,10 @@ def test_worker_anchor_batch_and_route_fill(monkeypatch):
 
 def test_engine_route_log_on_a_fake_engine(monkeypatch):
     """install_draft_route_log: routes of tagged tokens by absolute position,
-    snapshotted at forward launch, copied after the forward."""
+    snapshotted at forward launch, read after the forward from where MCore's
+    context had each router record them (its buffer on CUDA-graph steps,
+    ``recorded_topk_idx`` on eager steps). Reading a buffer bound once at
+    engine build lost every route on GPU (all drafts truncated to 0)."""
     from megatron.core import parallel_state as ps
 
     monkeypatch.setattr(ps, "get_tensor_model_parallel_world_size", lambda *a, **k: 1)
@@ -377,7 +380,8 @@ def test_engine_route_log_on_a_fake_engine(monkeypatch):
         return SimpleNamespace(record=[SimpleNamespace(sampling_params=sp)])
 
     L, K = 2, 2
-    buf = torch.full((16, L, K), -1, dtype=torch.int16)
+    mcore = torch.zeros((16, L, K), dtype=torch.int32)
+    replays = [SimpleNamespace(static_buffer=None, recorded_topk_idx=None) for _ in range(L)]
     ctx = SimpleNamespace(
         active_token_count=0,
         padded_active_token_count=0,
@@ -387,10 +391,18 @@ def test_engine_route_log_on_a_fake_engine(monkeypatch):
     )
 
     def forward_logits(input_ids, position_ids):
-        # the "router": write this step's routes (token j: value 10*step + j)
         n = ctx.active_token_count
-        buf[:n] = (10 * forward_logits.step + torch.arange(n)).view(n, 1, 1).to(torch.int16)
+        step = forward_logits.step
         forward_logits.step += 1
+        graph = step % 2 == 1  # eager prefill, graph decode, eager, ...
+        for j, r in enumerate(replays):
+            top = (100 * step + 10 * j + torch.arange(n)).view(n, 1).expand(n, K)
+            if graph:  # MCore binds its buffer; the replay leaves recorded_topk_idx stale
+                r.static_buffer = mcore[:, j]
+                r.static_buffer[:n].copy_(top)
+            else:  # no buffer: record_indices keeps the eager top-k
+                r.static_buffer = None
+                r.recorded_topk_idx = top.clone()
 
     forward_logits.step = 0
     controller = SimpleNamespace(_dynamic_step_forward_logits=forward_logits)
@@ -399,20 +411,22 @@ def test_engine_route_log_on_a_fake_engine(monkeypatch):
         requests={11: req("d|0"), 12: req(None)}, controller=controller
     )
     w.inference_context = ctx
-    w._route_record = {"buf": buf, "layers": [1, 3], "sequence_parallel": False}
+    w._route_record = {"replays": replays, "layers": [1, 3], "sequence_parallel": False}
     assert w.install_draft_route_log() is True
-    # prefill: request 11 (slot 0) prompt of 3 tokens, request 12 (slot 1) 2 tokens
+    # eager prefill: request 11 (slot 0) 3 prompt tokens, request 12 (slot 1) 2
     ctx.active_token_count = 5
     ctx.token_to_request_idx[:5] = torch.tensor([0, 0, 0, 1, 1])
     ctx.token_to_pos_ids[:5] = torch.tensor([0, 1, 2, 0, 1])
     controller._dynamic_step_forward_logits(None, None)
-    # decode: one token each, positions 3 and 2
-    ctx.active_token_count = 2
-    ctx.token_to_request_idx[:2] = torch.tensor([0, 1])
-    ctx.token_to_pos_ids[:2] = torch.tensor([3, 2])
-    controller._dynamic_step_forward_logits(None, None)
+    # graph decode, eager decode (one token each)
+    for pos in (3, 4):
+        ctx.active_token_count = 2
+        ctx.token_to_request_idx[:2] = torch.tensor([0, 1])
+        ctx.token_to_pos_ids[:2] = torch.tensor([pos, pos - 1])
+        controller._dynamic_step_forward_logits(None, None)
     out = w.pop_draft_routes(["d|0", "x"])
     assert list(out) == ["d|0"]
     layers, pos, routes = out["d|0"]
-    assert layers == [1, 3] and pos.tolist() == [0, 1, 2, 3]
-    assert routes[:, 0, 0].tolist() == [0, 1, 2, 10]
+    assert layers == [1, 3] and pos.tolist() == [0, 1, 2, 3, 4]
+    assert routes[:, 0, 0].tolist() == [0, 1, 2, 100, 200]
+    assert routes[:, 1, 1].tolist() == [10, 11, 12, 110, 210]
