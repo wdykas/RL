@@ -12,7 +12,8 @@
 # Pass (exit 0), as engine_q_tp.sh: every step mismatch/max_abs_logprob_diff == 0 and
 # exact_token_frac == 1 (rollout log-probs == the learner's training forward with the same
 # anchors), every "[engine q check]" exact, no scorer fallback; plus, with STICKY=1, every step
-# that verified drafts reports spec/sticky_rounds (continuations completed at theta_{k-1}).
+# that verified drafts reports spec/sticky_rounds (continuations completed at theta_{k-1}), and
+# every step after the first accepts draft tokens (no vacuous pass with every draft dropped).
 # Compare spec/accepted_frac and spec/full_accept against STICKY=0.
 #
 # Env: MODEL, EP (2), TP (1), STEPS (4), PROMPTS (16), MAXLEN (1024), DELTA (0.03), STICKY (1),
@@ -46,16 +47,19 @@ try:
     hist = json.load(open(path))
 except (OSError, ValueError) as exc:
     sys.exit(f"[sticky] no history ({exc})")
-ok = True
+why = []
 for i, h in enumerate(hist):
-    keys = ("spec/accepted_frac", "spec/full_accept", "spec/sticky_rounds",
+    keys = ("spec/draft_tokens", "spec/accepted_frac", "spec/full_accept", "spec/sticky_rounds",
             "spec/sticky_cont_draft_tokens", "spec/sticky_cont_accepted_frac",
             "spec/sticky_cont_retries", "spec/route_truncated_drafts", "spec/engine_q_dropped",
             "time/verify", "time/iteration")
     print(f"[sticky] step {i}: " + " ".join(f"{k.split('/')[-1]}={h.get(k)}" for k in keys))
     if sticky and h.get("spec/draft_tokens") and h.get("spec/sticky_rounds") is None:
-        ok = False
-print(f"[sticky] {'OK' if ok else 'MISSING sticky stats'}")
+        why.append(f"step {i}: no sticky stats")
+    if i >= 1 and not (h.get("spec/draft_tokens") or 0) * (h.get("spec/accepted_frac") or 0) > 0:
+        why.append(f"step {i}: no accepted draft tokens")
+ok = not why
+print(f"[sticky] {'OK' if ok else 'FAIL: ' + '; '.join(why)}")
 sys.exit(0 if ok else 1)
 EOF
 src=$?
