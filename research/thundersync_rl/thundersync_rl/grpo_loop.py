@@ -1098,6 +1098,12 @@ async def _run_one_step(
     t_finish = time.perf_counter()
     results = learner.finish()
     t_end = time.perf_counter()
+    if mismatch:
+        # Weights after this step's update: the exactness checks are only
+        # meaningful if they change every step (``mismatch/param_checksum``).
+        mismatch["mismatch/param_checksum"] = sum(
+            _run_workers(learner.policy, "model_param_checksum")
+        )
 
     # No "loss" metric: bucket chunks are backpropagated with advantage 1, so
     # the per-chunk loss values the worker sums are not the GRPO loss.
