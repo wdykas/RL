@@ -610,6 +610,7 @@ policy.make_sequence_length_divisible_by=128
 | `verify_batch_tokens` | Tokens per scorer forward batch (bounds logits memory), default 16384 |
 | `draft_budget` | Maximum new tokens per draft |
 | `merge_pipeline_calls` | One pipeline schedule call per dispatch and gradient destination (default `true`; section 2) |
+| `sticky_routing` / `sticky_routing_delta` | MoE: sticky routing anchored to the drafter (section 14c); off by default, δ 0.03 router-logit units |
 | `min_pipeline_microbatches` | Hold closed-group rows until this many micro-batches per learner rank are queued; flushed when rollouts end (`null`: 2·PP if PP > 1, else 0) |
 
 Debug switches: `THUNDERSYNC_SPEC_PROF` (verification timing), `THUNDERSYNC_SPEC_CHECK`
@@ -637,6 +638,7 @@ hidden states and print how many drafted tokens' log q match the engine bitwise)
 | `thundersync_rl/worker.py` | Megatron worker extension: streaming train calls, scorer build and refresh, weight stashes, stashed block verification, draft streams |
 | `thundersync_rl/block_verification.py` | Reference block verification, shared acceptance helpers, exact output law |
 | `thundersync_rl/block_verification_fused.py` | Block verification from raw logits with a Triton residual-mass kernel; lazy variant from per-position statistics |
+| `thundersync_rl/routes.py` | Sticky routing: engine route log, per-rank route merge, anchors (section 14c); rule in `nemo_rl/models/megatron/sticky_routing.py` |
 | `thundersync_rl/engine_q.py` | Engine-sourced q under BI: engine hidden-state log, per-step row mapping, verification from engine log q + rows on demand |
 | `thundersync_rl/logit_free.py` | `ChunkedHead`: LM-head statistics from hidden states in fixed row chunks, rows recomputed on demand |
 | `thundersync_rl/scorer_kernels.py` | SDPA core attention, Triton SwiGLU, selective LM head |
