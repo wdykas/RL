@@ -52,6 +52,7 @@ from thundersync_rl.engine_q import (
 from thundersync_rl.fused_train import FusedRef
 from thundersync_rl.routes import (
     anchored_draft_length,
+    compare_anchors,
     merge_route_parts,
     route_bytes,
     splice,
@@ -1379,6 +1380,8 @@ class SpeculativeGeneration:
         number is small when acceptance is high.
         """
         self._plan_cv = None
+        if os.environ.get("THUNDERSYNC_ENGINE_Q_CHECK") == "1":
+            await self._route_check(drafts)
         self.verify(drafts)
         rounds = cont_tokens = cont_kept = retries = 0
         while True:
@@ -1408,6 +1411,42 @@ class SpeculativeGeneration:
                 "spec/sticky_cont_retries": float(retries),
             }
         )
+
+    async def _route_check(self, drafts) -> None:
+        """Debug: the drafts' logged anchors against a fresh engine prefill.
+
+        ``THUNDERSYNC_ENGINE_Q_CHECK=1``, sticky routing. The engine still
+        holds the drafting weights here, so re-routing prompt + draft in one
+        prefill (another batch layout and code path than the decode steps
+        that logged most anchors) must give the same expert set at every
+        anchored position; a mis-mapped log (wrong slot or position) would
+        not. Counted in ``spec/route_check_tokens`` / ``spec/route_check_exact``.
+        """
+        ds = [d for v in drafts for d in v if len(d) > 8 and d[8] is not None and d[2]]
+        if not ds:
+            return
+        rank0 = self.base._policy.worker_group.workers[0]
+        rows = [torch.cat([d[0], torch.tensor(d[2], dtype=torch.long)]) for d in ds]
+        hkeys = self._hidden_keys([f"route-check:{j}" for j in range(len(ds))])
+        ray.get(
+            rank0.start_drafts.remote(
+                [r.tolist() for r in rows], [1] * len(rows), self.stream_interval,
+                hidden_keys=hkeys,
+            )
+        )
+        while not all(ray.get(rank0.drafts_done.remote())):
+            await asyncio.sleep(0.02)
+        self._collect_drafts(rank0)
+        refs = self._pop_routes(hkeys, [r.numel() for r in rows], [0] * len(rows))
+        self._pop_hidden(hkeys, [0] * len(rows))
+        tok = exact = 0
+        for d, ref in zip(ds, refs):
+            n = d[0].numel() + len(d[2])
+            t, e = compare_anchors(d[8][:n], d[8][:0] if ref is None else ref)
+            tok, exact = tok + t, exact + e
+        self.stats["spec/route_check_tokens"] = float(tok)
+        self.stats["spec/route_check_exact"] = float(exact)
+        print(f"[route check] drafts={len(ds)} tok={tok} exact={exact}", flush=True)
 
     async def _sticky_round(self, pending, rnd: int) -> tuple[int, int, int]:
         """One continuation round: engine (theta_{k-1}) drafts, learner verifies."""

@@ -25,6 +25,7 @@ from thundersync_rl.block_verification import output_distribution_given_draft
 from thundersync_rl.routes import (
     RouteLog,
     anchored_draft_length,
+    compare_anchors,
     merge_route_parts,
     splice,
     step_route_entries,
@@ -100,6 +101,19 @@ def test_anchored_length_and_splice():
     S = splice(A[:5], B)
     assert S.shape[0] == 9 and S[0, 0, 0] == 1 and S[4, 0, 0] == 3 and S[8, 0, 0] == -1
     assert S[2, 1, 0] == -1 and S[2, 0, 0] == 1
+
+
+def test_compare_anchors_against_a_reference_forward():
+    A = torch.full((6, 2, 2), -1, dtype=torch.int16)
+    A[:4] = torch.tensor([[1, 3], [0, 2]], dtype=torch.int16)  # positions 0..3 anchored
+    ref = A[:5].clone().to(torch.int32)
+    ref[1] = ref[1].flip(-1)  # same expert sets, other top-k order
+    assert compare_anchors(A, ref) == (4, 4)
+    ref[2, 1] = torch.tensor([0, 3])  # one layer routed elsewhere
+    assert compare_anchors(A, ref) == (4, 3)
+    assert compare_anchors(A, ref[:3]) == (4, 2)  # positions missing from ref
+    assert compare_anchors(A, A[:0]) == (4, 0)
+    assert compare_anchors(A[4:], ref) == (0, 0)  # nothing anchored
 
 
 # --------------------------------------------------------------------------

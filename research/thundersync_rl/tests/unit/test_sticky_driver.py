@@ -523,3 +523,45 @@ def test_route_truncated_drafts_keep_hidden_rows_matching_tokens():
     assert plans[(1, 2)].complete and plans[(1, 2)].prefix == [4, 5, 10, 11, EOD]
     assert plans[(8, 9)].complete and plans[(8, 9)].prefix == [4, EOD]
     assert plans[(3,)].prefix == [7, 9, EOD]
+
+
+@pytest.mark.parametrize("same_routes", [True, False])
+def test_route_check_against_an_engine_prefill(monkeypatch, same_routes):
+    """THUNDERSYNC_ENGINE_Q_CHECK=1: anchors vs the engine's re-prefill of the row."""
+    monkeypatch.setenv("THUNDERSYNC_ENGINE_Q_CHECK", "1")
+
+    class Engine(_Engine):
+        def pop_routes(self, keys):
+            val = 1 if same_routes or len(self.started) == 1 else 2
+            return {
+                k: _routes(None, n_pos, val=val)
+                for k, (_, _, _, n_pos) in zip(keys, self.cur[0])
+                if n_pos
+            }
+
+    engine = Engine(
+        [
+            [([4, 5, 6], False, [-0.1] * 3, 4), ([7], False, [-0.2], 1)],
+            # route-check prefill of [1,2,4,5,6] and [3,7] (+1 token each)
+            [([0], False, [-0.3], 5), ([0], False, [-0.3], 2)],
+        ]
+    )
+
+    def verify(rows, **_):  # reject at 0 with EOS: every rollout completes
+        return [(i, {"accepted": 0, "next": EOD, "logprobs": [-1.0]}) for i in range(len(rows))]
+
+    s = make_spec(
+        {"verify_drafts_block_engine": verify, "stash_head": lambda **kw: 1},
+        base_handlers=engine.handlers(),
+        verify_source="engine",
+        hidden_transport="driver",
+        sticky_delta=0.03,
+    )
+    prompts = [torch.tensor([1, 2]), torch.tensor([3])]
+    drafts = asyncio.run(s.draft_streaming(prompts))()
+    s.current_step = 1
+    asyncio.run(s.verify_sticky(drafts))
+    prompts_chk, budgets_chk, _ = engine.started[1]
+    assert prompts_chk == [[1, 2, 4, 5, 6], [3, 7]] and budgets_chk == [1, 1]
+    assert s.stats["spec/route_check_tokens"] == 4.0 + 1.0
+    assert s.stats["spec/route_check_exact"] == (5.0 if same_routes else 0.0)

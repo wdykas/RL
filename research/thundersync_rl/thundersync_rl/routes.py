@@ -195,6 +195,24 @@ def anchored_draft_length(anchors: torch.Tensor, prompt_len: int, g: int) -> int
     return max(0, min(g, n_ok - prompt_len + 1)) if n_ok >= prompt_len else 0
 
 
+def compare_anchors(anchors: torch.Tensor, ref: torch.Tensor) -> tuple[int, int]:
+    """(positions checked, positions equal) of ``anchors`` against ``ref``.
+
+    Positions where ``anchors`` is set at every layer are checked; each must
+    be set in ``ref`` with the same expert set at every layer (order within
+    the top-k ignored). Used to check logged anchors against an independent
+    engine forward of the same row.
+    """
+    pos = position_complete(anchors).nonzero().flatten()
+    if pos.numel() == 0:
+        return 0, 0
+    inside = pos < ref.shape[0]
+    a = anchors[pos].sort(-1).values
+    r = torch.full_like(a, NO_ANCHOR)
+    r[inside] = ref[pos[inside]].to(a.dtype).sort(-1).values
+    return int(pos.numel()), int((a == r).all(-1).all(-1).sum())
+
+
 def splice(anchors: torch.Tensor, new: torch.Tensor) -> torch.Tensor:
     """Anchors of a longer row: ``new`` where set, else the earlier ``anchors``.
 
