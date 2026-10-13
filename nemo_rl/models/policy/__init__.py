@@ -572,6 +572,10 @@ class MegatronConfig(TypedDict):
     freeze_config: NotRequired[dict[str, Any]]
     # Megatron-Core batch-invariant kernels (bitwise train/generation parity).
     batch_invariant_mode: NotRequired[bool]
+    # Sticky MoE routing threshold in router-score units (None/absent: off).
+    # Set by ThunderSync from thundersync.sticky_routing_delta
+    # (nemo_rl/models/megatron/sticky_routing.py).
+    sticky_routing_delta: NotRequired[float | None]
     batch_invariant_backend: NotRequired[Literal["deepgemm", "te_native", "triton"]]
     # Cross-rank EP combine: "ordered" is portable, "multimem" uses NVLS.
     batch_invariant_collective: NotRequired[Literal["multimem", "ordered"]]

@@ -50,6 +50,12 @@ from thundersync_rl.engine_q import (
     hidden_num_rows,
 )
 from thundersync_rl.fused_train import FusedRef
+from thundersync_rl.routes import (
+    anchored_draft_length,
+    merge_route_parts,
+    route_bytes,
+    splice,
+)
 
 
 @dataclass
@@ -66,6 +72,10 @@ class Plan:
     # Tail lookup: the rejected draft's tokens after the rejection point, a
     # reference for exact lookup speculative decoding of the continuation.
     dead_suffix: list[int] = field(default_factory=list)
+    # Sticky MoE routing: the drafter's routes for prompt + prefix positions
+    # ([positions, L, K] int16, -1 = self); the training forward of this
+    # rollout replays them (routes.py).
+    anchors: Optional[torch.Tensor] = field(default=None, compare=False)
 
 
 @dataclass
@@ -139,7 +149,7 @@ def engine_q_ready(d: tuple) -> bool:
         lps is not None
         and len(lps) == n
         and hid is not None
-        and (n == 0 or hidden_num_rows(hid) == n)
+        and (n == 0 or hidden_num_rows(hid) >= n)
     )
 
 
@@ -208,6 +218,7 @@ class SpeculativeGeneration:
         verify_lazy: bool = False,
         verify_source: str = "scorer",
         hidden_transport: str = "object_store",
+        sticky_delta: Optional[float] = None,
     ):
         self.base = base
         self.learner_policy = learner_policy
@@ -296,6 +307,30 @@ class SpeculativeGeneration:
                     flush=True,
                 )
                 self.verify_source = "scorer"
+        # Sticky MoE routing (routes.py, nemo_rl sticky_routing.py): drafts
+        # carry the drafter's routes (draft tuple index 8) and verification /
+        # training replay them; continuations up to the rollout cap are drafted
+        # by the same (previous) weights and verified (``verify_sticky``).
+        self.sticky_delta = sticky_delta
+        self._anchor_claims: dict[
+            tuple[int, ...], list[tuple[tuple[int, ...], torch.Tensor]]
+        ] = defaultdict(list)
+        if sticky_delta is not None:
+            if self.verify_source != "engine" or verify_mode != "block":
+                raise ValueError(
+                    "sticky routing needs verify_mode='block' with "
+                    "verify_source='engine' (the engine logs the drafter's routes "
+                    f"with its hidden states; got {verify_mode!r}/{self.verify_source!r})"
+                )
+            ok = ray.get(
+                workers.run_all_workers_single_data("install_draft_route_log")
+            )
+            if not any(x is True for x in ok) or any(x is False for x in ok):
+                raise RuntimeError(
+                    "sticky routing: the engine cannot log the drafter's routes "
+                    f"({ok}); is policy.megatron_cfg.sticky_routing_delta set on "
+                    "the generation workers (RouterReplay RECORD)?"
+                )
         self._seeds = itertools.count(1)
         self._verify_seeds = itertools.count(1)
         self.plans: dict[tuple[int, ...], list[Plan]] = defaultdict(list)
@@ -406,6 +441,13 @@ class SpeculativeGeneration:
             res = [_drafted(x) for x in self._collect_drafts(rank0)]
             hid = self._pop_hidden(hkeys, [len(x[0]) for x in res])
             res = [self._truncate(x, h) for x, h in zip(res, hid)]
+            anchors = self._pop_routes(
+                hkeys, [p.numel() for p in prompts], [len(x[0]) for x in res]
+            )
+            res = [
+                self._truncate_to_anchors(x, a, p.numel())
+                for x, a, p in zip(res, anchors, prompts)
+            ]
             return [
                 [
                     (
@@ -424,6 +466,7 @@ class SpeculativeGeneration:
                         [(step, 0, len(toks))],
                         lps,
                         hid[i],
+                        *(() if self.sticky_delta is None else (anchors[i],)),
                     )
                 ]
                 for i, (toks, done, lps) in enumerate(res)
@@ -503,6 +546,57 @@ class SpeculativeGeneration:
             ):
                 self.stats[name] = self.stats.get(name, 0.0) + v
         return out
+
+    def _pop_routes(
+        self, hkeys: list[str] | None, prompt_lens: list[int], lengths: list[int]
+    ) -> list[Optional[torch.Tensor]]:
+        """Each draft's dense anchors [P + g, L, K] (sticky routing), None if unlogged.
+
+        Every engine rank that routed the draft's tokens contributes its part
+        (pipeline stages: their layers; sequence-parallel TP ranks: their
+        positions); missing entries stay -1 and truncate the draft
+        (``_truncate_to_anchors``).
+        """
+        n = len(lengths)
+        if self.sticky_delta is None or hkeys is None:
+            return [None] * n
+        parts: dict[str, list] = defaultdict(list)
+        for r in ray.get(
+            self.base._policy.worker_group.run_all_workers_single_data(
+                "pop_draft_routes", keys=hkeys
+            )
+        ):
+            for k, v in r.items():
+                parts[k].append(v)
+        out: list[Optional[torch.Tensor]] = []
+        for k, plen, g in zip(hkeys, prompt_lens, lengths):
+            if k not in parts:
+                out.append(None)
+                continue
+            out.append(merge_route_parts(parts[k], plen + g)[0])
+        self.stats["spec/route_bytes_logged"] = self.stats.get(
+            "spec/route_bytes_logged", 0.0
+        ) + float(sum(map(route_bytes, out)))
+        return out
+
+    def _truncate_to_anchors(self, drafted, anchors, prompt_len: int):
+        """Cut a draft to the tokens whose anchors were all logged (sticky routing).
+
+        Any prefix of a draft is a valid draft, and whether a route was logged
+        is engine bookkeeping, not a function of the tokens, so this is exact.
+        """
+        if self.sticky_delta is None or anchors is None:
+            return drafted
+        toks, done, lps = drafted
+        m = anchored_draft_length(anchors, prompt_len, len(toks))
+        if m >= len(toks):
+            return drafted
+        for name, v in (
+            ("spec/route_truncated_drafts", 1.0),
+            ("spec/route_truncated_tokens", float(len(toks) - m)),
+        ):
+            self.stats[name] = self.stats.get(name, 0.0) + v
+        return toks[:m], False, (None if lps is None else lps[:m])
 
     def _count_hidden(self, name: str, nbytes: int) -> None:
         if self.verify_source == "engine":
@@ -662,9 +756,15 @@ class SpeculativeGeneration:
         """Engine-sourced q: drop drafts the engine did not fully log (counted)."""
         if self.verify_source != "engine":
             return drafts, 0
-        kept = [[d for d in variants if engine_q_ready(d)] for variants in drafts]
+        def ready(d):
+            if not engine_q_ready(d):
+                return False
+            # Sticky routing: p is defined only with the drafter's routes.
+            return self.sticky_delta is None or (len(d) > 8 and d[8] is not None)
+
+        kept = [[d for d in variants if ready(d)] for variants in drafts]
         self._release_hidden(
-            d for variants in drafts for d in variants if not engine_q_ready(d)
+            d for variants in drafts for d in variants if not ready(d)
         )
         dropped = sum(len(v) for v in drafts) - sum(len(v) for v in kept)
         return [v for v in kept if v], dropped
@@ -678,10 +778,10 @@ class SpeculativeGeneration:
                 self._count_hidden(
                     "spec/hidden_bytes_fetched", sum(map(hidden_nbytes, hidden))
                 )
-            return "verify_drafts_block_engine", {
-                "engine_logq": [d[6] for _, d in flat],
-                "hidden": hidden,
-            }
+            extra = {"engine_logq": [d[6] for _, d in flat], "hidden": hidden}
+            if self.sticky_delta is not None:
+                extra["anchors"] = [d[8] for _, d in flat]
+            return "verify_drafts_block_engine", extra
         return "verify_drafts_block_stashed", {}
 
     def _verified_hidden(self, flat, by_row: dict[int, Any], a: int = 0) -> None:
@@ -704,6 +804,25 @@ class SpeculativeGeneration:
         flat, rows = self._flat_rows(drafts)
         self._record_siblings(flat)
         if self.verify_mode == "block":
+            by_row = self._verify_block(flat, rows)
+        else:
+            res = ray.get(
+                self.learner_policy.worker_group.run_all_workers_single_data(
+                    "verify_drafts",
+                    rows=rows,
+                    prompt_lens=[d[0].numel() for _, d in flat],
+                    seeds=[d[1] for _, d in flat],
+                    vocab_limit=self.vocab_limit,
+                    head_k=self.head_k,
+                    batch_tokens=self.verify_batch_tokens,
+                )
+            )
+            by_row = dict(x for rank_res in res for x in rank_res)
+        self._finish_verify(drafts, flat, by_row, dropped)
+
+    def _verify_block(self, flat, rows) -> dict[int, dict[str, Any]]:
+        """Block-verify ``flat`` drafts on every verifier pool; results by row."""
+        if True:
             # Contiguous row slices per verifier pool, verified concurrently.
             k = len(self.verifiers)
             cuts = [round(j * len(flat) / k) for j in range(k + 1)]
@@ -739,21 +858,12 @@ class SpeculativeGeneration:
                 for a, refs in futs
                 for rank_res in ray.get(refs)
             ]
-        else:
-            res = ray.get(
-                self.learner_policy.worker_group.run_all_workers_single_data(
-                    "verify_drafts",
-                    rows=rows,
-                    prompt_lens=[d[0].numel() for _, d in flat],
-                    seeds=[d[1] for _, d in flat],
-                    vocab_limit=self.vocab_limit,
-                    head_k=self.head_k,
-                    batch_tokens=self.verify_batch_tokens,
-                )
-            )
         by_row = dict(x for rank_res in res for x in rank_res)
-        if self.verify_mode == "block":
-            self._verified_hidden(flat, by_row)
+        self._verified_hidden(flat, by_row)
+        return by_row
+
+    def _finish_verify(self, drafts, flat, by_row, dropped) -> None:
+        """Plans and acceptance statistics from verification results."""
         # Every verified prefix is a prefix of the same keyed target sequence, so
         # the longest one per trajectory is kept.
         best: dict[int, tuple[tuple[torch.Tensor, int, list[int]], dict[str, Any]]] = {}
@@ -819,12 +929,24 @@ class SpeculativeGeneration:
                 f"which is not a finished rollout ({n_acc} of {len(draft)} "
                 "tokens accepted)"
             )
+        anchors = None
+        if self.sticky_delta is not None:
+            # Training replays the anchors of prompt + kept tokens only: entries
+            # past the kept prefix are routes of rejected draft tokens.
+            anchors = d[8][: prompt.numel() + n_acc]
+            if n_acc == len(draft) and not complete:
+                # The bonus row's anchor (the last drafted token's route) was
+                # not logged: keep the whole draft, and the next token comes
+                # from a continuation round (``verify_sticky``), an exact
+                # sampler of p given this prefix like the bonus draw itself.
+                return Plan(seed, list(draft), lps[:n_acc], anchors=anchors)
         if complete:
             return Plan(
                 seed,
                 draft,
                 lps[:n_acc],
                 complete=True,
+                anchors=anchors,
                 fused=None
                 if fused is None
                 else FusedRef(
@@ -836,7 +958,9 @@ class SpeculativeGeneration:
         prefix = draft[:n_acc] + [r["next"]]
         done = r["next"] == self.eod or len(prefix) >= self.max_new_tokens
         dead = list(draft[n_acc + 1 :]) if getattr(self, "tail_lookup", False) else []
-        return Plan(seed, prefix, lps, complete=done, dead_suffix=dead)
+        return Plan(
+            seed, prefix, lps, complete=done, dead_suffix=dead, anchors=anchors
+        )
 
     def _record_siblings(self, flat) -> None:
         """Draft tokens of every prompt verified this step (tail-lookup references)."""
@@ -1036,6 +1160,159 @@ class SpeculativeGeneration:
         if self.verify_source == "engine":
             self.stats["spec/engine_q_dropped"] = float(dropped)
 
+    # -- sticky routing: verification and theta_n continuations --------------------
+
+    async def verify_sticky(self, drafts, max_rounds: int = 1000) -> None:
+        """Verify drafts and complete every drafted rollout (sticky MoE routing).
+
+        Called at the start of iteration k with the learner at theta_k and the
+        engine still at theta_{k-1} (the refit waits until this returns). The
+        target is p = F(theta_k; A): anchors A = plain theta_{k-1} routes on the
+        rollout's own prefix at every position up to the rollout cap (the cut
+        c = prompt + max_new_tokens, content-independent), "self" for rows
+        never drafted. Positions after a rejection need theta_{k-1} routes on
+        the new prefix, so the engine keeps theta_{k-1} and continues each
+        incomplete plan in rounds: it drafts from prompt + kept prefix to the
+        end (EOS or the cap) with its plain forward, logging routes, hidden
+        states and log-probs as for any draft, and the learner block-verifies
+        that draft against the same p (anchors: the earlier ones spliced with
+        the new route log). Every round is exact block verification of a q
+        draft against the fixed target p, so the final rollout is an exact
+        sample of p. Rounds end when every plan is complete; the expected
+        number is small when acceptance is high.
+        """
+        self._plan_cv = None
+        self.verify(drafts)
+        rounds = cont_tokens = cont_kept = retries = 0
+        while True:
+            pending = [
+                (key, plan)
+                for key, queue in self.plans.items()
+                for plan in queue
+                if not plan.complete
+            ]
+            if not pending:
+                break
+            if rounds >= max_rounds:
+                raise RuntimeError(
+                    f"sticky routing: {len(pending)} rollouts still incomplete after "
+                    f"{rounds} continuation rounds"
+                )
+            rounds += 1
+            n_tok, n_kept, n_retry = await self._sticky_round(pending, rounds)
+            cont_tokens += n_tok
+            cont_kept += n_kept
+            retries += n_retry
+        self.stats.update(
+            {
+                "spec/sticky_rounds": float(rounds),
+                "spec/sticky_cont_draft_tokens": float(cont_tokens),
+                "spec/sticky_cont_accepted_frac": cont_kept / max(cont_tokens, 1),
+                "spec/sticky_cont_retries": float(retries),
+            }
+        )
+
+    async def _sticky_round(self, pending, rnd: int) -> tuple[int, int, int]:
+        """One continuation round: engine (theta_{k-1}) drafts, learner verifies."""
+        rank0 = self.base._policy.worker_group.workers[0]
+        prompts = [
+            torch.cat(
+                [torch.tensor(key, dtype=torch.long), torch.tensor(plan.prefix, dtype=torch.long)]
+            )
+            for key, plan in pending
+        ]
+        budgets = [self.max_new_tokens - len(plan.prefix) for _, plan in pending]
+        hkeys = self._hidden_keys([f"c{rnd}:{j}" for j in range(len(pending))])
+        ray.get(
+            rank0.start_drafts.remote(
+                [p.tolist() for p in prompts],
+                budgets,
+                self.stream_interval,
+                hidden_keys=hkeys,
+            )
+        )
+        # Run to completion (EOS or the cap): there is no deadline here.
+        while not all(ray.get(rank0.drafts_done.remote())):
+            await asyncio.sleep(0.02)
+        res = [_drafted(x) for x in self._collect_drafts(rank0)]
+        hid = self._pop_hidden(hkeys, [len(x[0]) for x in res])
+        res = [self._truncate(x, h) for x, h in zip(res, hid)]
+        routes = self._pop_routes(
+            hkeys, [p.numel() for p in prompts], [len(x[0]) for x in res]
+        )
+        version = self.current_step - 1
+        flat, rows, owners, retry = [], [], [], 0
+        for j, ((key, plan), p, x, h, a) in enumerate(
+            zip(pending, prompts, res, hid, routes)
+        ):
+            if a is not None:
+                a = splice(plan.anchors, a)
+            toks, done, lps = self._truncate_to_anchors(x, a, p.numel())
+            d = (
+                p,
+                -1,
+                toks,
+                done,
+                f"c{rnd}:{j}",
+                [(version, 0, len(toks))],
+                lps,
+                h,
+                a,
+            )
+            if not toks or not engine_q_ready(d) or a is None:
+                # Nothing verifiable this round (logging is engine bookkeeping,
+                # independent of the tokens): retry from the same prefix.
+                self._release_hidden([d])
+                retry += 1
+                continue
+            flat.append((len(owners), d))
+            rows.append(torch.cat([p, torch.tensor(toks, dtype=torch.long)]))
+            owners.append(plan)
+        if not flat:
+            return 0, 0, retry
+        by_row = self._verify_block(flat, rows)
+        n_tok = n_kept = 0
+        for r, ((_, d), plan) in enumerate(zip(flat, owners)):
+            out = by_row[r]
+            p, toks, done = d[0], d[2], d[3]
+            g, n_acc = len(toks), out["accepted"]
+            lps = behavior_logprobs(out["logprobs"], n_acc, d[6], out.get("draft_logq"))
+            n_tok += g
+            n_kept += n_acc
+            if n_acc == g:
+                plan.prefix += list(toks)
+                plan.prefix_logprobs += lps[:g]
+                plan.anchors = d[8][: p.numel() + g]
+                plan.complete = bool(done) or len(plan.prefix) >= self.max_new_tokens
+            else:
+                y = out["next"]
+                plan.prefix += list(toks[:n_acc]) + [y]
+                plan.prefix_logprobs += lps[: n_acc + 1]
+                plan.anchors = d[8][: p.numel() + n_acc]
+                plan.complete = y == self.eod or len(plan.prefix) >= self.max_new_tokens
+        return n_tok, n_kept, retry
+
+    def claim_anchors(
+        self, prompt: torch.Tensor, token_ids: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        """Anchors of a finished speculative rollout (sticky routing), or None.
+
+        ``prompt``: the generation prompt; ``token_ids``: the trajectory. None
+        for rollouts that were never drafted: anchor = self, plain routing.
+        """
+        entries = self._anchor_claims.get(_key(prompt))
+        if not entries:
+            return None
+        p = prompt.numel()
+        for j, (gen, anchors) in enumerate(entries):
+            if (
+                token_ids.numel() >= p + len(gen)
+                and _key(token_ids[p : p + len(gen)]) == gen
+            ):
+                del entries[j]
+                return anchors
+        return None
+
     # -- GenerationInterface used by the rollout ----------------------------------
 
     async def generate_async(
@@ -1119,6 +1396,16 @@ class SpeculativeGeneration:
         lps = list(plan.prefix_logprobs)
         if plan.fused is not None:
             self._fused_claims[key].append((tuple(gen), plan.fused))
+        if self.sticky_delta is not None and plan.anchors is not None:
+            if not plan.complete:
+                # Its continuation would be decoded plainly by the refit
+                # engine, which is not the sticky policy the prefix was
+                # verified against.
+                raise RuntimeError(
+                    "sticky routing: a drafted rollout reached the rollout loop "
+                    "incomplete (verify_sticky must complete every plan)"
+                )
+            self._anchor_claims[key].append((tuple(gen), plan.anchors))
         if not plan.complete:
             ids = torch.cat([prompt, torch.tensor(plan.prefix, dtype=torch.long)])
             cont = BatchedDataDict(

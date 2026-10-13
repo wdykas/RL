@@ -19,7 +19,11 @@ import os
 import pprint
 
 from omegaconf import OmegaConf
-from thundersync_rl.grpo_loop import ThunderSyncMasterConfig, thundersync_grpo_train
+from thundersync_rl.grpo_loop import (
+    ThunderSyncMasterConfig,
+    configure_sticky_policy,
+    thundersync_grpo_train,
+)
 from thundersync_rl.worker import WORKER_FQN
 
 from nemo_rl.algorithms.grpo import setup
@@ -53,6 +57,9 @@ def main() -> None:
         config = parse_hydra_overrides(config, overrides)
     config = ThunderSyncMasterConfig(**OmegaConf.to_container(config, resolve=True))
     config.policy["worker_extension_cls_fqn"] = WORKER_FQN
+    # Sticky MoE routing: the Megatron workers read the threshold from the
+    # policy config when they build the model (RouterReplay instances).
+    configure_sticky_policy(config)
     config.logger["log_dir"] = get_next_experiment_dir(config.logger["log_dir"])
     pprint.pprint(config)
 

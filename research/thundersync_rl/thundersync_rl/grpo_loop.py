@@ -206,6 +206,22 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # (bounds their activation memory, about one training micro-batch of this
     # many tokens). Drafts over the budget are trained the regular way.
     fused_max_retained_tokens: int = 16384
+    # Sticky MoE routing anchored to the drafter (nemo_rl/models/megatron/
+    # sticky_routing.py, routes.py, DESIGN.md section 14c). The policy of step
+    # k is F(theta_k; A): at each token and MoE layer keep the anchor expert
+    # set A when its weakest router score is within ``sticky_routing_delta``
+    # of the best excluded one (router-logit units for softmax routers), else
+    # plain top-k. A = the plain theta_{k-1} forward's routes on the rollout's
+    # own prefix (drafted rollouts; up to the rollout cap), self for rollouts
+    # never drafted. Removes routing-flip noise from p/q (acceptance) at the
+    # price of a one-version routing lag. Requires an MoE model, speculate,
+    # verify_mode=block, verify_source=engine, draft_lookahead=1, single-turn
+    # rollouts, no tail_lookup and no engine prefix caching.
+    sticky_routing: bool = False
+    # 0.03 saturates on Qwen3-30B-A3B (full 48 layers, real GPU numerics: same
+    # per-token variance as 0.1 and pure replay; 0.003 keeps 66% vs 73% of
+    # 32k drafts; ACCEPTANCE_LEDGER section T). None disables sticky routing.
+    sticky_routing_delta: Optional[float] = 0.03
 
 
 def resolve_min_pipeline_microbatches(ts_cfg: ThunderSyncConfig, pp: int) -> int:
@@ -307,6 +323,84 @@ def validate_config(master_config: ThunderSyncMasterConfig) -> None:
     validate_expert_parallel(master_config.thundersync, master_config.policy)
     validate_fused_verify_train(master_config.thundersync, master_config.policy)
     validate_engine_verify_source(master_config.thundersync, master_config.policy)
+    validate_sticky_routing(master_config)
+
+
+def sticky_delta(ts_cfg: ThunderSyncConfig) -> Optional[float]:
+    """The sticky routing threshold in effect (None: sticky routing off)."""
+    if not ts_cfg.sticky_routing or ts_cfg.sticky_routing_delta is None:
+        return None
+    return float(ts_cfg.sticky_routing_delta)
+
+
+def validate_sticky_routing(master_config: ThunderSyncMasterConfig) -> None:
+    """Reject settings under which the sticky policy is not exactly sampled.
+
+    The anchors must be an exogenous function of each rollout's prefix (plain
+    theta_{k-1} routes up to the rollout cap), engine and learner must apply
+    the same rule bitwise (batch invariance, engine-sourced q), and every
+    token of a drafted rollout must be sampled from F(theta_k; A): drafted
+    tokens by block verification, the rest by theta_{k-1} continuation
+    rounds before the engine refits (``SpeculativeGeneration.verify_sticky``).
+    """
+    ts_cfg = master_config.thundersync
+    delta = sticky_delta(ts_cfg)
+    if delta is None:
+        return
+    policy_cfg = master_config.policy
+    mcore_gen = policy_cfg["generation"].get("mcore_generation_config") or {}
+    problems = []
+    if delta < 0:
+        problems.append(f"thundersync.sticky_routing_delta must be >= 0 (got {delta})")
+    if not ts_cfg.speculate:
+        problems.append("thundersync.speculate must be true")
+    if ts_cfg.verify_mode != "block" or ts_cfg.verify_source != "engine":
+        problems.append(
+            "thundersync.verify_mode='block' and verify_source='engine' are required "
+            "(the engine logs the drafter's routes with its hidden states, and p must "
+            "be the training forward with the same anchors)"
+        )
+    if ts_cfg.draft_lookahead != 1:
+        problems.append(
+            "thundersync.draft_lookahead must be 1 (drafts spanning versions would "
+            "need the routes of the latest drafter version on older segments; not "
+            "built yet)"
+        )
+    if ts_cfg.tail_lookup:
+        problems.append(
+            "thundersync.tail_lookup must be false (continuations are theta_{k-1} "
+            "drafting rounds, not engine lookup decoding)"
+        )
+    if (master_config.grpo.max_rollout_turns or 1) != 1:
+        problems.append(
+            "grpo.max_rollout_turns must be 1 (a later turn would be decoded on a "
+            "prefix whose anchors the engine cannot apply yet: not built yet)"
+        )
+    if mcore_gen.get("enable_prefix_caching"):
+        problems.append(
+            "policy.generation.mcore_generation_config.enable_prefix_caching must be "
+            "false (cached prompt positions are not re-routed, so their routes would "
+            "not be logged)"
+        )
+    if mcore_gen.get("num_speculative_tokens"):
+        problems.append("in-engine speculative decoding must be off")
+    if (policy_cfg["megatron_cfg"].get("expert_model_parallel_size") or 1) < 1:
+        problems.append("invalid expert_model_parallel_size")
+    if (policy_cfg.get("router_replay") or {}).get("enabled"):
+        problems.append("policy.router_replay.enabled (R3) must be false")
+    if problems:
+        raise ValueError("thundersync.sticky_routing: " + "; ".join(problems) + ".")
+
+
+def configure_sticky_policy(master_config: Any) -> None:
+    """Hand the sticky threshold to the Megatron workers (before they are built).
+
+    Workers read ``policy.megatron_cfg.sticky_routing_delta``: it enables
+    MCore's RouterReplay instances in the model (``moe_enable_routing_replay``)
+    and the sticky rule (``nemo_rl.models.megatron.sticky_routing``).
+    """
+    delta = sticky_delta(master_config.thundersync)
+    master_config.policy["megatron_cfg"]["sticky_routing_delta"] = delta
 
 
 def validate_engine_verify_source(
@@ -627,6 +721,17 @@ def build_chunk_data(
             "advantages": adv.unsqueeze(-1).expand(n, s).clone(),
         }
     )
+    anchors = [t.payload.get("anchors") for t in chunk.trajectories]
+    first = next((a for a in anchors if a is not None), None)
+    if first is not None:
+        # Sticky routing: the drafter's routes of each drafted rollout (row
+        # positions from 0); -1 (anchor = self) for undrafted rows and padding.
+        routed = torch.full((n, s, *first.shape[1:]), -1, dtype=torch.int16)
+        for b, a in enumerate(anchors):
+            if a is not None:
+                m = min(int(a.shape[0]), s)
+                routed[b, :m] = a[:m]
+        data["routed_experts"] = routed
     if chunk.padding:
         for k in ("sample_mask", "token_mask", "advantages"):
             data[k] = torch.zeros_like(data[k])
@@ -695,6 +800,9 @@ async def _run_one_step(
     pre_rollout=None,
     claim_fused: Optional[
         Callable[[torch.Tensor, torch.Tensor], Optional[FusedRef]]
+    ] = None,
+    claim_anchors: Optional[
+        Callable[[torch.Tensor, torch.Tensor], Optional[torch.Tensor]]
     ] = None,
 ) -> dict[str, Any]:
     G = master_config.grpo.num_generations_per_prompt
@@ -877,14 +985,20 @@ async def _run_one_step(
                     torch.cat([m["token_ids"] for m in state["message_log"]]),
                 )
                 fused_counts["claimed"] += fused is not None
+            payload = {
+                "message_log": state["message_log"],
+                "loss_multiplier": loss_mult,
+            }
+            if claim_anchors is not None:
+                payload["anchors"] = claim_anchors(
+                    torch.cat([m["token_ids"] for m in repeated["message_log"][i]]),
+                    torch.cat([m["token_ids"] for m in state["message_log"]]),
+                )
             traj = Trajectory(
                 group=(step, i // G),
                 index=i,
                 reward=reward,
-                payload={
-                    "message_log": state["message_log"],
-                    "loss_multiplier": loss_mult,
-                },
+                payload=payload,
                 num_tokens=ntok,
                 fused=fused,
             )
@@ -1005,7 +1119,9 @@ def thundersync_grpo_train(
             fused_max_retained_tokens=ts_cfg.fused_max_retained_tokens,
             verify_source=ts_cfg.verify_source,
             hidden_transport=ts_cfg.hidden_transport,
+            sticky_delta=sticky_delta(ts_cfg),
         )
+    sticky = spec is not None and spec.sticky_delta is not None
     G = master_config.grpo.num_generations_per_prompt
     if spec is not None and os.environ.get("THUNDERSYNC_SPEC_SELFTEST"):
         first = next(iter(dataloader))
@@ -1035,14 +1151,25 @@ def thundersync_grpo_train(
         if step >= max_steps:
             break
         t0 = time.perf_counter()
+        t_verify = 0.0
+        if spec is not None:
+            spec.current_step = step
+        if sticky and drafts is not None:
+            # Sticky routing: verify and complete every drafted rollout while
+            # the engine still holds theta_{step-1}, whose plain forward
+            # supplies the anchors of continuation positions; refit after.
+            t1 = time.perf_counter()
+            policy_generation.prepare_for_generation()
+            asyncio.run(spec.verify_sticky(drafts))
+            policy_generation.finish_generation()
+            t_verify = time.perf_counter() - t1
+            drafts = None
+        t_r = time.perf_counter()
         if stale:
             refit_policy_generation(policy, policy_generation, False)
         else:
             policy_generation.prepare_for_generation()
-        t_refit = time.perf_counter() - t0
-        t_verify = 0.0
-        if spec is not None:
-            spec.current_step = step
+        t_refit = time.perf_counter() - t_r
         pre_rollout = None
         chunked = (
             spec is not None
@@ -1112,6 +1239,7 @@ def thundersync_grpo_train(
                 claim_fused=spec.claim_fused
                 if spec is not None and ts_cfg.fused_verify_train
                 else None,
+                claim_anchors=spec.claim_anchors if sticky else None,
             )
         )
         drafts = metrics.pop("_drafts")

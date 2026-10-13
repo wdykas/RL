@@ -105,6 +105,7 @@ from nemo_rl.models.megatron.pipeline_parallel import (
     broadcast_obj_from_pp_rank,
     broadcast_tensors_from_last_stage,
 )
+from nemo_rl.models.megatron import sticky_routing
 from nemo_rl.models.megatron.router_replay import (
     router_replay_dimensions,
     router_replay_enabled,
@@ -651,7 +652,11 @@ class MegatronPolicyWorkerImpl(
         init_telemetry_worker()
 
         self.cfg = config
-        self._router_replay_enabled = router_replay_enabled(config)
+        # Sticky MoE routing (ThunderSync speculation) replays per-token anchors
+        # through the same RouterReplay plumbing as R3 router replay.
+        self._router_replay_enabled = router_replay_enabled(
+            config
+        ) or sticky_routing.configure(config) is not None
         self._nixl_preinit_agent = maybe_preinit_nixl_checkpoint_engine(config)
 
         # Set rank for non-collocated to check which ranks to broadcast from

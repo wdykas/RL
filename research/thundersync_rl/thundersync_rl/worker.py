@@ -223,6 +223,31 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         self._stream_busy_s = 0.0
         self._stream_merge_calls = merge_pipeline_calls
 
+    def _with_routes(self, data: BatchedDataDict) -> BatchedDataDict:
+        """Give a batch ``routed_experts`` when sticky routing is on.
+
+        Rows the driver gave anchors carry them; a batch without the field
+        (no rollout of it was drafted) gets -1 everywhere: anchor = self,
+        i.e. plain routing, which is the sticky policy of undrafted rows.
+        """
+        if (
+            "routed_experts" in data
+            or self._anchor_batch([], [], 0) is None
+            or "input_ids" not in data
+        ):
+            return data
+        b, width = data["input_ids"].shape[:2]
+        data["routed_experts"] = self._anchor_batch([None] * b, None, width)
+        return data
+
+    def train_microbatches(self, datas, *args, **kwargs):
+        return super().train_microbatches(
+            [self._with_routes(d) for d in datas], *args, **kwargs
+        )
+
+    def get_logprobs(self, *, data, **kwargs):
+        return super().get_logprobs(data=self._with_routes(data), **kwargs)
+
     def finish_train_step(self) -> dict[str, Any]:
         """Finish the train step; optionally perturb expert gradients (test only).
 
@@ -1495,6 +1520,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         class _Engine(orig):  # type: ignore[misc, valid-type]
             def __init__(self, controller, context, *args, **kwargs):
                 worker._install_hidden_copy(context)
+                worker._install_route_record(context)
                 super().__init__(controller, context, *args, **kwargs)
 
         de.DynamicInferenceEngine = _Engine
@@ -1556,6 +1582,146 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             "weight": weight,
             "materialized": materialized,
         }
+
+    # ---- Sticky MoE routing: the drafter's routes (anchors), engine side ----
+
+    def _install_route_record(self, context) -> None:
+        """Record every engine token's plain top-k into one static buffer.
+
+        Sticky routing only (``policy.megatron_cfg.sticky_routing_delta``).
+        MCore ``RouterReplay`` RECORD with a static buffer per MoE layer (a
+        [max_tokens, L_local, K] int16 tensor, one column per local layer):
+        the copy is part of each router's forward, so it is captured into the
+        engine's CUDA graphs, which is why it is armed here, before the engine
+        constructor captures them. Recording is restricted to inference
+        forwards (``sticky_routing``'s wrapper), so a training-shaped forward
+        in this process neither records nor overruns the buffer.
+        """
+        from megatron.core.transformer.moe.router_replay import RouterReplayAction
+
+        from nemo_rl.models.megatron import sticky_routing
+        from nemo_rl.models.megatron.router_replay import (
+            _router_replay_instances_for_model,
+        )
+
+        if sticky_routing.get_delta() is None or getattr(self, "_route_record", None):
+            return
+        sticky_routing.install()
+        insts = sorted(
+            _router_replay_instances_for_model(self._gen_model()), key=lambda x: x[1]
+        )
+        if not insts:
+            return
+        from megatron.core.utils import get_model_config
+
+        cfg = get_model_config(self._gen_model())
+        k = int(cfg.moe_router_topk)
+        dev = torch.device("cuda", torch.cuda.current_device())
+        buf = torch.full(
+            (int(context.max_tokens), len(insts), k), -1, dtype=torch.int16, device=dev
+        )
+        for j, (replay, _) in enumerate(insts):
+            replay.set_static_buffer(buf[:, j, :])
+            replay._nrl_record_inference_only = True
+            replay.set_router_replay_action(RouterReplayAction.RECORD)
+        self._route_record = {
+            "buf": buf,
+            "layers": [ln for _, ln in insts],
+            "sequence_parallel": bool(getattr(cfg, "sequence_parallel", False)),
+        }
+
+    def install_draft_route_log(self) -> bool | None:
+        """Log the routes of tagged draft requests (prompt and drafted tokens).
+
+        Generation workers, sticky routing. Wraps the controller's
+        ``_dynamic_step_forward_logits``, which runs in Python for every engine
+        forward (eager or CUDA-graph replay, legacy or async scheduling): before
+        the forward it snapshots the step's token layout from the context's
+        CPU bookkeeping (which at launch time describes exactly this forward:
+        slot and absolute position of every token), after it enqueues the
+        copy of this forward's route rows of tagged tokens to host memory, on
+        the forward's stream and before the next forward can overwrite the
+        buffer. Tags are the hidden-state log's draft keys
+        (``HIDDEN_KEY_ATTR``). Every rank that routes tokens logs: pipeline
+        stages their layers, sequence-parallel TP ranks their token shard
+        (TP rank 0 alone without sequence parallelism, where routes are
+        replicated). Returns True when installed, None on ranks with nothing
+        to log, False when unsupported.
+        """
+        from megatron.core import parallel_state as ps
+        from thundersync_rl.engine_q import HIDDEN_KEY_ATTR
+        from thundersync_rl.routes import RouteLog, step_route_entries
+
+        engine = getattr(self, "dynamic_inference_engine", None)
+        ctx = getattr(self, "inference_context", None)
+        rec = getattr(self, "_route_record", None)
+        if engine is None or ctx is None or rec is None:
+            return False
+        if getattr(self, "_route_log", None) is not None:
+            return True
+        tp = ps.get_tensor_model_parallel_world_size()
+        tp_rank = ps.get_tensor_model_parallel_rank()
+        sp = rec["sequence_parallel"] and tp > 1
+        if tp_rank != 0 and not sp:
+            return None
+        log = RouteLog()
+        buf = rec["buf"]
+        controller = engine.controller
+        orig = controller._dynamic_step_forward_logits
+
+        def snapshot():
+            n = int(ctx.active_token_count)
+            if n <= 0:
+                return []
+            slots = ctx.token_to_request_idx[:n].tolist()
+            keys: dict[int, str] = {}
+            eng = self.dynamic_inference_engine
+            for slot in set(slots):
+                rid = int(ctx.request_ids[slot])
+                entry = eng.requests.get(rid)
+                if entry is None:
+                    continue
+                key = getattr(entry.record[-1].sampling_params, HIDDEN_KEY_ATTR, None)
+                if key is not None:
+                    keys[slot] = key
+            if not keys:
+                return []
+            pos = ctx.token_to_pos_ids[:n].tolist()
+            if sp:
+                chunk = int(ctx.padded_active_token_count) // tp
+                return step_route_entries(slots, pos, keys, tp_rank * chunk, chunk)
+            return step_route_entries(slots, pos, keys, 0, n)
+
+        def forward_logits(*args, **kwargs):
+            entries = snapshot()
+            out = orig(*args, **kwargs)
+            if entries:
+                log.record(entries, buf[: max(r for r, _, _ in entries) + 1])
+            return out
+
+        controller._dynamic_step_forward_logits = forward_logits
+        self._route_log = log
+        return True
+
+    def pop_draft_routes(self, keys: list[str]) -> dict[str, tuple]:
+        """{key: (layer numbers, positions [m], routes [m, L_local, K] int16)}.
+
+        Drafts this rank logged; every key is closed (late rows dropped).
+        """
+        log = getattr(self, "_route_log", None)
+        if log is None:
+            return {}
+        layers = self._route_record["layers"]
+        out = {}
+        for k in keys:
+            r = log.pop(k)
+            if r is not None:
+                out[k] = (layers, r[0], r[1])
+        return out
+
+    def drafts_done(self) -> list[bool]:
+        """Finished flag per draft of the last ``start_drafts`` call (rank 0)."""
+        return list(getattr(self, "_draft_done", None) or [])
 
     def install_draft_hidden_log(self) -> bool | None:
         """Log the engine's LM-head input for tagged draft requests.
@@ -1864,9 +2030,14 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         seed: int,
         keys: list[str],
         batch_tokens: int = 0,
+        anchors: list[Any] | None = None,
         **_: Any,
     ) -> list[tuple[int, dict[str, Any]]]:
         """Block verification with q from the engine and p from the training model.
+
+        ``anchors[i]`` (sticky MoE routing): the drafter's routes of row i,
+        [positions, L, K] int16 (-1: self); p is then F(theta; anchors), the
+        sticky policy the rollouts are sampled from.
 
         Requires batch-invariant kernels (the engine's decode is the training
         forward) and the same parallel layout as the engine (TP, PP, EP; batch
@@ -1953,11 +2124,15 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         def row_logits():
             for batch in batches:
                 t0 = time.perf_counter()
-                lb = (
-                    self._training_forward(rows[batch[0]])
-                    if len(batch) == 1
-                    else self._training_forward_rows([rows[i] for i in batch])
-                )
+                if anchors is not None:
+                    lb = self._training_forward_rows(
+                        [rows[i] for i in batch],
+                        anchors=[anchors[i] for i in batch],
+                    )
+                elif len(batch) == 1:
+                    lb = self._training_forward(rows[batch[0]])
+                else:
+                    lb = self._training_forward_rows([rows[i] for i in batch])
                 self._prof["forward"] = (
                     self._prof.get("forward", 0.0) + time.perf_counter() - t0
                 )
@@ -2145,11 +2320,41 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 longest = padded
         return out
 
-    def _training_forward(self, row: torch.Tensor) -> torch.Tensor | None:
+    def _training_forward(
+        self, row: torch.Tensor, anchors: torch.Tensor | None = None
+    ) -> torch.Tensor | None:
         """Logits [1, S, V] of one row, computed exactly as a training forward."""
-        return self._training_forward_rows([row])
+        if anchors is None:
+            return self._training_forward_rows([row])
+        return self._training_forward_rows([row], anchors=[anchors])
 
-    def _training_forward_rows(self, rows: list[torch.Tensor]) -> torch.Tensor | None:
+    def _anchor_batch(
+        self, rows: list[torch.Tensor], anchors: list[Any] | None, width: int
+    ) -> torch.Tensor | None:
+        """``routed_experts`` [B, width, L, K] for a sticky-routing forward.
+
+        None when sticky routing is off. Rows without anchors (and padding)
+        get -1: anchor = self, i.e. plain routing for those tokens.
+        """
+        from nemo_rl.models.megatron import sticky_routing
+
+        if sticky_routing.get_delta() is None or not self._router_replay_enabled:
+            return None
+        from nemo_rl.models.megatron.router_replay import router_replay_dimensions
+        from megatron.core.utils import get_model_config
+
+        layers, k = router_replay_dimensions(get_model_config(self.model))
+        out = torch.full((len(rows), width, layers, k), -1, dtype=torch.int16)
+        for b, a in enumerate(anchors or []):
+            if a is None:
+                continue
+            n = min(int(a.shape[0]), width)
+            out[b, :n] = a[:n].to(torch.int16)
+        return out
+
+    def _training_forward_rows(
+        self, rows: list[torch.Tensor], anchors: list[Any] | None = None
+    ) -> torch.Tensor | None:
         """Logits [B, S, V] of ``rows`` in one micro-batch, exactly as a training forward.
 
         Same padding (``make_sequence_length_divisible_by``), micro-batch
@@ -2169,6 +2374,11 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         for b, row in enumerate(rows):
             ids[b, : lens[b]] = row
         data = BatchedDataDict({"input_ids": ids, "input_lengths": torch.tensor(lens)})
+        routed = self._anchor_batch(rows, anchors, ids.shape[1])
+        if routed is not None:
+            # Sticky routing: the forward that defines p replays the anchors
+            # through the training path's RouterReplay (REPLAY_FORWARD).
+            data["routed_experts"] = routed
         attach_media_token_validity_mask(data, self.media_placeholder_token_id)
         iterator, _, _, _, padded_seq_length = get_microbatch_iterator(
             data,
@@ -2183,6 +2393,20 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         mb = next(iterator)
 
         def forward(model):
+            if routed is None:
+                return _model_forward(model)
+            from nemo_rl.models.megatron.router_replay import (
+                clear_router_replay,
+                set_router_replay_forward,
+            )
+
+            set_router_replay_forward(model, mb.routed_experts_cp_sharded)
+            try:
+                return _model_forward(model)
+            finally:
+                clear_router_replay(model)
+
+        def _model_forward(model):
             return megatron_train.model_forward(
                 model=model,
                 data_dict=mb.data_dict,

@@ -1425,7 +1425,12 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
 
     if "moe_grouped_gemm" in config["megatron_cfg"]:
         model_cfg.moe_grouped_gemm = config["megatron_cfg"]["moe_grouped_gemm"]
-    model_cfg.moe_enable_routing_replay = router_replay_enabled(config)
+    # Sticky MoE routing (sticky_routing.py) uses the RouterReplay instances too.
+    from nemo_rl.models.megatron.sticky_routing import sticky_routing_enabled
+
+    model_cfg.moe_enable_routing_replay = router_replay_enabled(
+        config
+    ) or sticky_routing_enabled(config)
 
 
 def _apply_mtp_config(model_cfg: Any, config: PolicyConfig) -> None:

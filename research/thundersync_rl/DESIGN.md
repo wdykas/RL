@@ -1264,6 +1264,86 @@ is exact apart from fp16 subnormals and widens the range by 2^s. Default 0; prob
 before running it and set s=2-4 if headroom is below ~4x. The setting must match in training and
 generation (checked by the mismatch validator).
 
+## 14c. Sticky MoE routing anchored to the drafter (`thundersync.sticky_routing`)
+
+*Opt-in, off by default (`sticky_routing: false`; `sticky_routing_delta: 0.03` when on).
+Unit-tested (CPU + GPU) and checked on a real Megatron MoE on one GPU; not yet run end to
+end (launcher: `scripts/bi_tp/sticky_moe.sh`).* Design and measurements:
+`thundersync_work/research/agent_first_principles.md` section 3, `ACCEPTANCE_LEDGER.md`
+section T; implementation notes: `thundersync_work/research/agent_sticky_impl.md`.
+
+**Policy.** For MoE models, most of the per-token log p/q noise between consecutive versions
+is top-k route flips at near ties. The policy of step k is redefined as
+p_k = F(θ_k; A): at each token and MoE layer, with router scores s (θ_k) and anchor set A,
+keep A if min_{e∈A} s_e ≥ max_{e∉A} s_e − δ, else plain top-k
+(`nemo_rl/models/megatron/sticky_routing.py`; δ in router-logit units for softmax routers,
+default 0.03, which measured the same as 0.1 and pure replay on Qwen3-30B-A3B). Kept anchors
+are ordered by the current scores, so F(θ; plain_topk(θ)) is bitwise the plain forward.
+An anchor row with a negative or repeated id means "self" (plain top-k).
+
+**Anchor schedule (exogenous).** A at position t = the plain θ_{k−1} forward's top-k on the
+rollout's own prefix, for every position up to the rollout cap c = prompt + max_new_tokens
+(content-independent); "self" for rollouts never drafted (or whose draft was dropped for
+missing logs, which is bookkeeping, not content). No recursion: anchors always come from a
+plain forward. Drafts are single-version (`draft_lookahead=1`), so every drafted position's
+anchor is exactly the drafter's logged route.
+
+**Engine (drafter) side** (`worker.py`, `routes.py`). With sticky routing every MoE router's
+MCore `RouterReplay` is in RECORD with a static [max_tokens, L, K] int16 buffer, armed before
+the engine captures its CUDA graphs (the copy is part of the captured router), recording only
+in inference forwards. `install_draft_route_log` wraps the controller's
+`_dynamic_step_forward_logits` (Python on every forward, graphed or eager, legacy or async
+scheduling): it snapshots the step's token layout from the context's CPU bookkeeping at launch
+(slot and absolute position of each token, i.e. the forward being launched) and, after the
+launch, enqueues one asynchronous copy of the tagged tokens' route rows to pinned memory
+(`RouteLog`, keyed by draft key and absolute position, so eviction re-prefills overwrite the
+same positions). Prompt positions are logged by the draft's own prefill (prefix caching must
+be off). Pipeline stages log their layers, sequence-parallel TP ranks their token shard;
+`pop_draft_routes` returns (layer numbers, positions, rows) and the driver merges them into a
+dense [P+g, L, K] anchor tensor (`merge_route_parts`), draft tuple index 8. Drafts are cut to
+the tokens whose anchors are all logged (`anchored_draft_length`: g tokens need positions
+0..P+g−2). Cost: L·K·2 B per token (768 B at 48 layers × top-8) through the driver.
+
+**Learner side.** Every forward that defines p_k applies the rule with the same anchors:
+the verification forward (`_training_forward_rows(..., anchors=...)`, through NeMo RL's
+`set_router_replay_forward`, also under PP and in EP lockstep dummies), the training forward
+of the rollout (`routed_experts` [B, S, L, K] in the training batch, built in
+`build_chunk_data` from the plan's anchors; `_with_routes` gives all-self rows to batches
+without drafted rows), and the mismatch check's `get_logprobs`. The sticky wrapper around
+`RouterReplay.get_replay_topk` stores the effective selection for REPLAY_BACKWARD, so
+activation recompute replays exactly the forward's routes. Top-k has zero derivative a.e., so
+the gradient is the ordinary backward with routes fixed (as R3 router replay).
+
+**Continuations at θ_{k−1}** (`SpeculativeGeneration.verify_sticky`). Positions after a
+rejection still need θ_{k−1} routes on the new prefix. With sticky routing, at the start of
+iteration k the driver verifies the drafts while the engine still holds θ_{k−1} and completes
+every drafted rollout before the refit: each incomplete plan is continued by the engine's
+plain θ_{k−1} forward from prompt + kept prefix to EOS or the cap (logging routes, hidden
+states and log-probs as for any draft), and that draft is block-verified against the same
+p_k (anchors spliced: earlier ones + the new log); repeat until every plan is complete. A
+whole-accepted draft that is not finished emits no bonus token (the bonus row's anchor, the
+route of the last drafted token, was never computed): it continues with another round, which
+is an exact sampler of p given that prefix just as the bonus draw is. Then the engine refits
+to θ_k and the iteration's rollouts start (drafted ones return their completed plans; the
+rest decode plainly at θ_k = F(θ_k; self)). Exactness of the whole scheme (drafts cut at
+exogenous times, block verification, no bonus, continuation rounds) is checked by exact
+enumeration on a toy routed language model (`test_routes.py`, TV < 1e-12), with a control
+showing that anchoring continuations to self after a rejection (anchors depending on τ)
+is biased.
+
+**Requirements** (`validate_sticky_routing`): speculate, verify_mode=block,
+verify_source=engine (BI), draft_lookahead=1, max_rollout_turns=1, no tail_lookup, no
+engine prefix caching, no R3 router replay, an MoE model (the engine must report a route
+log, else the driver raises).
+
+**Cost and open issues.** No extra learner FLOPs beyond the verification forwards of
+continuation rounds. The engine refit waits for the continuation rounds, so rollouts no
+longer overlap verification (keeping θ_{k−1} available after the refit, e.g. as a sparse
+weight delta toggled per chunk, would restore the overlap; not built yet). Multi-version drafts
+(`draft_lookahead>1`), multi-turn rollouts (a later turn's prefill would need the anchors in
+the engine: sticky replay in engine prefill, not built yet) and a horizon c below the rollout
+cap (same engine feature) are not built yet.
+
 ## 15. Open work
 
 - **Stragglers.** About one rejected draft per step decodes its remainder at about 3 ms
@@ -1291,6 +1371,9 @@ generation (checked by the mismatch validator).
   mismatch 0, few dropped drafts), then Qwen3-8B where scorer mode runs out of memory, then
   at TP=2 (`scripts/bi_tp/engine_q_tp.sh`) and TP=4 (2 nodes); EP=2 on the tiny MoE
   (`engine_q_moe.sh`) and PP=2 (`engine_q_pp.sh`), then a real MoE at EP x PP.
+- **Sticky MoE routing on GPU** (section 14c). `scripts/bi_tp/sticky_moe.sh` on the tiny MoE
+  (EP=2, expert-gradient noise) and on `qwen3-30b-a3b-L4`, A/B against `STICKY=0`; then the
+  sparse-delta θ_{k−1} toggle so rollouts overlap verification again, and lookahead > 1.
 - **Fused verification + training on GPU.** Validate `fused_verify_train` end to end
   (`THUNDERSYNC_FUSED_CHECK=1`, gradient against the unfused path) and measure the saved
   learner time on short-output tasks (section 14).
