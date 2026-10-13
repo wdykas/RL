@@ -29,7 +29,8 @@ esac
 if [ "$NOISE" != 0 ]; then export THUNDERSYNC_DEBUG_EXPERT_GRAD_NOISE=$NOISE; fi
 export RUNS=${RUNS:-runs_sticky_moe}
 export TAG=${TAG:-sticky$STICKY-d$DELTA-ep$EP-tp$TP-$(basename "$MODEL")}
-STICKY_ARGS="++thundersync.draft_lookahead=1"
+# Legacy scheduling: MCore's dynamic engine rejects routing replay under async scheduling.
+STICKY_ARGS="++thundersync.draft_lookahead=1 ++policy.generation.mcore_generation_config.async_sched_mode=legacy"
 if [ "$STICKY" = 1 ]; then
   STICKY_ARGS+=" ++thundersync.sticky_routing=true ++thundersync.sticky_routing_delta=$DELTA"
 fi
