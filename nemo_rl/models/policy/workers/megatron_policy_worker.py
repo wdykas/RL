@@ -774,6 +774,21 @@ class MegatronPolicyWorkerImpl(
         self.mcore_state = model_and_optimizer_state.state
         self.model = model_and_optimizer_state.model
         self.optimizer = model_and_optimizer_state.optimizer
+        if (
+            self.optimizer is not None
+            and config["megatron_cfg"].get("forward_gemm_precision") is not None
+        ):
+            # fp16 GEMM forward caches fp16 expert weights; drop them when weights change.
+            from nemo_rl.models.megatron import fp16_moe
+
+            _step = self.optimizer.step
+
+            def _step_and_invalidate(*args, **kwargs):
+                out = _step(*args, **kwargs)
+                fp16_moe.invalidate_weight_cache()
+                return out
+
+            self.optimizer.step = _step_and_invalidate
         self.scheduler = model_and_optimizer_state.scheduler
         self.checkpointing_context = model_and_optimizer_state.checkpointing_context
         param_sync_func = model_and_optimizer_state.param_sync_func

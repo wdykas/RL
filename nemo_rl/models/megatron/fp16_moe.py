@@ -56,14 +56,16 @@ except ImportError:  # pragma: no cover
 # order into one fp32 accumulator, and products of fp16 operands are exact, so the
 # result depends only on the row, its expert's weight and K order. Measured bitwise
 # identical over BLOCK_M 16-128, BLOCK_N 32-256, BLOCK_K 32-128, 2-8 warps and 2-4
-# stages (research/thundersync_rl/DESIGN.md section 14b). The configuration is picked
-# per call from the expected rows per expert: small tiles for decode, large for
-# prefill and training.
+# stages (research/thundersync_rl/DESIGN.md section 14b), and bitwise equal to cuBLAS
+# without split-K. The configuration is picked per call from the expected rows per
+# expert. Tuned at 500B-MoE expert shapes (8 local experts, hidden 7168, expert FFN
+# 2048; thundersync_work/runs/moe_decode_sweep.json): fc1 decode 252 -> 168 us.
 TileConfig = tuple  # (BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages)
 _CONFIGS: tuple[tuple[int, TileConfig], ...] = (
-    (32, (16, 64, 64, 4, 3)),  # decode: up to ~32 rows per expert
-    (192, (128, 64, 128, 8, 3)),
-    (1 << 62, (128, 64, 64, 4, 3)),
+    (16, (16, 64, 128, 4, 4)),  # decode
+    (32, (32, 64, 128, 4, 4)),
+    (64, (64, 32, 128, 4, 4)),
+    (1 << 62, (128, 64, 64, 4, 4)),  # engine prefill (training uses cuBLAS)
 )
 BLOCK_M = 16  # row alignment of the engine's decode buckets (smallest tile)
 
@@ -352,11 +354,14 @@ class GroupedFp16Linear(torch.autograd.Function):
         k = x.shape[-1]
         x16 = x.reshape(-1, k).to(torch.float16)
         splits = list(m_splits)
-        cfg = select_config(sum(splits) / max(len(splits), 1))
-        dest, offs, m_pad = _aligned_rows(splits, cfg[0], x.device)
-        x_pad = torch.zeros((m_pad, k), dtype=torch.float16, device=x.device)
-        x_pad.index_copy_(0, dest, x16)
-        out = grouped_gemm(x_pad, list(weights), offs, cfg).index_select(0, dest)
+        if x16.is_cuda:
+            out = _expert_gemm_cublas(x16, splits, weights)
+        else:
+            cfg = select_config(sum(splits) / max(len(splits), 1))
+            dest, offs, m_pad = _aligned_rows(splits, cfg[0], x.device)
+            x_pad = torch.zeros((m_pad, k), dtype=torch.float16, device=x.device)
+            x_pad.index_copy_(0, dest, x16)
+            out = grouped_gemm(x_pad, list(weights), offs, cfg).index_select(0, dest)
         ctx.save_for_backward(x16, *weights)
         ctx.m_splits = splits
         ctx.x_dtype = x.dtype
@@ -379,6 +384,58 @@ class GroupedFp16Linear(torch.autograd.Function):
             start += m
         dx = dx.to(ctx.x_dtype).view(ctx.x_shape) if ctx.needs_input_grad[0] else None
         return (dx, None, *wgrads)
+
+
+# fp16 copies of the training model's expert weights (cuBLAS needs both operands in
+# fp16; the Triton kernel converts in registers instead), stacked [E, N, K] per expert
+# linear for the grouped GEMM. Valid until the weights change: the policy worker calls
+# invalidate_weight_cache() after every optimizer step (checkpoints load only at init).
+# Costs 2 bytes per local expert parameter.
+_WEIGHT_CACHE: dict[tuple[int, ...], tuple[tuple[int, ...], torch.Tensor]] = {}
+
+
+def invalidate_weight_cache() -> None:
+    """Drop cached fp16 expert weights (call after the weights change)."""
+    _WEIGHT_CACHE.clear()
+
+
+def _stacked_fp16(weights: tuple[torch.Tensor, ...]) -> torch.Tensor:
+    key = tuple(id(w) for w in weights)
+    ptrs = tuple(w.data_ptr() for w in weights)
+    hit = _WEIGHT_CACHE.get(key)
+    if hit is not None and hit[0] == ptrs:
+        return hit[1]
+    w16 = torch.stack([w.detach().to(torch.float16) for w in weights])
+    _WEIGHT_CACHE[key] = (ptrs, w16)
+    return w16
+
+
+def _expert_gemm_cublas(
+    x16: torch.Tensor, m_splits: list[int], weights: tuple[torch.Tensor, ...]
+) -> torch.Tensor:
+    """Training-side expert GEMMs on cuBLAS: fp16 x fp16(W_e).T -> fp32, one GEMM per expert.
+
+    Bitwise equal to ``grouped_gemm`` (the engine's Triton kernel) for every row:
+    both form exact fp16 products and accumulate K serially in fp32, and cuBLAS
+    without split-K (te_native workspace starvation) does not depend on M. At
+    500B-MoE expert shapes (8 experts, K 7168, 1024 rows each) the GPU time is
+    0.30 ms vs 1.21 ms for the Triton kernel. (Transformer Engine's grouped GEMM
+    gives the same bits at 0.35 ms but syncs the host every call.)
+    """
+    w16 = _stacked_fp16(weights)
+    m_total, n = x16.shape[0], w16.shape[1]
+    out = torch.empty((m_total, n), dtype=torch.float32, device=x16.device)
+    start = 0
+    for i, m in enumerate(m_splits):
+        if m:
+            torch.mm(
+                x16[start : start + m],
+                w16[i].t(),
+                out_dtype=torch.float32,
+                out=out[start : start + m],
+            )
+        start += m
+    return out
 
 
 def _mm32(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:

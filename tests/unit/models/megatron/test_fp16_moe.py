@@ -13,6 +13,7 @@
 # limitations under the License.
 """CPU tests of the fp16 MoE expert path (nemo_rl/models/megatron/fp16_moe.py)."""
 
+import pytest
 import torch
 
 from nemo_rl.models.megatron import fp16_moe as fm
@@ -127,3 +128,43 @@ def test_expert_down_proj_prescale_matches(monkeypatch):
     diff = (outs[0] - outs[1]).abs().max().item()
     print(f"prescale 2^-4 max |diff| {diff:.3e}")
     torch.testing.assert_close(outs[0], outs[1], rtol=0, atol=1e-4)
+
+
+needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+
+
+@needs_cuda
+def test_training_cublas_path_bitwise_equals_engine_kernel():
+    """Training (per-expert cuBLAS) and engine (Triton) expert GEMMs give identical bits."""
+    torch.manual_seed(0)
+    dev = torch.device("cuda")
+    ws = [
+        (torch.randn(96, 256, device=dev) * 0.02).to(torch.bfloat16) for _ in range(4)
+    ]
+    splits = [3, 0, 70, 19]
+    x = torch.randn(sum(splits), 256, device=dev)
+    fm.invalidate_weight_cache()
+    y = fm.grouped_linear(x, splits, ws)
+    for cfg in fm._CONFIGS:
+        bm = cfg[1][0]
+        dest, offs, m_pad = fm._aligned_rows(splits, bm, dev)
+        xp = torch.zeros(m_pad, 256, device=dev, dtype=torch.float16)
+        xp.index_copy_(0, dest, x.half())
+        ye = fm.grouped_gemm(xp, ws, offs, cfg[1]).index_select(0, dest)
+        assert torch.equal(y, ye), cfg
+
+
+@needs_cuda
+def test_fp16_weight_cache_invalidation():
+    dev = torch.device("cuda")
+    w = (torch.randn(32, 64, device=dev) * 0.02).to(torch.bfloat16)
+    x = torch.randn(8, 64, device=dev)
+    fm.invalidate_weight_cache()
+    y0 = fm.grouped_linear(x, [8], [w])
+    w.data.mul_(2)  # an optimizer-style in-place update (no version bump via .data)
+    torch.testing.assert_close(
+        fm.grouped_linear(x, [8], [w]), y0
+    )  # stale until invalidated
+    fm.invalidate_weight_cache()
+    torch.testing.assert_close(fm.grouped_linear(x, [8], [w]), 2 * y0)
+    fm.invalidate_weight_cache()
