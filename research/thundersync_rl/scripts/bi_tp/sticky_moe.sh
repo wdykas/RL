@@ -24,7 +24,7 @@
 # a draft-weights refit, and from step 1 on draft/changed_frac > 0 (the draft differs from theta_k).
 #
 # Env: MODEL, EP (2), TP (1), PP (1), STEPS (4), PROMPTS (16), MAXLEN (1024), DELTA (0.03),
-# STICKY (1), NOISE (expert-grad noise, 1), SCHED (engine scheduling: legacy | async; legacy),
+# STICKY (1), NOISE (expert-grad noise, 1), SCHED (engine scheduling: async | legacy; async),
 # DRAFT_WEIGHTS (current), ARGS (extra overrides).
 W=/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/wdykas/code/on-olicy-rl/thundersync_work
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -33,7 +33,7 @@ export EP=${EP:-2} TP=${TP:-1} PP=${PP:-1} MAXLEN=${MAXLEN:-1024} STEPS=${STEPS:
 STICKY=${STICKY:-1} DELTA=${DELTA:-0.03} NOISE=${NOISE:-1} DRAFT_WEIGHTS=${DRAFT_WEIGHTS:-current}
 if [ "$NOISE" != 0 ]; then export THUNDERSYNC_DEBUG_EXPERT_GRAD_NOISE=$NOISE; fi
 export RUNS=${RUNS:-runs_sticky_moe}
-SCHED=${SCHED:-legacy}
+SCHED=${SCHED:-async}
 export TAG=${TAG:-sticky$STICKY-d$DELTA-ep$EP-tp$TP-pp$PP-$SCHED-dw$DRAFT_WEIGHTS-$(basename "$MODEL")}
 STICKY_ARGS="++thundersync.draft_lookahead=1 ++policy.generation.mcore_generation_config.async_sched_mode=$SCHED"
 STICKY_ARGS+=" ++thundersync.draft_weights=$DRAFT_WEIGHTS"
