@@ -14,7 +14,7 @@
 #   >=4 GPUs per side (GPUS_PER_SIDE, default max(TP*PP, EP)): 2*GPS/4 nodes; run on the head of a Ray cluster (as
 #              tp_parity_submit.sh).
 #
-# Env: TP (2), PP (1), EP (1), STEPS (4), MODEL (Qwen/Qwen3-1.7B), PROMPTS (16), MAXLEN (2048), ACKPT (selective | full | false), RECOMPUTE_MODULES (moe),
+# Env: TP (2), PP (1), EP (1), STEPS (4), RUN_TIMEOUT (seconds for the whole run, 2400), MODEL (Qwen/Qwen3-1.7B), PROMPTS (16), MAXLEN (2048), ACKPT (selective | full | false), RECOMPUTE_MODULES (moe),
 # TAG, RUNS (output directory name under thundersync_work, runs_engine_q_tp), ARGS (extra Hydra
 # overrides, appended last), RL_ROOT_OVERRIDE (code checkout; default: the one holding this
 # script). Output: thundersync_work/$RUNS/$TAG/{run.log,history.json}.
@@ -88,7 +88,7 @@ OUT=$W/$RUNS/$TAG
 mkdir -p "$OUT"
 rm -f "$OUT/history.json"  # rewritten after every step: never check a previous run's
 echo "[engine_q] TP=$TP PP=$PP EP=$EP STEPS=$STEPS MODEL=$MODEL RL_ROOT=$RL_ROOT -> $OUT"
-timeout 2400 python research/thundersync_rl/run_thundersync_grpo.py \
+timeout ${RUN_TIMEOUT:-2400} python research/thundersync_rl/run_thundersync_grpo.py \
   --config research/thundersync_rl/configs/grpo_math_1.5b_thundersync_megatron.yaml \
   --history-json "$OUT/history.json" thundersync.granularity=group logger.log_dir="$OUT/logs" \
   logger.wandb_enabled=false logger.tensorboard_enabled=false \
