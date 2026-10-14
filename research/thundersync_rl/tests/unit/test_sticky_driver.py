@@ -349,6 +349,12 @@ def test_continuations_are_verified_in_pieces_while_decoding():
     assert plan.anchors.length == 1 + 6
     assert s.stats["spec/sticky_rounds"] == 3.0 and s.stats["spec/sticky_streams"] == 1.0
     assert s.stats["spec/sticky_cont_draft_tokens"] == 2 + 2 + 1
+    # Tail timeline (TailTrace): one row, drafted 1 token at the deadline, no
+    # verify0 rejection, one continuation rejection at generated position 4.
+    assert s.stats["tail/rows"] == 1 and s.stats["tail/v0_rejected_rows"] == 0
+    assert s.stats["tail/cont_rejects"] == 1 and s.stats["tail/slowest_final_len"] == 6
+    assert [r[:2] for r in s.stats["timeline/tail_rejects"]] == [[1, 4]]
+    assert len(s.stats["timeline/tail_rounds"]) == 3
 
 
 def test_sticky_round_retries_unlogged_continuations():

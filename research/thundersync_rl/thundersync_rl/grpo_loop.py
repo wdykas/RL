@@ -259,6 +259,12 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # tokens decoded past the verified piece (SpeculativeGeneration
     # ._continue_sticky). Fixed count: the cut is exogenous.
     sticky_continuation_chunk_tokens: int = 2048
+    # Measurement only (research/agent_tail.md): the drafting deadline waits
+    # until every draft finished (EOS or the cap), so each step verifies whole
+    # rollouts and its post-refit tail is the rejection tail alone. Exact (no
+    # draft is cut, so none is truncated by content); serializes drafting
+    # after training, so never for step-time runs. Requires sticky_routing.
+    draft_until_complete: bool = False
     # Weights the engine drafts the next step's rollouts with (draft_weights.py,
     # DESIGN.md section 14f). "current": theta_k. "momentum": theta_hat_{k+1} =
     # the AdamW step of the optimizer state (theta_k, m_k, v_k) with gradient 0,
@@ -381,6 +387,13 @@ def validate_config(master_config: ThunderSyncMasterConfig) -> None:
     validate_sticky_routing(master_config)
     validate_sticky_rounding(master_config)
     validate_null_bv(master_config)
+    if master_config.thundersync.draft_until_complete and not (
+        master_config.thundersync.sticky_routing
+    ):
+        raise ValueError(
+            "thundersync.draft_until_complete requires sticky_routing (the only "
+            "path that keeps draft streams running past the deadline)"
+        )
     validate_draft_weights(master_config)
 
 
@@ -1339,6 +1352,7 @@ def thundersync_grpo_train(
             null_bv=ts_cfg.null_bv,
             null_bv_policy=null_bv_policy(master_config) if ts_cfg.null_bv else None,
             sticky_chunk_tokens=ts_cfg.sticky_continuation_chunk_tokens,
+            draft_until_complete=ts_cfg.draft_until_complete,
             draft_weights=ts_cfg.draft_weights,
             max_seq_len=master_config.policy["max_total_sequence_length"],
         )

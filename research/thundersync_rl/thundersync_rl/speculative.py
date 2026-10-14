@@ -53,6 +53,7 @@ from thundersync_rl.engine_q import (
 )
 from thundersync_rl.fused_train import FusedRef
 from thundersync_rl.null_bv import NullGroup, NullPolicy, envelopes
+from thundersync_rl.tail_trace import TailTrace
 from thundersync_rl.routes import (
     RouteRefs,
     anchor_mismatches,
@@ -180,6 +181,9 @@ class Plan:
     # unfinished prefix and still decodes it (``_continue_sticky`` goes on
     # with it instead of starting a new one).
     stream: Optional[dict[str, Any]] = field(default=None, compare=False)
+    # (drafted tokens, accepted tokens) of the draft verification turned into
+    # this plan; None for plans not made from a draft (``TailTrace``).
+    verified: Optional[tuple[int, int]] = field(default=None, compare=False)
 
 
 @dataclass
@@ -326,6 +330,7 @@ class SpeculativeGeneration:
         null_bv: bool = False,
         null_bv_policy: Optional[dict[str, Any]] = None,
         sticky_chunk_tokens: int = 2048,
+        draft_until_complete: bool = False,
         draft_weights: str = "current",
         max_seq_len: Optional[int] = None,
     ):
@@ -439,6 +444,8 @@ class SpeculativeGeneration:
         # Continuations are verified every this many decoded tokens while the
         # engine keeps decoding them (``_continue_sticky``).
         self.sticky_chunk_tokens = sticky_chunk_tokens
+        # Measurement only: the deadline waits for every draft to finish.
+        self.draft_until_complete = draft_until_complete
         self._cont_ids = itertools.count()
         self._anchor_claims = PrefixClaims()
         # Route blocks by the step whose training replays them (freed by
@@ -594,6 +601,7 @@ class SpeculativeGeneration:
                 del self._null_slots[t]  # never verified (no drafts reached it)
             self._null_slots[step + 1] = dict(null_slots)
         hkeys = self._hidden_keys([f"{step + 1}:{i}" for i in range(len(prompts))])
+        t_start = time.perf_counter()
         ray.get(
             rank0.start_drafts.remote(
                 [p.tolist() for p in prompts],
@@ -607,9 +615,18 @@ class SpeculativeGeneration:
             plens = [p.numel() for p in prompts]
             streams: list[Any] = [None] * len(prompts)
             if self.sticky_delta is not None:
+                t_cut = time.perf_counter()
+                if self.draft_until_complete:
+                    idx = list(range(len(prompts)))
+                    while not all(d for _, d in ray.get(rank0.draft_lengths.remote(idx))):
+                        time.sleep(0.05)
+                self.stats["tail/next_draft_complete_wait_s"] = time.perf_counter() - t_cut
+                self.stats["tail/next_draft_window_s"] = time.perf_counter() - t_start
                 res, hid, anchors, streams = self._collect_running(
                     rank0, hkeys, plens, budget, target=step + 1
                 )
+                self.stats["tail/next_drafted_tokens"] = float(sum(len(x[0]) for x in res))
+                self.stats["tail/next_drafts"] = float(len(res))
             else:
                 res = [_drafted(x) for x in self._collect_drafts(rank0)]
                 res, hid, anchors = self._pop_logs(hkeys, plens, res, target=step + 1)
@@ -1367,6 +1384,7 @@ class SpeculativeGeneration:
         for i in range(len(drafts)):
             d, r = best[i]
             plan = self._plan(d, r)
+            plan.verified = (len(d[2]), r["accepted"])
             full += plan.complete and r["accepted"] == len(d[2])
             kept += r["accepted"]
             total += len(d[2])
@@ -1469,6 +1487,7 @@ class SpeculativeGeneration:
             n_out += 1
             outs_by_group[groups[r]] += 1
             plan = self._plan(d, res)
+            plan.verified = (g, res["accepted"])
             full += plan.complete and res["accepted"] == g
             kept += res["accepted"]
             total += g
@@ -1825,10 +1844,17 @@ class SpeculativeGeneration:
         target p, so the final rollout is an exact sample of p.
         """
         self._plan_cv = None
+        trace = TailTrace()
         if os.environ.get("THUNDERSYNC_ENGINE_Q_CHECK") == "1":
             await self._route_check(drafts)
+            trace.mark("route_check")
         streams = [d[9] for v in drafts for d in v if len(d) > 9 and d[9] is not None]
         self.verify(drafts)
+        trace.mark("verify0")
+        for key, queue in self.plans.items():
+            for plan in queue:
+                if plan.verified is not None:
+                    trace.verified(key, plan, *plan.verified)
         pending = [
             (key, plan)
             for key, queue in self.plans.items()
@@ -1841,7 +1867,8 @@ class SpeculativeGeneration:
         self._stop_streams([x for x in streams if id(x) not in kept])
         # Also with nothing pending (every draft whole-accepted and complete):
         # the step then reports zero continuation rounds instead of no stats.
-        await self._continue_sticky(pending)
+        await self._continue_sticky(pending, trace)
+        self.stats.update(trace.summary())
 
     def _stop_streams(self, streams) -> None:
         """Abort engine draft streams and close their logs (rank 0 + every engine)."""
@@ -1910,7 +1937,9 @@ class SpeculativeGeneration:
         self.stats["spec/route_check_exact"] = float(exact)
         print(f"[route check] drafts={len(ds)} tok={tok} exact={exact}", flush=True)
 
-    async def _continue_sticky(self, pending, max_retries: int = 100) -> None:
+    async def _continue_sticky(
+        self, pending, trace: Optional[TailTrace] = None, max_retries: int = 100
+    ) -> None:
         """Complete incomplete plans at theta_{k-1}, verifying while the engine decodes.
 
         One engine stream per plan decodes from prompt + kept prefix toward
@@ -2007,6 +2036,7 @@ class SpeculativeGeneration:
             ready = []
             for s, (toks, done, lps) in zip(cand, snaps):
                 a = s["taken"]
+                s["decoded"] = len(toks)  # stream length when its piece is taken
                 n = len(toks) - a if done else ((len(toks) - a) // chunk) * chunk
                 if n > 0 or done:
                     # (stream, piece, stream finished, piece log-probs)
@@ -2102,7 +2132,10 @@ class SpeculativeGeneration:
             if not flat:
                 continue
             stats["rounds"] += 1
+            t_verify = time.perf_counter()
             by_row = self._verify_block(flat, rows)
+            t_verify = time.perf_counter() - t_verify
+            n_rejects = 0
             done_streams = []
             for r, ((_, d), s) in enumerate(zip(flat, owners)):
                 out = by_row[r]
@@ -2113,6 +2146,7 @@ class SpeculativeGeneration:
                 )
                 stats["tokens"] += g
                 stats["kept"] += n_acc
+                start_pos = s["taken"]
                 if n_acc == g:
                     plan.prefix += list(toks)
                     plan.prefix_logprobs += lps[:g]
@@ -2124,6 +2158,7 @@ class SpeculativeGeneration:
                     if plan.complete:
                         done_streams.append(s)
                 else:
+                    n_rejects += 1
                     y = out["next"]
                     plan.prefix += list(toks[:n_acc]) + [y]
                     plan.prefix_logprobs += lps[: n_acc + 1]
@@ -2134,6 +2169,12 @@ class SpeculativeGeneration:
                     done_streams.append(s)
                     if not plan.complete:
                         restart.append(s)
+                if trace is not None:
+                    trace.piece(plan, start_pos, g, n_acc, s["decoded"])
+                    if plan.complete:
+                        trace.completed(plan)
+            if trace is not None:
+                trace.round(len(live), len(flat), t_verify, n_rejects)
             if done_streams:
                 stop(done_streams)
             if restart:
