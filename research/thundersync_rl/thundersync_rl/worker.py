@@ -227,6 +227,19 @@ def snapshot_drafts(
     return out
 
 
+def _call_log(worker: Any, name: str) -> None:
+    """Debug (``THUNDERSYNC_CALL_LOG``): which learner call this rank starts, in order.
+
+    Every learner rank must start the same calls in the same order (their
+    collectives pair up); comparing the ranks' sequences finds a desync.
+    """
+    if os.environ.get("THUNDERSYNC_CALL_LOG"):
+        print(
+            f"[call log] rank={getattr(worker, 'rank', '?')} {name} t={time.time():.6f}",
+            flush=True,
+        )
+
+
 if engine_prof.enabled():
     # Debug: engine step timing in every process that runs a dynamic engine.
     engine_prof.install()
@@ -362,6 +375,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         ``restore_training_weights``. The fp16 expert-weight cache keeps
         theta_k's casts, which are valid again after the bitwise restore.
         """
+        _call_log(self, "load_draft_weights")
         if getattr(self, "_draft_swap", None) is not None:
             raise RuntimeError("draft weights already loaded")
         self._draft_swap: Optional[DraftSwap] = load_draft(self.optimizer, kind)
@@ -370,6 +384,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
 
     def restore_training_weights(self) -> dict[str, float]:
         """Put the training weights theta_k back, bitwise (after ``load_draft_weights``)."""
+        _call_log(self, "restore_training_weights")
         swap, self._draft_swap = self._draft_swap, None
         if swap is None:
             raise RuntimeError("no draft weights loaded")
@@ -459,6 +474,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         pipeline parallelism a dispatch pays one fill/drain bubble per
         destination instead of one per chunk.
         """
+        _call_log(self, "stream_accumulate")
         t0 = time.perf_counter()
         fused_trained = fused_tokens = fused_fallback = 0
         state = self._train_step_state
@@ -591,6 +607,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
 
     def stream_finish_step(self) -> dict[str, Any]:
         """Barrier: write back, normalize, DP-reduce, clip, step."""
+        _call_log(self, "stream_finish_step")
         peak = self._train_step_state["grad_stream"].peak_open_buffers
         # Retained verification graphs never outlive the weights they were
         # taken at; any left (their rollout trained the regular way) go now.
@@ -2471,6 +2488,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         layers, fraction that kept the anchor, fraction whose experts differ
         from plain top-k).
         """
+        _call_log(self, "verify_drafts_block_engine")
         from megatron.core import parallel_state as ps
         from thundersync_rl.engine_q import (
             GatheredLogprobRows,

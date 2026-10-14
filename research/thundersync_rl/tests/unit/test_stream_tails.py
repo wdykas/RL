@@ -163,3 +163,46 @@ def test_canonical_order_needs_group_granularity_and_all_groups():
     pl.max_open_groups = 1
     with pytest.raises(ValueError, match="group granularity"):
         pl.set_order([(0, 0), (0, 1)])
+
+
+def test_learner_calls_never_overlap_while_streaming(monkeypatch):
+    """Piece verifications and training dispatches hold learner_lock end to end."""
+    import time as _time
+
+    from thundersync_rl import speculative as sp
+
+    spec = _spec()
+    in_flight, peak = [0], [0]
+
+    def submit(flat, rows, null_envelopes=None):
+        in_flight[0] += 1
+        peak[0] = max(peak[0], in_flight[0])
+        return [(0, ["ref"])]
+
+    def get(refs):
+        _time.sleep(0.01)
+        in_flight[0] -= 1
+        return [[(0, {"ok": True})]]
+
+    spec._submit_verify_block = submit
+    spec._verify_block_results = lambda flat, done: {0: done}
+    monkeypatch.setattr(sp.ray, "get", get)
+
+    async def train(lock):
+        for _ in range(5):
+            async with lock:
+                in_flight[0] += 1
+                peak[0] = max(peak[0], in_flight[0])
+                await asyncio.sleep(0.005)
+                in_flight[0] -= 1
+
+    async def main():
+        spec.begin_streaming_tails()
+        await asyncio.gather(
+            train(spec.learner_lock),
+            *(spec._verify_block_async([0], [0]) for _ in range(5)),
+        )
+        spec.end_streaming_tails()
+
+    asyncio.run(main())
+    assert peak[0] == 1

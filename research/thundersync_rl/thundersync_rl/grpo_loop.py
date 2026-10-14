@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import contextlib
 import itertools
 import os
 import time
@@ -1057,6 +1058,7 @@ async def _run_one_step(
     drafts_after_pre_rollout: bool = False,
     group_order: Optional[list[int]] = None,
     tail_groups: Optional[list[int]] = None,
+    learner_lock_owner: Optional[Any] = None,
 ) -> dict[str, Any]:
     """One step: rollouts, streaming training and the next step's drafts.
 
@@ -1066,8 +1068,14 @@ async def _run_one_step(
     the step's groups (prompt indices) one at a time in this order
     (``StreamPlanner.set_order``). ``tail_groups``: groups with pending tails,
     logged with each group's completion and dispatch times.
+    ``learner_lock_owner.learner_lock`` (the spec, set up when the step starts):
+    held by every learner call batch from submission to its last result (the
+    tails' piece verification and the refit hold it too), so the learner ranks
+    run the same calls in the same order (asynchronous Ray actors do not keep
+    submission order when several calls wait).
     """
     G = master_config.grpo.num_generations_per_prompt
+    learner_lock = getattr(learner_lock_owner, "learner_lock", None)
     repeated = batch.repeat_interleave(G)
     n = repeated.size
     mbs = master_config.policy["train_micro_batch_size"]
@@ -1179,9 +1187,14 @@ async def _run_one_step(
                     ]
                     for chunks in d.per_rank
                 ]
-                t0 = time.perf_counter()
-                rank_results = await asyncio.gather(*learner.submit(per_rank, d.closes))
-                t1 = time.perf_counter()
+                async with (
+                    learner_lock if learner_lock is not None else contextlib.nullcontext()
+                ):
+                    t0 = time.perf_counter()
+                    rank_results = await asyncio.gather(
+                        *learner.submit(per_rank, d.closes)
+                    )
+                    t1 = time.perf_counter()
                 pipeline_calls += max(
                     (r.get("num_calls", 0) for r in rank_results), default=0
                 )
@@ -1609,7 +1622,10 @@ def thundersync_grpo_train(
                     await spec.complete_tails(pending)
                     policy_generation.finish_generation()
                     tails_s.append(time.perf_counter() - t)
-                    refit_for_step()
+                    # The momentum stage and the refit call the learner: no
+                    # training dispatch may be in flight meanwhile.
+                    async with spec.learner_lock:
+                        refit_for_step()
                 except BaseException as exc:
                     spec.weights_ready(error=exc)
                     raise
@@ -1687,6 +1703,7 @@ def thundersync_grpo_train(
                 drafts_after_pre_rollout=tails is not None,
                 group_order=group_order,
                 tail_groups=tail_groups,
+                learner_lock_owner=spec if tails is not None else None,
             ))
         )
         t_refit = refit_s[0]

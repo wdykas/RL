@@ -30,6 +30,7 @@ unchanged: a request for a prompt that has a verified plan returns immediately
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import itertools
 import math
 import os
@@ -1293,12 +1294,21 @@ class SpeculativeGeneration:
         return self._verify_block_results(flat, [(a, ray.get(refs)) for a, refs in futs])
 
     async def _verify_block_async(self, flat, rows) -> dict[int, dict[str, Any]]:
-        """``_verify_block`` without blocking the driver's event loop."""
-        futs = self._submit_verify_block(flat, rows)
-        done = []
-        for a, refs in futs:
-            # A worker thread waits on the results; the event loop keeps going.
-            done.append((a, await asyncio.to_thread(ray.get, refs)))
+        """``_verify_block`` without blocking the driver's event loop.
+
+        Holds ``learner_lock`` (when streaming over the tails) from sending the
+        verification to receiving every rank's result: learner actors are
+        asynchronous Ray actors, which do not run queued calls in submission
+        order, so two call batches in flight at once could start in different
+        orders on different ranks and pair their collectives wrongly.
+        """
+        lock = getattr(self, "learner_lock", None)
+        async with lock if lock is not None else contextlib.nullcontext():
+            futs = self._submit_verify_block(flat, rows)
+            done = []
+            for a, refs in futs:
+                # A worker thread waits on the results; the event loop keeps going.
+                done.append((a, await asyncio.to_thread(ray.get, refs)))
         return self._verify_block_results(flat, done)
 
     def _submit_verify_block(self, flat, rows, null_envelopes=None) -> list:
@@ -1887,10 +1897,13 @@ class SpeculativeGeneration:
         self._tail_cv = asyncio.Condition()
         self._tail_error: Optional[BaseException] = None
         self._weights_ready = asyncio.Event()
+        # One learner call batch in flight at a time (``learner_lock``).
+        self.learner_lock = asyncio.Lock()
 
     def end_streaming_tails(self) -> None:
         self._tail_cv = None
         self._weights_ready = None
+        self.learner_lock = None
 
     async def _notify_tails(self) -> None:
         cv = getattr(self, "_tail_cv", None)
