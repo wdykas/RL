@@ -52,6 +52,7 @@ from thundersync_rl.engine_q import (
     ray_free,
 )
 from thundersync_rl.fused_train import FusedRef
+from thundersync_rl.multi_turn import TurnEnvironment, TurnRecord, pair_rows, replay
 from thundersync_rl.null_bv import NullGroup, NullPolicy, envelopes
 from thundersync_rl.routes import (
     RouteRefs,
@@ -180,6 +181,14 @@ class Plan:
     # unfinished prefix and still decodes it (``_continue_sticky`` goes on
     # with it instead of starting a new one).
     stream: Optional[dict[str, Any]] = field(default=None, compare=False)
+    # Multi-turn rollouts under sticky routing (``multi_turn.py``): ``prefix``
+    # then holds the whole row after the prompt (turns and observations), the
+    # current turn starts at ``prefix[turn_start]``, ``turns`` records every
+    # finished turn with the environment's answer, ``row`` is the rollout-loop
+    # row the plan serves.
+    turn_start: int = 0
+    turns: list[TurnRecord] = field(default_factory=list, compare=False)
+    row: Optional[int] = None
 
 
 @dataclass
@@ -441,6 +450,12 @@ class SpeculativeGeneration:
         self.sticky_chunk_tokens = sticky_chunk_tokens
         self._cont_ids = itertools.count()
         self._anchor_claims = PrefixClaims()
+        # Multi-turn rollouts (sticky routing, scheme A): the environment the
+        # driver steps at every verified turn end, and the drafted plans
+        # paired with rollout-loop rows (``bind_rows``/``claim_row``).
+        self.turn_env: Optional[TurnEnvironment] = None
+        self._row_prompts: list[torch.Tensor] = []
+        self._row_plans: dict[int, Plan] = {}
         # Route blocks by the step whose training replays them (freed by
         # ``release_routes`` once that step has trained).
         self._route_blocks: dict[int, list] = defaultdict(list)
@@ -1062,6 +1077,11 @@ class SpeculativeGeneration:
         Then no rollout of this step decodes on the engine (``_one`` returns the
         plan), so the engine need not hold theta_k for the step.
         """
+        if self._row_plans:
+            # Multi-turn: drafted plans are paired with rows (``bind_rows``).
+            return len(self._row_plans) == len(prompts) and all(
+                plan.complete for plan in self._row_plans.values()
+            )
         need = Counter(_key(p) for p in prompts)
         return all(
             all(plan.complete for plan in self.plans.get(key, [])[:n])
@@ -1829,18 +1849,85 @@ class SpeculativeGeneration:
             await self._route_check(drafts)
         streams = [d[9] for v in drafts for d in v if len(d) > 9 and d[9] is not None]
         self.verify(drafts)
+        ended = []
+        if self.turn_env is not None:
+            # Multi-turn: each drafted plan serves one rollout-loop row (the
+            # environment is stepped with that row's state). A plan whose
+            # first turn ended in verification goes to the environment.
+            self._row_plans = pair_rows(self._row_prompts, self.plans)
+            left = sum(len(q) for q in self.plans.values())
+            if left:
+                raise RuntimeError(
+                    f"multi-turn: {left} verified plans have no rollout row "
+                    "(drafted prompts differ from the step's rows)"
+                )
+            for i, plan in self._row_plans.items():
+                plan.row = i
+                if plan.complete:
+                    plan.complete = False
+                    ended.append((_key(self._row_prompts[i]), plan))
+            plans = [(_key(self._row_prompts[i]), p) for i, p in self._row_plans.items()]
+        else:
+            plans = [(key, plan) for key, queue in self.plans.items() for plan in queue]
         pending = [
             (key, plan)
-            for key, queue in self.plans.items()
-            for plan in queue
-            if not plan.complete
+            for key, plan in plans
+            if not plan.complete and not any(plan is q for _, q in ended)
         ]
         # The drafts' streams still decode: whole-accepted unfinished plans go
         # on with theirs, every other stream stops.
         kept = {id(plan.stream) for _, plan in pending if plan.stream is not None}
         self._stop_streams([x for x in streams if id(x) not in kept])
-        if pending:
-            await self._continue_sticky(pending)
+        if pending or ended:
+            await self._continue_sticky(pending, ended)
+
+    def bind_rows(self, rows: list[dict[str, Any]]) -> None:
+        """This step's rollout rows (multi-turn): initial sample states, in row order.
+
+        Called before ``verify_sticky``; the drafted plans are paired with
+        these rows there (``pair_rows``) and claimed by ``claim_row``.
+        """
+        if self.turn_env is None:
+            raise RuntimeError("bind_rows needs a turn environment (multi-turn rollouts)")
+        self.turn_env.bind(rows)
+        self._row_prompts = [
+            torch.cat([m["token_ids"] for m in r["message_log"]]) for r in rows
+        ]
+        self._row_plans = {}
+
+    def claim_row(self, row: int) -> Optional[Plan]:
+        """The finished drafted plan of rollout-loop row ``row`` (multi-turn), or None."""
+        plan = self._row_plans.pop(row, None)
+        if plan is not None and not plan.complete:
+            raise RuntimeError(
+                f"sticky routing: row {row}'s drafted multi-turn rollout reached the "
+                "rollout loop unfinished (verify_sticky must complete every turn)"
+            )
+        return plan
+
+    def replay_row(self, row: int) -> Optional[tuple[dict, dict, Optional[RouteRefs]]]:
+        """Row ``row``'s drafted multi-turn rollout, or None if undrafted.
+
+        (final sample state, sample metrics, anchors), rebuilt from the
+        recorded turns (the environment is not stepped again).
+        """
+        plan = self.claim_row(row)
+        if plan is None:
+            return None
+        state, metrics = replay(
+            self.turn_env, row, plan.prefix, plan.prefix_logprobs, plan.turns
+        )
+        return state, metrics, plan.anchors
+
+    def _turn_cap(self, key, plan: Plan) -> int:
+        """Most tokens the plan's current turn can generate (per-turn length cap)."""
+        return self._cap(len(key) + plan.turn_start)
+
+    def _turn_ended(self, key, plan: Plan, last: int) -> bool:
+        """Whether the verified prefix ends the current turn (``last``: its last token)."""
+        return last == self.eod or len(plan.prefix) - plan.turn_start >= self._turn_cap(
+            key, plan
+        )
 
     def _stop_streams(self, streams) -> None:
         """Abort engine draft streams and close their logs (rank 0 + every engine)."""
@@ -1909,7 +1996,7 @@ class SpeculativeGeneration:
         self.stats["spec/route_check_exact"] = float(exact)
         print(f"[route check] drafts={len(ds)} tok={tok} exact={exact}", flush=True)
 
-    async def _continue_sticky(self, pending, max_retries: int = 100) -> None:
+    async def _continue_sticky(self, pending, ended=(), max_retries: int = 100) -> None:
         """Complete incomplete plans at theta_{k-1}, verifying while the engine decodes.
 
         One engine stream per plan decodes from prompt + kept prefix toward
@@ -1927,13 +2014,50 @@ class SpeculativeGeneration:
         stream's own route log (its prefill re-routes prompt + prefix);
         pieces are cut to their logged routes and hidden rows, which is
         engine bookkeeping, independent of the tokens.
+
+        Multi-turn (``turn_env``): a verified prefix that ends a turn (EOS or
+        the per-turn cap) goes to the environment (``ended``: plans whose
+        turn ended before this call); unless the rollout ends there, its
+        observation is appended and a new stream decodes the next turn from
+        prompt + turns + observation. That stream's prefill routes the
+        observation positions: their anchors. Environment steps run
+        concurrently with the streams of other plans.
         """
         rank0 = self.base._policy.worker_group.workers[0]
         chunk = max(1, int(self.sticky_chunk_tokens))
         version = self.current_step - 1
-        stats = dict(rounds=0, streams=0, tokens=0, kept=0, retries=0)
+        stats = dict(rounds=0, streams=0, tokens=0, kept=0, retries=0, turns=0)
         live: list[dict[str, Any]] = []
         retries: dict[int, int] = defaultdict(int)
+        turns: dict[asyncio.Task, tuple] = {}
+
+        def end_turn(key, plan: Plan) -> None:
+            if self.turn_env is None:
+                plan.complete = True
+                return
+            task = asyncio.create_task(
+                self.turn_env.step(
+                    plan.row, len(key), list(plan.prefix), plan.turns, plan.turn_start
+                )
+            )
+            turns[task] = (key, plan)
+            stats["turns"] += 1
+
+        def next_turns() -> None:
+            """Apply finished environment steps; start the next turns' streams."""
+            nxt = []
+            for task in [t for t in turns if t.done()]:
+                key, plan = turns.pop(task)
+                rec = task.result()
+                plan.turns.append(rec)
+                if self.turn_env.rollout_ends(plan.turns):
+                    plan.complete = True
+                    continue
+                plan.prefix += rec.obs
+                plan.prefix_logprobs += [0.0] * len(rec.obs)
+                plan.turn_start = len(plan.prefix)
+                nxt.append((key, plan))
+            start(nxt)
 
         def start(items) -> None:
             if not items:
@@ -1947,7 +2071,10 @@ class SpeculativeGeneration:
                 )
                 for key, plan in items
             ]
-            budgets = [self._cap(len(key)) - len(plan.prefix) for key, plan in items]
+            budgets = [
+                self._turn_cap(key, plan) - (len(plan.prefix) - plan.turn_start)
+                for key, plan in items
+            ]
             hkeys = self._hidden_keys([f"c{next(self._cont_ids)}" for _ in items])
             idx = ray.get(
                 rank0.add_drafts.remote(
@@ -1964,7 +2091,7 @@ class SpeculativeGeneration:
                         plan=plan,
                         idx=i,
                         hkey=hk,
-                        length=len(key) + self._cap(len(key)),
+                        length=len(key) + plan.turn_start + self._turn_cap(key, plan),
                         taken=0,
                         routes=None,
                     )
@@ -1982,7 +2109,14 @@ class SpeculativeGeneration:
                 live.append(dict(plan.stream, key=key, plan=plan))
                 plan.stream = None
         start([(key, plan) for key, plan in pending if not any(s["plan"] is plan for s in live)])
-        while live:
+        for key, plan in ended:
+            end_turn(key, plan)
+        while live or turns:
+            if turns:
+                next_turns()
+            if not live:
+                await asyncio.sleep(0.02)
+                continue
             status = ray.get(rank0.draft_lengths.remote([s["idx"] for s in live]))
             cand = [
                 s
@@ -2117,21 +2251,18 @@ class SpeculativeGeneration:
                     plan.prefix_logprobs += lps[:g]
                     plan.anchors = d[8].truncate(p.numel() + g)
                     s["taken"] += g
-                    plan.complete = bool(done) or len(plan.prefix) >= self._cap(
-                        len(s["key"])
-                    )
-                    if plan.complete:
+                    if bool(done) or self._turn_ended(s["key"], plan, plan.prefix[-1]):
                         done_streams.append(s)
+                        end_turn(s["key"], plan)
                 else:
                     y = out["next"]
                     plan.prefix += list(toks[:n_acc]) + [y]
                     plan.prefix_logprobs += lps[: n_acc + 1]
                     plan.anchors = d[8].truncate(p.numel() + n_acc)
-                    plan.complete = y == self.eod or len(plan.prefix) >= self._cap(
-                        len(s["key"])
-                    )
                     done_streams.append(s)
-                    if not plan.complete:
+                    if self._turn_ended(s["key"], plan, y):
+                        end_turn(s["key"], plan)
+                    else:
                         restart.append(s)
             if done_streams:
                 stop(done_streams)
@@ -2145,6 +2276,7 @@ class SpeculativeGeneration:
                 "spec/sticky_cont_accepted_frac": stats["kept"]
                 / max(stats["tokens"], 1),
                 "spec/sticky_cont_retries": float(stats["retries"]),
+                "spec/sticky_env_turns": float(stats["turns"]),
             }
         )
 
