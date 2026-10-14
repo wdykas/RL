@@ -2650,6 +2650,78 @@ bitwise equal, rule active). Hybrid layer numbering: anchors exist per MoE route
 MoE layer numbers); Mamba and attention layers carry none. MCore's fused router (`moe_router_fusion`) bypasses
 RouterReplay and is not supported (as for route recording).
 
+## 14n. ts-nano-perf: one Nemotron-3-Nano branch for the at-scale A/B (2026-10-14)
+
+*Branch ts-nano-perf (../RL-nano-perf), code 2341c723. Merge order and conflict decisions are in the merge commits.
+Notes: thundersync_work/research/agent_nano_perf.md.*
+
+**Contents.**
+- nano-scale3-launch (unpermute + scale3 fixes)
+- engine package A
+- one-engine d9c6f55f (streaming over tails, ordered learner calls, chunk 128, canonical order, decode activation fix
+  4259748d)
+- ts-tail 1aabf28c (batched ⊥-BV rebuild; opt-in tail tools)
+- multi-turn A/B (needs `stream_training_over_tails=false`, 14m)
+- the A/B kit (rollout_lag=1 same-learner async-1, stock arms, progress watchdog)
+
+**Validation [M].**
+- Nano L8 EP2, parity reward, expert-grad noise: exactness PASS 4/4 on all 6 runs.
+  - Arms: ⊥-BV + momentum, momentum only, ⊥-BV + current, d1, d2, PERF.
+- GPU unit tests 307 pass; CPU 769 pass.
+- The d1/d2 checksums differ from step 0. This is engine sampling (one RNG stream per engine step, 14k), not
+  accumulation, so paired runs do not test determinism. The in-loop order replay (one-engine cc83f7bf) does.
+
+**Same-tree A/B, Nano L8 [M].**
+- Setup: EP2 (2+2 GPUs), 16 prompts x 8, 1k cap, MBS 8 / LPBS 4. Net s/step at steps 2-5 (checks subtracted).
+
+| arm | s/step |
+|---|---|
+| sync | 10.3 |
+| async1 | 7.55 |
+| async1_nrl | 7.9 |
+| sync_coloc | 19.6 |
+| ts_por | 11.0 |
+| ts_nonull | 12.2 |
+
+- ThunderSync is ≈ 0.69 of async-1 here.
+- Where the ts_por step goes:
+  - Learner training busy 5.4-5.9 s vs 2.7 s for the same rows on sync / async1 (same worker). Canonical group order
+    dispatches one group at a time: 16 dispatches of ~0.35 s. The fixed cost per dispatch, not the compute, doubles
+    the training time.
+  - Learner piece verification 0.6-1.5 s.
+  - verify0 1.1-2.4 s, serial at the top of the step, before any rollout; route check excluded.
+  - Tails 1.0-4.8 s, overlapped.
+- The ts step is learner-bound: busy 5.5-8.3 s plus verify0. async1 is generation-bound: 6.9 s next-batch decode,
+  learner 2.7 s hidden.
+- Next levers:
+  - fewer, larger canonical dispatches (fixed group blocks keep determinism);
+  - fused verify+train (ts-fused-vt);
+  - q-transport P0/P1 (the hidden/route put bug inflates verify and tails);
+  - verify0 overlap.
+
+**Full-depth decode [M] (thundersync_work/research/nano_perf/ep_decode_bench.py, full Nano, one node EP4).**
+- Engine config as the EP8 runs: max_tokens 16384, graphs to 512 tokens, NVLS dispatch.
+- ts-nano-perf decode: **27.9 ms/step at 1 row/rank, 29.0 ms at 8 rows**, graphs on.
+- Per-kind device time (graphs off, 10 steps): MoE kernels 23.7 of 28.9 ms. Each one is a *launch grid sized for the
+  padded worst-case buffer* (max_tokens x EP x top-k ≈ 393k rows at EP4, 786k at EP8), with early exit past the live
+  rows:
+  - `_relu2_probs_kernel` 9.6 ms (0.42 ms x 23);
+  - `_grouped_gemm_fp16w_kernel` 10.5 ms (0.23 ms x 46);
+  - `_unpermute_fp64_kernel` 2.4 ms (grid over global_max tokens);
+  - `_permute_tokens_kernel` 1.0 ms.
+  - Everything else: dense GEMMs 1.3, elementwise 3.0, Mamba 0.9, NVLS AGV + ordered RSV 0.4-1.3, attention 0.1 ms.
+- The pre-fix engine also ran eager relu, square, x prob and cast over all padded rows. That was ~4x the bounded
+  kernel's grid cost and covers the ~210 ms/step measured at EP8 (runs_nano_scale, RL-nano-scale2).
+  - Package A (≈12-15 ms at full depth) was also missing there.
+  - CUDA graphs were used in both (35 graphs, 64-512 tokens).
+- **Next engine lever:** make the MoE kernels' grids independent of the worst case.
+  - Option 1: persistent grid (SM count) looping to `offsets[-1]` / valid tokens.
+  - Option 2: grid per CUDA-graph bucket (bucket tokens x EP x top-k).
+  - Per-row compute is unchanged, so this is bitwise and CUDA-graph safe; the grid is per rank and independent of EP.
+  - [D] ~23 -> ~1-2 ms, so full Nano ≈ 6-8 ms/step at EP4. EP8 doubles today's padded grids (≈ 50 ms/step at EP8
+    today [D]), so EP8 gains more.
+  - Also: `select_engine_config` picks the grouped-GEMM tile from the padded row count.
+
 ## 15. Open work
 
 - **Stragglers.** About one rejected draft per step decodes its remainder at about 3 ms
