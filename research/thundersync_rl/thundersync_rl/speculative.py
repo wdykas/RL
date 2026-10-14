@@ -1880,6 +1880,8 @@ class SpeculativeGeneration:
         self._stop_streams([x for x in streams if id(x) not in kept])
         if pending or ended:
             await self._continue_sticky(pending, ended)
+        if self.turn_env is not None and os.environ.get("THUNDERSYNC_ENGINE_Q_CHECK") == "1":
+            await self._route_check_plans()
 
     def bind_rows(self, rows: list[dict[str, Any]]) -> None:
         """This step's rollout rows (multi-turn): initial sample states, in row order.
@@ -1952,11 +1954,45 @@ class SpeculativeGeneration:
         not. Counted in ``spec/route_check_tokens`` / ``spec/route_check_exact``.
         """
         ds = [d for v in drafts for d in v if len(d) > 8 and d[8] is not None and d[2]]
-        if not ds:
+        await self._route_check_rows(
+            [(d[0], d[2], d[8], f"key={d[4]} segments={d[5]}") for d in ds],
+            "route_check",
+        )
+
+    async def _route_check_plans(self) -> None:
+        """Debug: finished multi-turn plans' anchors against a fresh engine prefill.
+
+        ``THUNDERSYNC_ENGINE_Q_CHECK=1``, multi-turn sticky routing, after
+        ``_continue_sticky`` (the engine still holds the drafting weights).
+        Covers the observation positions, whose anchors come from the
+        continuation streams' prefills (``spec/route_check_mt_*``;
+        ``spec/route_check_mt_obs_positions``: anchored observation tokens).
+        """
+        items, obs = [], 0
+        for i, plan in sorted(self._row_plans.items()):
+            if plan.anchors is None or not plan.prefix:
+                continue
+            prompt = self._row_prompts[i]
+            n = plan.anchors.length - prompt.numel()
+            items.append((prompt, plan.prefix[:n], plan.anchors, f"row={i} turns={len(plan.turns)}"))
+            obs += sum(
+                max(0, min(t.gen_end + len(t.obs), n) - t.gen_end)
+                for t in plan.turns
+            )
+        self.stats["spec/route_check_mt_obs_positions"] = float(obs)
+        await self._route_check_rows(items, "route_check_mt")
+
+    async def _route_check_rows(self, items, name: str) -> None:
+        """Re-route (prompt, tokens) rows in one engine prefill; compare to their anchors.
+
+        ``items``: (prompt, tokens, ``RouteRefs``, label) per row. Counted in
+        ``spec/{name}_tokens`` / ``spec/{name}_exact``.
+        """
+        if not items:
             return
         rank0 = self.base._policy.worker_group.workers[0]
-        rows = [torch.cat([d[0], torch.tensor(d[2], dtype=torch.long)]) for d in ds]
-        hkeys = self._hidden_keys([f"route-check:{j}" for j in range(len(ds))])
+        rows = [torch.cat([p, torch.tensor(t, dtype=torch.long)]) for p, t, _, _ in items]
+        hkeys = self._hidden_keys([f"{name}:{j}" for j in range(len(items))])
         # Next to the drafts' streams, which keep running (``_collect_running``).
         idx = ray.get(
             rank0.add_drafts.remote(
@@ -1972,29 +2008,32 @@ class SpeculativeGeneration:
         )
         self._pop_hidden(hkeys, [0] * len(rows))
         tok = exact = 0
-        for d, ref in zip(ds, refs):
-            n = d[0].numel() + len(d[2])
-            mine = fetch_anchors(d[8], self._route_layers, None, n, ray.get)
+        for (p, toks, anchors, label), ref in zip(items, refs):
+            n = p.numel() + len(toks)
+            mine = fetch_anchors(anchors, self._route_layers, None, n, ray.get)
             other = fetch_anchors(ref, self._route_layers, mine.shape[-1], n, ray.get)
-            t, e = compare_anchors(mine, other)
-            tok, exact = tok + t, exact + e
-            if e < t:
+            nt, ne = compare_anchors(mine, other)
+            tok, exact = tok + nt, exact + ne
+            if ne < nt:
                 # First differing (position, layer) of this draft.
                 bad = anchor_mismatches(mine, other)
                 pos, col = bad[0].tolist()
                 print(
-                    f"[route check] mismatch key={d[4]} prompt={d[0].numel()} "
+                    f"[{name}] mismatch {label} prompt={p.numel()} "
                     f"len={n} pos={pos} layer={self._route_layers[col]} "
-                    f"positions={t - e} (pos, layer column)={bad[:8].tolist()} "
+                    f"positions={nt - ne} (pos, layer column)={bad[:8].tolist()} "
                     f"logged={mine[pos, col].tolist()} "
-                    f"prefill={other[pos, col].tolist()} segments={d[5]} "
-                    f"blocks={[(b.lo, b.hi) for b in d[8].blocks]}",
+                    f"prefill={other[pos, col].tolist()} "
+                    f"blocks={[(b.lo, b.hi) for b in anchors.blocks]}",
                     flush=True,
                 )
         (self._free_refs or ray_free)(self._route_blocks.pop(check, []))
-        self.stats["spec/route_check_tokens"] = float(tok)
-        self.stats["spec/route_check_exact"] = float(exact)
-        print(f"[route check] drafts={len(ds)} tok={tok} exact={exact}", flush=True)
+        self.stats[f"spec/{name}_tokens"] = float(tok)
+        self.stats[f"spec/{name}_exact"] = float(exact)
+        print(
+            f"[{name.replace('_', ' ')}] rows={len(items)} tok={tok} exact={exact}",
+            flush=True,
+        )
 
     async def _continue_sticky(self, pending, ended=(), max_retries: int = 100) -> None:
         """Complete incomplete plans at theta_{k-1}, verifying while the engine decodes.

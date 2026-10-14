@@ -1069,12 +1069,15 @@ async def _run_one_step(
     # and what the learner did with them.
     fused_counts = collections.Counter()
 
+    replayed = [0]  # drafted multi-turn rollouts rebuilt from their records
+
     async def rollout(i: int):
         drafted = replay_row(i) if replay_row is not None else None
         if drafted is not None:
             # Multi-turn rollout sampled turn by turn before the refit (sticky
             # routing, scheme A): rebuilt from its recorded turns, the
             # environment is not stepped again.
+            replayed[0] += 1
             return i, *drafted
         state, metrics = await run_sample_multi_turn_rollout(
             sample_idx=i,
@@ -1273,6 +1276,8 @@ async def _run_one_step(
         "max_gen_tokens": float(
             np.max([m["assistant_tokens"] for m in sample_metrics])
         ),
+        "mean_turns": float(np.mean([m["turn_count"] for m in sample_metrics])),
+        "max_turns": float(np.max([m["turn_count"] for m in sample_metrics])),
         "time/rollout": t_rollout_end - t_start,
         "time/post_rollout_to_step": t_end - t_rollout_end,
         # Barrier only: write-back, 1/N, DP reduce, clip, optimizer step.
@@ -1290,6 +1295,8 @@ async def _run_one_step(
         "_drafts": drafts,
         **mismatch,
     }
+    if replay_row is not None:
+        out["spec/replayed_multi_turn_rows"] = float(replayed[0])
     if claim_fused is not None:
         # Trajectories trained from their verification forward; each saved
         # one training forward of its row (fused/forward_tokens_saved tokens).
