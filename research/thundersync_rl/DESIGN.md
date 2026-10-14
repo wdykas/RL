@@ -1978,7 +1978,9 @@ mismatch 0 and exact_token_frac 1 every step (the horizon continuations' engine 
 training forward with the same anchors), route checks exact, 41–97 plans per step handed to the refit engine,
 15821 tokens routed with applied anchors. Control `NOAPPLY=1` (engine never applies): max |Δlog p| 0.30–0.44,
 exact_token_frac 0.80–0.84, i.e. the anchors below the horizon change the policy and the apply path is what
-reproduces it. Same check with the fused rule: PASS. Multi-turn (branch ts-multiturn-ab = ts-multiturn-a +
+reproduces it. Same check with the fused rule: PASS; also PASS at engine/learner PP = 2 (EP = 1; each stage applies
+its own layers' anchors, 42366 anchored tokens by step 3) and TP = 2 with sequence parallelism (EP = 2; each TP
+rank reads its token shard of the buffer, 37020 anchored tokens), mismatch 0 and route check exact every step. Multi-turn (branch ts-multiturn-ab = ts-multiturn-a +
 this branch, `_finish_turns`; toy stochastic environment, 3 turns × 128 tokens, H = 160, 4 steps): PASS, mismatch 0
 every step over every turn, route check over full rows exact incl. 1118–1382 anchored observation positions per
 step, 128 environment steps per step below the horizon (θ_{k−1}) and 234–280 turns finished on the refit engine
