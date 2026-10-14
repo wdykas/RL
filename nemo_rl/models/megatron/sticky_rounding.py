@@ -611,6 +611,8 @@ def token_mask_from_replay(model: torch.nn.Module, tp_group: Any = None) -> Opti
     if mask is None:
         return None
     if tp_group is not None and torch.distributed.get_world_size(tp_group) > 1:
+        if torch.cuda.is_available():
+            mask = mask.to(torch.cuda.current_device())
         parts = [torch.empty_like(mask) for _ in range(torch.distributed.get_world_size(tp_group))]
         torch.distributed.all_gather(parts, mask.contiguous(), group=tp_group)
         mask = torch.cat(parts)
