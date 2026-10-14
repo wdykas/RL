@@ -37,6 +37,17 @@ probability exactly 1/M, or BOT (``NULL_TOKEN``: the draft yields nothing, no
 residual sample). M = 1 is plain block verification, bit for bit.
 See ``null_bv.py`` for the pooled per-prompt process.
 
+Banded importance sampling (``band`` = b > 0, opt-in): the verification target
+is p~ = q at positions t <= T and p after, where T is the first position whose
+prefix log-ratio S_t = sum_{s<=t} log p(x_s)/q(x_s) has |S_t| >= b (T = g when
+the draft never leaves the band; the target beyond the draft is always p). p~
+is a function of the prefix only, so block verification against it is exact
+for p~; the in-band prefix is accepted with probability 1 and tau >= T for
+every output. With the continuation drawn from p, the output Y and its weight
+w = exp(S_T) satisfy E[w f(Y)] = E_p f(Y) for every f (the law of Y is p/w), so
+rows are exact in expectation, not in law (DESIGN.md §14e). Composes with ⊥-BV:
+P(output) is still exactly 1/M.
+
 Lazy evaluation (``lazy_stop_index``): h_i <= b_i and P(tau = g) = h_g = b_g, so
 with eta drawn up front tau = g is decided from b alone, and below g only
 positions with eta_i <= b_i need r_i (an O(V) pass over p_i and q_i).
@@ -68,6 +79,59 @@ def acceptance_weights(log_ratio: torch.Tensor, null_m: float = 1.0) -> torch.Te
     if null_m != 1.0:
         s_cum[1:] -= math.log(null_m)
     return (s_cum - torch.cummax(s_cum, 0).values).exp()
+
+
+def band_exit(log_ratio: torch.Tensor, band: float) -> int | None:
+    """Banded IS exit position T (1-based): the first t with |S_t| >= band, or
+    None when the prefix log-ratio never leaves the band.
+
+    ``log_ratio``: [g] log p(x_t) - log q(x_t) (fp32, as verification computes
+    it); S_t is its fp64 cumulative sum.
+    """
+    s = torch.cumsum(log_ratio.double(), 0)
+    hit = torch.nonzero(s.abs() >= band).flatten()
+    return int(hit[0]) + 1 if hit.numel() else None
+
+
+def banded_log_weight(kept_log_ratio: torch.Tensor, band: float) -> tuple[float, bool]:
+    """(log w, exited) of a banded-IS output from its kept draft tokens' log-ratios.
+
+    Every output keeps the draft through T (tau >= T), so the kept prefix holds
+    the exit, or the whole draft when it never left the band: log w = S_T, or
+    S_g without an exit.
+    """
+    t = band_exit(kept_log_ratio, band)
+    if t is None:
+        return float(kept_log_ratio.double().sum()), False
+    return float(torch.cumsum(kept_log_ratio.double(), 0)[t - 1]), True
+
+
+def banded_target(
+    lp: torch.Tensor, lq: torch.Tensor, draft: torch.Tensor, band: float
+) -> torch.Tensor:
+    """Target log-prob rows of banded IS: q's rows at positions 1..T, p's after.
+
+    ``lp``: [g+1, V], ``lq``: [g, V]. Rows past the draft (the bonus row) stay p.
+    """
+    g = draft.numel()
+    ar = torch.arange(g, device=lp.device)
+    t = band_exit(lp[ar, draft] - lq[ar, draft], band)
+    t = g if t is None else t
+    return torch.cat([lq[:t].to(lp.dtype), lp[t:]])
+
+
+def zero_mass_below(t_exit: int, residual_mass):
+    """Banded IS: ``residual_mass(idx, b_idx)`` with rows idx < ``t_exit`` (target
+    q, b <= 1, so sum (b q - q)+ = 0 exactly) set to 0 without reading them."""
+
+    def f(idx: torch.Tensor, bi: torch.Tensor) -> torch.Tensor:
+        out = torch.zeros(idx.numel(), dtype=torch.float64, device=bi.device)
+        sel = idx >= t_exit
+        if bool(sel.any()):
+            out[sel] = residual_mass(idx[sel], bi[sel])
+        return out
+
+    return f
 
 
 def check_null_m(null_m: float, g: int) -> None:
@@ -198,16 +262,22 @@ def emitted_token(index: int, vocab: int) -> int:
 
 
 def block_weights(
-    lp: torch.Tensor, lq: torch.Tensor, draft: torch.Tensor, null_m: float = 1.0
+    lp: torch.Tensor,
+    lq: torch.Tensor,
+    draft: torch.Tensor,
+    null_m: float = 1.0,
+    band: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return (h [g+1], b [g+1], residual masses r [g]) for a draft of length g.
 
     ``lp``: [g+1, V] target log-probs at positions 0..g; ``lq``: [g, V] draft
     log-probs at positions 0..g-1; ``draft``: [g] token ids. ``null_m``: ⊥-BV
-    envelope (1 = plain block verification).
+    envelope (1 = plain block verification). ``band``: banded IS (None: off).
     """
     g = draft.numel()
     check_null_m(null_m, g)
+    if band is not None:
+        lp = banded_target(lp, lq, draft, band)
     ar = torch.arange(g, device=lp.device)
     b = acceptance_weights(lp[ar, draft] - lq[ar, draft], null_m)
 
@@ -236,9 +306,16 @@ def block_verify(
     draft: torch.Tensor,
     generator: torch.Generator | None = None,
     null_m: float = 1.0,
+    band: float | None = None,
 ) -> tuple[int, int]:
-    """Sample (tau, y): keep draft[:tau], then emit y (``NULL_TOKEN``: BOT, no output)."""
+    """Sample (tau, y): keep draft[:tau], then emit y (``NULL_TOKEN``: BOT, no output).
+
+    ``band``: banded IS (see the module doc); the output's weight is
+    ``banded_log_weight`` of its kept tokens.
+    """
     g = draft.numel()
+    if band is not None:
+        lp = banded_target(lp, lq, draft, band)
     h, b, _ = block_weights(lp, lq, draft, null_m)
     eta = torch.rand(g + 1, generator=generator, dtype=torch.float64, device=lp.device)
     tau = int(torch.nonzero(eta <= h).flatten().max())
@@ -253,6 +330,7 @@ def block_verify_lazy(
     draft: torch.Tensor,
     generator: torch.Generator | None = None,
     null_m: float = 1.0,
+    band: float | None = None,
 ) -> tuple[int, int]:
     """``block_verify`` computing the residual masses r_i only where needed.
 
@@ -262,6 +340,8 @@ def block_verify_lazy(
     """
     g = draft.numel()
     check_null_m(null_m, g)
+    if band is not None:
+        lp = banded_target(lp, lq, draft, band)
     ar = torch.arange(g, device=lp.device)
     b = acceptance_weights(lp[ar, draft] - lq[ar, draft], null_m)
 
@@ -280,14 +360,21 @@ def block_verify_lazy(
 
 
 def output_distribution_given_draft(
-    lp: torch.Tensor, lq: torch.Tensor, draft: torch.Tensor, null_m: float = 1.0
+    lp: torch.Tensor,
+    lq: torch.Tensor,
+    draft: torch.Tensor,
+    null_m: float = 1.0,
+    band: float | None = None,
 ) -> list[tuple[int, torch.Tensor]]:
     """Exact law of (tau, y) for a fixed draft: [(tau, P(tau) * P(y | tau))].
 
     With ⊥-BV (``null_m`` > 1) the tau = 0 entry has V + 1 columns, the last
-    one being BOT.
+    one being BOT. ``band``: banded IS (y is then drawn from the banded target;
+    every non-BOT outcome has tau >= T).
     """
     g = draft.numel()
+    if band is not None:
+        lp = banded_target(lp, lq, draft, band)
     h, b, _ = block_weights(lp, lq, draft, null_m)
     out = []
     for i in range(g + 1):

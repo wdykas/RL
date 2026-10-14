@@ -502,6 +502,7 @@ def verify_engine_q(
     q_logprob_rows: Callable[[torch.Tensor], torch.Tensor],
     generator: Optional[torch.Generator] = None,
     null_m: float = 1.0,
+    band: Optional[float] = None,
 ) -> tuple[int, int, torch.Tensor, int]:
     """Block-verify one draft with p from training and q from the engine.
 
@@ -519,7 +520,7 @@ def verify_engine_q(
     logsumexp is 0). Returns (tau, y, logp, residual masses computed); logp are
     entries of ``p_logprobs``, i.e. training's own log-probs of the kept tokens.
     ``null_m`` > 1: null-augmented block verification (y = ``NULL_TOKEN``: BOT,
-    the draft yields no output).
+    the draft yields no output). ``band``: banded IS (``block_verification``).
     """
     from thundersync_rl.block_verification_fused import block_verify_stats_lazy
 
@@ -538,7 +539,7 @@ def verify_engine_q(
     lqx = engine_logq.to(device=dev, dtype=torch.float32)
     zeros = torch.zeros(g + 1, dtype=torch.float32, device=dev)
     return block_verify_stats_lazy(
-        lpx, lqx, zeros, zeros[:g], p_rows, q_logprob_rows, generator, null_m
+        lpx, lqx, zeros, zeros[:g], p_rows, q_logprob_rows, generator, null_m, band
     )
 
 

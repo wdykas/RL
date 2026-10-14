@@ -418,11 +418,13 @@ def test_validate_rejects_a_non_megatron_generation_backend():
     assert any("generation.backend must be 'megatron'" in v for v in result.violations)
 
 
-def test_validate_rejects_colocated_generation():
+def test_validate_colocated_generation_requires_mcore_reshard():
     config = _policy_config()
     config["generation"]["colocated"] = {"enabled": True}
     result = _validate(config)
-    assert any("does not support colocated generation" in v for v in result.violations)
+    assert any("refit_transport='mcore'" in v for v in result.violations)
+    config["generation"]["refit_transport"] = "mcore"
+    assert not any("colocated" in v for v in _validate(config).violations)
 
 
 def test_validate_rejects_missing_generation_block():

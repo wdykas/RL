@@ -87,6 +87,10 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.megatron.config import (
     resolve_refit_execution_batch_bytes,
 )
+from nemo_rl.models.generation.megatron.progress import (
+    GenerationProgressMonitor,
+    with_generated_token_counter,
+)
 from nemo_rl.models.generation.megatron.utils import (
     build_image_preprocessing_config,
     build_prompt_and_multimodal_data,
@@ -682,9 +686,10 @@ class MegatronGenerationMixin:
             inference_wrapped_model=self.inference_wrapped_model,
             tokenizer=self.megatron_tokenizer,
         )
-        self.dynamic_inference_engine = DynamicInferenceEngine(
-            text_generation_controller, self.inference_context
-        )
+        self.dynamic_inference_engine = with_generated_token_counter(
+            DynamicInferenceEngine
+        )(text_generation_controller, self.inference_context)
+        self._start_generation_progress_monitor(mcore_generation_config)
 
         self._inference_engine_initialized = True
         self._inference_engine_asleep = True
@@ -718,6 +723,22 @@ class MegatronGenerationMixin:
             from nemo_rl.models.megatron import mamba_bi_decode
 
             mamba_bi_decode.install()
+
+    def _start_generation_progress_monitor(self, mcore_generation_config: dict) -> None:
+        """Progress log + stall watchdog over this rank's engine counters (progress.py)."""
+        interval = mcore_generation_config.get("progress_log_interval_s")
+        if interval is None:
+            return
+        rank = torch.distributed.get_rank()
+        stall = mcore_generation_config.get("stall_timeout_s")
+        self._generation_progress = GenerationProgressMonitor(
+            self.dynamic_inference_engine,
+            rank,
+            interval_s=float(interval),
+            stall_timeout_s=float(stall) if stall is not None else 0.0,
+            log=rank == 0
+            or bool(mcore_generation_config.get("progress_log_all_ranks")),
+        ).start()
 
     async def _start_inference_coordinator(self):
         """Start the inference coordinator and engine loop."""
@@ -2251,17 +2272,22 @@ class MegatronGenerationRefitMixin:
             )
             self._swap_weights_plan_prepared = True
 
-        swap_model_weights(
-            self.model,
-            inference_model,
-            refit_method=self.cfg["generation"]["mcore_generation_config"][
-                "refit_backend"
-            ],
-            group=None,
-            src_rank_offset=0,
-            dst_rank_offset=0,
-            execution_batch_bytes=execution_batch_bytes,
-        )
+        # The inference model only runs under inference mode, where tensors it
+        # allocates lazily (e.g. the fp16 GEMM weight caches of the zero-mismatch
+        # recipe) become inference tensors; outside inference mode MCore's in-place
+        # copy into them raises. Write the new weights under inference mode too.
+        with torch.inference_mode():
+            swap_model_weights(
+                self.model,
+                inference_model,
+                refit_method=self.cfg["generation"]["mcore_generation_config"][
+                    "refit_backend"
+                ],
+                group=None,
+                src_rank_offset=0,
+                dst_rank_offset=0,
+                execution_batch_bytes=execution_batch_bytes,
+            )
         # Offload training model.
         self.model = self.move_model(
             self.model, "cpu", move_params=True, move_grads=False

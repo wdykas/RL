@@ -34,7 +34,9 @@ import triton.language as tl
 
 from thundersync_rl.block_verification import (
     acceptance_weights,
+    band_exit,
     check_null_m,
+    zero_mass_below,
     emit_distribution,
     emitted_token,
     lazy_slack,
@@ -170,6 +172,7 @@ def block_verify_stats_lazy(
     q_rows,
     generator: torch.Generator | None = None,
     null_m: float = 1.0,
+    band: float | None = None,
 ) -> tuple[int, int, torch.Tensor, int]:
     """Lazy block verification from per-position statistics and on-demand rows.
 
@@ -189,25 +192,43 @@ def block_verify_stats_lazy(
     means BOT (the draft yields no output); logp is then log p of the kept
     prefix only (empty, since BOT happens only at tau = 0). M = 1 takes exactly
     the plain path.
+
+    ``band``: banded IS (``block_verification``): the target is q at positions
+    1..T, so the log-ratio there is 0 and residual masses of rows i < T are
+    exactly 0 (b_i <= 1); those rows are never read. Pathwise identical to
+    ``block_verify`` with the same ``band``.
     """
     g = lpx.numel()
     check_null_m(null_m, g)
     dev = lse_p.device
-    b = acceptance_weights(lpx - lqx, null_m)
+    log_ratio = lpx - lqx
+    t_exit = 0  # rows below this have target q
+    if band is not None:
+        t = band_exit(log_ratio, band)
+        t_exit = g if t is None else t
+        log_ratio = torch.cat([torch.zeros_like(log_ratio[:t_exit]), log_ratio[t_exit:]])
+    b = acceptance_weights(log_ratio, null_m)
 
     def mass(idx, bi):
         return residual_masses(p_rows(idx), q_rows(idx), lse_p[idx], lse_q[idx], bi)
+
+    if t_exit:
+        mass = zero_mass_below(t_exit, mass)
 
     eta = torch.rand(g + 1, generator=generator, dtype=torch.float64, device=dev)
     tau, n_eval = lazy_stop_index(
         b, eta, null_root_residual(mass, b, null_m), lazy_slack(lse_p[:g])
     )
     at = torch.tensor([tau], device=dev)
-    p_row = p_rows(at)[0]
     q_row = None if tau == g else q_rows(at)[0]
     lse_q_tau = None if tau == g else lse_q[tau]
+    if tau < t_exit:
+        # Banded IS: the target row is q's (only the ⊥-BV root reaches here).
+        p_row, lse_p_tau = q_row, lse_q_tau
+    else:
+        p_row, lse_p_tau = p_rows(at)[0], lse_p[tau]
     m = null_m if tau == 0 and tau < g else 1.0
-    y = _emit(p_row, q_row, lse_p[tau], lse_q_tau, b[tau], generator, m)
+    y = _emit(p_row, q_row, lse_p_tau, lse_q_tau, b[tau], generator, m)
     if y < 0:
         return tau, y, lpx[:tau], n_eval
     logp = torch.cat([lpx[:tau], (p_row[y].float() - lse_p[tau]).view(1)])

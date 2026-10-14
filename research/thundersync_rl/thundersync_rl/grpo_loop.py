@@ -92,6 +92,14 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     #   "batch": after every rollout of the batch (batch-synchronous baseline).
     # All three produce the identical update; only the overlap differs.
     granularity: Literal["trajectory", "group", "batch"] = "trajectory"
+    # Rollout staleness, for the async baseline on THIS learner path (A/B kit arm
+    # "async1"): 0 = exact on-policy (every step's rollouts sampled at theta_k);
+    # 1 = the rollouts trained at step k were sampled at theta_{k-1}: the engine
+    # generates step k+1's batch at theta_k while the learner trains step k, with no
+    # verification (NeMo-RL async GRPO with max_trajectory_age_steps=1). Off-policy:
+    # pair it with loss_fn.use_importance_sampling_correction (weights
+    # exp(curr - generation_logprobs) from the training forward itself).
+    rollout_lag: Literal[0, 1] = 0
     # Where per-group gradient accumulators live: "cuda", or "cpu" for pinned
     # host memory (the paper's placement; trades H2D/D2H traffic for HBM).
     storage_device: Literal["cuda", "cpu"] = "cuda"
@@ -349,6 +357,22 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # plain theta_k decoding, not built on lanes yet) and the packed
     # collective refit (policy.generation.refit_transport null).
     cohort_lanes: int = 1
+    # Banded importance sampling (block_verification.py, DESIGN.md section
+    # 14e). None (default): off, every row is an exact sample of the current
+    # policy. b > 0: a draft is verified against q while its prefix log-ratio
+    # S_t = log p/q stays inside |S_t| < b and against p after the exit T; the
+    # row is trained with loss weight w = exp(S_T) (|log w| < b + one token's
+    # |log p/q|). Rows are then exact in expectation (E[w f(Y)] = E_p f), not
+    # in law: the gradient stays unbiased, rejections before T vanish, the
+    # weights cost 1/ESS in gradient variance (``spec/band_ess``). With
+    # grpo.normalize_rewards the leave-one-out std makes each prompt's scale
+    # an expectation over its other rows, which the weights do not reproduce
+    # (same per-prompt direction, scale off by O(TV(p, q)); see DESIGN).
+    # Requires speculate, verify_mode=block, verify_source=engine, no
+    # fused_verify_train, no null_bv (the pooled ⊥-BV grid is not banded). Composes
+    # with sticky routing (continuation rounds are plain BV), sticky rounding
+    # and momentum draft weights (q is whatever the engine drafted with).
+    banded_is_band: Optional[float] = None
 
 
 def resolve_min_pipeline_microbatches(ts_cfg: ThunderSyncConfig, pp: int) -> int:
@@ -446,6 +470,9 @@ def validate_config(master_config: ThunderSyncMasterConfig) -> None:
     assert not megatron_cfg.get("moe_router_bias_update_rate", 0.0), (
         "gradient streaming needs policy.megatron_cfg.moe_router_bias_update_rate=0"
     )
+    assert not (master_config.thundersync.rollout_lag and master_config.thundersync.speculate), (
+        "thundersync.rollout_lag=1 is the unverified async baseline; it excludes speculate"
+    )
     validate_speculation(master_config.thundersync, master_config.policy)
     validate_expert_parallel(master_config.thundersync, master_config.policy)
     validate_fused_verify_train(master_config.thundersync, master_config.policy)
@@ -463,6 +490,7 @@ def validate_config(master_config: ThunderSyncMasterConfig) -> None:
         )
     validate_draft_weights(master_config)
     validate_cohort_lanes(master_config)
+    validate_banded_is(master_config)
 
 
 def validate_cohort_lanes(master_config: ThunderSyncMasterConfig) -> None:
@@ -715,6 +743,34 @@ def validate_draft_weights(master_config: ThunderSyncMasterConfig) -> None:
         problems.append("policy.megatron_cfg.optimizer.optimizer must be 'adam'")
     if problems:
         raise ValueError("thundersync.draft_weights=momentum: " + "; ".join(problems) + ".")
+
+
+def validate_banded_is(master_config: ThunderSyncMasterConfig) -> None:
+    """Reject settings under which banded importance sampling is not built."""
+    ts_cfg = master_config.thundersync
+    band = ts_cfg.banded_is_band
+    if band is None:
+        return
+    problems = []
+    if not (0 < band < math.inf):
+        problems.append(f"the band must be finite and > 0 (got {band})")
+    if not ts_cfg.speculate:
+        problems.append("thundersync.speculate must be true")
+    if ts_cfg.verify_mode != "block" or ts_cfg.verify_source != "engine":
+        problems.append(
+            "thundersync.verify_mode='block' and verify_source='engine' are required "
+            "(the scorer path is not built yet)"
+        )
+    if ts_cfg.fused_verify_train:
+        problems.append("thundersync.fused_verify_train must be false (not built yet)")
+    if ts_cfg.null_bv:
+        problems.append(
+            "thundersync.null_bv must be false: pooled ⊥-BV verifies every row on a "
+            "grid of envelopes and decides on the driver, and that grid is not banded "
+            "(not built; the two are alternatives, DESIGN.md section 14e)"
+        )
+    if problems:
+        raise ValueError("thundersync.banded_is_band: " + "; ".join(problems) + ".")
 
 
 def null_bv_policy(master_config: Any) -> dict[str, Any]:
@@ -1082,6 +1138,9 @@ def build_chunk_data(
     A padding chunk keeps its template's tokens but is fully masked out
     (``sample_mask = token_mask = advantages = 0``): it runs a forward/backward
     that adds neither gradient nor normalization count.
+
+    Banded IS: a row's loss weight ``payload["is_weight"]`` multiplies its
+    advantage (a detached per-row constant, so open-group buckets stay exact).
     """
     message_logs = [t.payload["message_log"] for t in chunk.trajectories]
     add_grpo_token_loss_masks_and_generation_logprobs(message_logs)
@@ -1097,8 +1156,8 @@ def build_chunk_data(
         adv = torch.tensor(chunk.advantages, dtype=torch.float32)
     else:
         adv = torch.ones(n, dtype=torch.float32)
-    # Drop-IS (opt-in): a row's importance weight multiplies its advantage (a
-    # detached per-row constant, as banded IS on moe-banded-is).
+    # Drop-IS / banded IS (opt-in): a row's importance weight multiplies its
+    # advantage (a detached per-row constant).
     adv = adv * torch.tensor(
         [float(t.payload.get("is_weight", 1.0)) for t in chunk.trajectories]
     )
@@ -1174,6 +1233,41 @@ def _initial_sample_state(batch: BatchedDataDict, i: int) -> dict[str, Any]:
     }
 
 
+async def _generate_rollouts(
+    batch: BatchedDataDict,
+    policy_generation: GenerationInterface,
+    tokenizer,
+    task_to_env: dict[str, EnvironmentInterface],
+    master_config: ThunderSyncMasterConfig,
+) -> tuple[list[tuple[int, dict, dict]], float]:
+    """Every rollout of ``batch`` (G per prompt) at the engine's current weights.
+
+    Returns ``(i, final_state, metrics)`` per rollout and the wall time.
+    """
+    repeated = batch.repeat_interleave(master_config.grpo.num_generations_per_prompt)
+    t0 = time.perf_counter()
+
+    async def one(i: int):
+        state, metrics = await run_sample_multi_turn_rollout(
+            sample_idx=i,
+            initial_sample_state=_initial_sample_state(repeated, i),
+            policy_generation=policy_generation,
+            tokenizer=tokenizer,
+            task_to_env=task_to_env,
+            max_seq_len=master_config.policy["max_total_sequence_length"],
+            max_rollout_turns=master_config.grpo.max_rollout_turns,
+            greedy=False,
+        )
+        return i, state, metrics
+
+    out = await asyncio.gather(*(one(i) for i in range(repeated.size)))
+    return list(out), time.perf_counter() - t0
+
+
+async def _ready(x):
+    return x
+
+
 async def _run_one_step(
     *,
     step: int,
@@ -1208,6 +1302,9 @@ async def _run_one_step(
     ordered_learner: Optional[Any] = None,
     claim_row: Optional[Callable[[torch.Tensor, torch.Tensor], Any]] = None,
     tail_count: Optional[Callable[[torch.Tensor], int]] = None,
+    claim_log_weight: Optional[Callable[[torch.Tensor, torch.Tensor], float]] = None,
+    stale_rollouts: Optional[list[tuple[int, dict, dict]]] = None,
+    generate_next: Optional[Callable[[], Any]] = None,
 ) -> dict[str, Any]:
     """One step: rollouts, streaming training and the next step's drafts.
 
@@ -1221,7 +1318,11 @@ async def _run_one_step(
     dispatches are numbered learner calls (``learner_seq``) that every learner
     rank runs in the same order, interleaved with the tails' verification
     forwards (asynchronous Ray actors do not keep submission order when
-    several calls wait; ``ordered_call`` does).
+    several calls wait; ``ordered_call`` does). ``stale_rollouts``
+    (rollout_lag=1): this batch's rollouts, already generated at theta_{k-1},
+    are trained instead of sampling new ones, while ``generate_next()``
+    samples the next batch at theta_k on the engine concurrently (returned as
+    ``_next_rollouts``).
     """
     G = master_config.grpo.num_generations_per_prompt
     # Streaming over the tails: training dispatches are ordered learner calls
@@ -1286,6 +1387,7 @@ async def _run_one_step(
     wake = asyncio.Event()
     rollouts_done = False
     rewards = [0.0] * n
+    is_weights = [1.0] * n  # banded IS loss weights
     sample_metrics: list[dict[str, Any]] = [None] * n  # type: ignore[list-item]
     learner_busy = 0.0
     # Pipeline schedule calls of the busiest rank, summed over dispatches.
@@ -1420,6 +1522,9 @@ async def _run_one_step(
 
     draft_started = None
     learner_task = asyncio.create_task(learner_loop())
+    next_task = (
+        asyncio.create_task(generate_next()) if generate_next is not None else None
+    )
     draft_task = None
     n_done = 0
     after_verify = (
@@ -1438,7 +1543,12 @@ async def _run_one_step(
         verify_task.add_done_callback(_start_drafts)
     cut_task = None
     try:
-        for fut in asyncio.as_completed([rollout(i) for i in range(n)]):
+        sources = (
+            asyncio.as_completed([rollout(i) for i in range(n)])
+            if stale_rollouts is None
+            else [_ready((*r, None)) for r in stale_rollouts]
+        )
+        for fut in sources:
             i, state, metrics, anchors = await fut
             n_done += 1
             if (
@@ -1493,6 +1603,14 @@ async def _run_one_step(
                 )
                 if info is not None and info.log_weight:
                     payload["is_weight"] = math.exp(info.log_weight)
+            if claim_log_weight is not None:
+                is_weights[i] = math.exp(
+                    claim_log_weight(
+                        torch.cat([m["token_ids"] for m in repeated["message_log"][i]]),
+                        torch.cat([m["token_ids"] for m in state["message_log"]]),
+                    )
+                )
+                payload["is_weight"] = is_weights[i]
             traj = Trajectory(
                 group=(step, i // G),
                 index=i,
@@ -1522,6 +1640,9 @@ async def _run_one_step(
 
             cut_task = asyncio.create_task(cut_drafts())
         await learner_task
+        t_next = time.perf_counter()
+        next_rollouts = await next_task if next_task is not None else None
+        next_wait = time.perf_counter() - t_next
         if verify_task is not None:
             await verify_task
         t_wait = time.perf_counter()
@@ -1538,6 +1659,8 @@ async def _run_one_step(
             before_finish(drafts)  # learner still holds theta_k
         draft_score = time.perf_counter() - t_score
     except BaseException:
+        if next_task is not None:
+            next_task.cancel()
         if draft_task is not None:
             draft_task.cancel()
         if cut_task is not None:
@@ -1547,11 +1670,16 @@ async def _run_one_step(
         raise
     assert planner.all_done()
     t_rollout_end = last_rollout_t
+    t_check = time.perf_counter()
     mismatch = (
         train_gen_mismatch(all_trajectories, learner, tokenizer, master_config)
         if os.environ.get("THUNDERSYNC_MISMATCH_CHECK")
         else {}
     )
+    if mismatch:
+        # Debug forward on the step's critical path: reported so step-time
+        # comparisons can subtract it (``time/mismatch_check``).
+        mismatch["time/mismatch_check"] = time.perf_counter() - t_check
     t_finish = time.perf_counter()
     results = learner.finish()
     t_end = time.perf_counter()
@@ -1564,8 +1692,19 @@ async def _run_one_step(
 
     # No "loss" metric: bucket chunks are backpropagated with advantage 1, so
     # the per-chunk loss values the worker sums are not the GRPO loss.
+    # Rollout-token entropy estimate E[-log pi(token)] from the rollouts' own
+    # log-probs (the same definition for every A/B arm; on-policy it equals
+    # the stock loss's approx_entropy).
+    nll = n_tok = 0.0
+    for t in all_trajectories:
+        for m in t.payload["message_log"]:
+            lp = m.get("generation_logprobs") if m.get("role") == "assistant" else None
+            if lp is not None and len(lp):
+                nll -= float(torch.as_tensor(lp).float().sum())
+                n_tok += len(lp)
     out = {
         "reward": float(np.mean(rewards)),
+        "rollout_entropy": nll / max(n_tok, 1),
         "grad_norm": float(torch.as_tensor(results["grad_norm"]).float().mean()),
         "mean_gen_tokens": float(
             np.mean([m["assistant_tokens"] for m in sample_metrics])
@@ -1602,6 +1741,14 @@ async def _run_one_step(
     }
     if replay_row is not None:
         out["spec/replayed_multi_turn_rows"] = float(replayed[0])
+    if next_rollouts is not None:
+        # rollout_lag=1: the next batch, sampled at theta_k during this step.
+        out["_next_rollouts"], out["time/next_rollout"] = next_rollouts
+        out["time/next_rollout_wait"] = next_wait
+    if claim_log_weight is not None:
+        # Unbiased for the policy's mean reward (plain "reward" is the mean
+        # under the rows' own law p / w).
+        out["reward_is"] = float(np.mean(np.multiply(is_weights, rewards)))
     if claim_fused is not None:
         # Trajectories trained from their verification forward; each saved
         # one training forward of its row (fused/forward_tokens_saved tokens).
@@ -1676,6 +1823,7 @@ def make_speculative_generation(
         sticky_chunk_tokens=ts_cfg.sticky_continuation_chunk_tokens,
         draft_until_complete=ts_cfg.draft_until_complete,
         draft_weights=ts_cfg.draft_weights,
+        banded_is_band=ts_cfg.banded_is_band,
         max_seq_len=master_config.policy["max_total_sequence_length"],
         anchor_horizon=(
             ts_cfg.sticky_anchor_horizon if sticky_delta(ts_cfg) is not None else None
@@ -1760,6 +1908,8 @@ def thundersync_grpo_train(
         and ts_cfg.verify_mode == "block"
         and ts_cfg.draft_lookahead > 1
     )
+    lag = ts_cfg.rollout_lag
+    pending = None  # rollout_lag=1: rollouts of the next step's batch
     def _prompts(b):
         r = b.repeat_interleave(G)
         return [
@@ -1777,6 +1927,17 @@ def thundersync_grpo_train(
             break
         t0 = time.perf_counter()
         t_verify = 0.0
+        t_first = 0.0
+        if lag and pending is None:
+            # Step 0 of the lagged baseline: its rollouts come from theta_0.
+            t1 = time.perf_counter()
+            policy_generation.prepare_for_generation()
+            pending, _ = asyncio.run(
+                _generate_rollouts(
+                    batch, policy_generation, tokenizer, task_to_env, master_config
+                )
+            )
+            t_first = time.perf_counter() - t1
         if spec is not None:
             spec.current_step = step
         tails = None  # pending plans whose continuation rounds overlap training
@@ -1963,6 +2124,19 @@ def thundersync_grpo_train(
                 group_order=group_order,
                 tail_groups=tail_groups,
                 ordered_learner=spec if tails is not None else None,
+                claim_log_weight=spec.claim_log_weight
+                if spec is not None and ts_cfg.banded_is_band is not None
+                else None,
+                stale_rollouts=pending,
+                generate_next=(
+                    (
+                        lambda b=next_batch: _generate_rollouts(
+                            b, policy_generation, tokenizer, task_to_env, master_config
+                        )
+                    )
+                    if lag and next_batch is not None and step + 1 < max_steps
+                    else None
+                ),
             ))
         )
         t_refit = refit_s[0]
@@ -1982,6 +2156,9 @@ def thundersync_grpo_train(
             # Continuation rounds, overlapped with this step's training.
             metrics["time/tails"] = tails_s[0]
         drafts = metrics.pop("_drafts")
+        if lag:
+            pending = metrics.pop("_next_rollouts", None)
+            metrics["time/first_rollout"] = t_first
         if sticky:
             # This step's training has replayed every anchor targeted at it.
             spec.release_routes(step)

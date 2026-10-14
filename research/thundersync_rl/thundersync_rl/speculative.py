@@ -190,7 +190,9 @@ class Plan:
     # Needed a continuation after verification (a tail row: rejected inside
     # its draft, or a whole-accepted draft cut before EOS / the cap).
     tail: bool = field(default=False, compare=False)
-    # Drop-IS (opt-in): log of the row's importance weight max(1, W*/M).
+    # Log of the row's importance (loss) weight, 0 for exact samples of p.
+    # Opt-in tools only: drop-IS (log max(1, W*/M), needs null_bv) or banded
+    # IS (log w at the band exit, excludes null_bv).
     log_weight: float = field(default=0.0, compare=False)
     # Anchor horizon: the key of this plan's anchors on the generation workers
     # (``register_engine_anchors``); the refit engine continues the rollout
@@ -364,6 +366,7 @@ class SpeculativeGeneration:
         draft_weights: str = "current",
         max_seq_len: Optional[int] = None,
         anchor_horizon: Optional[int] = None,
+        banded_is_band: Optional[float] = None,
     ):
         self.base = base
         self.learner_policy = learner_policy
@@ -542,6 +545,21 @@ class SpeculativeGeneration:
                 "null_bv needs verify_mode='block' with verify_source='engine' "
                 f"(got {verify_mode!r}/{self.verify_source!r}; the scorer path is "
                 "not built yet)"
+            )
+        # Banded importance sampling (block_verification.py): drafts are
+        # verified against q inside the band and p after it; each rollout then
+        # carries a loss weight w (``claim_log_weight``). Only a draft's first
+        # verification is banded: continuations (sticky rounds) are plain BV,
+        # exact samplers of p as the weight requires.
+        self.banded_is_band = banded_is_band
+        self._weight_claims = PrefixClaims()
+        self._band_rows: list[tuple[float, bool]] = []
+        if banded_is_band is not None and (
+            self.verify_source != "engine" or verify_mode != "block"
+        ):
+            raise ValueError(
+                "banded_is_band needs verify_mode='block' with verify_source='engine' "
+                f"(got {verify_mode!r}/{self.verify_source!r})"
             )
         self._seeds = itertools.count(1)
         self._verify_seeds = itertools.count(1)
@@ -1349,7 +1367,7 @@ class SpeculativeGeneration:
         flat, rows = self._flat_rows(drafts)
         self._record_siblings(flat)
         if self.verify_mode == "block":
-            by_row = self._verify_block(flat, rows)
+            by_row = self._verify_block(flat, rows, band=self.banded_is_band)
         else:
             res = ray.get(
                 self.learner_policy.worker_group.run_all_workers_single_data(
@@ -1396,15 +1414,21 @@ class SpeculativeGeneration:
         return self._row_claims.claim(prompt, token_ids)
 
     def _verify_block(
-        self, flat, rows, null_envelopes: Optional[tuple[float, ...]] = None
+        self,
+        flat,
+        rows,
+        null_envelopes: Optional[tuple[float, ...]] = None,
+        band: Optional[float] = None,
     ) -> dict[int, dict[str, Any]]:
         """Block-verify ``flat`` drafts on every verifier pool; results by row.
 
         Engine-sourced verification places rows on a pool's data-parallel
         ranks by tokens (``lpt_owners``). ``null_envelopes`` (⊥-BV): every row
         is verified at each envelope; the driver decides (``_decide_null``).
+        ``band``: banded IS (only a draft's first verification; never with
+        ``null_envelopes``).
         """
-        futs = self._submit_verify_block(flat, rows, null_envelopes)
+        futs = self._submit_verify_block(flat, rows, null_envelopes, band=band)
         return self._verify_block_results(flat, [(a, ray.get(refs)) for a, refs in futs])
 
     async def _verify_block_async(self, flat, rows) -> dict[int, dict[str, Any]]:
@@ -1424,7 +1448,9 @@ class SpeculativeGeneration:
             self._learner_inflight.difference_update(r for _, refs in futs for r in refs)
         return self._verify_block_results(flat, done)
 
-    def _submit_verify_block(self, flat, rows, null_envelopes=None, ordered=False) -> list:
+    def _submit_verify_block(
+        self, flat, rows, null_envelopes=None, ordered=False, band=None
+    ) -> list:
         """Send ``flat``'s block verification to the verifier pools: [(first row, refs)].
 
         ``ordered``: as numbered learner calls while streaming over the tails.
@@ -1444,6 +1470,8 @@ class SpeculativeGeneration:
                 self._count_balance(lengths, owners, ranks)
             if null_envelopes is not None:
                 extra = {**extra, "null_envelopes": list(null_envelopes)}
+            if band is not None:
+                extra = {**extra, "band": band}
             seq = self.learner_seq() if ordered else None
             call = (method,) if seq is None else ("ordered_call",)
             if seq is not None:
@@ -1512,10 +1540,12 @@ class SpeculativeGeneration:
         # ones), token-weighted: drafted and kept tokens per age bucket.
         age_tok: dict[int, int] = {}
         age_kept: dict[int, int] = {}
+        pairs: list[tuple[int, int]] = []
         for i in range(len(drafts)):
             d, r = best[i]
             plan = self._plan(d, r)
             plan.verified = (len(d[2]), r["accepted"])
+            pairs.append((len(d[2]), r["accepted"]))
             full += plan.complete and r["accepted"] == len(d[2])
             kept += r["accepted"]
             total += len(d[2])
@@ -1530,6 +1560,8 @@ class SpeculativeGeneration:
             }
         )
         self._age_stats(age_tok, age_kept)
+        self._band_stats()
+        self._longest_stats(pairs)
         if self.verify_source == "engine":
             self.stats["spec/engine_q_dropped"] = float(dropped)
 
@@ -1610,6 +1642,7 @@ class SpeculativeGeneration:
         age_tok: dict[int, int] = {}
         age_kept: dict[int, int] = {}
         decided_len: list[int] = []
+        out_pairs: list[tuple[int, int]] = []
         rejected: list[tuple[int, int]] = []  # (draft length, tau) of tail decodes
         dropped_groups = getattr(self, "_null_dropped", set())
         n_tail_drops = 0
@@ -1643,6 +1676,7 @@ class SpeculativeGeneration:
             full += plan.complete and res["accepted"] == g
             kept += res["accepted"]
             total += g
+            out_pairs.append((g, res["accepted"]))
             if res["accepted"] < g:
                 n_tail += 1
                 rejected.append((g, res["accepted"]))
@@ -1711,6 +1745,8 @@ class SpeculativeGeneration:
                 }
             )
         self._age_stats(age_tok, age_kept)
+        self._band_stats()
+        self._longest_stats(out_pairs)
         if self.verify_source == "engine":
             self.stats["spec/engine_q_dropped"] = float(dropped)
 
@@ -1761,6 +1797,28 @@ class SpeculativeGeneration:
             and plan.anchors.complete >= c
         )
 
+    def _band_stats(self) -> None:
+        """Banded-IS statistics over this verification's outputs.
+
+        ``spec/band_ess``: (sum w)^2 / (n sum w^2), the weights' effective
+        sample fraction (1/ess = gradient-variance inflation from the weights);
+        ``spec/band_exit_frac``: outputs whose prefix left the band (only those
+        can be rejected).
+        """
+        rows, self._band_rows = self._band_rows, []
+        if self.banded_is_band is None or not rows:
+            return
+        w = [math.exp(lw) for lw, _ in rows]
+        self.stats.update(
+            {
+                "spec/band_outputs": float(len(w)),
+                "spec/band_exit_frac": sum(e for _, e in rows) / len(w),
+                "spec/band_ess": sum(w) ** 2 / (len(w) * sum(x * x for x in w)),
+                "spec/band_w_min": min(w),
+                "spec/band_w_max": max(w),
+            }
+        )
+
     def _stopped(self, d) -> bool:
         """Whether draft ``d``, if fully accepted, is a finished rollout."""
         # The draft terminated on its own (EOS/stop) rather than at the budget
@@ -1773,6 +1831,13 @@ class SpeculativeGeneration:
 
     def _plan(self, d, r) -> Plan:
         """Turn one draft and its verification result into a rollout plan."""
+        plan = self._plan_tokens(d, r)
+        if "band_log_weight" in r:
+            plan.log_weight = float(r["band_log_weight"])
+            self._band_rows.append((plan.log_weight, bool(r["band_exited"])))
+        return plan
+
+    def _plan_tokens(self, d, r) -> Plan:
         prompt, seed, draft = d[0], d[1], d[2]
         n_acc = r["accepted"]
         lps = behavior_logprobs(
@@ -1855,6 +1920,33 @@ class SpeculativeGeneration:
             age = min(max(self.current_step - v, 0), 4)
             age_tok[age] = age_tok.get(age, 0) + (b - a)
             age_kept[age] = age_kept.get(age, 0) + max(0, min(b, accepted) - a)
+
+    def _longest_stats(self, pairs: list[tuple[int, int]]) -> None:
+        """Earliest rejection among the longest verified drafts (``spec/longest_*``).
+
+        ``pairs`` = (draft length, accepted tokens) of every verified draft. The
+        longest drafts (top decile by length, at least one) are the step's likely
+        stragglers: a rejection at position t leaves (length - t) tokens to
+        decode after verification, so the step waits on the earliest one
+        (research note agent_short_acceptance.md, falsifier 1).
+        """
+        if not pairs:
+            return
+        lens = sorted((g for g, _ in pairs), reverse=True)
+        cut = lens[max(1, len(lens) // 10) - 1]
+        top = [(g, t) for g, t in pairs if g >= cut]
+        rej = [(g, t) for g, t in top if t < g]
+        self.stats.update(
+            {
+                "spec/longest_len_cut": float(cut),
+                "spec/longest_drafts": float(len(top)),
+                "spec/longest_rejections": float(len(rej)),
+                "spec/longest_min_reject_pos": float(min((t for _, t in rej), default=-1)),
+                "spec/longest_min_reject_frac": min((t / max(g, 1) for g, t in rej), default=1.0),
+                "spec/longest_max_remaining": float(max((g - t for g, t in rej), default=0)),
+                "spec/longest_accepted_frac": sum(t for _, t in top) / max(sum(g for g, _ in top), 1),
+            }
+        )
 
     def _age_stats(self, age_tok: dict, age_kept: dict) -> None:
         """spec/age{a}_token_frac and spec/age{a}_accepted_frac per draft age."""
@@ -1962,10 +2054,13 @@ class SpeculativeGeneration:
                 )
             else:
                 method, extra = self._verify_method(flat[a:b])
+                if self.banded_is_band is not None:
+                    extra["band"] = self.banded_is_band
                 refs = group.run_all_workers_single_data(method, **kwargs, **extra)
             calls.append((a, refs))
         kept = total = full = fused = 0
         age_tok: dict[int, int] = {}
+        pairs: list[tuple[int, int]] = []
         age_kept: dict[int, int] = {}
 
         async def fetch(a, refs):
@@ -2009,6 +2104,7 @@ class SpeculativeGeneration:
                 for j, r in by_row.items():
                     d = flat[a + j][1]
                     plan = self._plan(d, r)
+                    pairs.append((len(d[2]), r["accepted"]))
                     full += plan.complete and r["accepted"] == len(d[2])
                     fused += plan.fused is not None
                     kept += r["accepted"]
@@ -2025,6 +2121,8 @@ class SpeculativeGeneration:
             }
         )
         self._age_stats(age_tok, age_kept)
+        self._band_stats()
+        self._longest_stats(pairs)
         if self.fused_verify_train:
             self.stats["fused/retained"] = float(fused)
         if self.verify_source == "engine":
@@ -2080,8 +2178,11 @@ class SpeculativeGeneration:
         self._plan_cv = None
         trace = TailTrace()
         if os.environ.get("THUNDERSYNC_ENGINE_Q_CHECK") == "1":
+            t_check = time.perf_counter()
             await self._route_check(drafts)
             trace.mark("route_check")
+            # Debug re-prefill inside time/verify: reported so it can be subtracted.
+            self.stats["time/route_check"] = time.perf_counter() - t_check
         streams = [d[9] for v in drafts for d in v if len(d) > 9 and d[9] is not None]
         self.verify(drafts)
         trace.mark("verify0")
@@ -2393,6 +2494,14 @@ class SpeculativeGeneration:
         not. Counted in ``spec/route_check_tokens`` / ``spec/route_check_exact``.
         """
         ds = [d for v in drafts for d in v if len(d) > 8 and d[8] is not None and d[2]]
+        # THUNDERSYNC_ROUTE_CHECK_ROWS=n: check a seeded random sample of n drafts
+        # (bounded cost at scale; unset: every draft).
+        sample = int(os.environ.get("THUNDERSYNC_ROUTE_CHECK_ROWS", "0") or 0)
+        if 0 < sample < len(ds):
+            import random
+
+            pick = sorted(random.Random(self.current_step).sample(range(len(ds)), sample))
+            ds = [ds[j] for j in pick]
         await self._route_check_rows(
             [(d[0], d[2], d[8], f"key={d[4]} segments={d[5]}") for d in ds],
             "route_check",
@@ -2853,6 +2962,16 @@ class SpeculativeGeneration:
         """
         return self._anchor_claims.claim(prompt, token_ids)
 
+    def claim_log_weight(self, prompt: torch.Tensor, token_ids: torch.Tensor) -> float:
+        """Banded IS: log loss weight of a finished rollout (0 if it has none).
+
+        ``prompt``: the generation prompt; ``token_ids``: the trajectory. Rows
+        with equal verified prefixes are interchangeable here: their weights
+        are a function of that prefix (w = exp(S_T), T inside the prefix).
+        """
+        log_w = self._weight_claims.claim(prompt, token_ids)
+        return 0.0 if log_w is None else float(log_w)
+
     # -- GenerationInterface used by the rollout ----------------------------------
 
     async def generate_async(
@@ -2946,6 +3065,12 @@ class SpeculativeGeneration:
         lps = list(plan.prefix_logprobs)
         if plan.fused is not None:
             self._fused_claims.add(key, gen, plan.fused)
+        if self.banded_is_band is not None and plan.log_weight != 0.0:
+            # Registered when the plan is taken (complete under sticky
+            # routing): the weight is final at the first verification (every
+            # later token is from p); the claim matches the trajectory by its
+            # verified prefix.
+            self._weight_claims.add(key, gen, plan.log_weight)
         if self.sticky_delta is not None and plan.anchors is not None:
             if not plan.complete and plan.engine_key is None:
                 # Its continuation would be decoded plainly by the refit

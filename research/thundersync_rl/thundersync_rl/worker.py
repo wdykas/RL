@@ -2660,6 +2660,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         anchors: list[Any] | None = None,
         null_envelopes: list[float] | None = None,
         row_ranks: list[int] | None = None,
+        band: float | None = None,
         **_: Any,
     ) -> list[tuple[int, dict[str, Any]]]:
         """Block verification with q from the engine and p from the training model.
@@ -2674,6 +2675,10 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         log p(y) or None)} plus ``"token_logprobs"`` (log p of the drafted
         tokens up to the largest tau) and ``"draft_logq"`` (the same span);
         the driver decides which M each row is taken at (``decide_pools``).
+
+        ``band``: banded importance sampling (``block_verification``); every
+        output row then reports ``"band_log_weight"`` (log w = S_T, the row's
+        loss weight) and ``"band_exited"`` (its prefix left the band).
 
         ``anchors[i]`` (sticky MoE routing): the drafter's routes of row i,
         [positions, L, K] int16 (-1: self); p is then F(theta; anchors), the
@@ -2731,6 +2736,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         """
         _call_log(self, "verify_drafts_block_engine")
         from megatron.core import parallel_state as ps
+        from thundersync_rl.block_verification import banded_log_weight
         from thundersync_rl.engine_q import (
             GatheredLogprobRows,
             HiddenRows,
@@ -2842,6 +2848,8 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 return torch.stack(out)
 
             if null_envelopes is not None:
+                # Banded IS is rejected with null_bv by validation (§14e).
+                assert band is None, "banded IS does not compose with pooled null_bv"
                 grid, lpx, n_eval = verify_engine_q_grid(
                     p_lp, draft, lq, q_rows, gen, tuple(null_envelopes)
                 )
@@ -2856,13 +2864,20 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 }
                 n_rows += n_eval
             else:
-                tau, y, logp, n_eval = verify_engine_q(p_lp, draft, lq, q_rows, gen)
+                tau, y, logp, n_eval = verify_engine_q(
+                    p_lp, draft, lq, q_rows, gen, 1.0, band
+                )
                 res = {
                     "accepted": tau,
                     "next": y,
                     "logprobs": logp.tolist(),
                     "draft_logq": lq[:tau].tolist(),
                 }
+                if band is not None:
+                    # logp[:tau] are the log p of the kept draft tokens the scan used.
+                    log_w, exited = banded_log_weight(logp[:tau] - lq[:tau], band)
+                    res["band_log_weight"] = log_w
+                    res["band_exited"] = exited
                 n_rows += n_eval + (tau < g)
             fetched = h.fetched_bytes  # what the scan needed (not the check)
             if check:

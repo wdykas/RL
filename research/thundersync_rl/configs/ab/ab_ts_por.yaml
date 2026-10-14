@@ -1,0 +1,9 @@
+# Arm "ts_por": ThunderSync PLAN OF RECORD = ts_nonull + pooled null-augmented block verification
+# (⊥-BV, DESIGN §14d): the engine drafts K*G drafts per group (K = 1.5), verified in drafting order
+# against p/M (+) (1-1/M) BOT until the group's G slots fill; M per draft from the DP policy.
+defaults: ab_ts_nonull.yaml
+
+thundersync:
+  null_bv: true
+  null_bv_drafts_per_output: 1.5
+  null_bv_fixed_m: null  # DP envelope policy

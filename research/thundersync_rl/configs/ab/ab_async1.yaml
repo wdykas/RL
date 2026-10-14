@@ -1,0 +1,19 @@
+# Arm "async1": one-step-stale async GRPO on the ThunderSync learner path (run_thundersync_grpo.py,
+# thundersync.rollout_lag=1): the engine samples step k+1's batch at theta_k while the learner trains
+# step k on rollouts sampled at theta_{k-1}; no verification. Same worker, micro-batching, recipe,
+# logprob path (no separate prev/reference log-prob pass: ratio from the training forward,
+# force_on_policy_ratio) and GPUs as sync / ts_*; only the rollout policy differs. Off-policy
+# correction as NeMo-RL async: token IS weights exp(log pi_theta_k - log pi_theta_{k-1}), untruncated.
+# Differences to the stock NeMo-RL async loop (async1_nrl): one step of the same batch per
+# optimizer update (NeMo-RL: same), PPO-clip inactive in both (one update per batch -> ratio 1),
+# IS weights from the training forward instead of a separate prev-logprob forward (identical
+# values under batch invariance), streaming learner dispatch instead of NeMo-RL's train().
+defaults: ab_base.yaml
+
+thundersync:
+  granularity: group  # as ts_* (open-group gradient buckets are not exact under expert parallelism)
+  speculate: false
+  rollout_lag: 1
+
+loss_fn:
+  use_importance_sampling_correction: true
