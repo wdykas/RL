@@ -1,0 +1,9 @@
+# Arm "ts_banded" (opt-in tool, NOT the safe default recipe): ts_nonull + banded importance sampling
+# (DESIGN §14e). A draft's first verification accepts every prefix whose log-ratio stays inside the band
+# and carries the importance weight exp(S_T) into the loss; continuations after an exit are plain block
+# verification. Unbiased in expectation, not exact in law; spec/band_* report exits, ESS and weight range.
+# Does not compose with pooled ⊥-BV (validator rejects null_bv=true), hence based on ts_nonull.
+defaults: ab_ts_nonull.yaml
+
+thundersync:
+  banded_is_band: 0.5
