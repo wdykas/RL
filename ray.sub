@@ -261,6 +261,9 @@ COMMON_SRUN_ARGS+=" --no-container-mount-home"
 COMMON_SRUN_ARGS+=" --mpi=pmix"
 COMMON_SRUN_ARGS+=" --container-mounts=$MOUNTS"
 COMMON_SRUN_ARGS+=" --container-image=$CONTAINER"
+# Take PATH from the job environment, not the image: the image PATH lacks /opt/nemo_rl_venv/bin, so `ray` is not found
+# when the job is submitted from a login node (submit scripts put the venv first on PATH).
+COMMON_SRUN_ARGS+=" --container-env=PATH"
 COMMON_SRUN_ARGS+=" --container-workdir=$SLURM_SUBMIT_DIR"
 # Pass partition/account explicitly for overlapping srun calls.
 COMMON_SRUN_ARGS+=" -p $SLURM_JOB_PARTITION"
