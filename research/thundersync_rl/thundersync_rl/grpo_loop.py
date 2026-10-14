@@ -1116,8 +1116,7 @@ async def _run_one_step(
     if group_order is not None:
         planner.set_order([(step, p) for p in group_order])
 
-    learner.begin(
-        loss_fn,
+    begin_kw = dict(
         gbs=n,
         mbs=mbs,
         storage_device=ts_cfg.storage_device,
@@ -1125,6 +1124,75 @@ async def _run_one_step(
         max_open_groups=max_open_groups,
         merge_pipeline_calls=ts_cfg.merge_pipeline_calls,
     )
+    learner.begin(loss_fn, **begin_kw)
+    # Debug (THUNDERSYNC_DEBUG_ORDER_REPLAY): train only after the rollouts and
+    # first replay them in other arrival orders (``_order_replay``).
+    order_replay = bool(os.environ.get("THUNDERSYNC_DEBUG_ORDER_REPLAY")) and (
+        group_order is not None
+    )
+    replay_digests: dict[str, Any] = {}
+
+    def make_planner(order):
+        pl = StreamPlanner(
+            adv_fn,
+            dp_size=learner.dp_size,
+            max_chunk_trajectories=ts_cfg.max_chunk_trajectories,
+            max_open_groups=max_open_groups,
+            micro_batch_size=mbs,
+            equal_rank_microbatches=expert_parallel,
+            skip_zero_advantage_chunks=(
+                bool(getattr(loss_fn, "skip_zero_advantage_rows", False))
+                and not expert_parallel
+            ),
+            min_pipeline_microbatches=min_pipeline_microbatches,
+        )
+        for p in range(n // G):
+            pl.register_group((step, p), G)
+        if order is not None:
+            pl.set_order([(step, p) for p in order])
+        return pl
+
+    def grad_digests():
+        return [tuple(x) for x in _run_workers(learner.policy, "grad_digest")]
+
+    def replay(trajs, order, seed):
+        """Train ``trajs`` (arrival order shuffled by ``seed``) on a fresh step; digest it."""
+        import random as _random
+
+        learner.abort()
+        learner.begin(loss_fn, **begin_kw)
+        pl = make_planner(order)
+        arrival = list(trajs)
+        _random.Random(seed).shuffle(arrival)
+        for t in arrival:
+            pl.add(t)
+            while pl.has_work(flush=False):
+                d = pl.next_dispatch(flush=False)
+                ray.get(learner.submit(_build_dispatch(d), d.closes))
+        while pl.has_work():
+            d = pl.next_dispatch()
+            ray.get(learner.submit(_build_dispatch(d), d.closes))
+        out = grad_digests()
+        learner.abort()
+        learner.begin(loss_fn, **begin_kw)
+        return out
+
+    def _build_dispatch(d):
+        # Pad only chunks larger than a micro-batch.
+        return [
+            [
+                {
+                    "data": build_chunk_data(
+                        c, tokenizer, master_config, 1 if len(c.trajectories) <= mbs else mbs
+                    ),
+                    "group": c.group,
+                    "reward": c.reward,
+                    "fused_key": None if c.fused is None else c.fused.key,
+                }
+                for c in chunks
+            ]
+            for chunks in d.per_rank
+        ]
 
     t_start = time.perf_counter()
     wake = asyncio.Event()
@@ -1169,27 +1237,10 @@ async def _run_one_step(
             # Under PP, rows of closed groups are held until they fill the
             # pipeline (min_pipeline_microbatches) unless the rollouts are done.
             while planner.has_work(flush=rollouts_done) and (
-                ts_cfg.granularity != "batch" or rollouts_done
+                (ts_cfg.granularity != "batch" and not order_replay) or rollouts_done
             ):
                 d = planner.next_dispatch(flush=rollouts_done)
-                per_rank = [
-                    [
-                        {
-                            # Pad only chunks larger than a micro-batch.
-                            "data": build_chunk_data(
-                                c,
-                                tokenizer,
-                                master_config,
-                                1 if len(c.trajectories) <= mbs else mbs,
-                            ),
-                            "group": c.group,
-                            "reward": c.reward,
-                            "fused_key": None if c.fused is None else c.fused.key,
-                        }
-                        for c in chunks
-                    ]
-                    for chunks in d.per_rank
-                ]
+                per_rank = _build_dispatch(d)
                 t0 = time.perf_counter()
                 seq = None if ordered is None else ordered.learner_seq()
                 refs = learner.submit(per_rank, d.closes, seq=seq)
@@ -1329,6 +1380,15 @@ async def _run_one_step(
             all_trajectories.append(traj)
             planner.add(traj)
             wake.set()
+        if order_replay:
+            # Same trajectories, two other arrival orders under the canonical
+            # order (must equal the real step bitwise) and one with arrival
+            # order dispatch (control: expected to differ).
+            if ordered is not None:
+                await ordered.learner_drain()
+            replay_digests["canonical_a"] = replay(all_trajectories, group_order, 1)
+            replay_digests["canonical_b"] = replay(all_trajectories, group_order, 2)
+            replay_digests["arrival"] = replay(all_trajectories, None, 3)
         rollouts_done = True
         wake.set()
         if ordered is not None and draft_task is not None:
@@ -1370,6 +1430,16 @@ async def _run_one_step(
         learner.abort()
         raise
     assert planner.all_done()
+    if order_replay:
+        real = grad_digests()
+        for k, v in replay_digests.items():
+            same = v == real
+            print(f"[order replay] step={step} {k} same_as_real={same} real={real} {k}={v}", flush=True)
+            if k.startswith("canonical") and not same:
+                raise RuntimeError(f"order replay: {k} gradient differs from the real step")
+        replay_metrics = {
+            f"debug/order_replay_{k}_same": float(v == real) for k, v in replay_digests.items()
+        }
     t_rollout_end = last_rollout_t
     mismatch = (
         train_gen_mismatch(all_trajectories, learner, tokenizer, master_config)
@@ -1421,6 +1491,7 @@ async def _run_one_step(
         "time/draft_cut": draft_cut_s if draft_cut_s is not None else draft_wait,
         "_drafts": drafts,
         **mismatch,
+        **(replay_metrics if order_replay else {}),
     }
     if claim_fused is not None:
         # Trajectories trained from their verification forward; each saved

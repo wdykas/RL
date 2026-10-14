@@ -699,6 +699,20 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         self._fused_graphs = FusedGraphStore()
         self.abort_train_step()
 
+    @torch.no_grad()
+    def grad_digest(self) -> tuple[float, int]:
+        """Debug: (float64 sum, crc32 of the bytes) of this rank's gradient buffers now.
+
+        Bitwise fingerprint of the accumulated gradient before the step's
+        reductions (``THUNDERSYNC_DEBUG_ORDER_REPLAY``).
+        """
+        total, crc = 0.0, 0
+        for b in self.model.buffers + self.model.expert_parallel_buffers:
+            g = b.grad_data.detach()
+            total += float(g.double().sum())
+            crc = zlib.crc32(g.contiguous().view(torch.uint8).cpu().numpy().tobytes(), crc)
+        return total, crc
+
     def get_flat_grads(self) -> torch.Tensor:
         """Return this rank's gradient buffers on CPU (for equivalence tests).
 
