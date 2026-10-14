@@ -1312,6 +1312,9 @@ Decode ms/step, before -> after: Nano L16 5.77 -> 2.88 at 1 row and 8k context, 
 L16 7.84 -> 5.48 and 15.86 -> 13.49. The gain is in the intercept: the per-call weight casts (Nano L16 4.5 -> 1.6 ms of
 elementwise kernels per step). The slope per row is unchanged except for Mamba, where it drops 9% because there are no
 z reads (1.44 -> 1.31 us per row per layer at 8k).
+A rerun on an otherwise idle cluster node reproduces these numbers to within 1%. Fitting tau = tau0 + beta * rows
+(1 to 128 rows per GPU) gives, for Nano L16 at 8k, tau0 6.30 -> 3.42 ms and beta 0.0323 -> 0.0315 ms/row; at 32k,
+tau0 6.67 -> 3.80 ms and beta 0.0371 -> 0.0363 ms/row.
 
 **fp16 range.** Max |GEMM input| over 16 MATH prompts x 512 greedy tokens (HF bf16, decode
 included; `thundersync_work/fp16_range_probe.py`): Qwen3-8B 10752 (6.1x headroom to 65504),
