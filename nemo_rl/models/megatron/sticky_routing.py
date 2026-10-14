@@ -205,6 +205,27 @@ def engine_step_anchors(apply: tuple[torch.Tensor, int], n: int) -> torch.Tensor
     return buf[lo : lo + n]
 
 
+def _engine_select() -> Callable:
+    """The rule for engine forwards: one fused kernel on CUDA (bitwise equal to
+    ``sticky_select``, see ``sticky_routing_fused``), else the reference."""
+    fn = _STATE.get("engine_select")
+    if fn is None:
+        try:
+            from nemo_rl.models.megatron.sticky_routing_fused import sticky_select_fused
+        except ImportError:  # pragma: no cover (no Triton)
+            sticky_select_fused = None
+
+        def fn(scores, anchors, plain_vals, plain_idx, delta):
+            if sticky_select_fused is not None and scores.is_cuda:
+                return sticky_select_fused(
+                    scores.contiguous(), anchors, plain_vals, plain_idx, delta
+                )
+            return sticky_select(scores, anchors, plain_vals, plain_idx, delta)
+
+        _STATE["engine_select"] = fn
+    return fn
+
+
 def _inference_active() -> bool:
     try:
         from megatron.core.inference.utils import InferenceMode
@@ -263,7 +284,7 @@ def install() -> None:
             # rule against this step's per-token anchors (all -1 = self for
             # tokens without anchors: then bitwise the plain selection).
             anchors = engine_step_anchors(apply, int(scores.shape[0]))
-            vals, eff, _ = sticky_select(
+            vals, eff, _ = _engine_select()(
                 scores, anchors, probs, idx, _STATE["delta"]
             )
             return vals, eff
