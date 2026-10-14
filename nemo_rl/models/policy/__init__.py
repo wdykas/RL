@@ -576,6 +576,9 @@ class MegatronConfig(TypedDict):
     # Set by ThunderSync from thundersync.sticky_routing_delta
     # (nemo_rl/models/megatron/sticky_routing.py).
     sticky_routing_delta: NotRequired[float | None]
+    # Sticky fp16 rounding toward a theta_n anchor forward (absent: off). Set by
+    # ThunderSync from thundersync.sticky_rounding (nemo_rl/models/megatron/sticky_rounding.py).
+    sticky_rounding: NotRequired[bool]
     batch_invariant_backend: NotRequired[Literal["deepgemm", "te_native", "triton"]]
     # Cross-rank EP combine: "ordered" is portable, "multimem" uses NVLS.
     batch_invariant_collective: NotRequired[Literal["multimem", "ordered"]]

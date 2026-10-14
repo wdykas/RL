@@ -8,6 +8,8 @@ thundersync:
   max_buckets_per_group: 2  # distinct rewards per open group before collapsing to (G1, G2)
   max_open_groups: 4  # cap on groups holding gradient buckets (bounds accumulator memory)
   max_chunk_trajectories: 8
+  # Sticky fp16 rounding toward a theta_{k-1} anchor forward (DESIGN.md 14g; opt-in, needs sticky_routing).
+  sticky_rounding: false
   # Pipeline parallelism (DESIGN.md section 2): one pipeline call per dispatch and
   # gradient destination; hold closed-group rows until this many micro-batches per
   # learner rank are queued (null: 2 * PP when PP > 1, else 0), flushed at the end.

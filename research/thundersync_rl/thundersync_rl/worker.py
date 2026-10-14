@@ -227,6 +227,18 @@ def snapshot_drafts(
 class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
     """Driver-friendly wrappers over the core split API's streaming mode."""
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        from nemo_rl.models.megatron import sticky_rounding
+
+        # Sticky rounding (opt-in, DESIGN.md section 14g): every policy forward
+        # (verification, training, log-probs) runs the theta_n anchor forward
+        # in lockstep; theta_n is this rank's parameter shard on host, kept by
+        # ``finish_train_step`` before each optimizer step.
+        sticky_rounding.configure(
+            sticky_rounding.sticky_rounding_enabled(self.cfg), self.model
+        )
+
     def stream_begin_step(
         self,
         loss_fn: LossFunction,
@@ -293,6 +305,10 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         every reward is 0 (random tiny models). Exercises refit into the engine's expert
         weights: any stale engine weight shows up in the mismatch check.
         """
+        from nemo_rl.models.megatron import sticky_rounding
+
+        # theta_n of the next step's policy (the weights its drafts come from).
+        sticky_rounding.snapshot()
         scale = os.environ.get("THUNDERSYNC_DEBUG_EXPERT_GRAD_NOISE")
         if not scale:
             return super().finish_train_step()
@@ -2386,7 +2402,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             verify_engine_q_grid,
         )
 
-        from nemo_rl.models.megatron import sticky_routing
+        from nemo_rl.models.megatron import sticky_rounding, sticky_routing
 
         if not self.cfg["megatron_cfg"].get("batch_invariant_mode"):
             raise RuntimeError(
@@ -2424,6 +2440,8 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         sticky_check = check and anchors is not None
         if sticky_check:
             sticky_routing.start_stats()
+            if sticky_rounding.enabled():
+                sticky_rounding.start_stats()
 
         def row_logits():
             for batch in batches:
@@ -2550,6 +2568,14 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 f"differs_from_plain={st['differs_from_plain']:.6f}",
                 flush=True,
             )
+            if sticky_rounding.enabled():
+                sround = sticky_rounding.pop_stats()
+                print(
+                    f"[sround check] rank={self.rank} elements={int(sround['elements'])} "
+                    f"changed={int(sround['changed'])} "
+                    f"changed_frac={sround['changed_frac']:.6f}",
+                    flush=True,
+                )
         if os.environ.get("THUNDERSYNC_SPEC_PROF"):
             ntok = sum(rows[i].numel() for i, _ in results)
             print(

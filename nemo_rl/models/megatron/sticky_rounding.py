@@ -68,6 +68,8 @@ _STATE: dict[str, Any] = {
     "armed": False,
     "stats": None,
     "installed": False,
+    # GPTModel forwards with armed REPLAY_FORWARD routes open a policy forward.
+    "auto": False,
 }
 
 _KEY_COLS = 4  # (source rank, local token index, anchored, unused)
@@ -522,17 +524,57 @@ def _embedding_forward(orig):
     return forward
 
 
+def _inference_active() -> bool:
+    from megatron.core.inference.utils import InferenceMode
+
+    return bool(InferenceMode.is_active())
+
+
+def _gpt_forward(orig):
+    def forward(self, *args, **kwargs):
+        if not (_STATE["enabled"] and _STATE["auto"]) or _STATE["stream"] is not None:
+            return orig(self, *args, **kwargs)
+        if _inference_active():
+            return orig(self, *args, **kwargs)
+        from megatron.core import parallel_state as ps
+
+        tp_size = ps.get_tensor_model_parallel_world_size()
+        group = ps.get_tensor_model_parallel_group() if tp_size > 1 else None
+        mask = token_mask_from_replay(self, group)
+        if mask is None:  # not a policy forward (no sticky-routing anchors armed)
+            return orig(self, *args, **kwargs)
+        if not getattr(self, "pre_process", True):
+            raise NotImplementedError(
+                "sticky rounding with pipeline parallelism is not built yet (the "
+                "anchor residual stream must travel with the stage activation; "
+                "DESIGN.md section 14g)"
+            )
+        with policy_forward(
+            self,
+            mask,
+            ps.get_tensor_model_parallel_rank(),
+            tp_size,
+            torch.distributed.get_rank() if torch.distributed.is_initialized() else 0,
+        ):
+            return orig(self, *args, **kwargs)
+
+    forward.__wrapped__ = orig  # type: ignore[attr-defined]
+    return forward
+
+
 def install() -> None:
-    """Patch MCore's embedding / transformer layer and fp16_gemm's sites (idempotent)."""
+    """Patch MCore's GPT model / embedding / transformer layer and fp16_gemm's sites (idempotent)."""
     if _STATE["installed"]:
         return
     from megatron.core.models.common.embeddings.language_model_embedding import (
         LanguageModelEmbedding,
     )
+    from megatron.core.models.gpt.gpt_model import GPTModel
     from megatron.core.transformer.transformer_layer import TransformerLayer
 
     from nemo_rl.models.megatron import fp16_gemm, fp16_moe
 
+    GPTModel.forward = _gpt_forward(GPTModel.forward)
     LanguageModelEmbedding.forward = _embedding_forward(LanguageModelEmbedding.forward)
     TransformerLayer.forward = _layer_forward(TransformerLayer.forward)
     fp16_gemm.set_sticky_hooks(site_cast, moe_preprocess)
@@ -561,9 +603,19 @@ def lockstep_units(model: torch.nn.Module) -> list[torch.nn.Module]:
     return units
 
 
-def configure(enabled: bool, model: Optional[torch.nn.Module] = None) -> None:
-    """Enable sticky rounding for this process and build theta_n's host store."""
+def configure(
+    enabled: bool,
+    model: Optional[torch.nn.Module] = None,
+    arm_policy_forwards: bool = True,
+) -> None:
+    """Enable sticky rounding for this process and build theta_n's host store.
+
+    ``arm_policy_forwards``: every training-model forward with armed
+    sticky-routing replay targets (verification, training, log-probs) runs as
+    a policy forward; False leaves that to explicit ``policy_forward`` blocks.
+    """
     _STATE["enabled"] = bool(enabled)
+    _STATE["auto"] = bool(enabled and arm_policy_forwards)
     if not enabled:
         _STATE["store"] = None
         return

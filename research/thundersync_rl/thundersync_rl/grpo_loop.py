@@ -224,6 +224,18 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # per-token variance as 0.1 and pure replay; 0.003 keeps 66% vs 73% of
     # 32k drafts; ACCEPTANCE_LEDGER section T). None disables sticky routing.
     sticky_routing_delta: Optional[float] = 0.03
+    # Sticky fp16 rounding (nemo_rl/models/megatron/sticky_rounding.py,
+    # DESIGN.md section 14g; opt-in, not part of the default recipe). At every
+    # fp16 rounding site of the fp16-GEMM recipe the policy of step k rounds
+    # x to the anchor a (the plain theta_{k-1} forward's fp16 value on the same
+    # prefix) when a is one of x's two fp16 neighbours, else to nearest; same
+    # anchor schedule as sticky routing (drafted rollouts anchored, others
+    # self). The learner recomputes the anchors: every policy forward runs a
+    # theta_{k-1} forward in lockstep, its weights streamed per layer from a
+    # host copy of each rank's shard. Requires sticky_routing,
+    # forward_gemm_precision=fp16, pipeline parallel size 1 (not built yet),
+    # no activation recompute or context parallelism, fused_verify_train false.
+    sticky_rounding: bool = False
     # Pooled null-augmented block verification (⊥-BV; null_bv.py, DESIGN.md
     # section 14d). The engine drafts N = max(G, round(K G)) drafts per GRPO
     # group (K = ``null_bv_drafts_per_output``); each is block-verified
@@ -363,6 +375,7 @@ def validate_config(master_config: ThunderSyncMasterConfig) -> None:
     validate_fused_verify_train(master_config.thundersync, master_config.policy)
     validate_engine_verify_source(master_config.thundersync, master_config.policy)
     validate_sticky_routing(master_config)
+    validate_sticky_rounding(master_config)
     validate_null_bv(master_config)
     validate_draft_weights(master_config)
 
@@ -431,6 +444,47 @@ def validate_sticky_routing(master_config: ThunderSyncMasterConfig) -> None:
         problems.append("policy.router_replay.enabled (R3) must be false")
     if problems:
         raise ValueError("thundersync.sticky_routing: " + "; ".join(problems) + ".")
+
+
+def validate_sticky_rounding(master_config: ThunderSyncMasterConfig) -> None:
+    """Reject settings under which sticky rounding is not built (or not exact).
+
+    The anchor schedule and the continuation rounds are sticky routing's, so it
+    must be on; the anchor forward runs in lockstep inside the training
+    model's forward (no pipeline stages, no recompute, no context sharding yet).
+    """
+    ts_cfg = master_config.thundersync
+    if not ts_cfg.sticky_rounding:
+        return
+    mcfg = master_config.policy["megatron_cfg"]
+    problems = []
+    if sticky_delta(ts_cfg) is None:
+        problems.append(
+            "thundersync.sticky_routing must be on (its anchor schedule and theta_{k-1} "
+            "continuation rounds define where roundings are anchored)"
+        )
+    if mcfg.get("forward_gemm_precision") != "fp16":
+        problems.append("policy.megatron_cfg.forward_gemm_precision must be 'fp16'")
+    if (mcfg.get("pipeline_model_parallel_size") or 1) != 1:
+        problems.append(
+            "pipeline_model_parallel_size must be 1 (the anchor residual stream "
+            "travelling with the stage activation is not built yet)"
+        )
+    if (mcfg.get("context_parallel_size") or 1) != 1:
+        problems.append("context_parallel_size must be 1 (not built yet)")
+    if mcfg.get("activation_checkpointing"):
+        problems.append(
+            "activation_checkpointing must be false (recompute would need the "
+            "anchors again: not built yet)"
+        )
+    if mcfg.get("moe_token_dispatcher_type", "alltoall") not in ("alltoall", "allgather"):
+        problems.append("moe_token_dispatcher_type must be 'alltoall' or 'allgather'")
+    if mcfg.get("moe_shared_expert_overlap"):
+        problems.append("moe_shared_expert_overlap must be false")
+    if ts_cfg.fused_verify_train:
+        problems.append("thundersync.fused_verify_train must be false (not built yet)")
+    if problems:
+        raise ValueError("thundersync.sticky_rounding: " + "; ".join(problems) + ".")
 
 
 def validate_null_bv(master_config: ThunderSyncMasterConfig) -> None:
@@ -538,6 +592,9 @@ def configure_sticky_policy(master_config: Any) -> None:
     """
     delta = sticky_delta(master_config.thundersync)
     master_config.policy["megatron_cfg"]["sticky_routing_delta"] = delta
+    master_config.policy["megatron_cfg"]["sticky_rounding"] = bool(
+        master_config.thundersync.sticky_rounding
+    )
 
 
 def validate_engine_verify_source(

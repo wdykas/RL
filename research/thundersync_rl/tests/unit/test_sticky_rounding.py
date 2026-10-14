@@ -302,3 +302,69 @@ def test_config_flag():
     assert not sr.sticky_rounding_enabled({})
     assert not sr.sticky_rounding_enabled({"megatron_cfg": {"sticky_rounding": False}})
     assert sr.sticky_rounding_enabled({"megatron_cfg": {"sticky_rounding": True}})
+
+
+def _master(megatron=None, **ts):
+    from types import SimpleNamespace
+
+    from thundersync_rl.grpo_loop import ThunderSyncConfig
+
+    base = dict(
+        speculate=True,
+        verify_mode="block",
+        verify_source="engine",
+        verify_on="learner",
+        draft_lookahead=1,
+        sticky_routing=True,
+        sticky_rounding=True,
+    )
+    base.update(ts)
+    mcfg = {"forward_gemm_precision": "fp16", "expert_model_parallel_size": 2}
+    mcfg.update(megatron or {})
+    return SimpleNamespace(
+        thundersync=ThunderSyncConfig(**base),
+        grpo=SimpleNamespace(max_rollout_turns=1),
+        policy={
+            "megatron_cfg": mcfg,
+            "generation": {"mcore_generation_config": {"enable_prefix_caching": False}},
+        },
+    )
+
+
+def test_grpo_config_default_off_and_handoff():
+    from thundersync_rl.grpo_loop import (
+        ThunderSyncConfig,
+        configure_sticky_policy,
+        validate_sticky_rounding,
+    )
+
+    assert ThunderSyncConfig().sticky_rounding is False
+    m = _master()
+    validate_sticky_rounding(m)
+    configure_sticky_policy(m)
+    assert m.policy["megatron_cfg"]["sticky_rounding"] is True
+    assert sr.sticky_rounding_enabled(m.policy)
+    m = _master(sticky_rounding=False, sticky_routing=False)
+    validate_sticky_rounding(m)
+    configure_sticky_policy(m)
+    assert m.policy["megatron_cfg"]["sticky_rounding"] is False
+
+
+@pytest.mark.parametrize(
+    "ts,megatron,match",
+    [
+        ({"sticky_routing": False}, {}, "sticky_routing must be on"),
+        ({}, {"forward_gemm_precision": "bf16"}, "forward_gemm_precision"),
+        ({}, {"pipeline_model_parallel_size": 2}, "pipeline_model_parallel_size"),
+        ({}, {"context_parallel_size": 2}, "context_parallel_size"),
+        ({}, {"activation_checkpointing": True}, "activation_checkpointing"),
+        ({}, {"moe_token_dispatcher_type": "flex"}, "dispatcher"),
+        ({}, {"moe_shared_expert_overlap": True}, "shared_expert_overlap"),
+        ({"fused_verify_train": True}, {}, "fused_verify_train"),
+    ],
+)
+def test_grpo_config_rejects(ts, megatron, match):
+    from thundersync_rl.grpo_loop import validate_sticky_rounding
+
+    with pytest.raises(ValueError, match=match):
+        validate_sticky_rounding(_master(megatron, **ts))
