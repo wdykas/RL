@@ -52,6 +52,7 @@ from thundersync_rl.engine_q import (
     ray_free,
 )
 from thundersync_rl.fused_train import FusedRef
+from thundersync_rl.multi_turn import TurnEnvironment, TurnRecord, pair_rows, replay
 from thundersync_rl.null_bv import NullGroup, NullPolicy, envelopes
 from thundersync_rl.routes import (
     RouteRefs,
@@ -184,6 +185,14 @@ class Plan:
     # (``register_engine_anchors``); the refit engine continues the rollout
     # applying them below the horizon.
     engine_key: Optional[str] = None
+    # Multi-turn rollouts under sticky routing (``multi_turn.py``): ``prefix``
+    # then holds the whole row after the prompt (turns and observations), the
+    # current turn starts at ``prefix[turn_start]``, ``turns`` records every
+    # finished turn with the environment's answer, ``row`` is the rollout-loop
+    # row the plan serves.
+    turn_start: int = 0
+    turns: list[TurnRecord] = field(default_factory=list, compare=False)
+    row: Optional[int] = None
 
 
 @dataclass
@@ -452,6 +461,12 @@ class SpeculativeGeneration:
         self._anchor_keys = itertools.count()
         self._cont_ids = itertools.count()
         self._anchor_claims = PrefixClaims()
+        # Multi-turn rollouts (sticky routing, scheme A): the environment the
+        # driver steps at every verified turn end, and the drafted plans
+        # paired with rollout-loop rows (``bind_rows``/``claim_row``).
+        self.turn_env: Optional[TurnEnvironment] = None
+        self._row_prompts: list[torch.Tensor] = []
+        self._row_plans: dict[int, Plan] = {}
         # Route blocks by the step whose training replays them (freed by
         # ``release_routes`` once that step has trained).
         self._route_blocks: dict[int, list] = defaultdict(list)
@@ -1078,6 +1093,11 @@ class SpeculativeGeneration:
         Then no rollout of this step decodes on the engine (``_one`` returns the
         plan), so the engine need not hold theta_k for the step.
         """
+        if self._row_plans:
+            # Multi-turn: drafted plans are paired with rows (``bind_rows``).
+            return len(self._row_plans) == len(prompts) and all(
+                plan.complete for plan in self._row_plans.values()
+            )
         need = Counter(_key(p) for p in prompts)
         return all(
             all(plan.complete for plan in self.plans.get(key, [])[:n])
@@ -1873,21 +1893,47 @@ class SpeculativeGeneration:
             await self._route_check(drafts)
         streams = [d[9] for v in drafts for d in v if len(d) > 9 and d[9] is not None]
         self.verify(drafts)
+        ended = []
+        if self.turn_env is not None:
+            # Multi-turn: each drafted plan serves one rollout-loop row (the
+            # environment is stepped with that row's state). A plan whose
+            # first turn ended in verification goes to the environment.
+            self._row_plans = pair_rows(self._row_prompts, self.plans)
+            left = sum(len(q) for q in self.plans.values())
+            if left:
+                raise RuntimeError(
+                    f"multi-turn: {left} verified plans have no rollout row "
+                    "(drafted prompts differ from the step's rows)"
+                )
+            for i, plan in self._row_plans.items():
+                plan.row = i
+                if plan.complete:
+                    plan.complete = False
+                    if not self._horizon_done(plan, len(self._row_prompts[i])):
+                        # (Past the horizon the refit engine's turn loop,
+                        # ``finish_row``, steps the environment.)
+                        ended.append((_key(self._row_prompts[i]), plan))
+            plans = [(_key(self._row_prompts[i]), p) for i, p in self._row_plans.items()]
+        else:
+            plans = [(key, plan) for key, queue in self.plans.items() for plan in queue]
         pending = [
             (key, plan)
-            for key, queue in self.plans.items()
-            for plan in queue
-            if not plan.complete and not self._horizon_done(plan, len(key))
+            for key, plan in plans
+            if not plan.complete
+            and not any(plan is q for _, q in ended)
+            and not self._horizon_done(plan, len(key))
         ]
         # The drafts' streams still decode: whole-accepted unfinished plans go
         # on with theirs, every other stream stops.
         kept = {id(plan.stream) for _, plan in pending if plan.stream is not None}
         self._stop_streams([x for x in streams if id(x) not in kept])
-        if pending:
-            await self._continue_sticky(pending)
-        self._register_horizon_plans()
+        if pending or ended:
+            await self._continue_sticky(pending, ended)
+        if self.turn_env is not None and os.environ.get("THUNDERSYNC_ENGINE_Q_CHECK") == "1":
+            await self._route_check_plans()
+        self._register_horizon_plans(plans)
 
-    def _register_horizon_plans(self) -> None:
+    def _register_horizon_plans(self, plans) -> None:
         """Hand the anchors of plans the refit engine continues to the engine.
 
         Anchor horizon: every incomplete plan now has its anchors below c
@@ -1911,23 +1957,128 @@ class SpeculativeGeneration:
         for k, v in totals.items():
             self.stats[f"spec/anchor_{k}"] = v
         entries = {}
-        for key, queue in self.plans.items():
-            for plan in queue:
-                if plan.complete:
-                    continue
-                if not self._horizon_done(plan, len(key)):
-                    raise RuntimeError(
-                        "sticky routing: a drafted rollout left the theta_{k-1} "
-                        "rounds without its anchors below the horizon"
-                    )
-                plan.engine_key = f"h{next(self._anchor_keys)}"
-                entries[plan.engine_key] = self._cut(plan.anchors, len(key))
+        for key, plan in plans:
+            if plan.complete:
+                continue
+            if not self._horizon_done(plan, len(key)):
+                raise RuntimeError(
+                    "sticky routing: a drafted rollout left the theta_{k-1} "
+                    "rounds without its anchors below the horizon"
+                )
+            plan.engine_key = f"h{next(self._anchor_keys)}"
+            entries[plan.engine_key] = self._cut(plan.anchors, len(key))
         ray.get(
             self.base._policy.worker_group.run_all_workers_single_data(
                 "register_engine_anchors", entries=entries
             )
         )
         self.stats["spec/horizon_plans"] = float(len(entries))
+
+    def bind_rows(self, rows: list[dict[str, Any]]) -> None:
+        """This step's rollout rows (multi-turn): initial sample states, in row order.
+
+        Called before ``verify_sticky``; the drafted plans are paired with
+        these rows there (``pair_rows``) and claimed by ``claim_row``.
+        """
+        if self.turn_env is None:
+            raise RuntimeError("bind_rows needs a turn environment (multi-turn rollouts)")
+        self.turn_env.bind(rows)
+        self._row_prompts = [
+            torch.cat([m["token_ids"] for m in r["message_log"]]) for r in rows
+        ]
+        self._row_plans = {}
+
+    def claim_row(self, row: int) -> Optional[Plan]:
+        """The finished drafted plan of rollout-loop row ``row`` (multi-turn), or None."""
+        plan = self._row_plans.pop(row, None)
+        if plan is not None and not plan.complete and plan.engine_key is None:
+            raise RuntimeError(
+                f"sticky routing: row {row}'s drafted multi-turn rollout reached the "
+                "rollout loop unfinished (verify_sticky must complete every turn)"
+            )
+        return plan
+
+    async def replay_row(
+        self, row: int
+    ) -> Optional[tuple[dict, dict, Optional[RouteRefs]]]:
+        """Row ``row``'s drafted multi-turn rollout, or None if undrafted.
+
+        (final sample state, sample metrics, anchors), rebuilt from the
+        recorded turns (the environment is not stepped again). Anchor
+        horizon: a plan handed to the refit engine is finished first
+        (``_finish_turns``).
+        """
+        plan = self.claim_row(row)
+        if plan is None:
+            return None
+        if not plan.complete:
+            await self._finish_turns(row, plan)
+        state, metrics = replay(
+            self.turn_env, row, plan.prefix, plan.prefix_logprobs, plan.turns
+        )
+        return state, metrics, plan.anchors
+
+    async def _finish_turns(self, row: int, plan: Plan) -> None:
+        """Anchor horizon: finish a drafted multi-turn rollout on the refit engine.
+
+        The plan's anchors below c are complete (``_horizon_done``), so every
+        later token is sampled from p_k by the engine at theta_k with the
+        request tagged (``plan.engine_key``): each turn's prefill (prompt,
+        earlier turns, observations) re-applies the anchors below c by
+        position. Turn ends and environment steps follow the same rules as
+        the turns before the horizon (``TurnEnvironment``).
+        """
+        key = _key(self._row_prompts[row])
+        prompt = self._row_prompts[row]
+        while True:
+            n_turn = len(plan.prefix) - plan.turn_start
+            if n_turn > 0 and self._turn_ended(key, plan, plan.prefix[-1]):
+                rec = await self.turn_env.step(
+                    row, len(key), list(plan.prefix), plan.turns, plan.turn_start
+                )
+                plan.turns.append(rec)
+                if self.turn_env.rollout_ends(plan.turns):
+                    break
+                plan.prefix += rec.obs
+                plan.prefix_logprobs += [0.0] * len(rec.obs)
+                plan.turn_start = len(plan.prefix)
+                continue
+            ids = torch.cat([prompt, torch.tensor(plan.prefix, dtype=torch.long)])
+            cont = BatchedDataDict(
+                {
+                    "input_ids": ids.view(1, -1),
+                    "input_lengths": torch.tensor([ids.numel()]),
+                    "max_new_tokens": torch.tensor(
+                        [self._turn_cap(key, plan) - n_turn]
+                    ),
+                    "ts_anchor_key": [plan.engine_key],
+                }
+            )
+            new = 0
+            async for _, res in self.base.generate_async(cont):
+                glen = int(res["generation_lengths"][0])
+                c0 = ids.numel()
+                plan.prefix += res["output_ids"][0, c0 : c0 + glen].tolist()
+                plan.prefix_logprobs += res["logprobs"][0, c0 : c0 + glen].tolist()
+                new += glen
+            if new == 0 and not self._turn_ended(key, plan, plan.prefix[-1] if plan.prefix else -1):
+                raise RuntimeError(
+                    f"row {row}: the engine generated nothing before the turn ended"
+                )
+        plan.complete = True
+        self.stats["spec/horizon_engine_turns"] = self.stats.get(
+            "spec/horizon_engine_turns", 0.0
+        ) + float(len(plan.turns))
+
+    def _turn_cap(self, key, plan: Plan) -> int:
+        """Most tokens the plan's current turn can generate (per-turn length cap)."""
+        return self._cap(len(key) + plan.turn_start)
+
+    def _turn_ended(self, key, plan: Plan, last: int) -> bool:
+        """Whether the verified prefix ends the current turn (``last``: its last token)."""
+        return last == self.eod or len(plan.prefix) - plan.turn_start >= self._turn_cap(
+            key, plan
+        )
 
     def _stop_streams(self, streams) -> None:
         """Abort engine draft streams and close their logs (rank 0 + every engine)."""
@@ -1952,11 +2103,45 @@ class SpeculativeGeneration:
         not. Counted in ``spec/route_check_tokens`` / ``spec/route_check_exact``.
         """
         ds = [d for v in drafts for d in v if len(d) > 8 and d[8] is not None and d[2]]
-        if not ds:
+        await self._route_check_rows(
+            [(d[0], d[2], d[8], f"key={d[4]} segments={d[5]}") for d in ds],
+            "route_check",
+        )
+
+    async def _route_check_plans(self) -> None:
+        """Debug: finished multi-turn plans' anchors against a fresh engine prefill.
+
+        ``THUNDERSYNC_ENGINE_Q_CHECK=1``, multi-turn sticky routing, after
+        ``_continue_sticky`` (the engine still holds the drafting weights).
+        Covers the observation positions, whose anchors come from the
+        continuation streams' prefills (``spec/route_check_mt_*``;
+        ``spec/route_check_mt_obs_positions``: anchored observation tokens).
+        """
+        items, obs = [], 0
+        for i, plan in sorted(self._row_plans.items()):
+            if plan.anchors is None or not plan.prefix:
+                continue
+            prompt = self._row_prompts[i]
+            n = plan.anchors.length - prompt.numel()
+            items.append((prompt, plan.prefix[:n], plan.anchors, f"row={i} turns={len(plan.turns)}"))
+            obs += sum(
+                max(0, min(t.gen_end + len(t.obs), n) - t.gen_end)
+                for t in plan.turns
+            )
+        self.stats["spec/route_check_mt_obs_positions"] = float(obs)
+        await self._route_check_rows(items, "route_check_mt")
+
+    async def _route_check_rows(self, items, name: str) -> None:
+        """Re-route (prompt, tokens) rows in one engine prefill; compare to their anchors.
+
+        ``items``: (prompt, tokens, ``RouteRefs``, label) per row. Counted in
+        ``spec/{name}_tokens`` / ``spec/{name}_exact``.
+        """
+        if not items:
             return
         rank0 = self.base._policy.worker_group.workers[0]
-        rows = [torch.cat([d[0], torch.tensor(d[2], dtype=torch.long)]) for d in ds]
-        hkeys = self._hidden_keys([f"route-check:{j}" for j in range(len(ds))])
+        rows = [torch.cat([p, torch.tensor(t, dtype=torch.long)]) for p, t, _, _ in items]
+        hkeys = self._hidden_keys([f"{name}:{j}" for j in range(len(items))])
         # Next to the drafts' streams, which keep running (``_collect_running``).
         idx = ray.get(
             rank0.add_drafts.remote(
@@ -1972,31 +2157,34 @@ class SpeculativeGeneration:
         )
         self._pop_hidden(hkeys, [0] * len(rows))
         tok = exact = 0
-        for d, ref in zip(ds, refs):
-            n = d[0].numel() + len(d[2])
-            mine = fetch_anchors(d[8], self._route_layers, None, n, ray.get)
+        for (p, toks, anchors, label), ref in zip(items, refs):
+            n = p.numel() + len(toks)
+            mine = fetch_anchors(anchors, self._route_layers, None, n, ray.get)
             other = fetch_anchors(ref, self._route_layers, mine.shape[-1], n, ray.get)
-            t, e = compare_anchors(mine, other)
-            tok, exact = tok + t, exact + e
-            if e < t:
+            nt, ne = compare_anchors(mine, other)
+            tok, exact = tok + nt, exact + ne
+            if ne < nt:
                 # First differing (position, layer) of this draft.
                 bad = anchor_mismatches(mine, other)
                 pos, col = bad[0].tolist()
                 print(
-                    f"[route check] mismatch key={d[4]} prompt={d[0].numel()} "
+                    f"[{name}] mismatch {label} prompt={p.numel()} "
                     f"len={n} pos={pos} layer={self._route_layers[col]} "
-                    f"positions={t - e} (pos, layer column)={bad[:8].tolist()} "
+                    f"positions={nt - ne} (pos, layer column)={bad[:8].tolist()} "
                     f"logged={mine[pos, col].tolist()} "
-                    f"prefill={other[pos, col].tolist()} segments={d[5]} "
-                    f"blocks={[(b.lo, b.hi) for b in d[8].blocks]}",
+                    f"prefill={other[pos, col].tolist()} "
+                    f"blocks={[(b.lo, b.hi) for b in anchors.blocks]}",
                     flush=True,
                 )
         (self._free_refs or ray_free)(self._route_blocks.pop(check, []))
-        self.stats["spec/route_check_tokens"] = float(tok)
-        self.stats["spec/route_check_exact"] = float(exact)
-        print(f"[route check] drafts={len(ds)} tok={tok} exact={exact}", flush=True)
+        self.stats[f"spec/{name}_tokens"] = float(tok)
+        self.stats[f"spec/{name}_exact"] = float(exact)
+        print(
+            f"[{name.replace('_', ' ')}] rows={len(items)} tok={tok} exact={exact}",
+            flush=True,
+        )
 
-    async def _continue_sticky(self, pending, max_retries: int = 100) -> None:
+    async def _continue_sticky(self, pending, ended=(), max_retries: int = 100) -> None:
         """Complete incomplete plans at theta_{k-1}, verifying while the engine decodes.
 
         One engine stream per plan decodes from prompt + kept prefix toward
@@ -2014,13 +2202,50 @@ class SpeculativeGeneration:
         stream's own route log (its prefill re-routes prompt + prefix);
         pieces are cut to their logged routes and hidden rows, which is
         engine bookkeeping, independent of the tokens.
+
+        Multi-turn (``turn_env``): a verified prefix that ends a turn (EOS or
+        the per-turn cap) goes to the environment (``ended``: plans whose
+        turn ended before this call); unless the rollout ends there, its
+        observation is appended and a new stream decodes the next turn from
+        prompt + turns + observation. That stream's prefill routes the
+        observation positions: their anchors. Environment steps run
+        concurrently with the streams of other plans.
         """
         rank0 = self.base._policy.worker_group.workers[0]
         chunk = max(1, int(self.sticky_chunk_tokens))
         version = self.current_step - 1
-        stats = dict(rounds=0, streams=0, tokens=0, kept=0, retries=0)
+        stats = dict(rounds=0, streams=0, tokens=0, kept=0, retries=0, turns=0)
         live: list[dict[str, Any]] = []
         retries: dict[int, int] = defaultdict(int)
+        turns: dict[asyncio.Task, tuple] = {}
+
+        def end_turn(key, plan: Plan) -> None:
+            if self.turn_env is None:
+                plan.complete = True
+                return
+            task = asyncio.create_task(
+                self.turn_env.step(
+                    plan.row, len(key), list(plan.prefix), plan.turns, plan.turn_start
+                )
+            )
+            turns[task] = (key, plan)
+            stats["turns"] += 1
+
+        def next_turns() -> None:
+            """Apply finished environment steps; start the next turns' streams."""
+            nxt = []
+            for task in [t for t in turns if t.done()]:
+                key, plan = turns.pop(task)
+                rec = task.result()
+                plan.turns.append(rec)
+                if self.turn_env.rollout_ends(plan.turns):
+                    plan.complete = True
+                    continue
+                plan.prefix += rec.obs
+                plan.prefix_logprobs += [0.0] * len(rec.obs)
+                plan.turn_start = len(plan.prefix)
+                nxt.append((key, plan))
+            start(nxt)
 
         def start(items) -> None:
             if not items:
@@ -2034,16 +2259,18 @@ class SpeculativeGeneration:
                 )
                 for key, plan in items
             ]
-            # Anchor horizon: H + 1 tokens suffice (position c - 1 is routed by
-            # the forward that samples token H); the refit engine does the rest.
             budgets = [
-                self._cap(len(key)) - len(plan.prefix)
+                self._turn_cap(key, plan) - (len(plan.prefix) - plan.turn_start)
                 if self.anchor_horizon is None
-                # At least one token: a re-prefill logs every prefix position.
+                # Anchor horizon: H + 1 tokens suffice (position c - 1 is routed
+                # by the forward that samples token H); the refit engine does
+                # the rest. At least one: a re-prefill logs every prefix position.
                 else max(
                     1,
-                    min(self._cap(len(key)), int(self.anchor_horizon) + 1)
-                    - len(plan.prefix),
+                    min(
+                        self._turn_cap(key, plan) - (len(plan.prefix) - plan.turn_start),
+                        int(self.anchor_horizon) + 1 - len(plan.prefix),
+                    ),
                 )
                 for key, plan in items
             ]
@@ -2063,7 +2290,7 @@ class SpeculativeGeneration:
                         plan=plan,
                         idx=i,
                         hkey=hk,
-                        length=len(key) + self._cap(len(key)),
+                        length=len(key) + plan.turn_start + self._turn_cap(key, plan),
                         taken=0,
                         routes=None,
                     )
@@ -2081,7 +2308,14 @@ class SpeculativeGeneration:
                 live.append(dict(plan.stream, key=key, plan=plan))
                 plan.stream = None
         start([(key, plan) for key, plan in pending if not any(s["plan"] is plan for s in live)])
-        while live:
+        for key, plan in ended:
+            end_turn(key, plan)
+        while live or turns:
+            if turns:
+                next_turns()
+            if not live:
+                await asyncio.sleep(0.02)
+                continue
             status = ray.get(rank0.draft_lengths.remote([s["idx"] for s in live]))
             cand = [
                 s
@@ -2220,26 +2454,26 @@ class SpeculativeGeneration:
                     plan.prefix_logprobs += lps[:g]
                     plan.anchors = d[8].truncate(p.numel() + g)
                     s["taken"] += g
-                    # A stream ends at EOS or the cap, or (anchor horizon) at
-                    # its H + 1 token budget, which does not end the rollout.
-                    plan.complete = (
-                        bool(done)
-                        and (self.anchor_horizon is None or toks[-1] == self.eod)
-                    ) or len(plan.prefix) >= self._cap(len(s["key"]))
-                    if plan.complete or self._horizon_done(plan, len(s["key"])):
+                    if self._horizon_done(plan, len(s["key"])):
+                        # Anchor horizon: the refit engine continues this
+                        # rollout (incl. a turn end here: ``finish_row``).
                         done_streams.append(s)
+                    elif (bool(done) and self.anchor_horizon is None) or self._turn_ended(
+                        s["key"], plan, plan.prefix[-1]
+                    ):
+                        done_streams.append(s)
+                        end_turn(s["key"], plan)
                 else:
                     y = out["next"]
                     plan.prefix += list(toks[:n_acc]) + [y]
                     plan.prefix_logprobs += lps[: n_acc + 1]
                     plan.anchors = d[8].truncate(p.numel() + n_acc)
-                    plan.complete = y == self.eod or len(plan.prefix) >= self._cap(
-                        len(s["key"])
-                    )
                     done_streams.append(s)
-                    if not plan.complete and not self._horizon_done(
-                        plan, len(s["key"])
-                    ):
+                    if self._horizon_done(plan, len(s["key"])):
+                        pass
+                    elif self._turn_ended(s["key"], plan, y):
+                        end_turn(s["key"], plan)
+                    else:
                         restart.append(s)
             if done_streams:
                 stop(done_streams)
@@ -2253,6 +2487,7 @@ class SpeculativeGeneration:
                 "spec/sticky_cont_accepted_frac": stats["kept"]
                 / max(stats["tokens"], 1),
                 "spec/sticky_cont_retries": float(stats["retries"]),
+                "spec/sticky_env_turns": float(stats["turns"]),
             }
         )
 

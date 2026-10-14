@@ -1382,7 +1382,7 @@ showing that anchoring continuations to self after a rejection (anchors dependin
 is biased.
 
 **Requirements** (`validate_sticky_routing`): speculate, verify_mode=block,
-verify_source=engine (BI), draft_lookahead=1, max_rollout_turns=1, no tail_lookup, no
+verify_source=engine (BI), draft_lookahead=1, no tail_lookup, no
 engine prefix caching, no R3 router replay, an MoE model (the engine must report a route
 log, else the driver raises).
 
@@ -1401,9 +1401,8 @@ scheme rests on the enumeration tests (`test_routes.py`).
 continuations. The engine refit waits for the continuation rounds, so rollouts no
 longer overlap verification (keeping θ_{k−1} available after the refit, e.g. as a sparse
 weight delta toggled per chunk, would restore the overlap; not built yet). Multi-version drafts
-(`draft_lookahead>1`), multi-turn rollouts (a later turn's prefill would need the anchors in
-the engine: sticky replay in engine prefill, not built yet) are not built yet; a horizon c below the rollout
-cap with engine anchor apply: section 14i.
+(`draft_lookahead>1`) are not built yet. Multi-turn rollouts: section 14h; a horizon c below the
+rollout cap with engine anchor apply: section 14i.
 
 ## 14d. Pooled null-augmented block verification (`thundersync.null_bv`)
 
@@ -1806,6 +1805,91 @@ anchor forward stays the plain θ_{k−1} forward (the policy definition), indep
 **Measured value (emulation, ledger T).** Qwen3-30B-A3B 16 layers, steady-state AdamW: sticky rounding on top of
 sticky routing lowers Var_q(log p/q) 1.3x for θ_{k−1} drafts and 3–10x for momentum / oracle drafts (all three
 site kinds needed); ~20% of activation elements are rounded toward the anchor at steady state.
+
+## 14h. Multi-turn rollouts under sticky routing, scheme A (`grpo.max_rollout_turns > 1`)
+
+*Built on branch `ts-multiturn-a` (from ts-integration 29064e90); on whenever sticky routing is on
+and `grpo.max_rollout_turns > 1`. Unit-tested on a fake engine; GPU end to end: see the status line
+at the end of this section.* Design brief and exactness proof by enumeration:
+`thundersync_work/research/agent_multiturn_sticky.md` (tests on RL-sticky b8212df1,
+`test_sticky_multi_turn_all_turns_at_drafter_weights_is_exact`, TV < 1e-12, prefix-dependent
+stochastic environment, 3 turns; control `..._later_turns_plain_at_new_weights_are_biased`);
+implementation notes: `thundersync_work/research/agent_multiturn_a.md`.
+
+**Why.** A token of turn 2 depends on the hidden states of every earlier position, i.e. on
+F(θ_k; A) there. Decoding turn 2 on the refit engine (θ_k, plain routing) re-routes turn 1
+without its anchors: the result is neither p_k nor any policy the learner trains on (control
+test: biased).
+
+**Scheme A: every turn of a drafted rollout at the drafting weights, before the refit**
+(`multi_turn.py`, `SpeculativeGeneration.verify_sticky` / `_continue_sticky`).
+Turn 1 is drafted and block-verified as before. When a VERIFIED prefix ends a turn (EOS, or
+the per-turn cap `_cap(prompt + earlier turns and observations)`, the same budget the plain
+multi-turn path gets), the driver steps the environment on it (`TurnEnvironment.step`:
+`calculate_rewards` on the row's message log, in a thread so other rollouts' streams keep
+going). Unverified draft tokens never reach the environment or its tools. Unless the rollout
+ends there (terminated, observation truncated at the total-length cap, or `max_rollout_turns`
+turns), the observation is appended to the plan and a new θ_{k−1} stream decodes the next
+turn from prompt + turns + observation; its pieces are verified exactly like continuations
+(chunks of `sticky_continuation_chunk_tokens`, residual token on a rejection, restart from
+the new prefix). The plan's `prefix` is the whole row after the prompt (turn tokens and
+observation tokens; observation log-probs are placeholders, masked from the loss);
+`Plan.turns` records each turn's span and the environment's answer.
+- Anchors of observation positions come from the continuation stream's own prefill (plain
+  θ_{k−1} on the actual prefix: the definition of A). Each new stream re-logs every position
+  of its row (prefix caching is off), so the plan's `RouteRefs` after its last verified piece
+  cover the whole row up to the last generated token; the final observation follows every
+  generated token and needs no anchor.
+- Rows: each drafted plan is paired with one rollout-loop row (`bind_rows` before
+  `verify_sticky`; rows with the same prompt take its plans in queue order, which does not
+  depend on the tokens), so the environment sees that row's `extra_env_info`/`task_name`.
+- Rollout loop (`grpo_loop._run_one_step`): a row with a finished drafted plan is rebuilt from
+  the recorded turns (`multi_turn.replay`: same message log, rewards, metadata and metrics as
+  `run_sample_multi_turn_rollout`, checked against it in `test_multi_turn_sticky.py`); the
+  environment is NOT stepped again (environments need not be deterministic; tools may have side
+  effects). Training anchors come with the plan. Rows without a plan (never drafted, dropped
+  drafts, ⊥-BV fresh slots) run `run_sample_multi_turn_rollout` unchanged at θ_k ("self"
+  everywhere, F(θ; self) = plain).
+- Exactness [proof by enumeration, brief]: each piece is a q draft given the current prefix,
+  block-verified against the fixed target p = F(θ_k; A); an environment step is a function of the
+  verified prefix and its own randomness. No new decision rule. ⊥-BV composes: its output
+  decisions are made on turn-1 drafts; every later token is conditional sampling given a
+  verified prefix [derived].
+- Not supported (raise): environment `next_stop_strings` and per-sample `stop_strings` (drafts
+  and continuations run without stop strings; same as single-turn speculation).
+
+**Per-rank / per-step costs at scale [derived].**
+- Driver: one environment step per verified turn end (the same count as plain multi-turn) and one
+  stream start per later turn; per turn only token lists cross the driver (the turn's tokens, the
+  observation's ids). Routes stay object-store handles (`RouteRefs`), never fetched by the driver.
+  Environment steps run concurrently (one thread each) with every other rollout's streams.
+- Engine (θ_{k−1}): each later turn is a new request whose prefill re-reads prompt + earlier turns
+  + observation: O(turns × S) prefill tokens per rollout without prefix caching, plus its route
+  log (L_local × K int16 per position on the logging rank, e.g. Ultra-like L=60/PP, K=22: 2.6 kB
+  per position per stage, all positions re-logged per turn). Step 4 of the brief (reuse the
+  plan's anchors for cached positions so only new positions are logged, prefill O(observation)
+  per turn) is not built yet; prefix caching stays off under sticky routing.
+- Learner: unchanged per token: anchors for every row position (observations included) fetched
+  per pipeline stage from the object store; one verification forward per piece (as single-turn
+  continuations).
+- Critical path: the refit waits until every turn of every drafted rollout is done, so
+  ENVIRONMENT LATENCY (tool calls) now blocks the refit. Correct but slow for agentic tasks.
+  Fixes: θ_{k−1} retention after the refit (engine keeps θ_{k−1} as a second weight version or
+  sparse delta, continuations run on it while new rollouts run at θ_k), or scheme B (anchor
+  horizon H with sticky replay in engine prefill: θ_{k−1} work bounded by H tokens; another
+  branch, `ts-multiturn-b`).
+
+**Checks** (`scripts/bi_tp/sticky_multiturn_moe.sh`: `sticky_moe.sh` with the stochastic toy
+environment `toy_multi_turn_env.py`, `--toy-multi-turn-env TURNS`, small per-turn budget).
+Everything `sticky_moe.sh` asserts (mismatch 0 over every assistant token of every turn, engine q
+exact, drafts' route check exact, weights change, drafts accepted, sticky rule active) plus, every
+step after the first: drafted multi-turn rollouts replayed (`spec/replayed_multi_turn_rows`), the
+driver stepped the environment (`spec/sticky_env_turns`), some rollout ran > 1 turn
+(`max_turns`), and the finished plans' anchors equal a fresh engine prefill of their full rows
+(`[route check mt]`, `spec/route_check_mt_exact == spec/route_check_mt_tokens > 0`) with anchored
+observation positions among them (`spec/route_check_mt_obs_positions > 0`).
+
+*GPU status:* pending (first run 2026-10-14).
 
 ## 14i. Sticky routing anchor horizon with engine anchor apply (`thundersync.sticky_anchor_horizon`)
 
