@@ -1626,10 +1626,20 @@ experts; each rank owns ≈ P/W main elements, P/(TP·PP·EP-share) model elemen
   host → device copy, ~0.1 s, is the only delay) instead of from `draft_start_frac`. Drafting while
   the rollout tail decodes needs a second weight version on the engine (a θ̂ replica, or
   per-request weight versions via a sparse delta): not built yet.
-- next (not built yet): take the stage off the critical path by receiving θ̂ into the engine's host
-  staging during the rollouts (the receive writes host buffers, not live parameters; the learner
-  side runs before its first dispatch), or by a sparse θ̂ − θ_k delta (~1% of elements change per
-  step at L4 [measured below]) applied on the engine.
+- remaining waits (not built yet; critical-path scout #6): (1) drafting still starts only after the
+  step's *last* rollout, so one long fresh decode delays all next-step drafting by up to a full decode
+  (the learner-lock wait is gone). Design: at `draft_start_frac` the engine loads θ̂_{k+1} and starts
+  drafting; every step-k rollout still decoding continues on the engine as a q = θ̂_{k+1} draft that
+  the learner block-verifies in pieces against p_k (the streamed-continuation machinery of 14c:
+  rejection → residual sample → restart from the new prefix). Exact for any q (section 4); such rows
+  are never drafted rows ("self" anchors under sticky routing), so their target is plain θ_k. Cost:
+  learner verification forwards of those tail tokens (it trains them anyway) and a rejection rate set
+  by θ̂_{k+1} vs θ_k (one optimizer step apart). (2) The stage is on the critical path at the top of
+  the step. Design: stage during the continuation phase instead — the engine receives θ̂ into its host
+  staging (the receive writes host buffers, not the live θ̂_k the continuations decode with) and the
+  learner computes θ̂ into a separate bucket buffer between verification pieces (so its parameters stay
+  θ_k for verification), or a sparse θ̂ − θ_k delta (~1% of elements change per step at L4 [measured
+  below]) applied on the engine. Per-rank cost unchanged except one bucket of learner scratch.
 
 **Measurements.**
 - End to end exact [measured, 2026-10-13 20:36]: `DRAFT_WEIGHTS=momentum scripts/bi_tp/sticky_moe.sh`
