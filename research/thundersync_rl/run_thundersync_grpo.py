@@ -20,6 +20,7 @@ import pprint
 import sys
 import traceback
 
+import ray
 from omegaconf import OmegaConf
 from thundersync_rl.grpo_loop import (
     ThunderSyncMasterConfig,
@@ -116,6 +117,19 @@ def main() -> None:
         os.makedirs(os.path.dirname(os.path.abspath(args.history_json)), exist_ok=True)
         with open(args.history_json, "w") as f:
             json.dump(history, f, indent=1)
+    # Release the workers and placement groups while Ray is still connected.
+    # Left to garbage collection they are shut down from __del__ during
+    # interpreter finalization, after Ray's atexit teardown: the Ray calls there
+    # reconnect a new driver to the cluster and crash in CoreWorkerProcess
+    # (exit 1 after a completed run).
+    for obj in (policy_generation, policy, *(_clusters or ())):
+        shutdown = getattr(obj, "shutdown", None)
+        if shutdown is not None:
+            try:
+                shutdown()
+            except Exception as exc:  # teardown only: report, keep going
+                print(f"[thundersync] shutdown of {type(obj).__name__} failed: {exc}")
+    ray.shutdown()
 
 
 if __name__ == "__main__":

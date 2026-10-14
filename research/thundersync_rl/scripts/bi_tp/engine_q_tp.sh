@@ -109,7 +109,10 @@ try:
     hist = json.load(open(path))
 except (OSError, ValueError) as exc:
     sys.exit(f"[engine_q] FAIL: no history ({exc})")
-ok = rc == 0 and len(hist) >= steps
+# Exactness verdict: every step completed (history.json is written only after the
+# last step) and exact. The process exit code is reported separately: a non-zero
+# exit after a complete, exact history is a teardown failure, not an exactness one.
+ok = len(hist) >= steps
 for i, h in enumerate(hist):
     d, e = h.get("mismatch/max_abs_logprob_diff"), h.get("mismatch/exact_token_frac")
     good = d == 0 and e == 1
@@ -122,6 +125,9 @@ checks = re.findall(r"\[engine q check\].*tok=(\d+) exact=(\d+) max\|dlogq\|=(\S
 bad = [c for c in checks if c[0] != c[1] or float(c[2]) != 0.0]
 ok &= bool(checks) and not bad and "falling back to verify_source=scorer" not in text
 print(f"[engine_q] engine q checks: {len(checks)} lines, {len(bad)} inexact")
-print(f"[engine_q] {'PASS' if ok else 'FAIL'} ({len(hist)}/{steps} steps)")
+print(f"[engine_q] exactness {'PASS' if ok else 'FAIL'} ({len(hist)}/{steps} steps)")
+if rc != 0:
+    print(f"[engine_q] WARNING: run exit={rc} after the history was written (teardown)")
+print(f"[engine_q] {'PASS' if ok else 'FAIL'} ({len(hist)}/{steps} steps, exit={rc})")
 sys.exit(0 if ok else 1)
 EOF

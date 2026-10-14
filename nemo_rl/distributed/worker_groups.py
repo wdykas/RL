@@ -1234,6 +1234,12 @@ class RayWorkerGroup:
         """
         if not self._workers:
             return True
+        # Skip if Ray is already gone (typically from a __del__ during _Py_Finalize
+        # after Ray's atexit teardown): any Ray API call would auto-connect a new
+        # driver to the cluster and hit the fatal core_worker_process.cc CHECK.
+        # The actors die with the job. Same guard as RayVirtualCluster.shutdown.
+        if not ray.is_initialized():
+            return True
 
         success = True
 
