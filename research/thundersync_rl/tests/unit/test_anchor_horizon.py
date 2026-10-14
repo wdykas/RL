@@ -403,3 +403,39 @@ def test_fused_rule_is_bitwise_the_reference(E, K):
         assert torch.equal(out[0], ref[0]) and torch.equal(out[1], ref[1])
         assert torch.equal(out[2], ref[2])
     assert bool(ref[2].any()) and not bool(ref[2].all())
+
+
+@pytest.mark.parametrize("device", devices)
+def test_engine_apply_nemotron_sigmoid_bias_router(sticky_on, monkeypatch, device):
+    """Nemotron-3 router (sigmoid scores, expert bias selects, top-6 of 128):
+    the rule acts on the selection scores (sigmoid + bias), probabilities are
+    the sigmoid scores of the effective experts; engine apply == learner."""
+    from megatron.core.inference import utils as inf_utils
+    from megatron.core.transformer.moe.moe_utils import topk_routing_with_score_function
+    from megatron.core.transformer.moe.router_replay import RouterReplayAction
+
+    monkeypatch.setattr(inf_utils.InferenceMode, "is_active", lambda *a, **k: True)
+    g = torch.Generator().manual_seed(11)
+    T, E, K = 80, 128, 6
+    logits = torch.randn(T, E, generator=g).to(device)
+    bias = (0.05 * torch.randn(E, generator=g)).to(device)
+    sel = torch.sigmoid(logits.float().cpu()) + bias.cpu()
+    anchors = torch.topk(sel + 0.02 * torch.randn(T, E, generator=g), K).indices
+    anchors[::4] = NO_ANCHOR
+    anchors = anchors.to(torch.int16).to(device)
+
+    def route(replay):
+        return topk_routing_with_score_function(
+            logits, K, score_function="sigmoid", expert_bias=bias, router_replay=replay,
+            scaling_factor=2.5,
+        )
+
+    eng = _replay()
+    setattr(eng, sr.APPLY_ATTR, (anchors, 0))
+    eng.set_router_replay_action(RouterReplayAction.RECORD)
+    lrn = _replay()
+    lrn.set_target_indices(anchors.long())
+    lrn.set_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+    (pe, me), (pl, ml), (pp, mp) = route(eng), route(lrn), route(None)
+    assert torch.equal(me, ml) and torch.equal(pe, pl)
+    assert torch.equal(me[::4], mp[::4]) and not torch.equal(me, mp)
