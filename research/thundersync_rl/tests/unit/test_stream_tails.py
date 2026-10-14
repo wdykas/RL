@@ -166,44 +166,45 @@ def test_canonical_order_needs_group_granularity_and_all_groups():
         pl.set_order([(0, 0), (0, 1)])
 
 
-def test_learner_calls_never_overlap_while_streaming(monkeypatch):
-    """Piece verifications and training dispatches hold learner_lock end to end."""
-    import time as _time
+def test_ordered_learner_calls_run_in_sequence_order():
+    """Worker side: calls arriving in any order run in their sequence order."""
+    import random
+    from types import SimpleNamespace
 
+    from thundersync_rl.worker import ThunderSyncMegatronPolicyWorker
+
+    W = ThunderSyncMegatronPolicyWorker.__ray_metadata__.modified_class
+    ran = []
+    worker = SimpleNamespace(work=lambda tag: ran.append(tag) or tag)
+
+    async def main():
+        calls = list(range(12))
+        random.Random(0).shuffle(calls)  # arrival order differs from the numbering
+        out = await asyncio.gather(
+            *(W.ordered_call(worker, seq, "work", tag=seq) for seq in calls)
+        )
+        assert out == calls
+
+    asyncio.run(main())
+    assert ran == list(range(12))
+
+
+def test_learner_sequencer_and_drain(monkeypatch):
+    """Driver side: numbers only while streaming; drain waits for every sent call."""
     from thundersync_rl import speculative as sp
 
     spec = _spec()
-    in_flight, peak = [0], [0]
-
-    def submit(flat, rows, null_envelopes=None):
-        in_flight[0] += 1
-        peak[0] = max(peak[0], in_flight[0])
-        return [(0, ["ref"])]
-
-    def get(refs):
-        _time.sleep(0.01)
-        in_flight[0] -= 1
-        return [[(0, {"ok": True})]]
-
-    spec._submit_verify_block = submit
-    spec._verify_block_results = lambda flat, done: {0: done}
-    monkeypatch.setattr(sp.ray, "get", get)
-
-    async def train(lock):
-        for _ in range(5):
-            async with lock:
-                in_flight[0] += 1
-                peak[0] = max(peak[0], in_flight[0])
-                await asyncio.sleep(0.005)
-                in_flight[0] -= 1
+    assert spec.learner_seq() is None  # not streaming: plain calls
+    waited = []
+    monkeypatch.setattr(sp.ray, "wait", lambda refs, num_returns: waited.append(list(refs)))
 
     async def main():
         spec.begin_streaming_tails()
-        await asyncio.gather(
-            train(spec.learner_lock),
-            *(spec._verify_block_async([0], [0]) for _ in range(5)),
-        )
+        assert [spec.learner_seq() for _ in range(3)] == [0, 1, 2]
+        spec.learner_track(["a", "b"])
+        await spec.learner_drain()
         spec.end_streaming_tails()
+        assert spec.learner_seq() is None
 
     asyncio.run(main())
-    assert peak[0] == 1
+    assert sorted(waited[0]) == ["a", "b"]

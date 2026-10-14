@@ -1296,27 +1296,25 @@ class SpeculativeGeneration:
     async def _verify_block_async(self, flat, rows) -> dict[int, dict[str, Any]]:
         """``_verify_block`` without blocking the driver's event loop.
 
-        Holds ``learner_lock`` (when streaming over the tails) from sending the
-        verification to receiving every rank's result: learner actors are
-        asynchronous Ray actors, which do not run queued calls in submission
-        order, so two call batches in flight at once could start in different
-        orders on different ranks and pair their collectives wrongly.
+        While streaming over the tails it is an ordered learner call
+        (``ordered_call``): learner actors are asynchronous Ray actors, which
+        may start queued calls in different orders on different ranks; the
+        numbered calls run in the same order everywhere.
         """
-        lock = getattr(self, "learner_lock", None)
-        t0 = time.perf_counter()
-        async with lock if lock is not None else contextlib.nullcontext():
-            if lock is not None:
-                # Time this verification waited for a training dispatch (lock cost).
-                self.lock_wait["verify"] += time.perf_counter() - t0
-            futs = self._submit_verify_block(flat, rows)
-            done = []
-            for a, refs in futs:
-                # A worker thread waits on the results; the event loop keeps going.
-                done.append((a, await asyncio.to_thread(ray.get, refs)))
+        futs = self._submit_verify_block(flat, rows, ordered=True)
+        done = []
+        for a, refs in futs:
+            # A worker thread waits on the results; the event loop keeps going.
+            done.append((a, await asyncio.to_thread(ray.get, refs)))
+        if getattr(self, "learner_ordered", False):
+            self._learner_inflight.difference_update(r for _, refs in futs for r in refs)
         return self._verify_block_results(flat, done)
 
-    def _submit_verify_block(self, flat, rows, null_envelopes=None) -> list:
-        """Send ``flat``'s block verification to the verifier pools: [(first row, refs)]."""
+    def _submit_verify_block(self, flat, rows, null_envelopes=None, ordered=False) -> list:
+        """Send ``flat``'s block verification to the verifier pools: [(first row, refs)].
+
+        ``ordered``: as numbered learner calls while streaming over the tails.
+        """
         # Contiguous row slices per verifier pool, verified concurrently.
         k = len(self.verifiers)
         cuts = [round(j * len(flat) / k) for j in range(k + 1)]
@@ -1332,11 +1330,15 @@ class SpeculativeGeneration:
                 self._count_balance(lengths, owners, ranks)
             if null_envelopes is not None:
                 extra = {**extra, "null_envelopes": list(null_envelopes)}
+            seq = self.learner_seq() if ordered else None
+            call = (method,) if seq is None else ("ordered_call",)
+            if seq is not None:
+                extra = {**extra, "seq": seq, "method": method}
             futs.append(
                 (
                     a,
                     g.run_all_workers_single_data(
-                        method,
+                        *call,
                         **extra,
                         rows=rows[a:b],
                         prompt_lens=[d[0].numel() for _, d in flat[a:b]],
@@ -1356,6 +1358,8 @@ class SpeculativeGeneration:
                     ),
                 )
             )
+            if seq is not None:
+                self.learner_track(futs[-1][1])
         return futs
 
     def _verify_block_results(self, flat, done) -> dict[int, dict[str, Any]]:
@@ -1901,20 +1905,43 @@ class SpeculativeGeneration:
         self._tail_cv = asyncio.Condition()
         self._tail_error: Optional[BaseException] = None
         self._weights_ready = asyncio.Event()
-        # One learner call batch in flight at a time (``learner_lock``).
-        # THUNDERSYNC_DEBUG_NO_LEARNER_LOCK: control that lets them overlap.
-        self.learner_lock = (
-            None if os.environ.get("THUNDERSYNC_DEBUG_NO_LEARNER_LOCK") else asyncio.Lock()
-        )
-        self.lock_wait = {"verify": 0.0, "train": 0.0, "refit": 0.0}
+        # Learner calls in flight are numbered and run in that order on every
+        # rank (``learner_seq`` / ``ordered_call``); ``learner_drain`` waits
+        # for all of them before an unordered call (the refit).
+        self.learner_ordered = True
+        self._learner_inflight: set = set()
+        self.learner_wait = {"drain": 0.0}
 
     def end_streaming_tails(self) -> None:
-        for k, v in getattr(self, "lock_wait", {}).items():
-            # Seconds each kind of learner call waited for the learner lock.
-            self.stats[f"learner/lock_wait_{k}_s"] = v
+        for k, v in getattr(self, "learner_wait", {}).items():
+            self.stats[f"learner/{k}_wait_s"] = v
         self._tail_cv = None
         self._weights_ready = None
-        self.learner_lock = None
+        self.learner_ordered = False
+
+    def learner_seq(self) -> Optional[int]:
+        """The next ordered-call number while streaming over the tails, else None.
+
+        Persistent across steps: the workers count every ordered call they run.
+        """
+        if not self.__dict__.get("learner_ordered", False):
+            return None
+        if "_learner_seq" not in self.__dict__:
+            self._learner_seq = itertools.count()
+        return next(self._learner_seq)
+
+    def learner_track(self, refs) -> None:
+        """Ordered learner calls in flight (``learner_drain`` waits for them)."""
+        self._learner_inflight.update(refs)
+
+    async def learner_drain(self) -> None:
+        """Wait until every ordered learner call sent so far has finished."""
+        t0 = time.perf_counter()
+        pending = list(self._learner_inflight)
+        if pending:
+            await asyncio.to_thread(ray.wait, pending, num_returns=len(pending))
+        self._learner_inflight.difference_update(pending)
+        self.learner_wait["drain"] += time.perf_counter() - t0
 
     async def _notify_tails(self) -> None:
         cv = getattr(self, "_tail_cv", None)

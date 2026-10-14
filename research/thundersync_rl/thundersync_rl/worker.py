@@ -24,6 +24,7 @@ group closes. At the barrier, the folded batch gradient is written back into
 the grad buffers and the regular ``finish_train_step`` runs unchanged.
 """
 
+import asyncio
 import functools
 import os
 import time
@@ -420,6 +421,34 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         (``LaneStepOps.fingerprint``); one pass over the rank's parameters.
         """
         return EngineStage._checksum(EngineStage._params(self.model))
+
+    async def ordered_call(self, seq: int, method: str, **kwargs) -> Any:
+        """Run learner method ``method`` as this rank's ``seq``-th ordered call.
+
+        The learner workers are asynchronous Ray actors (they have async
+        methods), which may start queued calls in a different order on each
+        rank. The driver numbers every learner call it sends while several are
+        in flight (training dispatches, verification forwards) and each rank
+        runs them strictly in that order: call ``seq`` waits until calls
+        0..seq-1 have run here. The method itself is synchronous and runs on
+        this actor's event loop, so calls never overlap. Every rank therefore
+        runs the same sequence, and their collectives pair up, by construction.
+        """
+        cv = getattr(self, "_ordered_cv", None)
+        if cv is None:
+            cv = self._ordered_cv = asyncio.Condition()
+            self._ordered_next = 0
+        async with cv:
+            while self._ordered_next != seq:
+                if seq < self._ordered_next:
+                    raise RuntimeError(f"ordered learner call {seq} arrived after {self._ordered_next}")
+                await cv.wait()
+        try:
+            return getattr(self, method)(**kwargs)
+        finally:
+            self._ordered_next += 1
+            async with cv:
+                cv.notify_all()
 
     def engine_step_stats(self) -> dict[str, float]:
         """Engine rank (debug, ``THUNDERSYNC_ENGINE_PROF``): step timing since the last call."""

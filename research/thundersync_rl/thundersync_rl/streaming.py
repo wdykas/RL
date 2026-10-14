@@ -538,14 +538,25 @@ class StreamingLearner:
         self,
         per_rank_items: list[list[dict[str, Any]]],
         closes: list[tuple[GroupId, dict[float, float]]],
+        seq: Optional[int] = None,
     ) -> list[ray.ObjectRef]:
+        """Send one dispatch; ``seq``: its place in the ordered learner calls."""
         assert len(per_rank_items) == self.dp_size
-        fut = self.worker_group.run_all_workers_sharded_data(
-            "stream_accumulate",
-            items=per_rank_items,
-            closes=[closes] * self.dp_size,
-            **_SHARD_AXES,
-        )
+        if seq is None:
+            fut = self.worker_group.run_all_workers_sharded_data(
+                "stream_accumulate",
+                items=per_rank_items,
+                closes=[closes] * self.dp_size,
+                **_SHARD_AXES,
+            )
+        else:
+            fut = self.worker_group.run_all_workers_sharded_data(
+                "ordered_call",
+                items=per_rank_items,
+                closes=[closes] * self.dp_size,
+                common_kwargs={"seq": seq, "method": "stream_accumulate"},
+                **_SHARD_AXES,
+            )
         return fut.futures
 
     def finish(self) -> dict[str, Any]:
