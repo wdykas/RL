@@ -43,6 +43,7 @@ from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.megatron_policy_worker import (
     MegatronPolicyWorkerImpl,
 )
+from thundersync_rl import engine_prof
 from thundersync_rl.draft_weights import (
     DraftSwap,
     EngineStage,
@@ -226,6 +227,11 @@ def snapshot_drafts(
     return out
 
 
+if engine_prof.enabled():
+    # Debug: engine step timing in every process that runs a dynamic engine.
+    engine_prof.install()
+
+
 @ray.remote(
     runtime_env=get_runtime_env_for_policy_worker("megatron_policy_worker")
 )  # pragma: no cover
@@ -399,6 +405,12 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         (``LaneStepOps.fingerprint``); one pass over the rank's parameters.
         """
         return EngineStage._checksum(EngineStage._params(self.model))
+
+    def engine_step_stats(self) -> dict[str, float]:
+        """Engine rank (debug, ``THUNDERSYNC_ENGINE_PROF``): step timing since the last call."""
+        from thundersync_rl import engine_prof
+
+        return engine_prof.summary()
 
     def keep_refit_group(self, lane: int) -> None:
         """Learner rank: file the live refit communicator under engine lane ``lane``.

@@ -1661,6 +1661,16 @@ def thundersync_grpo_train(
         stale = True
         metrics["time/refit"] = t_refit
         metrics["time/iteration"] = time.perf_counter() - t0
+        if os.environ.get("THUNDERSYNC_ENGINE_PROF"):
+            # Debug: engine step timing of this step (rank 0 logged; all printed).
+            per_rank = ray.get(
+                policy_generation._policy.worker_group.run_all_workers_single_data(
+                    "engine_step_stats"
+                )
+            )
+            for r, st in enumerate(per_rank):
+                print(f"[engine prof] step={step} rank={r} {st}", flush=True)
+            metrics.update(per_rank[0] or {})
         history.append(metrics)
         scalars = {k: v for k, v in metrics.items() if isinstance(v, (int, float))}
         print(
