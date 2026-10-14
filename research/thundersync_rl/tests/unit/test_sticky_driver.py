@@ -635,7 +635,14 @@ def test_engine_route_log_on_a_fake_engine(monkeypatch):
                 r.recorded_topk_idx = top.clone()
 
     forward_logits.step = 0
-    controller = SimpleNamespace(_dynamic_step_forward_logits=forward_logits)
+    controller = SimpleNamespace(
+        _dynamic_step_forward_logits=forward_logits,
+        _dynamic_step_context_init=lambda **kw: (None, None, None),
+    )
+
+    def step(dummy=False):
+        controller._dynamic_step_context_init(is_dummy_forward=dummy)
+        controller._dynamic_step_forward_logits(None, None)
     w = _worker()
     w.dynamic_inference_engine = SimpleNamespace(
         requests={11: req("d|0"), 12: req(None)}, controller=controller
@@ -650,13 +657,20 @@ def test_engine_route_log_on_a_fake_engine(monkeypatch):
     ctx.active_token_count = 5
     ctx.token_to_request_idx[:5] = torch.tensor([0, 0, 0, 1, 1])
     ctx.token_to_pos_ids[:5] = torch.tensor([0, 1, 2, 0, 1])
-    controller._dynamic_step_forward_logits(None, None)
+    step()
     # graph decode, eager decode (one token each)
     for pos in (3, 4):
         ctx.active_token_count = 2
         ctx.token_to_request_idx[:2] = torch.tensor([0, 1])
         ctx.token_to_pos_ids[:2] = torch.tensor([pos, pos - 1])
-        controller._dynamic_step_forward_logits(None, None)
+        step()
+    # Both requests finish; an idle expert-parallel rank runs dummy steps:
+    # MCore sets only the counts, slots / ids / positions are the last step's.
+    # Their padding rows must not overwrite position 4 (e2e: the last
+    # position of the last request to finish, and position 0 of the first
+    # request of the last prefill step, failed the route check).
+    step(dummy=True)
+    step(dummy=True)
     out = w.pop_draft_routes(["d|0", "x"])
     assert list(out) == ["d|0"]
     layers, lo, complete, blocks = out["d|0"]
@@ -831,6 +845,7 @@ def _fake_engine_base():
             num_mtp_depths=0,
             _router_record_bookkeeping=lambda: "mcore routes",
             _dynamic_step_forward_logits=lambda *a: None,
+            _dynamic_step_context_init=lambda **kw: (None, None, None),
         )
 
     ctx = SimpleNamespace(config=SimpleNamespace(async_sched_mode=AsyncScheduleMode.ASYNC))

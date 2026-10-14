@@ -1973,8 +1973,19 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             )
             return full
 
+        orig_init = controller._dynamic_step_context_init
+        dummy = [False]
+
+        def context_init(*args, **kwargs):
+            # An expert-parallel dummy step (MCore ``dummy_forward``, idle EP
+            # ranks) sets only request and token counts: request ids, slots
+            # and positions are still the last real step's, so its padding
+            # rows would be logged as that step's tokens.
+            dummy[0] = bool(kwargs.get("is_dummy_forward", False))
+            return orig_init(*args, **kwargs)
+
         def forward_logits(*args, **kwargs):
-            sel = select()
+            sel = None if dummy[0] else select()
             out = orig(*args, **kwargs)
             if sel is not None:
                 rows = step_rows(int(sel[0][-1]) + 1)
@@ -1982,6 +1993,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                     log.record(rows, *sel)
             return out
 
+        controller._dynamic_step_context_init = context_init
         controller._dynamic_step_forward_logits = forward_logits
 
     def pop_draft_routes(self, keys: list[str], close: bool = True) -> dict[str, tuple]:
