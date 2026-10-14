@@ -1518,7 +1518,7 @@ the price: `agent_multi_draft.md` §3).
 
 *Opt-in, default `current`. Unit-tested (formula, Megatron DistributedOptimizer on 1 and 2 ranks
 with TP / EP / DP sharding, driver order, config); end to end exact on the tiny MoE with sticky
-routing at EP=2, with and without ⊥-BV (`sticky_moe.sh`, `null_bv_moe.sh`, 2026-10-13); TP=2 / L4 runs queued.*
+routing at EP=2, with and without ⊥-BV (`sticky_moe.sh`, `null_bv_moe.sh`, 2026-10-13) and at TP=2 EP=2 with sequence parallelism; L4 runs queued.*
 Implementation notes: `thundersync_work/research/agent_momentum_draft.md`; offline numbers:
 `ACCEPTANCE_LEDGER.md` section T (per-token Var log p/q of a θ_n draft vs a momentum draft:
 ~10–15x lower with momentum on Qwen3-30B-A3B layers).
@@ -1610,6 +1610,8 @@ experts; each rank owns ≈ P/W main elements, P/(TP·PP·EP-share) model elemen
   route check exact (39368/39368, 25945/25945, 24712/24712 tokens: the anchors logged on θ̂ equal a
   fresh θ̂ prefill), sticky rule active, weights change every step, draft refit every drafting step
   with `draft/changed_frac` 0.09–0.13% of elements from step 1 (0 at step 0: no momentum yet).
+- TP=2 EP=2 (SP) sticky + momentum (`TP=2 DRAFT_WEIGHTS=momentum sticky_moe.sh`): `[engine_q] PASS (4/4)`,
+  `[sticky] OK`, mismatch 0 [measured].
 - ⊥-BV (14d) + sticky + momentum (`DRAFT_WEIGHTS=momentum scripts/bi_tp/null_bv_moe.sh`, K 1.5, M 2):
   `[engine_q] PASS (4/4)`, `[null_bv] OK`, mismatch 0; accepted .971/.996/.985, ⊥ fraction .32–.33, tail-decode
   fraction .016–.031, 1.48 drafts per output, no fresh slots [measured].
