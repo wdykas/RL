@@ -1288,8 +1288,9 @@ are ordered by the current scores, so F(θ; plain_topk(θ)) is bitwise the plain
 An anchor row with a negative or repeated id means "self" (plain top-k).
 
 **Anchor schedule (exogenous).** A at position t = the plain θ_{k−1} forward's top-k on the
-rollout's own prefix, for every position up to the rollout cap c = prompt + max_new_tokens
-(content-independent); "self" for rollouts never drafted (or whose draft was dropped for
+rollout's own prefix, for every position up to the rollout cap c = prompt + min(max_new_tokens,
+max_total_sequence_length − prompt) (the engine stops there; a plan at c is complete:
+`SpeculativeGeneration._cap`; content-independent); "self" for rollouts never drafted (or whose draft was dropped for
 missing logs, which is bookkeeping, not content). No recursion: anchors always come from a
 plain forward. Drafts are single-version (`draft_lookahead=1`), so every drafted position's
 anchor is exactly the drafter's logged route.
@@ -1319,8 +1320,14 @@ copy to a pinned staging ring (`RouteLog`): no host-device sync and no Python pe
 (0.2–0.4 ms host time per forward vs 3.6–5.5 ms before, which waited for the forward;
 `thundersync_work/research/agent_scaling_fixes.md`). Staged rows are appended to a host store
 once their copy completed; rows are keyed by draft key and absolute position, so eviction
-re-prefills write the same positions. A rebuilt engine's forward is wrapped into the same log
-and new router instances are re-armed. Prompt positions are logged by the draft's own prefill
+re-prefills write the same positions. Expert-parallel dummy steps (an idle engine runs MCore
+`dummy_forward`, whose context sets only request and token counts: request ids, slots and
+positions are still the last real step's) select no tokens; the wrapper reads each forward's
+`is_dummy_forward` from `_dynamic_step_context_init`. (Logging them overwrote the last position
+of the last request to finish and position 0 of the first request of the last prefill step with
+padding routes: `[route check]` 4 positions off at EP=2, 2 at PP=2; reproduced on one GPU with two
+`dummy_forward` steps, exact with the fix: `thundersync_work/research/agent_route_regression.md`.) A rebuilt engine's forward
+is wrapped into the same log and new router instances are re-armed. Prompt positions are logged by the draft's own prefill
 (prefix caching must be off). Pipeline stages log their layers; under sequence parallelism the
 TP shards are all-gathered (only on steps with tagged tokens) and TP rank 0 logs.
 **Transport** (`RouteRefs`): `pop_draft_routes` puts each draft's dense routes in the Ray object
