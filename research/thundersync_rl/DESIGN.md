@@ -1595,6 +1595,10 @@ experts; each rank owns ≈ P/W main elements, P/(TP·PP·EP-share) model elemen
 - critical path: the draft refit runs after the step's last rollout, between learner
   dispatches; it delays the learner's remaining dispatches by load + stash + refit + restore
   (measured below) and the start of drafting by the same amount.
+- drafting window: one weight set per engine, so θ̂ drafts cannot share the engine with the
+  step's own θ_k rollouts; drafting runs from the last rollout to the optimizer step instead of
+  from `draft_start_frac`. Drafting while the rollout tail decodes needs a second weight version
+  on the engine (a θ̂ replica, or per-request weight versions via a sparse delta): not built yet.
 
 **Measurements.** (filled below as runs complete)
 
