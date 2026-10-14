@@ -1869,6 +1869,60 @@ anchor forward stays the plain θ_{k−1} forward (the policy definition), indep
 sticky routing lowers Var_q(log p/q) 1.3x for θ_{k−1} drafts and 3–10x for momentum / oracle drafts (all three
 site kinds needed); ~20% of activation elements are rounded toward the anchor at steady state.
 
+## 14h. Learner memory at scale (2026-10-14 multi-node OOMs)
+
+**What failed.** The first multi-node runs of ts-integration (Qwen3-30B-A3B, 48 layers, TP1 PP1 EP8 and PP2 x EP2,
+micro-batch 8 x 2048 = 16384 tokens per rank) died with CUDA OOM inside the *training* forward of step 0
+(`stream_accumulate` -> `train_microbatches` -> MoE experts), and the PP run then hung on idle GPUs. Full
+Nemotron-3-Nano at EP=2 (single node, optimizer offload, micro-batch 1) also OOMed in its first training forward.
+
+**Root cause [M] (thundersync_work/research/agent_oom.md, allocator snapshots).**
+- No activation recompute: a training micro-batch kept every layer's activations, 166 KB per token per Qwen3 layer:
+  MoE rows 95 KB (k = 8 rows per token x 11.9 KB: fp32 fc1 output saved by SwiGLU, fp16 fc1 / fc2 inputs) + dense
+  71 KB. Per rank: S + L·T·(a_d + k·ρ·a_r), ρ = the rank's received-row imbalance (1.19 / 1.55 measured on EP8 ranks
+  7 / 2 from the OOM allocation sizes; the router is frozen, so ρ is whatever the data gives). With S = 38 GB (step 0:
+  bf16 params + fp32 grads + fp16 expert cache), the most loaded rank needs 3.0-3.6 GB per layer and runs out after
+  40-48 layers: the observed ~145 GB of transient memory, OOM inside `routed_experts_compute`.
+- The fp32-input LM head (`fp32_gemm`, hi/lo split) held 3 logits-sized fp32 buffers at once (3 x 9.3 GiB), and the
+  TP=1 batch-invariant log-probs kept the log-softmax output for backward (a 4th).
+- Nano EP=2: static. 155.9 GiB was allocated before the first training call (bf16 params + fp32 grads + the
+  DistributedOptimizer fp32 master shard, which optimizer offload leaves on GPU), plus the persistent fp16 expert
+  cache (2 B per local expert parameter, 29.4 GB). EP=8 is the Nano layout.
+- Hang: on a learner exception the driver called `stream_abort_step` on every rank with an unbounded `ray.get`;
+  ranks blocked in a collective with the failed rank (PP send/recv, EP all-to-all) never answered.
+
+**Fixes (all bitwise: mismatch 0 and engine-q exact on Qwen3 L4/L16 and Nano L8, EP=2; param checksums identical
+with and without recompute).**
+- Activation recompute in the learner (`engine_q_tp.sh` ACKPT): `selective` (default at PP=1; Megatron selective
+  recompute of the MoE block - router, dispatch, experts, combine - which then keeps only its fp32 input; routes
+  replay exactly through R3 REPLAY_BACKWARD and the sticky wrapper) or `full` (default at PP>1; every layer keeps only
+  its fp32 [T, hidden] input). Sticky rounding still requires `false` (its anchor forward is not recomputed yet).
+- `fp32_gemm` on CUDA: row-chunked (4096 rows), in place: the output is the only [M, N] buffer.
+- TP=1 BI log-probs (`_LocalVocabLogprob`): save only the logits; backward recomputes the softmax per chunk.
+- fp16 expert weights for the training GEMMs are cast just in time per layer and the 4 most recent expert linears
+  (two MoE layers) are kept, buffers reused: 2 x 0.3 GiB at Nano EP=8 instead of 7.35 GB (29.4 GB at EP=2). Cost
+  [M] +0.33 ms per MoE layer forward at Nano EP=8 shapes (+15% of the expert forward GEMMs; +1.2 ms at EP=2).
+- `StreamingLearner.abort` waits at most 60 s; the driver exits (`os._exit(1)`) on any training exception, so Ray
+  kills the job's actors and the job ends (validated: both OOM reproductions exited within ~1 min).
+
+**Per-rank learner budget (T = tokens per micro-batch, L = layers on the rank, H hidden, V vocab, n = micro-batches
+in flight on a PP stage (1 at PP=1, up to PP under 1F1B)).**
+peak = S + n·L·T·c + (one recomputed layer: T·(a_d + k·ρ·a_r)) + loss (2·T·V/TP·4 B + chunk temporaries), where
+S = (2 + 4) B per local parameter + optimizer state (precision-aware FusedAdam: 10 B per shard element, allocated at
+the first step; plain DistributedOptimizer: 12 B) + the two-layer fp16 expert buffers, and c = 4H B (full) or
+a_d + 4H B (selective; a_d measured 71 KB Qwen3, ~85 KB per Nano Mamba layer). Measured [M] L16 EP=2, T = 16384:
+transient 72.6 GB (none) -> 47 GB (selective) -> 26 GB (full) for Qwen3; 48.7 -> 37.2 GB for Nano (selective).
+- Qwen3-30B-A3B EP=8, T = 16384, L = 48, after step 1 [D]: S = 69.5 GB (31 GB at step 0); selective peak ~166 GB,
+  full ~104 GB (184 GB GPU) -> selective.
+- Qwen3-30B-A3B PP=2 x EP=2 [D]: S = 125 GB; selective ~193 GB (2 micro-batches in flight) does not fit, full
+  ~159 GB -> full (submit scripts default ACKPT=full at PP>1).
+- Nemotron-3-Nano EP=8 (52 layers: 23 Mamba, 23 MoE, 6 attention; plain DistributedOptimizer) [D]: S = 83 GB after
+  step 1; selective ~153 GB, full ~114 GB -> selective fits.
+- Ultra [H: ~470B expert + 30B dense params, hidden ~8k, ~100 layers, V 131k; e.g. TP=4 (SP) PP=4 EP=64]: S ~45 GB
+  per rank; full recompute keeps 25 layers x T x 8 KB / TP x 4 in flight = 13 GB at T = 16k (54 GB for one 64k
+  sequence), selective ~106 GB at T = 16k -> full at PP>1. Every term is per micro-batch tokens and per rank shard;
+  none grows with the global batch, and EP enters only through ρ of one recomputed layer.
+
 ## 15. Open work
 
 - **Stragglers.** About one rejected draft per step decodes its remainder at about 3 ms
