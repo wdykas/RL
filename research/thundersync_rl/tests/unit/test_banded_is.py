@@ -381,7 +381,7 @@ def test_driver_plans_claims_and_stats(monkeypatch):
 
     s = make_spec(
         {"verify_drafts_block_engine": verify, "stash_head": lambda **kw: 1},
-        base_handlers={"install_draft_hidden_log": lambda: True},
+        base_handlers={"install_draft_hidden_log": lambda **_: True},
         verify_source="engine",
         hidden_transport="driver",
         banded_is_band=0.5,

@@ -20,7 +20,7 @@ import thundersync_rl.speculative as spec_mod
 import torch
 from test_speculative_driver import _spec
 
-ENGINE = {"install_draft_hidden_log": lambda: True}
+ENGINE = {"install_draft_hidden_log": lambda **_: True}
 LOAD = {
     "draft/compute_s": 0.1,
     "draft/gather_s": 0.2,

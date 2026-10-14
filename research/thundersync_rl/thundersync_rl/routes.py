@@ -49,6 +49,8 @@ from typing import Any, Callable, Optional, Sequence
 import numpy as np
 import torch
 
+from thundersync_rl.engine_q import own_block
+
 NO_ANCHOR = -1
 ROUTE_DTYPE = torch.int16
 # Positions per object-store block of a draft's routes. The learner fetches
@@ -375,7 +377,8 @@ def put_routes(
     """
     out = []
     for a in range(0, int(rows.shape[0]), block_positions):
-        b = rows[a : a + block_positions].contiguous()
+        # A row slice is a view: pickling it would ship the whole draft (own_block).
+        b = own_block(rows[a : a + block_positions])
         lo = start + a
         out.append((put(b), lo, lo + int(b.shape[0]), b.numel() * b.element_size()))
     return out

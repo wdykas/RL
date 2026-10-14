@@ -54,6 +54,9 @@ import torch
 
 # Sampling-params attribute that tags a draft request for hidden-state logging.
 HIDDEN_KEY_ATTR = "ts_hidden_key"
+# Key of the per-call transport statistics in ``pop_draft_hidden`` /
+# ``take_draft_hidden`` results (not a draft key).
+HIDDEN_STATS_KEY = "__ts_hidden_stats__"
 # Sampling-params attribute of a request that continues an anchored rollout at
 # theta_k (anchor horizon): its key in ``register_engine_anchors``.
 ANCHOR_KEY_ATTR = "ts_anchor_key"
@@ -95,8 +98,9 @@ class HiddenLog:
     Engine side. ``record`` copies the selected rows of a forward's LM-head
     input to (pinned, when CUDA is available) host memory without blocking
     the engine; ``pop`` returns rows 0..n-1 of a draft, or None if any is
-    missing. Memory: d x 2 bytes (bf16) per drafted token, released as drafts
-    are popped. Thread-safe (the engine records on its loop thread).
+    missing. Memory: d x (head-input dtype) bytes per drafted token (4 d under
+    the fp32 LM head of the fp16-GEMM recipe, 2 d otherwise), released as
+    drafts are popped. Thread-safe (the engine records on its loop thread).
     """
 
     def __init__(self, chunk_rows: int = 8192):
@@ -200,6 +204,308 @@ class HiddenLog:
             return sum(len(s) for s in self._rows.values())
 
 
+# Rows per object-store block; also the sealing granularity of
+# ``SealingHiddenLog`` (defined here so both use the same value).
+HIDDEN_BLOCK_ROWS = int(os.environ.get("THUNDERSYNC_HIDDEN_BLOCK_ROWS", "256"))
+
+
+class SealingHiddenLog(HiddenLog):
+    """``HiddenLog`` that puts full blocks into the object store while drafting.
+
+    Each time the rows [s, s + B) of an open draft are all logged (s = the
+    draft's seal frontier, B = ``block_rows``), a background thread stacks
+    them (a fresh tensor that owns its bytes), ``ray.put``s it and drops the
+    pinned rows. ``pop_refs`` / ``take_refs`` (the ``as_refs`` transport) then
+    hand out the sealed blocks' handles and put only the rows not sealed yet,
+    so the deadline cost is O(drafts) rather than O(drafted tokens).
+
+    Bit-identity: a sealed block holds exactly the logged rows (``torch.stack``
+    copies bytes), so the learner reads the same bytes as with ``pop`` +
+    ``put_hidden``. A row the engine rewrites after its block was sealed
+    (recompute after an eviction) is bitwise the same under batch invariance
+    and is dropped. A take that ends inside a sealed block re-splits that block
+    (one local ``get`` and two puts of < B rows), so every handle handed out
+    covers whole objects and the driver's free-after-verify stays per object.
+
+    Bounded: seal jobs are tiny (key, start) notices in a queue of at most
+    ``max_pending`` entries; when it is full a block is simply sealed later
+    (``record`` never blocks the engine). Pinned rows are dropped as soon as
+    their block is put, so host memory holds each row once (pinned or in the
+    object store), as without sealing.
+    """
+
+    def __init__(
+        self,
+        chunk_rows: int = 8192,
+        block_rows: int = HIDDEN_BLOCK_ROWS,
+        put: Optional[Callable[[Any], Any]] = None,
+        get: Optional[Callable[[Any], Any]] = None,
+        free: Optional[Callable[[list], None]] = None,
+        max_pending: int = 1024,
+    ):
+        import queue
+
+        super().__init__(chunk_rows)
+        self.block_rows = block_rows
+        self._put = put
+        self._getf = get
+        self._freef = free
+        # key -> [(ref, lo, rows, nbytes)] sealed blocks, contiguous from the
+        # key's hand-out frontier; key -> seal frontier; key -> jobs in flight.
+        self._sealed: dict[str, list[tuple[Any, int, int, int]]] = {}
+        self._next_seal: dict[str, int] = {}
+        self._pending: dict[str, int] = {}
+        self._cond = threading.Condition(self._lock)
+        self._jobs: "queue.Queue" = queue.Queue(maxsize=max_pending)
+        self.sealed_bytes = 0
+        self.seal_put_s = 0.0
+        self.tail_put_bytes = 0
+        self.resplits = 0
+        self._thread = threading.Thread(
+            target=self._run, name="ts-hidden-seal", daemon=True
+        )
+        self._thread.start()
+
+    # -- object store helpers ------------------------------------------------
+    def _do_put(self, b: torch.Tensor) -> Any:
+        if self._put is not None:
+            return self._put(b)
+        import ray
+
+        return ray.put(b)
+
+    def _do_get(self, ref: Any) -> torch.Tensor:
+        if self._getf is not None:
+            return self._getf(ref)
+        import ray
+
+        return ray.get(ref)
+
+    def _do_free(self, refs: list) -> None:
+        if not refs:
+            return
+        (self._freef or ray_free)(refs)
+
+    # -- engine side -----------------------------------------------------------
+    def record(self, entries: list[tuple[int, str, int]], hidden: torch.Tensor) -> None:
+        with self._lock:
+            # Rows already sealed (an eviction recompute rewrites the same t,
+            # bitwise the same under batch invariance) are dropped.
+            entries = [
+                e for e in entries if e[2] >= self._next_seal.get(e[1], 0)
+            ]
+        if not entries:
+            return
+        super().record(entries, hidden)
+        with self._lock:
+            for key in {k for _, k, _ in entries}:
+                self._schedule(key)
+
+    def _schedule(self, key: str) -> None:
+        """Queue seal jobs for every complete block at the key's frontier (lock held)."""
+        import queue
+
+        if key in self._closed:
+            return
+        slots = self._rows.get(key)
+        if not slots:
+            return
+        s = self._next_seal.get(key, 0)
+        B = self.block_rows
+        while all(t in slots for t in range(s, s + B)):
+            try:
+                self._jobs.put_nowait((key, s))
+            except queue.Full:
+                return  # sealed on a later record
+            self._pending[key] = self._pending.get(key, 0) + 1
+            s += B
+            self._next_seal[key] = s
+
+    def _run(self) -> None:
+        import time as _time
+
+        while True:
+            job = self._jobs.get()
+            if job is None:
+                return
+            key, s = job
+            try:
+                with self._lock:
+                    slots = self._rows.get(key, {})
+                    rows = [slots.get(t) for t in range(s, s + self.block_rows)]
+                    ok = key not in self._closed and all(r is not None for r in rows)
+                if ok:
+                    for ev in {id(c[0]): c[3] for c, _ in rows}.values():
+                        if ev is not None:
+                            ev.synchronize()
+                    blk = torch.stack([c[0][i] for c, i in rows])
+                    t0 = _time.perf_counter()
+                    ref = self._do_put(blk)
+                    dt = _time.perf_counter() - t0
+                    nb = blk.numel() * blk.element_size()
+                    stale = None
+                    with self._lock:
+                        slots = self._rows.get(key, {})
+                        if key in self._closed or any(
+                            slots.get(t) is not r
+                            for t, r in zip(range(s, s + self.block_rows), rows)
+                        ):
+                            stale = ref  # closed or taken meanwhile
+                        else:
+                            for t in range(s, s + self.block_rows):
+                                c, _ = slots.pop(t)
+                                c[2] -= 1
+                            self._sealed.setdefault(key, []).append(
+                                (ref, s, self.block_rows, nb)
+                            )
+                            self.sealed_bytes += nb
+                            self.seal_put_s += dt
+                    if stale is not None:
+                        self._do_free([stale])
+            finally:
+                with self._lock:
+                    self._pending[key] = self._pending.get(key, 1) - 1
+                    if self._pending[key] <= 0:
+                        self._pending.pop(key, None)
+                    self._cond.notify_all()
+
+    def _wait_key(self, key: str) -> None:
+        """Wait until no seal job of ``key`` is in flight (lock held)."""
+        while self._pending.get(key, 0) > 0:
+            self._cond.wait()
+
+    # -- hand-out ----------------------------------------------------------------
+    def _put_rows(self, rows: list) -> list[tuple[Any, int, int]]:
+        """Put pinned rows [(chunk, idx)] as fresh blocks of <= B rows."""
+        for ev in {id(c[0]): c[3] for c, _ in rows}.values():
+            if ev is not None:
+                ev.synchronize()
+        out = []
+        for a in range(0, len(rows), self.block_rows):
+            blk = torch.stack([c[0][i] for c, i in rows[a : a + self.block_rows]])
+            nb = blk.numel() * blk.element_size()
+            out.append((self._do_put(blk), int(blk.shape[0]), nb))
+            self.tail_put_bytes += nb
+        return out
+
+    def _take_locked(self, key: str, lo: int, n: int) -> list[tuple[Any, int, int]]:
+        """Blocks covering rows lo..lo+m-1 (longest logged run, m <= n); lock held."""
+        sealed = self._sealed.get(key, [])
+        slots = self._rows.get(key, {})
+        out: list[tuple[Any, int, int]] = []
+        cur, end = lo, lo + n
+        while cur < end:
+            blk = next((b for b in sealed if b[1] <= cur < b[1] + b[2]), None)
+            if blk is not None:
+                ref, b_lo, b_rows, nb = blk
+                if b_lo == cur and b_lo + b_rows <= end:
+                    out.append((ref, b_rows, nb))
+                    sealed.remove(blk)
+                    cur += b_rows
+                    continue
+                # The take starts or ends inside this block: re-split it so
+                # every handle covers whole objects.
+                h = self._do_get(ref)
+                sealed.remove(blk)
+                self._do_free([ref])
+                self.resplits += 1
+                parts = [(b_lo, cur), (cur, min(end, b_lo + b_rows)), (min(end, b_lo + b_rows), b_lo + b_rows)]
+                for a, b in parts:
+                    if b <= a:
+                        continue
+                    piece = h[a - b_lo : b - b_lo].clone()
+                    r = self._do_put(piece)
+                    pnb = piece.numel() * piece.element_size()
+                    if a == cur:
+                        out.append((r, b - a, pnb))
+                    else:
+                        sealed.append((r, a, b - a, pnb))
+                cur = min(end, b_lo + b_rows)
+                continue
+            run = []
+            while cur + len(run) < end and (cur + len(run)) in slots and not any(
+                b[1] == cur + len(run) for b in sealed
+            ):
+                run.append(slots.pop(cur + len(run)))
+            if not run:
+                break  # a row the engine did not log: the draft is cut here
+            for c, _ in run:
+                c[2] -= 1
+            out.extend(self._put_rows(run))
+            cur += len(run)
+        sealed.sort(key=lambda b: b[1])
+        # Rows below the new frontier are handed out; seal from there on.
+        self._next_seal[key] = max(self._next_seal.get(key, 0), cur)
+        return out
+
+    def take_refs(self, key: str, lo: int, n: int) -> Optional[list[tuple[Any, int, int]]]:
+        """``take`` as object-store blocks [(ref, rows, bytes)]; the key stays open."""
+        with self._lock:
+            self._wait_key(key)
+            out = self._take_locked(key, lo, n)
+            self._schedule(key)
+        if not out:
+            return None if n else []
+        return out
+
+    def pop_refs(self, key: str, n: int) -> Optional[list[tuple[Any, int, int]]]:
+        """``pop`` as object-store blocks [(ref, rows, bytes)]; closes the key."""
+        with self._lock:
+            self._wait_key(key)
+            out = self._take_locked(key, 0, n)
+            left = self._close_locked(key)
+        self._do_free(left)
+        if not out:
+            return None if n else []
+        return out
+
+    def _close_locked(self, key: str) -> list:
+        self._closed.add(key)
+        for c, _ in self._rows.pop(key, {}).values():
+            c[2] -= 1
+        left = [b[0] for b in self._sealed.pop(key, [])]
+        self._next_seal.pop(key, None)
+        return left
+
+    def close(self, key: str) -> None:
+        with self._lock:
+            self._wait_key(key)
+            left = self._close_locked(key)
+        self._do_free(left)
+
+    def pop(self, key: str, n: int) -> Optional[torch.Tensor]:
+        """Tensor rows (driver transport / tests): sealed blocks are fetched back."""
+        blocks = self.pop_refs(key, n)
+        if blocks is None:
+            return None
+        if not blocks:
+            return torch.empty(0, 0)
+        h = torch.cat([self._do_get(r) for r, _, _ in blocks])
+        self._do_free([r for r, _, _ in blocks])
+        return h
+
+    def take(self, key: str, lo: int, n: int) -> Optional[torch.Tensor]:
+        blocks = self.take_refs(key, lo, n)
+        if blocks is None:
+            return None
+        if not blocks:
+            return torch.empty(0, 0)
+        h = torch.cat([self._do_get(r) for r, _, _ in blocks])
+        self._do_free([r for r, _, _ in blocks])
+        return h
+
+    def live_rows(self) -> int:
+        with self._lock:
+            return sum(len(s) for s in self._rows.values()) + sum(
+                b[2] for bl in self._sealed.values() for b in bl
+            )
+
+    def stop(self) -> None:
+        self._jobs.put(None)
+        self._thread.join()
+
+
+
 # ---------------------------------------------------------------------------
 # Moving hidden states: generation worker -> object store -> verifying learner
 # ---------------------------------------------------------------------------
@@ -301,7 +607,6 @@ def free_hidden(hiddens, free: Optional[Callable[[list], None]] = None) -> int:
 # and 3.7 MB at d = 7168 (bf16), well above Ray's inline-object size. Each
 # block is one ray.put, so larger blocks cut per-put overhead at the step
 # deadline (THUNDERSYNC_HIDDEN_BLOCK_ROWS overrides it for measurements).
-HIDDEN_BLOCK_ROWS = int(os.environ.get("THUNDERSYNC_HIDDEN_BLOCK_ROWS", "256"))
 
 
 def put_hidden(
@@ -320,9 +625,27 @@ def put_hidden(
         put = ray.put
     out = []
     for a in range(0, int(h.shape[0]), block_rows):
-        b = h[a : a + block_rows].contiguous()
+        b = own_block(h[a : a + block_rows])
         out.append((put(b), int(b.shape[0]), b.numel() * b.element_size()))
     return out
+
+
+def own_block(b: torch.Tensor) -> torch.Tensor:
+    """``b`` as a tensor that owns exactly its own bytes.
+
+    Pickling a torch tensor (``ray.put``) ships its whole storage, and a row
+    slice of a larger tensor is a view of that storage (``.contiguous()`` is a
+    no-op on it): putting the 256-row blocks of an n-row draft as views would
+    ship n rows per block, n^2/256 rows per draft. Clone unless ``b`` already
+    owns exactly its bytes.
+    """
+    if (
+        b.is_contiguous()
+        and b.storage_offset() == 0
+        and b.untyped_storage().nbytes() == b.numel() * b.element_size()
+    ):
+        return b
+    return b.clone()
 
 
 def cat_hidden(parts: list) -> Any:
@@ -364,10 +687,22 @@ class HiddenRows:
     the node's copy in the object store).
     """
 
-    def __init__(self, src: Any, get: Optional[Callable[[Any], Any]] = None):
+    def __init__(
+        self,
+        src: Any,
+        get: Optional[Callable[[Any], Any]] = None,
+        prefetched: Optional[dict] = None,
+    ):
         self.src = src
         self.fetched_bytes = 0
+        # Storage bytes actually deserialized (== fetched_bytes for blocks
+        # that own their bytes; see ``own_block``) and wall time spent
+        # waiting for blocks inside the scan.
+        self.fetched_real_bytes = 0
+        self.fetch_s = 0.0
         self._get = get
+        # ref -> concurrent.futures.Future of the block, from ``HiddenPrefetch``.
+        self._prefetched = prefetched if prefetched is not None else {}
         if isinstance(src, HiddenRefs):
             self._starts = []
             a = 0
@@ -382,12 +717,21 @@ class HiddenRows:
             seg = self.src.segs[k]
             if seg.ref is None:
                 raise RuntimeError("hidden states of this draft were already released")
-            get = self._get
-            if get is None:
-                import ray
+            import time as _time
 
-                get = ray.get
-            h = get(seg.ref)
+            t0 = _time.perf_counter()
+            fut = self._prefetched.get(_ref_key(seg.ref))
+            if fut is not None and not fut.cancelled():
+                h = fut.result()
+            else:
+                get = self._get
+                if get is None:
+                    import ray
+
+                    get = ray.get
+                h = get(seg.ref)
+            self.fetch_s += _time.perf_counter() - t0
+            self.fetched_real_bytes += h.untyped_storage().nbytes()
             if h.shape[0] != seg.rows:
                 raise RuntimeError(
                     f"hidden block has {h.shape[0]} rows, expected {seg.rows}"
@@ -406,6 +750,90 @@ class HiddenRows:
             k = bisect.bisect_right(self._starts, t) - 1
             out.append(self._block(k)[t - self._starts[k]])
         return torch.stack(out)
+
+
+def _ref_key(ref: Any) -> Any:
+    """Hashable identity of an object-store handle (ObjectRef id, else the object)."""
+    b = getattr(ref, "binary", None)
+    return b() if callable(b) else ref
+
+
+class HiddenPrefetch:
+    """Verifier side: fetch the blocks of upcoming drafts in a background thread.
+
+    ``submit(hiddens)`` starts fetching every block of one verification batch
+    (``HiddenRefs`` of its drafts); ``futures`` maps a block's handle to its
+    Future, which ``HiddenRows`` waits on instead of a blocking ``ray.get``.
+    Bounded: at most ``max_batches`` batches are held, and a batch is only
+    submitted while the held bytes stay under ``max_bytes`` (the first batch
+    always is: one batch is what an on-demand scan may cache anyway); a batch
+    that is not submitted is fetched on demand as before. ``release`` drops the
+    oldest batch's blocks. Moves bytes only: the scan reads the same blocks.
+    """
+
+    def __init__(
+        self,
+        get: Optional[Callable[[Any], Any]] = None,
+        max_bytes: int = 8 << 30,
+        max_batches: int = 2,
+    ):
+        from concurrent.futures import ThreadPoolExecutor
+
+        self._get = get
+        self._pool = ThreadPoolExecutor(1, thread_name_prefix="ts-hidden-prefetch")
+        self.max_bytes = max_bytes
+        self.max_batches = max_batches
+        self.futures: dict[Any, Any] = {}
+        self._held: list[tuple[list, int]] = []
+        self.submitted_bytes = 0
+        self.skipped_batches = 0
+
+    def held_bytes(self) -> int:
+        return sum(nb for _, nb in self._held)
+
+    def submit(self, hiddens: list) -> bool:
+        segs = [
+            seg
+            for h in hiddens
+            if isinstance(h, HiddenRefs)
+            for seg in h.segs
+            if seg.ref is not None
+        ]
+        nb = sum(seg.nbytes for seg in segs)
+        if self._held and (
+            len(self._held) >= self.max_batches or self.held_bytes() + nb > self.max_bytes
+        ):
+            self.skipped_batches += 1
+            return False
+        get = self._get
+        if get is None:
+            import ray
+
+            get = ray.get
+        keys = []
+        for seg in segs:
+            k = _ref_key(seg.ref)
+            if k not in self.futures:
+                self.futures[k] = self._pool.submit(get, seg.ref)
+                keys.append(k)
+        self._held.append((keys, nb))
+        self.submitted_bytes += nb
+        return True
+
+    def release(self) -> None:
+        """Drop the oldest held batch's blocks (cancel any not yet fetched)."""
+        if not self._held:
+            return
+        keys, _ = self._held.pop(0)
+        for k in keys:
+            f = self.futures.pop(k, None)
+            if f is not None:
+                f.cancel()
+
+    def close(self) -> None:
+        while self._held:
+            self.release()
+        self._pool.shutdown(wait=True)
 
 
 # Rows per full-vocabulary log-softmax when log-probs of many positions are

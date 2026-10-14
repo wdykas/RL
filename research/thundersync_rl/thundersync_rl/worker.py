@@ -2317,8 +2317,13 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         """Finished flag per draft of the last ``start_drafts`` call (rank 0)."""
         return list(getattr(self, "_draft_done", None) or [])
 
-    def install_draft_hidden_log(self) -> bool | None:
+    def install_draft_hidden_log(self, seal_blocks: bool = False) -> bool | None:
         """Log the engine's LM-head input for tagged draft requests.
+
+        ``seal_blocks`` (object-store transport): a ``SealingHiddenLog`` that
+        puts each full ``HIDDEN_BLOCK_ROWS`` block while drafting, so the
+        deadline puts only partial tails (``THUNDERSYNC_HIDDEN_SEAL=0``
+        disables it for A/B).
 
         Generation workers. A forward pre-hook on the engine model's output
         layer copies, per forward, the row of each tagged request's last input
@@ -2366,7 +2371,12 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         layer = _unwrap(self._gen_model()).output_layer
         if getattr(layer, "sequence_parallel", False) and not materialized:
             return False
-        log = HiddenLog()
+        if seal_blocks and os.environ.get("THUNDERSYNC_HIDDEN_SEAL", "1") != "0":
+            from thundersync_rl.engine_q import SealingHiddenLog
+
+            log = SealingHiddenLog()
+        else:
+            log = HiddenLog()
 
         def lookup(rid, engine):
             # Not cached: the engine may reuse request ids, so a cached id
@@ -2495,17 +2505,10 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         only if its lazy scan needs them. This worker owns the objects but
         keeps no reference: the driver frees them after verification.
         """
-        from thundersync_rl.engine_q import put_hidden
-
         log = getattr(self, "_hidden_log", None)
         if log is None:
             return {}
-        out = {}
-        for k, n in zip(keys, lengths):
-            h = log.pop(k, n)
-            if h is not None and n > 0:
-                out[k] = put_hidden(h) if as_refs else h
-        return out
+        return self._hand_out_hidden(log, keys, [0] * len(keys), lengths, as_refs, True)
 
     def take_draft_hidden(
         self,
@@ -2519,16 +2522,52 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         As ``pop_draft_hidden`` (same transport), for drafts verified in
         pieces while the engine keeps decoding them.
         """
-        from thundersync_rl.engine_q import put_hidden
-
         log = getattr(self, "_hidden_log", None)
         if log is None:
             return {}
-        out = {}
+        return self._hand_out_hidden(log, keys, starts, lengths, as_refs, False)
+
+    def _hand_out_hidden(self, log, keys, starts, lengths, as_refs: bool, close: bool):
+        """Shared body of ``pop_draft_hidden`` (close) / ``take_draft_hidden``.
+
+        Also returns ``HIDDEN_STATS_KEY``: this call's wall time and the bytes it
+        put (storage bytes, i.e. what the object store really holds), plus the
+        sealing log's cumulative counters.
+        """
+        from thundersync_rl.engine_q import HIDDEN_STATS_KEY, SealingHiddenLog, put_hidden
+
+        t0 = time.perf_counter()
+        sealing = as_refs and isinstance(log, SealingHiddenLog)
+        out: dict[str, Any] = {}
+        put_bytes = 0
+        tail0 = log.tail_put_bytes if sealing else 0
         for k, a, n in zip(keys, starts, lengths):
-            h = log.take(k, a, n)
+            if sealing:
+                blocks = log.pop_refs(k, n) if close else log.take_refs(k, a, n)
+                if blocks is not None and n > 0:
+                    out[k] = blocks
+                continue
+            h = log.pop(k, n) if close else log.take(k, a, n)
             if h is not None and n > 0:
-                out[k] = put_hidden(h) if as_refs else h
+                if as_refs:
+                    out[k] = put_hidden(h)
+                    put_bytes += sum(b[2] for b in out[k])
+                else:
+                    out[k] = h
+        if sealing:
+            put_bytes = log.tail_put_bytes - tail0
+        stats = {"call_s": time.perf_counter() - t0, "put_bytes": put_bytes}
+        if sealing:
+            # Background sealing since the previous hand-out (deltas).
+            cum = {
+                "sealed_bytes": log.sealed_bytes,
+                "seal_put_s": log.seal_put_s,
+                "resplits": log.resplits,
+            }
+            last = getattr(self, "_hidden_seal_last", {})
+            stats.update({k: v - last.get(k, 0) for k, v in cum.items()})
+            self._hidden_seal_last = cum
+        out[HIDDEN_STATS_KEY] = stats
         return out
 
     def close_draft_logs(self, keys: list[str]) -> None:
@@ -2739,6 +2778,8 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         from thundersync_rl.block_verification import banded_log_weight
         from thundersync_rl.engine_q import (
             GatheredLogprobRows,
+            HiddenPrefetch,
+            HiddenRefs,
             HiddenRows,
             hidden_num_rows,
             verify_engine_q,
@@ -2786,8 +2827,41 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             if sticky_rounding.enabled():
                 sticky_rounding.start_stats()
 
+        # Verifier prefetch (object-store transport, last stage only): fetch
+        # the next forward batch's hidden blocks in a background thread while
+        # the current batch runs, at most two batches / THUNDERSYNC_HIDDEN_
+        # PREFETCH_GB held. Default ("auto") under null-BV, whose lazy scans
+        # read most rows (a ⊥ outcome scans to the root); plain BV reads few
+        # rows of few drafts, so it keeps fetching on demand. Bytes only: the
+        # scans read the same blocks.
+        pf_mode = os.environ.get("THUNDERSYNC_HIDDEN_PREFETCH", "auto")
+        use_pf = last_stage and any(isinstance(h, HiddenRefs) for h in hidden) and (
+            pf_mode in ("1", "all") or (pf_mode == "auto" and null_envelopes is not None)
+        )
+        pf = (
+            HiddenPrefetch(
+                max_bytes=int(
+                    float(os.environ.get("THUNDERSYNC_HIDDEN_PREFETCH_GB", "8")) * 2**30
+                )
+            )
+            if use_pf
+            else None
+        )
+        pf_held: list[int] = []
+
+        def prefetch(b: int) -> None:
+            if pf is not None and b < len(batches) and b not in pf_held:
+                if pf.submit([hidden[i] for i in batches[b]]):
+                    pf_held.append(b)
+
         def row_logits():
-            for batch in batches:
+            for bi, batch in enumerate(batches):
+                if pf is not None:
+                    while pf_held and pf_held[0] < bi:
+                        pf.release()  # every row of that batch is verified
+                        pf_held.pop(0)
+                    prefetch(bi)
+                    prefetch(bi + 1)
                 t0 = time.perf_counter()
                 if anchors is not None:
                     lb = self._training_forward_rows(
@@ -2830,7 +2904,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             assert lq.numel() == g, (lq.numel(), g)
             assert hidden_num_rows(hidden[i]) == g, (hidden_num_rows(hidden[i]), g)
             # Phase 2 only: rows (per segment) fetched when the scan asks.
-            h = HiddenRows(hidden[i])
+            h = HiddenRows(hidden[i], prefetched=None if pf is None else pf.futures)
             version = [0] * g
             for v, a, b in segments[i]:
                 version[a:b] = [v] * (b - a)
@@ -2879,7 +2953,14 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                     res["band_log_weight"] = log_w
                     res["band_exited"] = exited
                 n_rows += n_eval + (tau < g)
-            fetched = h.fetched_bytes  # what the scan needed (not the check)
+            # What the scan needed (not the check): nominal and storage bytes,
+            # and the time the scan waited for blocks.
+            fetched = h.fetched_bytes
+            fetch_info = {
+                "hidden_real_bytes_fetched": h.fetched_real_bytes,
+                "hidden_fetch_s": h.fetch_s,
+            }
+            self._prof["hidden_fetch_s"] = self._prof.get("hidden_fetch_s", 0.0) + h.fetch_s
             if check:
                 for a in range(0, g, 512):
                     idx = torch.arange(a, min(g, a + 512))
@@ -2901,8 +2982,12 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                             f"versions_at={[version[t] for t in pos]} segs={segments[i]}",
                             flush=True,
                         )
-            results.append((i, {**res, "hidden_bytes_fetched": fetched}))
+            results.append((i, {**res, "hidden_bytes_fetched": fetched, **fetch_info}))
             del p_lp, h
+        if pf is not None:
+            self._prof["hidden_prefetched_bytes"] = pf.submitted_bytes
+            self._prof["hidden_prefetch_skipped"] = pf.skipped_batches
+            pf.close()
         for _ in range(n_dummy):
             # Expert parallelism: out of rows, join the other replicas' forwards.
             self._dummy_training_forward()

@@ -141,7 +141,7 @@ class _Engine:
 
     def handlers(self):
         return {
-            "install_draft_hidden_log": lambda: True,
+            "install_draft_hidden_log": lambda **_: True,
             "install_draft_route_log": lambda: [1],
             "start_drafts": self.start,
             "add_drafts": self.add,
@@ -395,7 +395,7 @@ def test_incomplete_sticky_plan_never_reaches_plain_decoding():
 
     s = make_spec(
         {},
-        base_handlers={"install_draft_hidden_log": lambda: True, "install_draft_route_log": lambda: [1]},
+        base_handlers={"install_draft_hidden_log": lambda **_: True, "install_draft_route_log": lambda: [1]},
         verify_source="engine",
         sticky_delta=0.03,
     )
@@ -410,7 +410,7 @@ def test_sticky_step_without_continuations_reports_zero_rounds():
     # continuation stats (zero), which the exactness scripts require.
     s = make_spec(
         {},
-        base_handlers={"install_draft_hidden_log": lambda: True, "install_draft_route_log": lambda: [1]},
+        base_handlers={"install_draft_hidden_log": lambda **_: True, "install_draft_route_log": lambda: [1]},
         verify_source="engine",
         sticky_delta=0.03,
     )
@@ -425,7 +425,7 @@ def test_sticky_requires_engine_route_log():
         make_spec(
             {},
             base_handlers={
-                "install_draft_hidden_log": lambda: True,
+                "install_draft_hidden_log": lambda **_: True,
                 "install_draft_route_log": lambda: False,
             },
             verify_source="engine",

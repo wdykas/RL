@@ -45,6 +45,7 @@ import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from thundersync_rl.engine_q import (
+    HIDDEN_STATS_KEY,
     HiddenRefs,
     cat_hidden,
     free_hidden,
@@ -67,9 +68,13 @@ from thundersync_rl.routes import (
 )
 
 
+# Per-draft transport results of engine-q verification (worker -> driver).
+HIDDEN_FETCH_KEYS = ("hidden_bytes_fetched", "hidden_real_bytes_fetched", "hidden_fetch_s")
+
+
 def _null_result(res: dict[str, Any], m: Optional[float]) -> dict[str, Any]:
     """A ⊥-BV row's result at envelope ``m`` from its grid (None: unused)."""
-    base = {"hidden_bytes_fetched": res.get("hidden_bytes_fetched", 0)}
+    base = {k: res.get(k, 0) for k in HIDDEN_FETCH_KEYS}
     if m is None:
         return {**base, "null": "unused", "accepted": 0, "next": -1, "logprobs": []}
     tau, y, lp_y = res["null_grid"][m]
@@ -461,7 +466,10 @@ class SpeculativeGeneration:
             ray.get(workers.run_all_workers_single_data("install_lookup_references"))
         if verify_source == "engine":
             ok = ray.get(
-                workers.run_all_workers_single_data("install_draft_hidden_log")
+                workers.run_all_workers_single_data(
+                    "install_draft_hidden_log",
+                    seal_blocks=hidden_transport == "object_store",
+                )
             )
             if not any(x is True for x in ok) or any(x is False for x in ok):
                 print(
@@ -815,6 +823,7 @@ class SpeculativeGeneration:
             return [None] * len(lengths)
         refs = self.hidden_transport == "object_store"
         merged: dict[str, Any] = {}
+        t_call, sts = time.perf_counter(), []
         for r in ray.get(
             self.base._policy.worker_group.run_all_workers_single_data(
                 "pop_draft_hidden",
@@ -823,7 +832,11 @@ class SpeculativeGeneration:
                 **({"as_refs": True} if refs else {}),
             )
         ):
+            sts.append(self._hidden_call_stats(r))
             merged.update(r)
+        self._count_hidden("spec/hidden_handout_wall_s", time.perf_counter() - t_call)
+        for name, k in (("spec/hidden_put_s", "call_s"), ("spec/hidden_seal_put_s", "seal_put_s")):
+            self._count_hidden(name, max([st.get(k, 0.0) for st in sts] or [0.0]))
         out: list[Any] = []
         for k, n in zip(hkeys, lengths):
             if n == 0:
@@ -843,6 +856,7 @@ class SpeculativeGeneration:
         """Hidden rows start..start+m-1 of running drafts (``_pop_hidden`` for pieces)."""
         refs = self.hidden_transport == "object_store"
         merged: dict[str, Any] = {}
+        t_call, sts = time.perf_counter(), []
         for r in ray.get(
             self.base._policy.worker_group.run_all_workers_single_data(
                 "take_draft_hidden",
@@ -852,7 +866,11 @@ class SpeculativeGeneration:
                 **({"as_refs": True} if refs else {}),
             )
         ):
+            sts.append(self._hidden_call_stats(r))
             merged.update(r)
+        self._count_hidden("spec/hidden_handout_wall_s", time.perf_counter() - t_call)
+        for name, k in (("spec/hidden_put_s", "call_s"), ("spec/hidden_seal_put_s", "seal_put_s")):
+            self._count_hidden(name, max([st.get(k, 0.0) for st in sts] or [0.0]))
         out: list[Any] = []
         for k, n in zip(hkeys, lengths):
             if n == 0:
@@ -982,6 +1000,20 @@ class SpeculativeGeneration:
         ):
             self.stats[name] = self.stats.get(name, 0.0) + v
         return toks[:m], False, (None if lps is None else lps[:m])
+
+    def _hidden_call_stats(self, r: dict) -> dict:
+        """Fold one worker's ``HIDDEN_STATS_KEY`` entry into the step stats.
+
+        Times are per worker (they run in parallel): the step stat is the sum
+        over calls of the slowest worker's time.
+        """
+        st = r.pop(HIDDEN_STATS_KEY, None)
+        if not st:
+            return {}
+        self._count_hidden("spec/hidden_put_real_bytes", st.get("put_bytes", 0))
+        self._count_hidden("spec/hidden_sealed_bytes", st.get("sealed_bytes", 0))
+        self._count_hidden("spec/hidden_resplits", st.get("resplits", 0))
+        return st
 
     def _count_hidden(self, name: str, nbytes: int) -> None:
         if self.verify_source == "engine":
@@ -1340,10 +1372,10 @@ class SpeculativeGeneration:
         if self.verify_source != "engine":
             return
         if self.hidden_transport == "object_store":
-            self._count_hidden(
-                "spec/hidden_bytes_fetched",
-                sum(r.get("hidden_bytes_fetched", 0) for r in by_row.values()),
-            )
+            for k in HIDDEN_FETCH_KEYS:
+                self._count_hidden(
+                    "spec/" + k, sum(r.get(k, 0) for r in by_row.values())
+                )
         self._release_hidden(flat[a + j][1] for j in by_row)
 
     def verify(self, drafts: list[list[tuple[torch.Tensor, int, list[int]]]]) -> None:
