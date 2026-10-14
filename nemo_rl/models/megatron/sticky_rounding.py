@@ -251,20 +251,12 @@ class AnchorStream:
 
     # -- weights ------------------------------------------------------------
     def params(self, unit: torch.nn.Module, device: torch.device) -> dict[str, torch.Tensor]:
-        """theta_n of ``unit`` on GPU; prefetches the next unit, frees older ones.
-
-        At most two units are resident: the one in use and the next in flight.
-        """
+        """theta_n of ``unit`` on GPU (prefetched by ``done`` of the previous unit)."""
         if self.store is None or not self.store.ready:
             return {}
         i = self.store.index(unit)
         if i not in self._buf:
             self._buf[i] = self.store.fetch(i, device)
-        for j in [j for j in self._buf if j < i]:
-            del self._buf[j]
-        nxt = i + 1
-        if nxt < len(self.store.units) and nxt not in self._buf:
-            self._buf[nxt] = self.store.fetch(nxt, device)
         tensors, ev = self._buf[i]
         if ev is not None:
             cur = torch.cuda.current_stream()
@@ -272,6 +264,20 @@ class AnchorStream:
             for t in tensors.values():
                 t.record_stream(cur)
         return tensors
+
+    def done(self, unit: torch.nn.Module, device: torch.device) -> None:
+        """The anchor pass of ``unit`` finished: free it and prefetch the next unit.
+
+        The next unit's copy overlaps the policy pass of this unit; at most one
+        unit is resident outside that overlap.
+        """
+        if self.store is None or not self.store.ready:
+            return
+        i = self.store.index(unit)
+        self._buf.pop(i, None)
+        nxt = i + 1
+        if nxt < len(self.store.units) and nxt not in self._buf:
+            self._buf[nxt] = self.store.fetch(nxt, device)
 
     def release(self) -> None:
         self._buf.clear()
@@ -494,9 +500,12 @@ def _layer_forward(orig):
             a_args = (s.hidden, *args[1:])
         from torch.func import functional_call
 
+        dev = _device(self)
         with _anchor_pass(s):
-            params = s.params(self, _device(self))
+            params = s.params(self, dev)
             out = functional_call(self, params, a_args, a_kwargs, strict=False)
+        del params
+        s.done(self, dev)
         s.hidden = out[0] if isinstance(out, tuple) else out
         with _policy_pass(s):
             result = orig(self, *args, **kwargs)
@@ -515,9 +524,12 @@ def _embedding_forward(orig):
             return out
         from torch.func import functional_call
 
+        dev = _device(self)
         with _anchor_pass(s):
-            params = s.params(self, _device(self))
+            params = s.params(self, dev)
             s.hidden = functional_call(self, params, args, kwargs, strict=False)
+        del params
+        s.done(self, dev)
         return out
 
     forward.__wrapped__ = orig  # type: ignore[attr-defined]

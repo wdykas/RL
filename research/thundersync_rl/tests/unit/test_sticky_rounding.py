@@ -270,14 +270,16 @@ def test_theta_store_keeps_the_snapshot():
     assert store.host_bytes() == sum(p.numel() * 4 for p in [*emb.parameters(), *lin.parameters()])
 
 
-def test_stream_prefetch_keeps_at_most_two_units():
+def test_stream_keeps_one_unit_and_prefetches_the_next():
     units = [torch.nn.Linear(2, 2) for _ in range(4)]
     store = sr.ThetaStore(units)
     store.snapshot()
     s = sr.AnchorStream(store, torch.ones(1, dtype=torch.bool))
     for i, u in enumerate(units):
-        s.params(u, torch.device("cpu"))
-        assert sorted(s._buf) == [j for j in (i, i + 1) if j < len(units)]
+        got = s.params(u, torch.device("cpu"))
+        assert sorted(s._buf) == [i] and torch.equal(got["weight"], u.weight)
+        s.done(u, torch.device("cpu"))
+        assert sorted(s._buf) == ([i + 1] if i + 1 < len(units) else [])
 
 
 def test_policy_forward_requires_a_snapshot_for_anchored_tokens():

@@ -559,8 +559,6 @@ def invalidate_weight_cache() -> None:
 
 
 def _stacked_fp16(weights: tuple[torch.Tensor, ...]) -> torch.Tensor:
-    if not _HOOKS["cache"]:
-        return torch.stack([w.detach().to(torch.float16) for w in weights])
     key = tuple(id(w) for w in weights)
     ptrs = tuple(w.data_ptr() for w in weights)
     hit = _WEIGHT_CACHE.get(key)
@@ -583,15 +581,17 @@ def _expert_gemm_cublas(
     0.30 ms vs 1.21 ms for the Triton kernel. (Transformer Engine's grouped GEMM
     gives the same bits at 0.35 ms but syncs the host every call.)
     """
-    w16 = _stacked_fp16(weights)
-    m_total, n = x16.shape[0], w16.shape[1]
+    # Uncached (transient weights): one expert's fp16 copy at a time.
+    w16 = _stacked_fp16(weights) if _HOOKS["cache"] else None
+    m_total, n = x16.shape[0], weights[0].shape[0]
     out = torch.empty((m_total, n), dtype=torch.float32, device=x16.device)
     start = 0
     for i, m in enumerate(m_splits):
         if m:
+            w = w16[i] if w16 is not None else weights[i].detach().to(torch.float16)
             torch.mm(
                 x16[start : start + m],
-                w16[i].t(),
+                w.t(),
                 out_dtype=torch.float32,
                 out=out[start : start + m],
             )
