@@ -170,10 +170,43 @@ def fp32_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     turns it into TF32 regardless of ``allow_tf32``. The fp16 GEMM is batch
     invariant at every M tested (1..4096) and runs on tensor cores.
     """
-    x32 = x.float()
-    hi = x32.to(torch.float16)
-    lo = ((x32 - hi.float()) * _SPLIT_SCALE).to(torch.float16)
-    return fp16_gemm(hi, weight) + fp16_gemm(lo, weight) / _SPLIT_SCALE
+    tracked = torch.is_grad_enabled() and (x.requires_grad or weight.requires_grad)
+    if not x.is_cuda or tracked:
+        x32 = x.float()
+        hi = x32.to(torch.float16)
+        lo = ((x32 - hi.float()) * _SPLIT_SCALE).to(torch.float16)
+        return fp16_gemm(hi, weight) + fp16_gemm(lo, weight) / _SPLIT_SCALE
+    return _fp32_gemm_chunked(x, weight)
+
+
+# Rows per step of the chunked fp32-input GEMM: bounds its temporaries (the split
+# operands and the lo-term product) to this many rows, whatever M is.
+_FP32_GEMM_CHUNK_ROWS = 4096
+
+
+def _fp32_gemm_chunked(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """``fp32_gemm`` with one [M, N] fp32 buffer: the output.
+
+    The unchunked expression holds hi @ w.T, lo @ w.T, its scaled copy and the
+    sum at once: 3-4 [M, N] fp32 buffers, which for the LM head are logits-sized
+    (3 x 9.3 GiB for 16384 tokens x 151936 vocab). Here each row chunk writes
+    hi @ w.T into the output, forms lo @ w.T for the chunk only, scales it in
+    place and adds it in place: the same fp32 operations on the same values, so
+    bitwise the same result (row results do not depend on M: cuBLAS without
+    split-K under the batch-invariant backend, see ``_mm``).
+    """
+    k, n = x.shape[-1], weight.shape[0]
+    x2 = x.reshape(-1, k)
+    w16t = weight.to(torch.float16).t()
+    out = torch.empty((x2.shape[0], n), dtype=torch.float32, device=x.device)
+    for start in range(0, x2.shape[0], _FP32_GEMM_CHUNK_ROWS):
+        x32 = x2[start : start + _FP32_GEMM_CHUNK_ROWS].float()
+        hi = x32.to(torch.float16)
+        lo = ((x32 - hi.float()) * _SPLIT_SCALE).to(torch.float16)
+        o = out[start : start + _FP32_GEMM_CHUNK_ROWS]
+        torch.mm(hi, w16t, out_dtype=torch.float32, out=o)
+        o.add_(torch.mm(lo, w16t, out_dtype=torch.float32).div_(_SPLIT_SCALE))
+    return out.view(*x.shape[:-1], n)
 
 
 _GEMMS = {FP16_GEMM: fp16_gemm, FP32_HEAD: fp32_gemm}

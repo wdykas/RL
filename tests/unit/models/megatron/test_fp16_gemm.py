@@ -290,3 +290,23 @@ def test_down_proj_prescale_is_exact_and_widens_range():
     assert torch.isfinite(
         fg.fp16_linear(big, w, fg.COMM_NONE, None, scale_log2=2)
     ).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("m", [1, 7, 4096, 4097, 9000])
+def test_fp32_gemm_chunked_is_bitwise_the_unchunked_expression(m, monkeypatch):
+    """The CUDA fp32_gemm (row-chunked, in-place) equals hi@w.T + (lo@w.T)/2^11 bit for bit."""
+    monkeypatch.setattr(fg, "_FP32_GEMM_CHUNK_ROWS", 4096)
+    torch.manual_seed(m)
+    x = torch.randn(m, 512, device="cuda") * 3
+    w = (torch.randn(1000, 512, device="cuda") * 0.05).to(torch.bfloat16)
+    x32 = x.float()
+    hi = x32.to(torch.float16)
+    lo = ((x32 - hi.float()) * fg._SPLIT_SCALE).to(torch.float16)
+    ref = fg.fp16_gemm(hi, w) + fg.fp16_gemm(lo, w) / fg._SPLIT_SCALE
+    out = fg.fp32_gemm(x, w)
+    assert out.dtype == torch.float32 and out.shape == ref.shape
+    assert torch.equal(out, ref)
+    # Row results do not depend on how many rows share the call.
+    assert torch.equal(fg.fp32_gemm(x[: max(1, m // 3)], w), out[: max(1, m // 3)])
+    assert torch.equal(fg.fp32_gemm(x.view(1, m, 512), w).view(m, -1), out)

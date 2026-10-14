@@ -24,7 +24,8 @@ export TAG=${TAG:-sround$SROUND-d$DELTA-ep$EP-tp$TP-$(basename "$MODEL")}
 if [ "$SROUND" = 1 ]; then
   export ARGS="++thundersync.sticky_rounding=true ${ARGS:-}"
 fi
-STICKY=1 bash "$HERE/sticky_moe.sh"
+# Sticky rounding's anchor forward is not recomputed yet (validate_sticky_rounding): no activation recompute.
+ACKPT=false STICKY=1 bash "$HERE/sticky_moe.sh"
 rc=$?
 [ "$SROUND" = 1 ] || exit $rc
 OUT=$W/$RUNS/$TAG

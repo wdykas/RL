@@ -14,7 +14,7 @@
 #   >=4 GPUs per side (GPUS_PER_SIDE, default max(TP*PP, EP)): 2*GPS/4 nodes; run on the head of a Ray cluster (as
 #              tp_parity_submit.sh).
 #
-# Env: TP (2), PP (1), EP (1), STEPS (4), MODEL (Qwen/Qwen3-1.7B), PROMPTS (16), MAXLEN (2048),
+# Env: TP (2), PP (1), EP (1), STEPS (4), MODEL (Qwen/Qwen3-1.7B), PROMPTS (16), MAXLEN (2048), ACKPT (true),
 # TAG, RUNS (output directory name under thundersync_work, runs_engine_q_tp), ARGS (extra Hydra
 # overrides, appended last), RL_ROOT_OVERRIDE (code checkout; default: the one holding this
 # script). Output: thundersync_work/$RUNS/$TAG/{run.log,history.json}.
@@ -48,6 +48,12 @@ case $GPS in
             policy.generation.colocated.resources.gpus_per_node=4) ;;
 esac
 SP=$([ "$TP" -gt 1 ] && echo true || echo false)
+# Full-layer activation recompute in the learner (Megatron recompute_granularity=full, uniform, 1 layer):
+# a training micro-batch then keeps one fp32 [T, hidden] input per layer instead of every layer's activations
+# (~166 KB per token per Qwen3-30B-A3B layer: 128 GB at 16384 tokens x 48 layers, the 2026-10-14 multi-node
+# OOMs). Routes are replayed exactly in the recomputed forward (R3 REPLAY_BACKWARD). ACKPT=false: no recompute
+# (sticky rounding requires it: its anchor forward is not recomputed yet).
+ACKPT=${ACKPT:-true}
 PAR=(policy.megatron_cfg.tensor_model_parallel_size=$TP
      policy.megatron_cfg.pipeline_model_parallel_size=$PP
      policy.megatron_cfg.expert_model_parallel_size=$EP
@@ -57,7 +63,7 @@ PAR=(policy.megatron_cfg.tensor_model_parallel_size=$TP
      ++policy.generation.mcore_generation_config.pipeline_model_parallel_size=${GEN_PP:-$PP}
      ++policy.generation.mcore_generation_config.expert_model_parallel_size=$EP
      ++policy.generation.mcore_generation_config.materialize_only_last_token_logits=true
-     policy.megatron_cfg.activation_checkpointing=false)
+     policy.megatron_cfg.activation_checkpointing=$ACKPT)
 read -r -a BIF < $W/bi_flags.txt
 BIF+=(++policy.generation.mcore_generation_config.transformer_impl=inference_optimized)
 SPEC=(++thundersync.speculate=true ++thundersync.verify_mode=block
