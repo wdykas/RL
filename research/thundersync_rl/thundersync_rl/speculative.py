@@ -1578,7 +1578,14 @@ class SpeculativeGeneration:
         """
         if self.anchor_horizon is None:
             return None
-        return prompt_len + min(int(self.anchor_horizon), self._cap(prompt_len))
+        # The rollout's cap: max_new_tokens bounds one turn only when the
+        # rollout has several (multi-turn: the total-length cap bounds it).
+        cap = (
+            self._cap(prompt_len)
+            if self.turn_env is None or self.max_seq_len is None
+            else max(0, self.max_seq_len - prompt_len)
+        )
+        return prompt_len + min(int(self.anchor_horizon), cap)
 
     def _cut(self, anchors: Optional[RouteRefs], prompt_len: int) -> Optional[RouteRefs]:
         """``anchors`` restricted to positions below the horizon (self beyond)."""

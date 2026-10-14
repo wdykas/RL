@@ -372,3 +372,19 @@ def test_horizon_hands_later_turns_to_the_refit_engine():
     assert state["message_log"][3]["generation_logprobs"].tolist() == [-1.0, -0.5, -0.5]
     assert metrics["turn_count"] == 2 and anchors is plan.anchors
     assert s.stats["spec/horizon_engine_turns"] == 2.0
+
+
+def test_multi_turn_horizon_is_bounded_by_the_total_length_cap():
+    """max_new_tokens bounds one turn; a multi-turn rollout's horizon is
+    clipped by the total-length cap only."""
+    s = make_spec(
+        {},
+        base_handlers={"install_draft_hidden_log": lambda: True, "install_draft_route_log": lambda: [1]},
+        verify_source="engine",
+        sticky_delta=0.03,
+        anchor_horizon=40,
+        max_seq_len=64,
+    )
+    assert s._horizon(2) == 2 + 16  # single-turn: the rollout cap (16 tokens)
+    s.turn_env = TurnEnvironment(_Tokenizer(), {}, max_seq_len=64, max_turns=3)
+    assert s._horizon(2) == 2 + 40 and s._horizon(30) == 64
