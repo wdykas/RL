@@ -1336,7 +1336,12 @@ SCHED=async default | legacy), with the Mamba SSD parity port active: PASS with 
 under async and legacy scheduling (2026-10-14): train == engine mismatch 0 and exact_token_frac 1
 on every step, engine q exact, weights change every step, every sticky step's anchors equal a
 fresh engine prefill ([route check]) and the sticky rule changes routes against plain top-k
-(thundersync_work/research/agent_hybrid_integration.md).
+(thundersync_work/research/agent_hybrid_integration.md). With the integrated recipe (branch ts-hybrid-integ:
+sticky routing + momentum draft weights + pooled ⊥-BV, async scheduling) the same check PASSES (2026-10-14): sticky +
+momentum + ⊥-BV and its STICKY=0 control both give mismatch 0 and exact_token_frac 1 on all 4 steps, engine q exact,
+3 ⊥-BV steps (128 output slots from 192 drafts, no fresh slots), momentum drafts staged every step; with sticky every
+step's route check is exact (196608 / 57384 / 50028 tokens) and deadline-cut drafts are completed by 8–11 Mamba
+continuation rounds (thundersync_work/research/agent_nano_integ.md).
 
 **Full Nemotron-3-Nano (52 layers, 31.6B) per-rank layout** [derived from the HF config; TP=1, PP=1].
 Routed experts 29.4B, everything else 2.2B. Learner rank (N GPUs, EP=E, DistributedOptimizer, fp32 masters
