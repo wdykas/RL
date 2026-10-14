@@ -1517,7 +1517,8 @@ the price: `agent_multi_draft.md` §3).
 ## 14f. Momentum-predicted draft weights (`thundersync.draft_weights: momentum`)
 
 *Opt-in, default `current`. Unit-tested (formula, Megatron DistributedOptimizer on 1 and 2 ranks
-with TP / EP / DP sharding, driver order, config); end-to-end runs: see "Measurements".*
+with TP / EP / DP sharding, driver order, config); end to end exact on the tiny MoE with sticky
+routing at EP=2 (`sticky_moe.sh`, 2026-10-13); ⊥-BV / TP=2 / L4 runs queued.*
 Implementation notes: `thundersync_work/research/agent_momentum_draft.md`; offline numbers:
 `ACCEPTANCE_LEDGER.md` section T (per-token Var log p/q of a θ_n draft vs a momentum draft:
 ~10–15x lower with momentum on Qwen3-30B-A3B layers).
@@ -1602,7 +1603,23 @@ experts; each rank owns ≈ P/W main elements, P/(TP·PP·EP-share) model elemen
   from `draft_start_frac`. Drafting while the rollout tail decodes needs a second weight version
   on the engine (a θ̂ replica, or per-request weight versions via a sparse delta): not built yet.
 
-**Measurements.** (filled below as runs complete)
+**Measurements.**
+- End to end exact [measured, 2026-10-13 20:36]: `DRAFT_WEIGHTS=momentum scripts/bi_tp/sticky_moe.sh`
+  (tiny MoE, EP=2, sticky δ 0.03, expert-gradient noise, 4 steps, precision-aware optimizer off,
+  `draft_start_frac=1`): `[engine_q] PASS (4/4 steps)`, mismatch 0 every step, engine q exact,
+  route check exact (39368/39368, 25945/25945, 24712/24712 tokens: the anchors logged on θ̂ equal a
+  fresh θ̂ prefill), sticky rule active, weights change every step, draft refit every drafting step
+  with `draft/changed_frac` 0.09–0.13% of elements from step 1 (0 at step 0: no momentum yet).
+- Draft-refit cost on this toy (2+2 GPUs): load 22 ms, refit 138 ms (same as the regular refit,
+  `time/refit` 124 ms), restore 4 ms, peak extra learner memory 0.41 GB [measured]. Draft compute
+  alone: 15 ms per 1e9 owned elements, 0.42 GB (`bench_draft.py`) [measured].
+- Acceptance: steps 1–3 `spec/accepted_frac` .967/.953/.980 with momentum vs .921/.917/.969 in the
+  earlier θ_k run of the same script (moe-null-bv, 17:38) — NOT a paired comparison (that run used
+  the precision-aware optimizer and drafting from the first finished rollout: 2–4x more draft
+  tokens) [measured, unpaired]. The paired arms (`sticky_cur`, ⊥-BV, TP2/EP2, L4) are queued in
+  `thundersync_work/research/momdraft/queue_exactness.sh` and did not get the node lock before the
+  reservation ended. On this random tiny model the drafter/target gap is dominated by the injected
+  gradient noise; the ledger-T numbers on real layers are the relevant acceptance evidence.
 
 **Not built yet.** Precision-aware optimizer (masters in TE FusedAdam), Megatron-FSDP,
 fp8/fp4 param gather, a two-step draft for lookahead > 1, overlapping the draft refit with the
