@@ -1279,6 +1279,30 @@ shared experts, expert TP, latent MoE (rejected at config time); the NCCL infere
 EP>=3 is untested (the default NVLS dispatcher is used); TP=4 training forward measured
 batch-invariant (0/16 sequences differ), TP=4 engine not yet run.
 
+**Engine weight casts (engine package A).** Every recipe GEMM rounds its weight to fp16, and at decode the cast costs
+4-8x the GEMM itself (Super-120B at TP=1: ~15 ms/step of dense casts plus 2.6 ms of LM-head casts, measured per shape in
+research/agent_speedup_engine.md). The dedicated engine model (`is_refit_destination`, `refit_transport: null`) therefore
+holds its dense GEMM weights in fp16 (`fp16_gemm.hold_fp16_weights`, called by `_prepare_engine_numerics` before the
+context is sized and the CUDA graphs are captured): each patched linear's, the untied LM head's and the router's
+`.data` becomes its fp16 copy. That is the same bytes and no second copy, and the per-call cast becomes a no-op. Nothing
+is cached, so there is nothing to invalidate: refit `copy_` rounds bf16 -> fp16 once per refit, and momentum
+`EngineStage` stage/load round-trips the fp16 storage. Embeddings, norms, tied heads and Mamba conv/A/D stay bf16. The
+native MCore and M-to-N refits write raw sender-dtype bytes into the parameters, so with those transports the engine
+keeps the per-call cast (not built yet). The fp32 head (and router) GEMM runs once on stacked [hi; lo] rows on both sides
+(bitwise the two-GEMM result: the BI GEMM is row-invariant).
+
+**Hybrid engine memory (engine package A).** Batch-invariant Mamba decode (MCore) replays the training chunk scan from
+per-slot buffers of the current chunk's x, z, dt, B, C (fp32 under the recipe). `mamba_bi_decode` (installed by
+`_prepare_engine_numerics` when the engine is batch-invariant) does two things:
+- It drops the z buffer. The gate is row-local and only the target row is stored, so the scan runs without z, and one
+  kernel applies the scan's gate expression to the target row with the current token's z. That is bitwise the same,
+  and saves chunk x d_inner x 4 B per slot per Mamba layer (Nano-30B 46 MiB/slot, +28% sequences/GPU at 8k; Super
+  160 MiB, +37%) [derived].
+- It counts the remaining replay buffers in `DynamicInferenceContext`'s Mamba share (MCore counts only conv + SSM
+  state), keeping the KV share, so `max_requests` sized from memory cannot overcommit. Per rank, no communication.
+
+The same z change inside the chunk-scan kernel is the Megatron-LM draft PR `fix/mamba-bi-decode-drop-z-buffer`.
+
 **fp16 range.** Max |GEMM input| over 16 MATH prompts x 512 greedy tokens (HF bf16, decode
 included; `thundersync_work/fp16_range_probe.py`): Qwen3-8B 10752 (6.1x headroom to 65504),
 Qwen3-14B 7296 (9x), Qwen3-30B-A3B 484 (135x, expert down_proj). The dense down-projection input
