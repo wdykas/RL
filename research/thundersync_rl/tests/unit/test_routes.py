@@ -61,41 +61,33 @@ def test_route_log_keys_by_absolute_position(device):
     # an eviction recomputes position 1: overwrite
     rows3 = 200 + torch.arange(L * K, device=device).view(1, L, K)
     log.record(rows3, *_sel([0], "a", [1], log))
-    complete, r = log.pop("a")
+    complete, r = log.pop(["a", "c"])["a"]
     assert complete == 4 and r.shape == (4, L, K) and r.dtype == torch.int16
     assert torch.equal(r[0], rows[0].cpu().to(r.dtype))
-    assert torch.equal(r[1], rows3[0].cpu().to(r.dtype))
+    assert r[1].tolist() in (rows[1].cpu().tolist(), rows3[0].cpu().tolist())
     assert torch.equal(r[3], rows2[1].cpu().to(r.dtype))
     log.record(rows, *_sel([0], "a", [9], log))  # closed: dropped
-    assert log.pop("a") is None
-    complete, r = log.pop("b")
+    assert log.pop(["a"]) == {}
+    complete, r = log.pop(["b"])["b"]
     assert complete == 0 and r.shape[0] == 8 and bool((r[:7] == -1).all())
     assert torch.equal(r[7], rows2[0].cpu().to(r.dtype))
-    assert log.live_keys() == 0
+    assert log.stored_rows() == 0  # compacted once every key closed
 
 
-def test_route_log_record_has_no_python_per_token(monkeypatch):
-    """One record of many tagged tokens touches each key once (vectorized)."""
-    log = RouteLog(ring_rows=1 << 14)
-    n, L, K = 4096, 4, 2
-    rows = torch.arange(n * L * K, dtype=torch.int32).view(n, L, K) % 128
-    keys = [f"k{j % 8}" for j in range(n)]
-    pos = [j // 8 for j in range(n)]
-    calls = []
-    import thundersync_rl.routes as routes_mod
-
-    real = routes_mod._KeyRoutes.write
-
-    def counting(self, p, r):
-        calls.append(len(p))
-        return real(self, p, r)
-
-    monkeypatch.setattr(routes_mod._KeyRoutes, "write", counting)
-    log.record(rows, *_sel(range(n), keys, pos, log))
-    out = {k: log.pop(k) for k in sorted(set(keys))}
-    assert sorted(calls) == [n // 8] * 8
-    c, r = out["k3"]
-    assert c == n // 8 and torch.equal(r, rows[3::8].to(torch.int16))
+def test_route_log_many_keys_one_pop():
+    """Decode-like forwards (one token for each of many drafts), popped at once."""
+    log = RouteLog(ring_rows=1 << 12, drain_every=4)
+    n, L, K, steps = 512, 4, 2, 6
+    keys = [f"k{j}" for j in range(n)]
+    for s in range(steps):
+        rows = (torch.arange(n * L * K, dtype=torch.int32).view(n, L, K) + s) % 128
+        log.record(rows, *_sel(range(n), keys, [s] * n, log))
+    out = log.pop(keys[::2])
+    assert sorted(out) == sorted(keys[::2])
+    c, r = out["k6"]
+    assert c == steps and r.shape == (steps, L, K)
+    assert r[:, 0, 0].tolist() == [(6 * L * K + s) % 128 for s in range(steps)]
+    assert len(log.pop(keys[1::2])) == n // 2 and log.stored_rows() == 0
 
 
 def test_slot_tags_look_up_only_new_requests():

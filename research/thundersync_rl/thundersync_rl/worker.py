@@ -1838,12 +1838,10 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         if log is None:
             return {}
         layers = self._route_record["layers"]
-        out = {}
-        for k in keys:
-            r = log.pop(k)
-            if r is not None:
-                out[k] = (layers, r[0], put_routes(r[1], ray.put))
-        return out
+        return {
+            k: (layers, complete, put_routes(rows, ray.put))
+            for k, (complete, rows) in log.pop(keys).items()
+        }
 
     def drafts_done(self) -> list[bool]:
         """Finished flag per draft of the last ``start_drafts`` call (rank 0)."""

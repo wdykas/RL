@@ -57,38 +57,6 @@ ROUTE_DTYPE = torch.int16
 ROUTE_BLOCK_POSITIONS = 4096
 
 
-class _KeyRoutes:
-    """Dense host routes of one draft key: rows [cap, L, K] and a logged mask."""
-
-    def __init__(self, shape: tuple[int, int]):
-        self.rows = np.full((0, *shape), NO_ANCHOR, dtype=np.int16)
-        self.logged = np.zeros(0, dtype=bool)
-
-    def write(self, pos: np.ndarray, rows: np.ndarray) -> None:
-        need = int(pos.max()) + 1
-        if need > self.logged.shape[0]:
-            cap = max(need, 2 * self.logged.shape[0], 256)
-            grown = np.full((cap, *self.rows.shape[1:]), NO_ANCHOR, dtype=np.int16)
-            grown[: self.rows.shape[0]] = self.rows
-            mask = np.zeros(cap, dtype=bool)
-            mask[: self.logged.shape[0]] = self.logged
-            self.rows, self.logged = grown, mask
-        # Duplicate positions in one write (an eviction recomputed them) carry
-        # bitwise-equal routes under batch invariance: any of them may win.
-        self.rows[pos] = rows
-        self.logged[pos] = True
-
-    def complete(self) -> int:
-        """Number of leading positions logged (positions 0..complete-1)."""
-        missing = np.flatnonzero(~self.logged)
-        return int(missing[0]) if missing.size else int(self.logged.shape[0])
-
-    def extent(self) -> int:
-        """One past the last logged position."""
-        hit = np.flatnonzero(self.logged)
-        return int(hit[-1]) + 1 if hit.size else 0
-
-
 class RouteLog:
     """Engine side: routes of tagged requests by (key, absolute position).
 
@@ -98,15 +66,18 @@ class RouteLog:
     positions (numpy arrays). It gathers the tagged rows on the device (the
     index reaches the device from pinned memory without blocking), enqueues
     one asynchronous copy into a pinned staging ring and records an event: no
-    host-device synchronization and no Python per token, so it neither stalls
-    the forward it follows nor breaks asynchronous scheduling. Staged rows move
-    into each key's dense host buffer (one vectorized scatter per key per
+    host-device synchronization and no Python per token or per request, so it
+    neither stalls the forward it follows nor breaks asynchronous scheduling.
+    Staged rows are appended to a host store (one vectorized copy per
     forward) once their copy has completed: at later records when the event
-    has fired, and at ``pop``. ``pop(key)`` returns (complete, routes
-    [extent, L_local, K] int16, -1 where unlogged), where positions
-    0..complete-1 are all logged; the key is then closed (later rows are
-    dropped). A position recorded twice (an engine eviction recomputes it)
-    keeps one of its rows: under batch invariance they are bitwise equal.
+    has fired, and at ``pop``.
+
+    ``pop(keys)`` returns, per key that has rows, (complete, routes [extent,
+    L_local, K] int16, -1 where unlogged) where positions 0..complete-1 are
+    all logged: one vectorized pass over the store plus one dense scatter per
+    key. Popped keys are closed (later rows are dropped). A position recorded
+    twice (an engine eviction recomputes it) keeps one of its rows: under
+    batch invariance they are bitwise equal.
     """
 
     def __init__(self, ring_rows: int = 65536, drain_every: int = 64):
@@ -114,41 +85,53 @@ class RouteLog:
         self.drain_every = drain_every
         self._lock = threading.Lock()
         self._ids: dict[str, int] = {}
-        self._closed: set[int] = set()
-        self._keys: dict[int, _KeyRoutes] = {}
+        self._closed = np.zeros(0, dtype=bool)  # by key id
         self._ring: Optional[torch.Tensor] = None
         self._head = 0
         self._pending: deque = deque()  # (start, m, kid, pos, event)
+        # Host store of drained rows (grows by doubling; compacted at pop).
+        self._rows: Optional[np.ndarray] = None
+        self._kid = np.zeros(0, dtype=np.int64)
+        self._pos = np.zeros(0, dtype=np.int64)
+        self._used = 0
         self.recorded = 0
 
     def key_id(self, key: str) -> int:
         with self._lock:
-            kid = self._ids.get(key)
-            if kid is None:
-                kid = self._ids[key] = len(self._ids)
-            return kid
+            return self._key_id(key)
 
-    def is_closed(self, kid: int) -> bool:
-        return kid in self._closed
+    def _key_id(self, key: str) -> int:
+        kid = self._ids.get(key)
+        if kid is None:
+            kid = self._ids[key] = len(self._ids)
+            if kid >= self._closed.shape[0]:
+                grown = np.zeros(max(1024, 2 * self._closed.shape[0]), dtype=bool)
+                grown[: self._closed.shape[0]] = self._closed
+                self._closed = grown
+        return kid
 
     def _stage(self, m: int, like: torch.Tensor) -> int:
         """Start row of m free staging rows (drains what the reuse overwrites)."""
         shape = tuple(like.shape[1:])
-        if self._ring is None or tuple(self._ring.shape[1:]) != shape or m > self._ring.shape[0]:
+        if (
+            self._ring is None
+            or tuple(self._ring.shape[1:]) != shape
+            or m > self._ring.shape[0]
+        ):
             self._drain(force=True)
             self._ring = torch.empty(
-                (max(self.ring_rows, m), *shape), dtype=ROUTE_DTYPE, pin_memory=like.is_cuda
+                (max(self.ring_rows, m), *shape),
+                dtype=ROUTE_DTYPE,
+                pin_memory=like.is_cuda,
             )
             self._head = 0
         if self._head + m > self._ring.shape[0]:
             self._head = 0
         lo, hi = self._head, self._head + m
-        # Rows still staged in [lo, hi) must reach their keys first. Their
-        # forwards ran a whole ring ago, so the wait is normally zero.
-        while self._pending and any(
-            s < hi and lo < s + n for s, n, *_ in self._pending
-        ):
-            self._move(self._pending.popleft(), wait=True)
+        # Rows still staged in [lo, hi) must be drained first. Their forwards
+        # ran a whole ring ago, so the wait is normally zero.
+        while self._pending and any(s < hi and lo < s + n for s, n, *_ in self._pending):
+            self._move(self._pending.popleft())
         self._head = hi
         return lo
 
@@ -169,7 +152,9 @@ class RouteLog:
             if rows.is_cuda:
                 event = torch.cuda.Event()
                 event.record()
-            self._pending.append((start, m, np.asarray(kid), np.asarray(pos), event))
+            self._pending.append(
+                (start, m, np.asarray(kid, dtype=np.int64), np.asarray(pos, dtype=np.int64), event)
+            )
             self.recorded += m
             if len(self._pending) >= self.drain_every:
                 self._drain(force=False)
@@ -179,41 +164,72 @@ class RouteLog:
             ev = self._pending[0][4]
             if not force and ev is not None and not ev.query():
                 return
-            self._move(self._pending.popleft(), wait=True)
+            self._move(self._pending.popleft())
 
-    def _move(self, item, wait: bool) -> None:
+    def _move(self, item) -> None:
+        """Append one staged forward's rows to the store (closed keys dropped)."""
         start, m, kid, pos, event = item
-        if event is not None and wait:
+        if event is not None:
             event.synchronize()
-        rows = self._ring[start : start + m].numpy()
-        order = np.argsort(kid, kind="stable")
-        kid_sorted = kid[order]
-        bounds = np.flatnonzero(np.diff(kid_sorted)) + 1
-        for grp in np.split(order, bounds):
-            k = int(kid[grp[0]])
-            if k in self._closed:
-                continue
-            dst = self._keys.get(k)
-            if dst is None:
-                dst = self._keys[k] = _KeyRoutes(rows.shape[1:])
-            dst.write(pos[grp], rows[grp])
+        keep = ~self._closed[kid]
+        rows = self._ring[start : start + m].numpy()[keep]
+        kid, pos = kid[keep], pos[keep]
+        k = int(kid.shape[0])
+        if k == 0:
+            return
+        if self._rows is None or self._used + k > self._rows.shape[0]:
+            cap = max(self._used + k, 2 * (0 if self._rows is None else self._rows.shape[0]), 4096)
+            grown = np.empty((cap, *rows.shape[1:]), dtype=np.int16)
+            kg, pg = np.empty(cap, dtype=np.int64), np.empty(cap, dtype=np.int64)
+            if self._rows is not None:
+                grown[: self._used] = self._rows[: self._used]
+                kg[: self._used], pg[: self._used] = self._kid[: self._used], self._pos[: self._used]
+            self._rows, self._kid, self._pos = grown, kg, pg
+        u = self._used
+        self._rows[u : u + k] = rows
+        self._kid[u : u + k], self._pos[u : u + k] = kid, pos
+        self._used = u + k
 
-    def pop(self, key: str) -> Optional[tuple[int, torch.Tensor]]:
+    def pop(self, keys: Sequence[str]) -> dict[str, tuple[int, torch.Tensor]]:
         with self._lock:
-            kid = self._ids.get(key)
-            if kid is None:
-                kid = self._ids[key] = len(self._ids)
+            ids = np.array([self._key_id(k) for k in keys], dtype=np.int64)
             self._drain(force=True)
-            self._closed.add(kid)
-            dense = self._keys.pop(kid, None)
-            if dense is None:
-                return None
-            n = dense.extent()
-            return dense.complete(), torch.from_numpy(dense.rows[:n].copy())
+            self._closed[ids] = True
+            if self._used == 0 or ids.size == 0:
+                return {}
+            u = self._used
+            want = np.zeros(self._closed.shape[0], dtype=bool)
+            want[ids] = True
+            sel = np.flatnonzero(want[self._kid[:u]])
+            out: dict[str, tuple[int, torch.Tensor]] = {}
+            if sel.size:
+                order = sel[np.argsort(self._kid[sel], kind="stable")]
+                kid_sorted = self._kid[order]
+                name = {int(i): k for k, i in zip(keys, ids)}
+                for grp in np.split(order, np.flatnonzero(np.diff(kid_sorted)) + 1):
+                    pos = self._pos[grp]
+                    n = int(pos.max()) + 1
+                    dense = np.full((n, *self._rows.shape[1:]), NO_ANCHOR, dtype=np.int16)
+                    logged = np.zeros(n, dtype=bool)
+                    # Duplicate positions carry bitwise-equal routes: any wins.
+                    dense[pos] = self._rows[grp]
+                    logged[pos] = True
+                    missing = np.flatnonzero(~logged)
+                    complete = int(missing[0]) if missing.size else n
+                    out[name[int(self._kid[grp[0]])]] = (complete, torch.from_numpy(dense))
+            # Compact once closed keys hold at least half of the store.
+            live = ~self._closed[self._kid[:u]]
+            if 2 * int(live.sum()) <= u:
+                keep = np.flatnonzero(live)
+                k = int(keep.size)
+                self._rows[:k] = self._rows[keep]
+                self._kid[:k], self._pos[:k] = self._kid[keep], self._pos[keep]
+                self._used = k
+            return out
 
-    def live_keys(self) -> int:
+    def stored_rows(self) -> int:
         with self._lock:
-            return len(self._keys)
+            return self._used
 
 
 class SlotTags:
