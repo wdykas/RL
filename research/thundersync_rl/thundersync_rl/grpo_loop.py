@@ -1672,6 +1672,7 @@ async def _run_one_step(
                 await ordered.learner_drain()
             replay_digests["canonical_a"] = replay(all_trajectories, group_order, 1, group_blocks)
             replay_digests["canonical_b"] = replay(all_trajectories, group_order, 2, group_blocks)
+            replay_digests["canonical_a_again"] = replay(all_trajectories, group_order, 1, group_blocks)
             replay_digests["arrival"] = replay(all_trajectories, None, 3)
         rollouts_done = True
         wake.set()
@@ -1721,11 +1722,21 @@ async def _run_one_step(
     assert planner.all_done()
     if order_replay:
         real = grad_digests()
+        bad = []
         for k, v in replay_digests.items():
             same = v == real
             print(f"[order replay] step={step} {k} same_as_real={same} real={real} {k}={v}", flush=True)
             if k.startswith("canonical") and not same:
-                raise RuntimeError(f"order replay: {k} gradient differs from the real step")
+                bad.append(k)
+        # canonical_a_again repeats canonical_a's exact order: if even it differs,
+        # the training kernels themselves are not deterministic.
+        print(
+            f"[order replay] step={step} canonical_a==canonical_a_again="
+            f"{replay_digests['canonical_a'] == replay_digests['canonical_a_again']}",
+            flush=True,
+        )
+        if bad:
+            raise RuntimeError(f"order replay: {bad} gradient differs from the real step")
         replay_metrics = {
             f"debug/order_replay_{k}_same": float(v == real) for k, v in replay_digests.items()
         }
