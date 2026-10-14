@@ -31,7 +31,26 @@ with success probability 1/M_j. M_j and the stopping rule depend only on the
 counts (drafts left d, slots left s), never on draft contents, so the
 successes taken in index order are iid p (optional sampling), and the G slots
 are G iid p-samples. Forbidden: reordering drafts or choosing M_j by content
-(length, reward, acceptance).
+(length, reward, acceptance) of the row itself, of later rows, or of any
+pool-wide statistic over the other drafts (e.g. M_j from the mean length of
+all other drafts: biased, z = +208 in agent_tail_exact_schemes.md section 3.4,
+because the other drafts' envelopes then depend on X_j, which decides whether
+j is reached). Earlier rows' outcomes may enter (the counts do); this module
+uses counts only, and ``NullPolicy.m`` accepts nothing but the two counts.
+
+Opt-in variants (off by default; ``agent_tail.md``):
+  * prompt drop (``NullPolicy.prompt_drop``, constant M = ``fixed_m``): M
+    never falls to 1; once a pool cannot fill its slots (d < s) the prompt is
+    dropped (``NullGroup.dropped``) and a spare prompt takes its place. The
+    drop is a function of success counts only, whose law (Bernoulli(1/M) per
+    draft given the past) is the same for every prompt, so the kept prompts
+    are an independent thinning and their groups are G iid p-samples. It
+    shifts which prompts train (like DAPO's dynamic-sampling filter) only
+    through the spare order, never through the samples' contents.
+  * drop-IS (``record(output, tail_dropped=True)``): an output that needs a
+    tail decode does not fill a slot; kept rows carry the importance weight
+    max(1, W*/M) (W* = max prefix ratio). Unbiased gradient, not exact
+    samples: opt-in only, like banded IS.
 
 M_j policy: a dynamic program over (d, s) minimising the expected
 critical-path cost sum over outputs of P(tail decode) * E[tail / cap] plus a
@@ -104,12 +123,14 @@ class NullPolicy:
 
     ``logratio_var``: per-token Var log p/q (v); ``ref_len``: draft length the
     cost model uses (the rollout cap). ``fixed_m``: constant envelope instead of
-    the DP (still M = 1 when d <= s).
+    the DP (still M = 1 when d <= s). ``prompt_drop`` (needs ``fixed_m``):
+    M = ``fixed_m`` at every count, and the pool is dropped once d < s.
     """
 
     logratio_var: float = 8e-7
     ref_len: int = 32768
     fixed_m: Optional[float] = None
+    prompt_drop: bool = False
     grid: tuple[float, ...] = M_GRID
     _table: dict[tuple[int, int], float] = field(default_factory=dict, repr=False)
     _value: dict[tuple[int, int], float] = field(default_factory=dict, repr=False)
@@ -120,6 +141,12 @@ class NullPolicy:
             raise ValueError(f"null_bv fixed M must be >= 1 (got {self.fixed_m})")
         if any(not m >= 1.0 for m in self.grid):
             raise ValueError(f"null_bv M grid must be >= 1 (got {self.grid})")
+        if self.prompt_drop and self.fixed_m is None:
+            raise ValueError("null_bv prompt drop needs a constant envelope (fixed_m)")
+
+    def drop(self, d: int, s: int) -> bool:
+        """Whether a pool with ``d`` drafts and ``s`` empty slots left is dropped."""
+        return self.prompt_drop and d < s
 
     def costs(self) -> dict[float, float]:
         """Expected critical-path cost of one verified draft at envelope M
@@ -144,9 +171,15 @@ class NullPolicy:
 
     def m(self, d: int, s: int) -> float:
         """Envelope for the next draft with ``d`` drafts (this one included) and
-        ``s`` empty slots left."""
+        ``s`` empty slots left. Counts only: never a function of draft contents."""
+        if type(d) is not int or type(s) is not int:
+            raise TypeError("null_bv envelopes depend on the counts (d, s) only")
         if s <= 0:
             raise ValueError("no slot left: the draft must not be verified")
+        if self.prompt_drop:
+            if d < s:
+                raise ValueError("a pool with fewer drafts than slots is dropped")
+            return float(self.fixed_m)
         if d <= s:
             return 1.0
         if self.fixed_m is not None:
@@ -182,8 +215,10 @@ def drafts_per_prompt(k: float, group_size: int) -> int:
 class NullGroup:
     """Sequential ⊥-BV state of one prompt: drafts in index order, G slots.
 
-    ``next_m()`` -> envelope for the next draft (None: slots full, stop);
-    ``record(output: bool)`` after its verification.
+    ``next_m()`` -> envelope for the next draft (None: slots full, or the
+    pool dropped (``dropped``), stop); ``record(output)`` after its
+    verification. ``tail_dropped`` (drop-IS): an output that needs a tail
+    decode is discarded and does not fill a slot.
     """
 
     def __init__(self, n_drafts: int, slots: int, policy: NullPolicy):
@@ -193,24 +228,36 @@ class NullGroup:
         self.verified = 0
         self.outputs = 0
         self.bots = 0
+        self.tail_drops = 0
+        self.dropped = False
 
     def next_m(self) -> Optional[float]:
-        if self.s <= 0 or self.d <= 0:
+        if self.dropped or self.s <= 0:
+            return None
+        if self.policy.drop(self.d, self.s):
+            self.dropped = True
+            return None
+        if self.d <= 0:
             return None
         return self.policy.m(self.d, self.s)
 
-    def record(self, output: bool) -> None:
+    def record(self, output: bool, tail_dropped: bool = False) -> None:
         self.d -= 1
         self.verified += 1
-        if output:
+        if output and not tail_dropped:
             self.s -= 1
             self.outputs += 1
+        elif output:
+            self.tail_drops += 1
         else:
             self.bots += 1
 
 
 def envelopes(policy: NullPolicy) -> tuple[float, ...]:
-    """Every M ``policy.m`` can return: 1 (d <= s) and the grid or the fixed M."""
+    """Every M ``policy.m`` can return: 1 (d <= s) and the grid or the fixed M
+    (prompt drop: the fixed M only)."""
+    if policy.prompt_drop:
+        return (float(policy.fixed_m),)
     ms = {1.0} | ({float(policy.fixed_m)} if policy.fixed_m is not None else set(policy.grid))
     return tuple(sorted(ms))
 
@@ -220,6 +267,7 @@ def decide_pools(
     slots: dict[str, int],
     outcomes: list[dict[float, bool]],
     policy: NullPolicy,
+    dropped: Optional[set[str]] = None,
 ) -> list[Optional[float]]:
     """The envelope each row is decided at, None for rows left unused.
 
@@ -227,7 +275,7 @@ def decide_pools(
     order. ``outcomes[i][M]``: whether row i yields an output (not BOT) when
     verified at envelope M (every M of ``envelopes(policy)``). The sequential
     count process of ``NullGroup``: M from (drafts left, slots left), stop
-    when the slots are full.
+    when the slots are full. ``dropped`` (prompt drop) collects the dropped pools.
     """
     count: dict[str, int] = {}
     for g in groups:
@@ -239,4 +287,9 @@ def decide_pools(
         out.append(m)
         if m is not None:
             state[g].record(oc[m])
+    if dropped is not None:
+        for g, st in state.items():
+            st.next_m()  # a pool short after its last draft is dropped too
+            if st.dropped:
+                dropped.add(g)
     return out

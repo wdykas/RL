@@ -79,6 +79,7 @@ def _null_result(res: dict[str, Any], m: Optional[float]) -> dict[str, Any]:
         "draft_logq": res["draft_logq"][:tau],
         "null": "out" if y >= 0 else "bot",
         "null_m": m,
+        "log_wstar": res.get("null_log_wstar", 0.0),
     }
 
 
@@ -184,6 +185,19 @@ class Plan:
     # (drafted tokens, accepted tokens) of the draft verification turned into
     # this plan; None for plans not made from a draft (``TailTrace``).
     verified: Optional[tuple[int, int]] = field(default=None, compare=False)
+    # Needed a continuation after verification (a tail row: rejected inside
+    # its draft, or a whole-accepted draft cut before EOS / the cap).
+    tail: bool = field(default=False, compare=False)
+    # Drop-IS (opt-in): log of the row's importance weight max(1, W*/M).
+    log_weight: float = field(default=0.0, compare=False)
+
+
+@dataclass(frozen=True)
+class RowInfo:
+    """Verification facts of one rollout the trainer may use (``claim_row``)."""
+
+    tail: bool
+    log_weight: float
 
 
 @dataclass
@@ -329,6 +343,8 @@ class SpeculativeGeneration:
         sticky_delta: Optional[float] = None,
         null_bv: bool = False,
         null_bv_policy: Optional[dict[str, Any]] = None,
+        null_bv_drop_is: bool = False,
+        null_bv_spare_prompts: int = 0,
         sticky_chunk_tokens: int = 2048,
         draft_until_complete: bool = False,
         draft_weights: str = "current",
@@ -448,6 +464,11 @@ class SpeculativeGeneration:
         self.draft_until_complete = draft_until_complete
         self._cont_ids = itertools.count()
         self._anchor_claims = PrefixClaims()
+        self._row_claims = PrefixClaims()
+        # Tail rows per prompt key of the current step's plans (``tail_count``).
+        self._tail_counts: dict[tuple[int, ...], int] = {}
+        # ⊥-BV prompt drop: prompt keys whose pools were dropped this step.
+        self.null_dropped_keys: set[tuple[int, ...]] = set()
         # Route blocks by the step whose training replays them (freed by
         # ``release_routes`` once that step has trained).
         self._route_blocks: dict[int, list] = defaultdict(list)
@@ -481,6 +502,13 @@ class SpeculativeGeneration:
         self.null_bv_policy = dict(null_bv_policy or {})
         # Built once: its DP table is memoised across steps.
         self._null_policy = NullPolicy(**self.null_bv_policy) if null_bv else None
+        # Drop-IS (opt-in, unbiased gradient, not exact samples): outputs that
+        # need a tail decode are discarded like BOT; kept rows are weighted.
+        self.null_bv_drop_is = null_bv_drop_is
+        # Prompt drop: the step trains on the first (prompts - spares) prompts
+        # whose pools were not dropped (``null_selected_keys``, drafting order).
+        self.null_bv_spare_prompts = null_bv_spare_prompts
+        self.null_selected_keys: Optional[list[tuple[int, ...]]] = None
         self._null_slots: dict[int, dict[tuple[int, ...], int]] = {}
         if null_bv and (self.verify_source != "engine" or verify_mode != "block"):
             raise ValueError(
@@ -1267,6 +1295,8 @@ class SpeculativeGeneration:
                 "fused_verify_train runs through chunked verification only"
             )
         drafts, dropped = self._engine_q_filter(drafts)
+        self.null_dropped_keys, self._null_dropped = set(), set()
+        self.null_selected_keys = None
         null = self._null_prepare(drafts)
         if null is not None:
             drafts, names, slots, n_empty = null
@@ -1275,6 +1305,7 @@ class SpeculativeGeneration:
             groups = [names[_key(d[0])] for _, d in flat]
             by_row = self._verify_null(flat, rows, groups, slots)
             self._finish_verify_null(flat, by_row, groups, slots, dropped, n_empty)
+            self._count_tails()
             return
         flat, rows = self._flat_rows(drafts)
         self._record_siblings(flat)
@@ -1294,6 +1325,36 @@ class SpeculativeGeneration:
             )
             by_row = dict(x for rank_res in res for x in rank_res)
         self._finish_verify(drafts, flat, by_row, dropped)
+        self._count_tails()
+
+    def _select_prompts(self) -> None:
+        """Prompt drop: keep the first (prompts - spares) undropped prompts in
+        drafting order (dropped ones fill a shortfall and decode fresh); plans
+        of the other prompts are discarded so their tails are never decoded."""
+        order = list(self._null_all_slots)  # drafting (= batch) order
+        train = len(order) - self.null_bv_spare_prompts
+        dropped = self.null_dropped_keys
+        kept = [k for k in order if k not in dropped][:train]
+        kept += [k for k in order if k in dropped][: train - len(kept)]
+        self.null_selected_keys = kept
+        for key in [k for k in self.plans if k not in set(kept)]:
+            del self.plans[key]
+
+    def _count_tails(self) -> None:
+        """Mark plans that need a continuation and count them per prompt."""
+        self._tail_counts = {}
+        for key, queue in self.plans.items():
+            for plan in queue:
+                plan.tail = not plan.complete
+            self._tail_counts[key] = sum(plan.tail for plan in queue)
+
+    def tail_count(self, prompt: torch.Tensor) -> int:
+        """Rollouts of this prompt whose plan needed a continuation (tail rows)."""
+        return self._tail_counts.get(_key(prompt), 0)
+
+    def claim_row(self, prompt: torch.Tensor, token_ids: torch.Tensor) -> Optional[RowInfo]:
+        """Verification facts of a finished speculative rollout (None: never drafted)."""
+        return self._row_claims.claim(prompt, token_ids)
 
     def _verify_block(
         self, flat, rows, null_envelopes: Optional[tuple[float, ...]] = None
@@ -1444,9 +1505,19 @@ class SpeculativeGeneration:
             for j in sorted(range(len(batch)), key=lambda j: batch[j]):
                 i, r = batch[j], res[j]
                 m = state[groups[i]].next_m()
+                tail_drop = False
                 if m is not None:
-                    state[groups[i]].record(r["null_grid"][m][1] >= 0)
+                    tau, y, _ = r["null_grid"][m]
+                    output = y >= 0
+                    # Drop-IS: an output rejected inside its draft is dropped.
+                    tail_drop = self.null_bv_drop_is and output and tau < len(flat[i][1][2])
+                    state[groups[i]].record(output, tail_dropped=tail_drop)
                 out[i] = _null_result(r, m)
+                if tail_drop:
+                    out[i]["null"] = "tail_dropped"
+        for st in state.values():
+            st.next_m()  # a pool left short after its last draft is dropped too
+        self._null_dropped = {g for g, st in state.items() if st.dropped}
         skipped = [i for q in queue.values() for i in q]
         self._release_hidden(flat[i][1] for i in skipped)
         for i in skipped:
@@ -1470,13 +1541,20 @@ class SpeculativeGeneration:
         age_kept: dict[int, int] = {}
         decided_len: list[int] = []
         rejected: list[tuple[int, int]] = []  # (draft length, tau) of tail decodes
+        dropped_groups = getattr(self, "_null_dropped", set())
+        n_tail_drops = 0
+        weights: list[float] = []
         for r, (_, d) in enumerate(flat):
             res = by_row[r]
             state = res.get("null")
             if state is None:
                 raise RuntimeError(f"null_bv: row {r} was verified without its group")
-            if state == "unused":
-                n_unused += 1
+            if state == "unused" or groups[r] in dropped_groups:
+                # Unused, or its prompt was dropped (count-only): no plan.
+                n_unused += state == "unused"
+                continue
+            if state == "tail_dropped":
+                n_tail_drops += 1
                 continue
             m_sum += float(res["null_m"])
             g = len(d[2])
@@ -1488,6 +1566,10 @@ class SpeculativeGeneration:
             outs_by_group[groups[r]] += 1
             plan = self._plan(d, res)
             plan.verified = (g, res["accepted"])
+            if self.null_bv_drop_is:
+                # max(1, W*/M): the kept row's law is p P(no tail | y) / P(no tail).
+                plan.log_weight = max(0.0, float(res["log_wstar"]) - math.log(res["null_m"]))
+                weights.append(math.exp(plan.log_weight))
             full += plan.complete and res["accepted"] == g
             kept += res["accepted"]
             total += g
@@ -1504,7 +1586,11 @@ class SpeculativeGeneration:
             long_rej = [(g, t) for g, t in rejected if g >= cut]
         else:
             cut, long_rej = 0, []
-        fresh = sum(max(0, s - outs_by_group[grp]) for grp, s in slots.items())
+        fresh = sum(
+            max(0, s - outs_by_group[grp])
+            for grp, s in slots.items()
+            if grp not in dropped_groups
+        )
         # Prompts with slots but no verifiable draft at all decode fresh too.
         named = set(getattr(self, "_null_names", {}))
         fresh += sum(
@@ -1537,6 +1623,23 @@ class SpeculativeGeneration:
                 ),
             }
         )
+        if self._null_policy.prompt_drop:
+            inv = {name: key for key, name in self._null_names.items()}
+            self.null_dropped_keys = {inv[g] for g in dropped_groups}
+            self._select_prompts()
+            self.stats["spec/null_dropped_prompts"] = float(len(dropped_groups))
+            self.stats["spec/null_drop_rate"] = len(dropped_groups) / max(len(slots), 1)
+        if self.null_bv_drop_is:
+            sw, sw2 = sum(weights), sum(w * w for w in weights)
+            self.stats.update(
+                {
+                    "spec/drop_is_tail_drops": float(n_tail_drops),
+                    "spec/drop_is_ess": sw * sw / (len(weights) * sw2) if weights else 1.0,
+                    "spec/drop_is_weighted_frac": sum(w != 1.0 for w in weights)
+                    / max(len(weights), 1),
+                    "spec/drop_is_max_weight": max(weights, default=1.0),
+                }
+            )
         self._age_stats(age_tok, age_kept)
         if self.verify_source == "engine":
             self.stats["spec/engine_q_dropped"] = float(dropped)
@@ -2293,6 +2396,8 @@ class SpeculativeGeneration:
                     "incomplete (verify_sticky must complete every plan)"
                 )
             self._anchor_claims.add(key, gen, plan.anchors)
+        if plan.verified is not None:
+            self._row_claims.add(key, gen, RowInfo(plan.tail, plan.log_weight))
         if not plan.complete:
             ids = torch.cat([prompt, torch.tensor(plan.prefix, dtype=torch.long)])
             cont = BatchedDataDict(
