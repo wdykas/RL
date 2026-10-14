@@ -7,7 +7,7 @@
 #   L=4 bash .../nano_hybrid_fp16.sh                                        # L4 (MEME, no attention)
 #   STICKY=0 bash .../nano_hybrid_fp16.sh                                   # plain routing A/B
 #   TF32=ieee bash .../nano_hybrid_fp16.sh                                  # IEEE fp32 Mamba SSD dots
-#   SCHED=async bash .../nano_hybrid_fp16.sh                                # MCore async engine scheduling
+#   SCHED=legacy bash .../nano_hybrid_fp16.sh                               # MCore legacy engine scheduling (default async)
 #
 # Pass (exit 0): as sticky_moe.sh (mismatch 0, exact_token_frac 1, engine-q exact, no scorer
 # fallback; non-vacuity: weights change every step (expert-grad noise), steps >= 1 accept draft
@@ -25,7 +25,7 @@ if [ ! -f "$MODEL/model.safetensors" ]; then
 fi
 export EP=${EP:-2} TP=${TP:-1} PP=${PP:-1} MAXLEN=${MAXLEN:-1024} STEPS=${STEPS:-4}
 export RUNS=${RUNS:-runs_nano_hybrid}
-export SCHED=${SCHED:-legacy}
+export SCHED=${SCHED:-async}
 export TAG=${TAG:-nano-L$L-fp16-sticky${STICKY:-1}-ep$EP-$SCHED${TF32:+-$TF32}}
 RECIPE="++policy.megatron_cfg.optimizer.use_precision_aware_optimizer=false
  ++policy.megatron_cfg.fp32_residual_connection=true ++policy.megatron_cfg.forward_gemm_precision=fp16

@@ -1331,9 +1331,12 @@ the engine's conv input to the conv-state dtype, params_dtype by default, which 
 Hybrids use the same route record, transport and async-scheduling path as MoE models (no
 hybrid-specific scheduler requirement; per-rank route cost = that of section 14c with L = number
 of 'E' layers of the stage: Nano 23 x 6, Super 40 x 22 int16 per token). 4-GPU check
-`scripts/bi_tp/nano_hybrid_fp16.sh` (Nano L8, EP=2, SCHED=async|legacy): train == engine
-mismatch 0 on every step with sticky on and off, async and legacy (2026-10-14; status of the
-route check: thundersync_work/research/agent_hybrid_integration.md).
+`scripts/bi_tp/nano_hybrid_fp16.sh` (Nano L8 MEMEM*EM, EP=2, expert-grad noise, 4 steps,
+SCHED=async default | legacy), with the Mamba SSD parity port active: PASS with sticky on and off
+under async and legacy scheduling (2026-10-14): train == engine mismatch 0 and exact_token_frac 1
+on every step, engine q exact, weights change every step, every sticky step's anchors equal a
+fresh engine prefill ([route check]) and the sticky rule changes routes against plain top-k
+(thundersync_work/research/agent_hybrid_integration.md).
 
 **Anchor schedule (exogenous).** A at position t = the plain θ_{k−1} forward's top-k on the
 rollout's own prefix, for every position up to the rollout cap c = prompt + min(max_new_tokens,
