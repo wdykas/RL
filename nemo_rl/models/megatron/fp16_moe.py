@@ -40,7 +40,8 @@ Backward: dgrad / wgrad per expert on bf16 casts with fp32 accumulation.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+import contextlib
+from typing import Any, Iterator, Optional
 
 import torch
 
@@ -530,6 +531,26 @@ class GroupedFp16Linear(torch.autograd.Function):
 # invalidate_weight_cache() after every optimizer step (checkpoints load only at init).
 # Costs 2 bytes per local expert parameter.
 _WEIGHT_CACHE: dict[tuple[int, ...], tuple[tuple[int, ...], torch.Tensor]] = {}
+# Sticky rounding's anchor forward runs on transient theta_n weights (streamed
+# from host): those must not enter the cache (ids and pointers get reused).
+# ``fc2_input``: sticky rounding's hook on the expert fc2 input rows.
+_HOOKS: dict[str, Any] = {"cache": True, "fc2_input": None}
+
+
+def set_fc2_input_hook(hook: Optional[Any]) -> None:
+    """Install (None: remove) sticky rounding's expert fc2-input hook."""
+    _HOOKS["fc2_input"] = hook
+
+
+@contextlib.contextmanager
+def weight_cache_disabled() -> Iterator[None]:
+    """Expert GEMMs inside the block convert their weights without caching."""
+    prev = _HOOKS["cache"]
+    _HOOKS["cache"] = False
+    try:
+        yield
+    finally:
+        _HOOKS["cache"] = prev
 
 
 def invalidate_weight_cache() -> None:
@@ -538,6 +559,8 @@ def invalidate_weight_cache() -> None:
 
 
 def _stacked_fp16(weights: tuple[torch.Tensor, ...]) -> torch.Tensor:
+    if not _HOOKS["cache"]:
+        return torch.stack([w.detach().to(torch.float16) for w in weights])
     key = tuple(id(w) for w in weights)
     ptrs = tuple(w.data_ptr() for w in weights)
     hit = _WEIGHT_CACHE.get(key)
@@ -615,6 +638,8 @@ def training_experts_forward(
         probs = probs * (2.0**-s)
     h = grouped_linear(x, m_splits, _expert_weights(module.linear_fc1))
     a = swiglu_probs(h, probs)
+    if _HOOKS["fc2_input"] is not None:
+        a = _HOOKS["fc2_input"](module, a, m_splits)
     y = grouped_linear(a, m_splits, _expert_weights(module.linear_fc2))
     if s:
         y = y * (2.0**s)

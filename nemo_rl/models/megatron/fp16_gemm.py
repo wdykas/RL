@@ -71,7 +71,26 @@ _STATE: dict[str, Any] = {
     "head": FP32_HEAD,
     "orig": {},
     "down_scale": 0,
+    # Sticky rounding (sticky_rounding.py, opt-in): fp16 cast of a rounding
+    # site, site_cast(site, x) -> fp16, and the training MoE preprocess hook.
+    # None: plain round-to-nearest.
+    "site_cast": None,
+    "moe_preprocess": None,
 }
+
+
+def set_sticky_hooks(site_cast: Optional[Any], moe_preprocess: Optional[Any]) -> None:
+    """Install (or with None remove) sticky rounding's site hooks."""
+    _STATE["site_cast"] = site_cast
+    _STATE["moe_preprocess"] = moe_preprocess
+
+
+def _to_fp16(x: torch.Tensor, site: Any) -> torch.Tensor:
+    """fp16 cast of an activation at a rounding site (sticky rounding if installed)."""
+    cast = _STATE["site_cast"]
+    if cast is None or site is None:
+        return x.to(torch.float16)
+    return cast(site, x)
 
 # Target |amax| of an attention-output gradient dO after scaling into fp16: 2^0.
 # FlashAttention's dV = P^T dO sums dO over every query attending a key, so an
@@ -225,14 +244,17 @@ class Fp16Linear(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x, weight, comm, group, precision=FP16_GEMM, scale_log2=0):  # noqa: D102
+    def forward(ctx, x, weight, comm, group, precision=FP16_GEMM, scale_log2=0, site=None):  # noqa: D102
         # Down-projection prescale (``down_proj_prescale_log2``): x * 2^-s before
         # the fp16 cast and the fp32 output * 2^s; power-of-two scaling only
         # shifts exponents, so it widens fp16's range without changing rounding
         # (except for values that become fp16 subnormals).
         if scale_log2:
             x = x * (2.0**-scale_log2)
-        x16 = x.to(_OPERAND_DTYPE[precision])
+        if _OPERAND_DTYPE[precision] == torch.float16:
+            x16 = _to_fp16(x, site)
+        else:
+            x16 = x.to(_OPERAND_DTYPE[precision])
         if comm == COMM_SP_GATHER:
             x16 = _gather_rows(x16, group)
         out = _GEMMS[precision](x16, weight)
@@ -273,7 +295,7 @@ class Fp16Linear(torch.autograd.Function):
             if ctx.scale_log2:  # x16 holds x * 2^-s
                 wgrad = wgrad * (2.0**ctx.scale_log2)
             wgrad = wgrad.to(weight.dtype)
-        return dgrad, wgrad, None, None, None, None
+        return dgrad, wgrad, None, None, None, None, None
 
 
 def fp16_linear(
@@ -283,9 +305,13 @@ def fp16_linear(
     group: Any = None,
     precision: str = FP16_GEMM,
     scale_log2: int = 0,
+    site: Any = None,
 ) -> torch.Tensor:
-    """Autograd-aware ``Fp16Linear``; plain forward under no_grad / inference."""
-    return Fp16Linear.apply(x, weight, comm, group, precision, scale_log2)
+    """Autograd-aware ``Fp16Linear``; plain forward under no_grad / inference.
+
+    ``site``: key of the input's rounding site for sticky rounding (the module).
+    """
+    return Fp16Linear.apply(x, weight, comm, group, precision, scale_log2, site)
 
 
 class RMSNormFp32(torch.autograd.Function):
@@ -353,10 +379,10 @@ class ToFp16Scaled(torch.autograd.Function):
     """x -> fp16 (forward). Backward: grad / box.scale, in x's dtype."""
 
     @staticmethod
-    def forward(ctx, x, box):  # noqa: D102
+    def forward(ctx, x, box, site=None):  # noqa: D102
         ctx.x_dtype = x.dtype
         ctx.box = box
-        return x.to(torch.float16)
+        return _to_fp16(x, site)
 
     @staticmethod
     def backward(ctx, grad):  # noqa: D102
@@ -367,7 +393,7 @@ class ToFp16Scaled(torch.autograd.Function):
         g = grad.float()
         if ctx.box.scale is not None:
             g = g / ctx.box.scale
-        return g.to(ctx.x_dtype), None
+        return g.to(ctx.x_dtype), None, None
 
 
 class FromFp16Scaled(torch.autograd.Function):
@@ -448,7 +474,7 @@ def _te_linear_forward(module: Any, x: torch.Tensor, norm: bool):
     else:
         comm = COMM_NONE
     scale = _STATE["down_scale"] if getattr(module, "_fp16_down_proj", False) else 0
-    out = fp16_linear(x, weight, comm, group, scale_log2=scale)
+    out = fp16_linear(x, weight, comm, group, scale_log2=scale, site=module)
     bias = getattr(module, "bias", None)
     has_bias = (
         bool(getattr(module, "use_bias", False)) and bias is not None and bias.numel()
@@ -498,7 +524,7 @@ def _make_output_layer_forward(cls: type):
             comm = COMM_TP_COPY
         else:
             comm = COMM_NONE
-        out = fp16_linear(input_, w, comm, group, _STATE["head"])
+        out = fp16_linear(input_, w, comm, group, _STATE["head"], site=self)
         if self.bias is not None and not self.skip_bias_add:
             out = out + self.bias.float()
         gather = (
@@ -532,21 +558,24 @@ def _patch_te_rmsnorm() -> None:
     cls.forward = forward
 
 
-def _cast_qkv(outputs: Any, box: Optional[_GradScaleBox]) -> Any:
-    def cast(t: Any) -> Any:
+def _cast_qkv(outputs: Any, box: Optional[_GradScaleBox], site: Any = None) -> Any:
+    """q / k / v (and any other float output) to fp16; ``site``: the attention module."""
+
+    def cast(t: Any, i: int) -> Any:
         if (
             not torch.is_tensor(t)
             or not t.is_floating_point()
             or t.dtype == torch.float16
         ):
             return t
+        key = None if site is None else (site, i)
         if box is not None:
-            return ToFp16Scaled.apply(t, box)
-        return t.to(torch.float16)
+            return ToFp16Scaled.apply(t, box, key)
+        return _to_fp16(t, key)
 
     if isinstance(outputs, tuple):
-        return tuple(cast(t) for t in outputs)
-    return cast(outputs)
+        return tuple(cast(t, i) for i, t in enumerate(outputs))
+    return cast(outputs, 0)
 
 
 def _patch_attention() -> None:
@@ -566,7 +595,7 @@ def _patch_attention() -> None:
         if torch.is_grad_enabled():
             box = _GradScaleBox()
             self._fp16_gemm_box = box
-        return _cast_qkv(outputs, box)
+        return _cast_qkv(outputs, box, self)
 
     def forward_post_core_attn(self, core_attn_out):
         box = self.__dict__.pop("_fp16_gemm_box", None)
@@ -707,6 +736,11 @@ def _patch_moe() -> None:
             and hidden_states.dtype == torch.float32
         ):
             hidden_states = hidden_states.to(torch.float16).view(torch.bfloat16)
+        elif _STATE["moe_preprocess"] is not None and not InferenceMode.is_active():
+            # Sticky rounding: the dispatched copy's fc1-input rounding.
+            hidden_states = _STATE["moe_preprocess"](
+                self, hidden_states, probs, routing_map
+            )
         return orig_preprocess(self, hidden_states, probs, routing_map)
 
     MoELayer.preprocess = preprocess
