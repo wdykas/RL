@@ -1839,8 +1839,9 @@ class SpeculativeGeneration:
         # on with theirs, every other stream stops.
         kept = {id(plan.stream) for _, plan in pending if plan.stream is not None}
         self._stop_streams([x for x in streams if id(x) not in kept])
-        if pending:
-            await self._continue_sticky(pending)
+        # Also with nothing pending (every draft whole-accepted and complete):
+        # the step then reports zero continuation rounds instead of no stats.
+        await self._continue_sticky(pending)
 
     def _stop_streams(self, streams) -> None:
         """Abort engine draft streams and close their logs (rank 0 + every engine)."""

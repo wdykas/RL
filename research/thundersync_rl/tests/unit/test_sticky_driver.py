@@ -399,6 +399,21 @@ def test_incomplete_sticky_plan_never_reaches_plain_decoding():
         asyncio.run(s._one(0, datum))
 
 
+def test_sticky_step_without_continuations_reports_zero_rounds():
+    # Every draft whole-accepted and complete: the step still reports its
+    # continuation stats (zero), which the exactness scripts require.
+    s = make_spec(
+        {},
+        base_handlers={"install_draft_hidden_log": lambda: True, "install_draft_route_log": lambda: [1]},
+        verify_source="engine",
+        sticky_delta=0.03,
+    )
+    s.current_step = 1
+    asyncio.run(s._continue_sticky([]))
+    assert s.stats["spec/sticky_rounds"] == 0.0
+    assert s.stats["spec/sticky_cont_draft_tokens"] == 0.0
+
+
 def test_sticky_requires_engine_route_log():
     with pytest.raises(RuntimeError, match="cannot log"):
         make_spec(
