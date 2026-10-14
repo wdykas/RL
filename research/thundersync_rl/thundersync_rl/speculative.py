@@ -327,6 +327,7 @@ class SpeculativeGeneration:
         null_bv_policy: Optional[dict[str, Any]] = None,
         sticky_chunk_tokens: int = 2048,
         draft_weights: str = "current",
+        max_seq_len: Optional[int] = None,
     ):
         self.base = base
         self.learner_policy = learner_policy
@@ -334,6 +335,9 @@ class SpeculativeGeneration:
         self.head_k = head_k
         self.draft_budget = draft_budget
         self.max_new_tokens = max_new_tokens
+        # Total-length cap of a rollout (prompt + generated), as the engine
+        # enforces it (``max_total_sequence_length``); None: none.
+        self.max_seq_len = max_seq_len
         self.pad_token_id = pad_token_id
         self.draft_variants = draft_variants
         self.variant_eps = variant_eps
@@ -1518,6 +1522,18 @@ class SpeculativeGeneration:
         if self.verify_source == "engine":
             self.stats["spec/engine_q_dropped"] = float(dropped)
 
+    def _cap(self, prompt_len: int) -> int:
+        """Most tokens a rollout of this prompt can generate (the length cap).
+
+        ``max_new_tokens``, or fewer where prompt + generated would pass the
+        engine's total-length cap: the engine stops there, so a prefix at
+        this cap is a finished rollout (a continuation of it would generate
+        nothing). It depends on the prompt length only, never on content.
+        """
+        if self.max_seq_len is None:
+            return self.max_new_tokens
+        return max(0, min(self.max_new_tokens, self.max_seq_len - prompt_len))
+
     def _stopped(self, d) -> bool:
         """Whether draft ``d``, if fully accepted, is a finished rollout."""
         # The draft terminated on its own (EOS/stop) rather than at the budget
@@ -1526,7 +1542,7 @@ class SpeculativeGeneration:
         # Cohort/streamed drafts carry the full budget: finished = EOS or the cap.
         stopped = finished and (len(d) > 4 or len(d[2]) < self.draft_budget)
         # A draft at the length cap is a finished rollout: nothing follows it.
-        return stopped or len(d[2]) >= self.max_new_tokens
+        return stopped or len(d[2]) >= self._cap(d[0].numel())
 
     def _plan(self, d, r) -> Plan:
         """Turn one draft and its verification result into a rollout plan."""
@@ -1576,7 +1592,7 @@ class SpeculativeGeneration:
                 ),
             )
         prefix = draft[:n_acc] + [r["next"]]
-        done = r["next"] == self.eod or len(prefix) >= self.max_new_tokens
+        done = r["next"] == self.eod or len(prefix) >= self._cap(prompt.numel())
         dead = list(draft[n_acc + 1 :]) if getattr(self, "tail_lookup", False) else []
         return Plan(
             seed, prefix, lps, complete=done, dead_suffix=dead, anchors=anchors
@@ -1931,7 +1947,7 @@ class SpeculativeGeneration:
                 )
                 for key, plan in items
             ]
-            budgets = [self.max_new_tokens - len(plan.prefix) for _, plan in items]
+            budgets = [self._cap(len(key)) - len(plan.prefix) for key, plan in items]
             hkeys = self._hidden_keys([f"c{next(self._cont_ids)}" for _ in items])
             idx = ray.get(
                 rank0.add_drafts.remote(
@@ -1948,7 +1964,7 @@ class SpeculativeGeneration:
                         plan=plan,
                         idx=i,
                         hkey=hk,
-                        length=p.numel() + self.max_new_tokens - len(plan.prefix),
+                        length=len(key) + self._cap(len(key)),
                         taken=0,
                         routes=None,
                     )
@@ -2101,8 +2117,8 @@ class SpeculativeGeneration:
                     plan.prefix_logprobs += lps[:g]
                     plan.anchors = d[8].truncate(p.numel() + g)
                     s["taken"] += g
-                    plan.complete = (
-                        bool(done) or len(plan.prefix) >= self.max_new_tokens
+                    plan.complete = bool(done) or len(plan.prefix) >= self._cap(
+                        len(s["key"])
                     )
                     if plan.complete:
                         done_streams.append(s)
@@ -2111,8 +2127,8 @@ class SpeculativeGeneration:
                     plan.prefix += list(toks[:n_acc]) + [y]
                     plan.prefix_logprobs += lps[: n_acc + 1]
                     plan.anchors = d[8].truncate(p.numel() + n_acc)
-                    plan.complete = (
-                        y == self.eod or len(plan.prefix) >= self.max_new_tokens
+                    plan.complete = y == self.eod or len(plan.prefix) >= self._cap(
+                        len(s["key"])
                     )
                     done_streams.append(s)
                     if not plan.complete:

@@ -1340,6 +1340,7 @@ def thundersync_grpo_train(
             null_bv_policy=null_bv_policy(master_config) if ts_cfg.null_bv else None,
             sticky_chunk_tokens=ts_cfg.sticky_continuation_chunk_tokens,
             draft_weights=ts_cfg.draft_weights,
+            max_seq_len=master_config.policy["max_total_sequence_length"],
         )
     sticky = spec is not None and spec.sticky_delta is not None
     G = master_config.grpo.num_generations_per_prompt

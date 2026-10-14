@@ -1003,3 +1003,26 @@ def test_rows_are_placed_on_model_data_parallel_ranks():
     assert data_parallel_size(pool(1, 4, 1, 1)) == 4
     assert data_parallel_size(SimpleNamespace()) == 1
 
+
+def test_prefix_at_the_total_length_cap_is_a_finished_rollout():
+    """The engine stops a rollout at prompt + generated = max_seq_len (before
+    max_new_tokens for long prompts). A residual token that reaches that cap
+    ends the rollout: a continuation of it would generate nothing (the sticky
+    run retried such an empty continuation until it gave up)."""
+    from thundersync_rl.speculative import SpeculativeGeneration
+
+    spec = object.__new__(SpeculativeGeneration)
+    spec.base = SimpleNamespace()
+    spec.max_new_tokens, spec.max_seq_len, spec.draft_budget = 8, 10, 8
+    spec.sticky_delta, spec.eod = None, -1
+    prompt = torch.arange(4)  # cap: 10 - 4 = 6 generated tokens
+    assert spec._cap(4) == 6 and spec._cap(1) == 8
+    d = (prompt, 0, [1, 2, 3, 4, 5, 6], False, "k", [], None, None)
+    r = {"accepted": 5, "next": 9, "logprobs": [-0.1] * 6}
+    plan = spec._plan(d, r)
+    assert plan.prefix == [1, 2, 3, 4, 5, 9] and plan.complete
+    # Whole acceptance of a draft that the engine stopped at the cap.
+    plan = spec._plan(d, {"accepted": 6, "next": None, "logprobs": [-0.1] * 6})
+    assert plan.complete
+    spec.max_seq_len = None
+    assert not spec._plan(d, r).complete
