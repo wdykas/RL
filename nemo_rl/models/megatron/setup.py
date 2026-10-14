@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import copy
 import hashlib
 import json
@@ -1993,6 +1994,35 @@ def _create_checkpoint_config(
     return CheckpointConfig(**kwargs)
 
 
+@contextlib.contextmanager
+def _checkpoint_load_debug_logging():
+    """NRL_CKPT_LOAD_DEBUG=1: per-rank timestamped timings of every dist-checkpoint
+    load phase (Megatron's ``debug_time`` DEBUG lines: metadata exchange, this
+    rank's storage reads, the tensor/object exchange), to find a rank that stalls
+    the fully-parallel load. Off by default."""
+    if os.environ.get("NRL_CKPT_LOAD_DEBUG") != "1":
+        yield
+        return
+    import logging
+
+    log = logging.getLogger("megatron.core.dist_checkpointing")
+    handler = logging.StreamHandler()
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+    handler.setFormatter(
+        logging.Formatter(f"[ckpt load debug] %(asctime)s rank {rank} %(message)s")
+    )
+    old_level, old_propagate = log.level, log.propagate
+    log.addHandler(handler)
+    log.setLevel(logging.DEBUG)
+    log.propagate = False
+    try:
+        yield
+    finally:
+        log.removeHandler(handler)
+        log.setLevel(old_level)
+        log.propagate = old_propagate
+
+
 def _validate_training_config(config: PolicyConfig, model_cfg: Any) -> None:
     """Validate training configuration."""
     assert "train_iters" in config["megatron_cfg"], (
@@ -2638,15 +2668,22 @@ def setup_model_and_optimizer(
     if should_load_checkpoint:
         if pre_load_checkpoint_hook is not None:
             pre_load_checkpoint_hook(state, model)
-        load_checkpoint(
-            state,
-            model,
-            optimizer,
-            scheduler,
-            checkpointing_context=checkpointing_context,
-            skip_load_to_model_and_opt=HAVE_FSDP2 and megatron_cfg.dist.use_torch_fsdp2,
+        load_start = time.time()
+        with _checkpoint_load_debug_logging():
+            load_checkpoint(
+                state,
+                model,
+                optimizer,
+                scheduler,
+                checkpointing_context=checkpointing_context,
+                skip_load_to_model_and_opt=HAVE_FSDP2
+                and megatron_cfg.dist.use_torch_fsdp2,
+            )
+        print(
+            f"Checkpoint loaded (rank {torch.distributed.get_rank()}: "
+            f"{time.time() - load_start:.1f} s)",
+            flush=True,
         )
-        print("Checkpoint loaded")
 
         # See _force_sync_optimizer_fp32_from_model: required when
         # optimizer_cpu_offload=True so the first optimizer step does Adam on the
