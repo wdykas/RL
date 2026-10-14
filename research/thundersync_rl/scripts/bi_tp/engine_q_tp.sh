@@ -101,6 +101,10 @@ timeout ${RUN_TIMEOUT:-2400} python research/thundersync_rl/run_thundersync_grpo
   > "$OUT/run.log" 2>&1
 rc=$?
 echo "[engine_q] run exit=$rc"
+if [ "${PERF:-0}" = 1 ]; then
+  echo "[engine_q] SKIPPED (PERF mode, checks off)"
+  exit $rc
+fi
 grep -a "\[engine q check\]\|falling back\|stash_head\|ep_dummy_forwards" "$OUT/run.log" | tail -n 20
 python - "$OUT/history.json" "$OUT/run.log" "$STEPS" "$rc" <<'EOF'
 import json, re, sys

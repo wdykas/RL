@@ -36,9 +36,11 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import contextlib
 import itertools
 import os
 import time
+import zlib
 import warnings
 from types import SimpleNamespace
 from typing import Any, Callable, Literal, Optional
@@ -65,6 +67,7 @@ from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.logger import Logger
 from thundersync_rl.fused_train import FusedRef
+from thundersync_rl.lanes import CohortLanes, Lane, LaneStepOps, refit_lane
 from thundersync_rl.null_bv import drafts_per_prompt
 from thundersync_rl.routes import RouteRefs
 from thundersync_rl.speculative import SpeculativeGeneration, cohort_draft
@@ -257,8 +260,22 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # many decoded tokens while the engine keeps decoding them; a rejection
     # restarts the continuation from the new prefix, so it wastes at most the
     # tokens decoded past the verified piece (SpeculativeGeneration
-    # ._continue_sticky). Fixed count: the cut is exogenous.
-    sticky_continuation_chunk_tokens: int = 2048
+    # ._continue_sticky). Fixed count: the cut is exogenous. Below the rollout
+    # cap, so a rejection is found before the stream decodes its whole
+    # remainder (2048 > a 1024 cap re-decoded the remainder: 1.2-1.9x plain
+    # decode per kept token, DESIGN.md section 14k).
+    sticky_continuation_chunk_tokens: int = 128
+    # Sticky, one engine: serve and train every rollout whose plan is complete
+    # while the continuation rounds of the other rows still run (both are
+    # learner-side at theta_k; DESIGN.md section 14k). False: training starts
+    # after the last tail (the refit and the rollouts follow verify_sticky).
+    stream_training_over_tails: bool = True
+    # With stream_training_over_tails: train groups with no pending tail first,
+    # then the groups whose rows still decode tails, one group per dispatch in a
+    # canonical order fixed after the drafts' verification ((tail?, group
+    # index)), so the accumulated gradient is bitwise independent of arrival
+    # times (StreamPlanner.set_order). False: dispatch as rows arrive.
+    canonical_group_order: bool = True
     # Weights the engine drafts the next step's rollouts with (draft_weights.py,
     # DESIGN.md section 14f). "current": theta_k. "momentum": theta_hat_{k+1} =
     # the AdamW step of the optimizer state (theta_k, m_k, v_k) with gradient 0,
@@ -277,6 +294,17 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # Megatron's distributed optimizer (Adam; with or without the
     # precision-aware optimizer).
     draft_weights: Literal["current", "momentum"] = "current"
+    # Cohort lanes (lanes.py, DESIGN.md section 14j): 2 splits the engine fleet
+    # into two engines of policy.generation.colocated.resources GPUs each
+    # (run_thundersync_grpo.py builds the second), each holding one weight
+    # version. At step k the lane of cohort k keeps its drafting weights and
+    # completes cohort k's continuation streams, while the other lane refits
+    # the drafter of cohort k+1 and drafts it from the top of the step; roles
+    # alternate. 1: one engine (single version). Requires sticky routing
+    # (the lanes carry the continuation anchors; without it the remainder is
+    # plain theta_k decoding, not built on lanes yet) and the packed
+    # collective refit (policy.generation.refit_transport null).
+    cohort_lanes: int = 1
 
 
 def resolve_min_pipeline_microbatches(ts_cfg: ThunderSyncConfig, pp: int) -> int:
@@ -382,6 +410,33 @@ def validate_config(master_config: ThunderSyncMasterConfig) -> None:
     validate_sticky_rounding(master_config)
     validate_null_bv(master_config)
     validate_draft_weights(master_config)
+    validate_cohort_lanes(master_config)
+
+
+def validate_cohort_lanes(master_config: ThunderSyncMasterConfig) -> None:
+    """Settings under which two engine lanes keep every cohort on its version."""
+    ts_cfg = master_config.thundersync
+    if ts_cfg.cohort_lanes == 1:
+        return
+    gen = master_config.policy["generation"]
+    problems = []
+    if ts_cfg.cohort_lanes != 2:
+        problems.append(f"cohort_lanes must be 1 or 2 (got {ts_cfg.cohort_lanes})")
+    if sticky_delta(ts_cfg) is None:
+        problems.append(
+            "thundersync.sticky_routing must be on (lanes complete each cohort's "
+            "continuations on its drafting weights; the non-sticky remainder path "
+            "is not built on lanes yet)"
+        )
+    if gen.get("backend") != "megatron" or gen.get("refit_transport") is not None:
+        problems.append(
+            "policy.generation.backend must be megatron with refit_transport null "
+            "(one packed-collective refit communicator per lane)"
+        )
+    if ts_cfg.draft_after_verify or ts_cfg.fused_verify_train:
+        problems.append("draft_after_verify and fused_verify_train must be off")
+    if problems:
+        raise ValueError("thundersync.cohort_lanes: " + "; ".join(problems) + ".")
 
 
 def sticky_delta(ts_cfg: ThunderSyncConfig) -> Optional[float]:
@@ -1001,8 +1056,29 @@ async def _run_one_step(
     ] = None,
     draft_swap: Optional[Callable[[], None]] = None,
     draft_start_frac: Optional[float] = None,
+    drafts_after_pre_rollout: bool = False,
+    group_order: Optional[list[int]] = None,
+    tail_groups: Optional[list[int]] = None,
+    ordered_learner: Optional[Any] = None,
 ) -> dict[str, Any]:
+    """One step: rollouts, streaming training and the next step's drafts.
+
+    ``drafts_after_pre_rollout``: the drafter also waits for ``pre_rollout``
+    (sticky streaming over the tails: the continuation rounds and the refit
+    that puts the drafter's weights on the engine). ``group_order``: dispatch
+    the step's groups (prompt indices) one at a time in this order
+    (``StreamPlanner.set_order``). ``tail_groups``: groups with pending tails,
+    logged with each group's completion and dispatch times.
+    ``ordered_learner`` (the spec while streaming over the tails): training
+    dispatches are numbered learner calls (``learner_seq``) that every learner
+    rank runs in the same order, interleaved with the tails' verification
+    forwards (asynchronous Ray actors do not keep submission order when
+    several calls wait; ``ordered_call`` does).
+    """
     G = master_config.grpo.num_generations_per_prompt
+    # Streaming over the tails: training dispatches are ordered learner calls
+    # (SpeculativeGeneration.learner_seq), interleaved with verification.
+    ordered = ordered_learner
     repeated = batch.repeat_interleave(G)
     n = repeated.size
     mbs = master_config.policy["train_micro_batch_size"]
@@ -1037,6 +1113,8 @@ async def _run_one_step(
     )
     for p in range(n // G):
         planner.register_group((step, p), G)
+    if group_order is not None:
+        planner.set_order([(step, p) for p in group_order])
 
     learner.begin(
         loss_fn,
@@ -1061,6 +1139,8 @@ async def _run_one_step(
     # (t_start, t_end, n_trajectories, n_tokens, n_bucket_chunks) per dispatch.
     arrivals: list[tuple[float, int, int, float]] = []
     dispatches: list[tuple[float, float, int, int, int]] = []
+    # (group, dispatch start, dispatch end) for every group a dispatch trains.
+    group_dispatch: list[tuple[int, float, float]] = []
     last_rollout_t = None
     all_trajectories: list[Trajectory] = []
     # Fused verification + training: trajectories handed a retained forward,
@@ -1111,7 +1191,15 @@ async def _run_one_step(
                     for chunks in d.per_rank
                 ]
                 t0 = time.perf_counter()
-                rank_results = await asyncio.gather(*learner.submit(per_rank, d.closes))
+                seq = None if ordered is None else ordered.learner_seq()
+                refs = learner.submit(per_rank, d.closes, seq=seq)
+                if seq is not None:
+                    ordered.learner_track(refs)
+                if rollouts_done and not planner.has_work():
+                    last_sent.set()
+                rank_results = await asyncio.gather(*refs)
+                if seq is not None:
+                    ordered._learner_inflight.difference_update(refs)
                 t1 = time.perf_counter()
                 pipeline_calls += max(
                     (r.get("num_calls", 0) for r in rank_results), default=0
@@ -1121,6 +1209,8 @@ async def _run_one_step(
                         fused_counts[k] += r[k]
                 learner_busy += t1 - t0
                 chunks = [c for cs in d.per_rank for c in cs if not c.padding]
+                for gid in sorted({t.group[1] for c in chunks for t in c.trajectories}):
+                    group_dispatch.append((gid, t0 - t_start, t1 - t_start))
                 dispatches.append(
                     (
                         t0 - t_start,
@@ -1132,8 +1222,12 @@ async def _run_one_step(
                 )
                 num_dispatches += 1
             if rollouts_done and not planner.has_work():
+                last_sent.set()
                 return
 
+    # The step's last training dispatch is on the learner (sticky streaming:
+    # the next cohort's drafts are cut meanwhile, ``cut_drafts``).
+    last_sent = asyncio.Event()
     verify_task = (
         asyncio.create_task(pre_rollout()) if pre_rollout is not None else None
     )
@@ -1150,6 +1244,16 @@ async def _run_one_step(
             await asyncio.to_thread(draft_swap)
             return await draft_after()
 
+    if drafts_after_pre_rollout and verify_task is not None and drafter is not None:
+        draft_when_ready = drafter
+
+        async def drafter():
+            nonlocal draft_started
+            await asyncio.shield(verify_task)
+            draft_started = time.perf_counter()  # the drafter's weights are in
+            return await draft_when_ready()
+
+    draft_started = None
     learner_task = asyncio.create_task(learner_loop())
     draft_task = None
     n_done = 0
@@ -1161,10 +1265,13 @@ async def _run_one_step(
         # runs uncontended on the GPUs it shares with the drafting engine.
         def _start_drafts(_task):
             nonlocal draft_task
+            nonlocal draft_started
             if draft_task is None:
+                draft_started = time.perf_counter()
                 draft_task = asyncio.create_task(drafter())
 
         verify_task.add_done_callback(_start_drafts)
+    cut_task = None
     try:
         for fut in asyncio.as_completed([rollout(i) for i in range(n)]):
             i, state, metrics = await fut
@@ -1175,12 +1282,19 @@ async def _run_one_step(
                 and not after_verify
                 and n_done >= draft_start_frac * n
             ):
+                draft_started = time.perf_counter()
                 draft_task = asyncio.create_task(drafter())
             if learner_task.done():
                 # Surface learner failures now instead of after the last rollout.
                 learner_task.result()
             last_rollout_t = time.perf_counter()
             reward = float(state["total_reward"])
+            if os.environ.get("THUNDERSYNC_DEBUG_PARITY_REWARD"):
+                # Debug: a reward that is a fixed function of the rollout's tokens
+                # (crc32 parity), so truncated models with zero task reward still
+                # train on nonzero advantages (determinism checks need them).
+                toks = torch.cat([m["token_ids"] for m in state["message_log"]])
+                reward = float(zlib.crc32(toks.to(torch.int64).numpy().tobytes()) & 1)
             rewards[i] = reward
             sample_metrics[i] = metrics
             loss_mult = float(repeated["loss_multiplier"][i])
@@ -1217,13 +1331,31 @@ async def _run_one_step(
             wake.set()
         rollouts_done = True
         wake.set()
+        if ordered is not None and draft_task is not None:
+            # Sticky streams go on decoding after the cut (their tokens become
+            # continuation pieces), so the cut time only moves tokens between
+            # the next verify0 and its continuation rounds: cut while the last
+            # training dispatch runs instead of after it.
+            async def cut_drafts():
+                await last_sent.wait()
+                t = time.perf_counter()
+                d = await draft_task
+                if callable(d):
+                    d = await asyncio.to_thread(d)
+                return d, time.perf_counter() - t
+
+            cut_task = asyncio.create_task(cut_drafts())
         await learner_task
         if verify_task is not None:
             await verify_task
         t_wait = time.perf_counter()
-        drafts = await draft_task if draft_task is not None else None
-        if callable(drafts):  # streaming drafts: cut them off at this deadline
-            drafts = drafts()
+        if cut_task is not None:
+            drafts, draft_cut_s = await cut_task
+        else:
+            drafts = await draft_task if draft_task is not None else None
+            if callable(drafts):  # streaming drafts: cut them off at this deadline
+                drafts = drafts()
+            draft_cut_s = None
         draft_wait = time.perf_counter() - t_wait
         t_score = time.perf_counter()
         if before_finish is not None and drafts is not None:
@@ -1232,6 +1364,8 @@ async def _run_one_step(
     except BaseException:
         if draft_task is not None:
             draft_task.cancel()
+        if cut_task is not None:
+            cut_task.cancel()
         learner_task.cancel()
         learner.abort()
         raise
@@ -1275,8 +1409,16 @@ async def _run_one_step(
         "timeline/arrivals": arrivals,
         "timeline/dispatches": dispatches,
         "timeline/step_end": t_end - t_start,
+        "timeline/group_dispatch": group_dispatch,
+        "timeline/tail_groups": list(tail_groups or []),
         "time/draft_wait": draft_wait,
+        # When this step's drafter started, from the start of the rollouts.
+        "time/draft_start": (
+            draft_started - t_start if draft_started is not None else float("nan")
+        ),
         "time/draft_score": draft_score,
+        # Overlapped cut: its own duration (draft_wait is what it left exposed).
+        "time/draft_cut": draft_cut_s if draft_cut_s is not None else draft_wait,
         "_drafts": drafts,
         **mismatch,
     }
@@ -1291,6 +1433,70 @@ async def _run_one_step(
     return out
 
 
+def next_draft_prompts(
+    next_batch: BatchedDataDict, ts_cfg: ThunderSyncConfig, G: int
+) -> tuple[list[torch.Tensor], Optional[dict[tuple[int, ...], int]]]:
+    """Prompts of the next step's drafts and, with ⊥-BV, its slots per prompt."""
+    null_slots = None
+    if ts_cfg.null_bv:
+        # K G drafts per group, in a fixed (drafting) order; the next step
+        # requests G rollouts per batch entry.
+        n_drafts = drafts_per_prompt(ts_cfg.null_bv_drafts_per_output, G)
+        nxt = next_batch.repeat_interleave(n_drafts)
+        counts = collections.Counter()
+        for i in range(next_batch.size):
+            p = torch.cat([m["token_ids"] for m in next_batch["message_log"][i]])
+            counts[tuple(int(t) for t in p.tolist())] += G
+        null_slots = dict(counts)
+    else:
+        nxt = next_batch.repeat_interleave(G)
+    prompts = [
+        torch.cat([m["token_ids"] for m in nxt["message_log"][i]])
+        for i in range(nxt.size)
+    ]
+    return prompts, null_slots
+
+
+def make_speculative_generation(
+    generation: GenerationInterface,
+    policy: Policy,
+    tokenizer,
+    master_config: ThunderSyncMasterConfig,
+) -> SpeculativeGeneration:
+    """The speculative wrapper of one engine (one per lane with cohort lanes)."""
+    ts_cfg = master_config.thundersync
+    return SpeculativeGeneration(
+        generation,
+        policy,
+        vocab_limit=len(tokenizer),
+        head_k=ts_cfg.spec_head_k,
+        draft_budget=ts_cfg.draft_budget,
+        max_new_tokens=master_config.policy["generation"]["max_new_tokens"],
+        pad_token_id=tokenizer.pad_token_id,
+        draft_variants=ts_cfg.draft_variants,
+        variant_eps=ts_cfg.variant_eps,
+        verify_mode=ts_cfg.verify_mode,
+        verify_precision=ts_cfg.verify_precision,
+        verify_lazy=ts_cfg.verify_lazy,
+        verify_batch_tokens=ts_cfg.verify_batch_tokens,
+        tail_lookup=ts_cfg.tail_lookup,
+        tail_lookup_max_refs=ts_cfg.tail_lookup_max_refs,
+        longest_first=ts_cfg.verify_longest_first,
+        verify_on=ts_cfg.verify_on,
+        pool_weights=ts_cfg.verify_pool_weights,
+        fused_verify_train=ts_cfg.fused_verify_train,
+        fused_max_retained_tokens=ts_cfg.fused_max_retained_tokens,
+        verify_source=ts_cfg.verify_source,
+        hidden_transport=ts_cfg.hidden_transport,
+        sticky_delta=sticky_delta(ts_cfg),
+        null_bv=ts_cfg.null_bv,
+        null_bv_policy=null_bv_policy(master_config) if ts_cfg.null_bv else None,
+        sticky_chunk_tokens=ts_cfg.sticky_continuation_chunk_tokens,
+        draft_weights=ts_cfg.draft_weights,
+        max_seq_len=master_config.policy["max_total_sequence_length"],
+    )
+
+
 def thundersync_grpo_train(
     policy: Policy,
     policy_generation: GenerationInterface,
@@ -1301,13 +1507,26 @@ def thundersync_grpo_train(
     master_config: ThunderSyncMasterConfig,
     logger: Optional[Logger] = None,
     on_step: Optional[Callable[[list[dict[str, Any]]], None]] = None,
+    lanes: Optional[list[Lane]] = None,
 ) -> list[dict[str, Any]]:
     """``on_step(history)`` runs after every completed step (e.g. to persist the
-    per-step history, so a run cut short still has every finished step's metrics)."""
+    per-step history, so a run cut short still has every finished step's metrics).
+    ``lanes``: the engine lanes (``lanes.build_engine_lanes``) when
+    ``thundersync.cohort_lanes`` is 2; ``policy_generation`` is then lane 0."""
     validate_config(master_config)
     ts_cfg = master_config.thundersync
     adv_fn = make_group_advantage_fn(master_config)
     learner = StreamingLearner(policy)
+    if (ts_cfg.cohort_lanes > 1) != (lanes is not None):
+        raise ValueError(
+            f"thundersync.cohort_lanes={ts_cfg.cohort_lanes} but "
+            f"{'no' if lanes is None else len(lanes)} engine lanes were built"
+        )
+    if lanes is not None:
+        return _train_on_lanes(
+            policy, lanes, learner, adv_fn, dataloader, tokenizer, loss_fn,
+            task_to_env, master_config, logger, on_step,
+        )
     max_steps = master_config.grpo.max_num_steps
     history = []
     stale = False  # setup() already performed the initial refit
@@ -1315,35 +1534,8 @@ def thundersync_grpo_train(
     spec = None
     if ts_cfg.speculate:
         policy_generation.prepare_for_generation()
-        spec = SpeculativeGeneration(
-            policy_generation,
-            policy,
-            vocab_limit=len(tokenizer),
-            head_k=ts_cfg.spec_head_k,
-            draft_budget=ts_cfg.draft_budget,
-            max_new_tokens=master_config.policy["generation"]["max_new_tokens"],
-            pad_token_id=tokenizer.pad_token_id,
-            draft_variants=ts_cfg.draft_variants,
-            variant_eps=ts_cfg.variant_eps,
-            verify_mode=ts_cfg.verify_mode,
-            verify_precision=ts_cfg.verify_precision,
-            verify_lazy=ts_cfg.verify_lazy,
-            verify_batch_tokens=ts_cfg.verify_batch_tokens,
-            tail_lookup=ts_cfg.tail_lookup,
-            tail_lookup_max_refs=ts_cfg.tail_lookup_max_refs,
-            longest_first=ts_cfg.verify_longest_first,
-            verify_on=ts_cfg.verify_on,
-            pool_weights=ts_cfg.verify_pool_weights,
-            fused_verify_train=ts_cfg.fused_verify_train,
-            fused_max_retained_tokens=ts_cfg.fused_max_retained_tokens,
-            verify_source=ts_cfg.verify_source,
-            hidden_transport=ts_cfg.hidden_transport,
-            sticky_delta=sticky_delta(ts_cfg),
-            null_bv=ts_cfg.null_bv,
-            null_bv_policy=null_bv_policy(master_config) if ts_cfg.null_bv else None,
-            sticky_chunk_tokens=ts_cfg.sticky_continuation_chunk_tokens,
-            draft_weights=ts_cfg.draft_weights,
-            max_seq_len=master_config.policy["max_total_sequence_length"],
+        spec = make_speculative_generation(
+            policy_generation, policy, tokenizer, master_config
         )
     sticky = spec is not None and spec.sticky_delta is not None
     G = master_config.grpo.num_generations_per_prompt
@@ -1385,6 +1577,7 @@ def thundersync_grpo_train(
         t_verify = 0.0
         if spec is not None:
             spec.current_step = step
+        tails = None  # pending plans whose continuation rounds overlap training
         if sticky and drafts is not None:
             # Sticky routing: verify and complete every drafted rollout while
             # the engine still holds the drafting weights (theta_{step-1}, or
@@ -1392,8 +1585,13 @@ def thundersync_grpo_train(
             # supplies the anchors of continuation positions; refit after.
             t1 = time.perf_counter()
             policy_generation.prepare_for_generation()
-            asyncio.run(spec.verify_sticky(drafts))
-            policy_generation.finish_generation()
+            if ts_cfg.stream_training_over_tails:
+                # Only the drafts' verification here; the continuation rounds
+                # run inside the step, under the training of complete groups.
+                tails = asyncio.run(spec.begin_sticky(drafts))
+            else:
+                asyncio.run(spec.verify_sticky(drafts))
+                policy_generation.finish_generation()
             t_verify = time.perf_counter() - t1
             drafts = None
         staged = (
@@ -1402,25 +1600,82 @@ def thundersync_grpo_train(
             and next_batch is not None
             and step + 1 < max_steps
         )
-        # Sticky: verify_sticky completed every drafted rollout. When every
-        # rollout of this step is served by a complete plan the engine decodes
-        # nothing at theta_k, so it takes theta_hat_{step+1} directly and
-        # drafts from the start of the step (no theta_k refit, no host stage).
-        draft_now = staged and sticky and spec.plans_cover(_prompts(batch))
-        if staged:
-            # theta_hat_{step+1} needs only the state after the last update:
-            # stage it on the engine now, while learner and engine are idle.
-            spec.stage_draft_weights(
-                lambda: refit_policy_generation(policy, policy_generation, False),
-                stage_on_engine=not draft_now,
-            )
-        t_r = time.perf_counter()
-        if (stale or staged) and not draft_now:
-            refit_policy_generation(policy, policy_generation, False)
+        # Sticky: every drafted rollout is (or, streaming, will be) complete.
+        # When every rollout of this step is served by a complete plan the
+        # engine decodes nothing at theta_k, so it takes theta_hat_{step+1}
+        # directly and drafts from the start of the step (no theta_k refit,
+        # no host stage).
+        draft_now = (
+            staged
+            and sticky
+            and spec.plans_cover(_prompts(batch), pending_ok=tails is not None)
+        )
+        refit_s = []
+
+        def refit_for_step(staged=staged, draft_now=draft_now):
+            if staged:
+                # theta_hat_{step+1} needs only the state after the last
+                # update; the learner and the engine are idle (streaming: the
+                # actor queue orders it between training micro-batches).
+                spec.stage_draft_weights(
+                    lambda: refit_policy_generation(policy, policy_generation, False),
+                    stage_on_engine=not draft_now,
+                )
+            t_r = time.perf_counter()
+            if (stale or staged) and not draft_now:
+                refit_policy_generation(policy, policy_generation, False)
+            else:
+                policy_generation.prepare_for_generation()
+            refit_s.append(time.perf_counter() - t_r)
+
+        tails_s = []
+        group_order = tail_groups = None
+        if tails is None:
+            refit_for_step()
         else:
-            policy_generation.prepare_for_generation()
-        t_refit = time.perf_counter() - t_r
-        pre_rollout = None
+            # Groups whose rows still decode tails (a pending plan of their
+            # prompt), fixed by the drafts' verification, not by timing.
+            pending_keys = {key for key, _ in tails}
+            row_keys = [tuple(x.tolist()) for x in _prompts(batch)]
+            tail_groups = [
+                p for p in range(len(row_keys) // G) if row_keys[p * G] in pending_keys
+            ]
+            if ts_cfg.canonical_group_order:
+                # Ready now, then after their tails, then rows never drafted
+                # (decoded at theta_k once the tails are done and it is refit).
+                n_plans = collections.Counter()
+                for key, queue in spec.plans.items():
+                    n_plans[key] += len(queue)
+                need = collections.Counter(row_keys)
+                fresh = {
+                    p for p in range(len(row_keys) // G)
+                    if n_plans[row_keys[p * G]] < need[row_keys[p * G]]
+                }
+                late = set(tail_groups) | fresh
+                group_order = [p for p in range(len(row_keys) // G) if p not in late]
+                group_order += [p for p in tail_groups if p not in fresh]
+                group_order += sorted(fresh)
+
+            async def tails_then_refit(pending=tails):
+                # Continuation rounds on the drafting weights, then theta_k:
+                # rollouts never drafted and the next cohort's drafts wait for it.
+                t = time.perf_counter()
+                try:
+                    await spec.complete_tails(pending)
+                    policy_generation.finish_generation()
+                    tails_s.append(time.perf_counter() - t)
+                    # The momentum stage and the refit call the learner: no
+                    # training dispatch may be in flight meanwhile.
+                    # The momentum stage and the refit are unordered learner
+                    # calls: every ordered call sent so far finishes first, and
+                    # none is sent while they run (they block the event loop).
+                    await spec.learner_drain()
+                    refit_for_step()
+                except BaseException as exc:
+                    spec.weights_ready(error=exc)
+                    raise
+                spec.weights_ready()
+        pre_rollout = None if tails is None else tails_then_refit
         chunked = (
             spec is not None
             and ts_cfg.verify_mode == "block"
@@ -1455,23 +1710,7 @@ def thundersync_grpo_train(
             new = {t: _prompts(ahead[t - step - 1]) for t in targets}
             drafter = lambda new=new, step=step: spec.draft_cohorts(step, new)  # noqa: E731
         elif spec is not None and next_batch is not None and step + 1 < max_steps:
-            null_slots = None
-            if ts_cfg.null_bv:
-                # K G drafts per group, in a fixed (drafting) order; the next
-                # step requests G rollouts per batch entry.
-                n_drafts = drafts_per_prompt(ts_cfg.null_bv_drafts_per_output, G)
-                nxt = next_batch.repeat_interleave(n_drafts)
-                null_slots = collections.Counter()
-                for i in range(next_batch.size):
-                    p = torch.cat([m["token_ids"] for m in next_batch["message_log"][i]])
-                    null_slots[tuple(int(t) for t in p.tolist())] += G
-                null_slots = dict(null_slots)
-            else:
-                nxt = next_batch.repeat_interleave(G)
-            next_prompts = [
-                torch.cat([m["token_ids"] for m in nxt["message_log"][i]])
-                for i in range(nxt.size)
-            ]
+            next_prompts, null_slots = next_draft_prompts(next_batch, ts_cfg, G)
             drafter = (  # noqa: E731
                 (
                     lambda prompts=next_prompts, slots=null_slots: spec.draft_streaming(
@@ -1483,6 +1722,7 @@ def thundersync_grpo_train(
             )
         policy.prepare_for_training()
         metrics = asyncio.run(
+            _run_streaming_tails(spec, tails is not None)(
             _run_one_step(
                 step=step,
                 batch=batch,
@@ -1505,8 +1745,28 @@ def thundersync_grpo_train(
                     spec.load_staged_draft_weights if staged and not draft_now else None
                 ),
                 draft_start_frac=0.0 if draft_now else None,
-            )
+                drafts_after_pre_rollout=tails is not None,
+                group_order=group_order,
+                tail_groups=tail_groups,
+                ordered_learner=spec if tails is not None else None,
+            ))
         )
+        t_refit = refit_s[0]
+        if tails is not None:
+            # Every learner rank ran the same ordered calls in the same order.
+            digests = ray.get(
+                policy.worker_group.run_all_workers_single_data("ordered_digest")
+            )
+            if len(set(map(tuple, digests))) != 1:
+                raise RuntimeError(f"learner ranks ran different call sequences: {digests}")
+            metrics["learner/ordered_calls"] = float(digests[0][0])
+            busy = ray.get(policy.worker_group.run_all_workers_single_data("ordered_busy"))
+            for method in sorted({m for b in busy for m in b}):
+                # Max over ranks: learner seconds in training vs piece verification.
+                metrics[f"learner/busy_{method}_s"] = max(b.get(method, 0.0) for b in busy)
+        if tails_s:
+            # Continuation rounds, overlapped with this step's training.
+            metrics["time/tails"] = tails_s[0]
         drafts = metrics.pop("_drafts")
         if sticky:
             # This step's training has replayed every anchor targeted at it.
@@ -1519,23 +1779,191 @@ def thundersync_grpo_train(
         stale = True
         metrics["time/refit"] = t_refit
         metrics["time/iteration"] = time.perf_counter() - t0
+        if os.environ.get("THUNDERSYNC_ENGINE_PROF"):
+            # Debug: engine step timing of this step (rank 0 logged; all printed).
+            per_rank = ray.get(
+                policy_generation._policy.worker_group.run_all_workers_single_data(
+                    "engine_step_stats"
+                )
+            )
+            for r, st in enumerate(per_rank):
+                print(f"[engine prof] step={step} rank={r} {st}", flush=True)
+            metrics.update(per_rank[0] or {})
         history.append(metrics)
-        scalars = {k: v for k, v in metrics.items() if isinstance(v, (int, float))}
-        print(
-            f"[thundersync step {step}] "
-            + " ".join(
-                f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}"
-                for k, v in scalars.items()
-            ),
-            flush=True,
-        )
-        print(
-            f"[thundersync step {step} done] {time.strftime('%Y-%m-%dT%H:%M:%S')}",
-            flush=True,
-        )
-        if logger is not None:
-            logger.log_metrics(scalars, step + 1, prefix="thundersync")
+        _log_step(step, metrics, logger)
         if on_step is not None:
             on_step(history)
+        step += 1
+    return history
+
+
+def _run_streaming_tails(spec, on: bool):
+    """Run a step coroutine with ``spec``'s streaming-over-tails state (if ``on``)."""
+
+    async def run(coro):
+        if not on:
+            return await coro
+        spec.begin_streaming_tails()
+        try:
+            return await coro
+        finally:
+            spec.end_streaming_tails()
+
+    return run
+
+
+def _log_step(step: int, metrics: dict[str, Any], logger: Optional[Logger]) -> None:
+    scalars = {k: v for k, v in metrics.items() if isinstance(v, (int, float))}
+    print(
+        f"[thundersync step {step}] "
+        + " ".join(
+            f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}"
+            for k, v in scalars.items()
+        ),
+        flush=True,
+    )
+    print(
+        f"[thundersync step {step} done] {time.strftime('%Y-%m-%dT%H:%M:%S')}",
+        flush=True,
+    )
+    if logger is not None:
+        logger.log_metrics(scalars, step + 1, prefix="thundersync")
+
+
+def _train_on_lanes(
+    policy: Policy,
+    lanes: list[Lane],
+    learner: StreamingLearner,
+    adv_fn,
+    dataloader,
+    tokenizer,
+    loss_fn: LossFunction,
+    task_to_env: dict[str, EnvironmentInterface],
+    master_config: ThunderSyncMasterConfig,
+    logger: Optional[Logger],
+    on_step: Optional[Callable[[list[dict[str, Any]]], None]] = None,
+) -> list[dict[str, Any]]:
+    """Training loop on cohort lanes (lanes.py, DESIGN.md section 14j).
+
+    Same algorithm as ``thundersync_grpo_train`` with sticky routing and
+    lookahead 1; only where and when the engine work runs differs: cohort
+    step+1 is drafted on the other lane from the top of step ``step``
+    (``CohortLanes.step``), not after cohort ``step``'s continuations.
+    """
+    ts_cfg = master_config.thundersync
+    G = master_config.grpo.num_generations_per_prompt
+    max_steps = master_config.grpo.max_num_steps
+    momentum = ts_cfg.draft_weights != "current"
+    for lane in lanes:
+        lane.generation.prepare_for_generation()
+        lane.spec = make_speculative_generation(
+            lane.generation, policy, tokenizer, master_config
+        )
+    sched = CohortLanes(lanes)
+    check_weights = bool(os.environ.get("THUNDERSYNC_MISMATCH_CHECK"))
+
+    def lane_fingerprint(lane):
+        # Debug: the weights the lane's engine ranks hold, read from the engine.
+        return sum(
+            ray.get(
+                lane.generation._policy.worker_group.run_all_workers_single_data(
+                    "engine_weight_checksum"
+                )
+            )
+        )
+
+    batches = iter(dataloader)
+    batch, next_batch = next(batches, None), next(batches, None)
+    drafts = None
+    history = []
+    step = 0
+    while batch is not None and step < max_steps:
+        t0 = time.perf_counter()
+        x, y = sched.cohort_lane(step), sched.drafting_lane(step)
+        for lane in lanes:
+            lane.spec.current_step = step
+        times = collections.Counter()
+
+        def timed(key, fn):
+            t = time.perf_counter()
+            try:
+                return fn()
+            finally:
+                times[key] += time.perf_counter() - t
+
+        def put_drafter(lane, target, refit):
+            if momentum:
+                # theta_hat_{step+1} from (theta_step, m, v): learner load,
+                # refit of this lane alone, learner restore; no host stage.
+                lane.spec.stage_draft_weights(refit, stage_on_engine=False)
+            else:
+                refit()
+
+        def start_drafts(lane, target, nb=next_batch):
+            prompts, slots = next_draft_prompts(nb, ts_cfg, G)
+            return asyncio.run(lane.spec.draft_streaming(prompts, null_slots=slots))
+
+        def complete_cohort(lane, cohort_drafts):
+            lane.generation.prepare_for_generation()
+            timed("time/verify", lambda: asyncio.run(lane.spec.verify_sticky(cohort_drafts)))
+
+        def run_step(lane, collector, b=batch, y=y):
+            async def drafter():
+                return collector
+
+            policy.prepare_for_training()
+            return asyncio.run(
+                _run_one_step(
+                    step=step,
+                    batch=b,
+                    learner=learner,
+                    policy_generation=lane.spec,
+                    tokenizer=tokenizer,
+                    task_to_env=task_to_env,
+                    loss_fn=loss_fn,
+                    master_config=master_config,
+                    ts_cfg=ts_cfg,
+                    adv_fn=adv_fn,
+                    drafter=drafter if collector is not None else None,
+                    before_finish=y.spec.score_prev,
+                    claim_anchors=lane.spec.claim_anchors,
+                    draft_start_frac=0.0,
+                )
+            )
+
+        def needs_current(lane, b=batch):
+            # Rollouts without a complete plan decode at theta_step on the lane.
+            prompts = [
+                torch.cat([m["token_ids"] for m in r])
+                for r in b.repeat_interleave(G)["message_log"]
+            ]
+            return not lane.spec.plans_cover(prompts)
+
+        ops = LaneStepOps(
+            drafter_version=lambda t: ("theta_hat", t) if momentum else ("theta", t - 1),
+            put_drafter=put_drafter,
+            refit_lane=lambda lane: timed("time/refit", lambda: refit_lane(policy, lane)),
+            start_drafts=start_drafts,
+            complete_cohort=complete_cohort,
+            needs_current=needs_current,
+            run_step=run_step,
+            fingerprint=lane_fingerprint if check_weights else None,
+        )
+        draft_next = next_batch is not None and step + 1 < max_steps
+        metrics, drafts = sched.step(step, drafts, draft_next, ops)
+        # This step's training has replayed every anchor targeted at it.
+        x.spec.release_routes(step)
+        metrics["time/verify"] = times["time/verify"]
+        metrics["time/refit"] = times["time/refit"]
+        for lane in (x, y):
+            metrics.update(lane.spec.stats)
+            lane.spec.stats = {}
+        metrics["lanes/refits"] = float(sum(lane.refits for lane in lanes))
+        metrics["time/iteration"] = time.perf_counter() - t0
+        history.append(metrics)
+        _log_step(step, metrics, logger)
+        if on_step is not None:
+            on_step(history)
+        batch, next_batch = next_batch, next(batches, None)
         step += 1
     return history

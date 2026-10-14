@@ -179,9 +179,14 @@ if HAVE_TRITON:
         p_ptr,  # [rows] fp32
         out_ptr,  # [rows, F] fp32 or fp16
         F,
+        valid_ptr,  # scalar int32/int64: rows from here on are skipped (HAS_VALID)
         BLOCK: tl.constexpr,
+        HAS_VALID: tl.constexpr,
     ):
         row = tl.program_id(0).to(tl.int64)
+        if HAS_VALID:
+            if row >= tl.load(valid_ptr).to(tl.int64):
+                return
         cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
         mask = cols < F
         gate = tl.load(h_ptr + row * 2 * F + cols, mask=mask, other=0.0)
@@ -191,6 +196,29 @@ if HAVE_TRITON:
         tl.store(
             out_ptr + row * F + cols, value.to(out_ptr.dtype.element_ty), mask=mask
         )
+
+    @triton.jit
+    def _relu2_probs_kernel(
+        h_ptr,  # [rows, F] fp32
+        p_ptr,  # [rows] fp32
+        out_ptr,  # [rows, F] fp32 or fp16
+        F,
+        valid_ptr,  # scalar int32/int64: rows from here on are skipped (HAS_VALID)
+        BLOCK: tl.constexpr,
+        HAS_VALID: tl.constexpr,
+    ):
+        # _relu2_eager's ops in its order: relu, (r * r), * p in fp32, then one cast.
+        row = tl.program_id(0).to(tl.int64)
+        if HAS_VALID:
+            if row >= tl.load(valid_ptr).to(tl.int64):
+                return
+        cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        mask = cols < F
+        h = tl.load(h_ptr + row * F + cols, mask=mask, other=0.0)
+        p = tl.load(p_ptr + row)
+        r = tl.maximum(h, 0.0)
+        value = (r * r) * p
+        tl.store(out_ptr + row * F + cols, value.to(out_ptr.dtype.element_ty), mask=mask)
 
     @triton.jit
     def _unpermute_fp64_kernel(
@@ -401,8 +429,14 @@ def _swiglu_eager(h: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
     return (gate / (1.0 + torch.exp(-gate))) * up * probs.float().unsqueeze(-1)
 
 
-def swiglu_probs_fwd(h: torch.Tensor, probs: torch.Tensor, out_dtype=torch.float32):
-    """SiLU(gate) * up * prob in fp32 (one Triton kernel on CUDA), cast to out_dtype."""
+def swiglu_probs_fwd(
+    h: torch.Tensor, probs: torch.Tensor, out_dtype=torch.float32, valid_rows=None
+):
+    """SiLU(gate) * up * prob in fp32 (one Triton kernel on CUDA), cast to out_dtype.
+
+    ``valid_rows`` (engine, device scalar): rows from it on are not computed
+    (left uninitialized); see ``relu2_probs_fwd``.
+    """
     if not h.is_cuda:
         return _swiglu_eager(h, probs).to(out_dtype)
     rows, two_f = h.shape
@@ -410,7 +444,13 @@ def swiglu_probs_fwd(h: torch.Tensor, probs: torch.Tensor, out_dtype=torch.float
     out = torch.empty((rows, f), dtype=out_dtype, device=h.device)
     block = min(triton.next_power_of_2(f), 1024)
     _swiglu_probs_kernel[(rows, triton.cdiv(f, block))](
-        h.contiguous(), probs.float().contiguous(), out, f, BLOCK=block
+        h.contiguous(),
+        probs.float().contiguous(),
+        out,
+        f,
+        out if valid_rows is None else valid_rows,
+        BLOCK=block,
+        HAS_VALID=valid_rows is not None,
     )
     return out
 
@@ -444,14 +484,36 @@ def _relu2_eager(h: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
     return (r * r) * probs.float().unsqueeze(-1)
 
 
-def relu2_probs_fwd(h: torch.Tensor, probs: torch.Tensor, out_dtype=torch.float32):
+def relu2_probs_fwd(
+    h: torch.Tensor, probs: torch.Tensor, out_dtype=torch.float32, valid_rows=None
+):
     """ReLU(h)^2 * prob in fp32 (non-gated squared-ReLU experts, Nemotron-H), cast to out_dtype.
 
-    Eager elementwise ops: a row's value depends only on that row (batch
-    invariant) and the ops are CUDA-graph capturable. Training and the engine
-    call this same function.
+    A row's value depends only on that row (batch invariant). Training runs the
+    eager ops. ``valid_rows`` (the engine, a device scalar: the permuted rows'
+    end, ``offsets[-1]``): one Triton kernel with the eager ops' order and
+    rounding (bitwise the same values) that skips rows from ``valid_rows`` on.
+    Under expert parallelism the engine's CUDA-graph buffers hold the worst-case
+    row count (every EP rank's tokens x top-k), so the eager ops spent ~2.2 ms
+    per MoE layer and decode step on padding at Nemotron-3-Nano shapes; those
+    rows are never read (the grouped GEMM stops at ``offsets[-1]``, unpermute
+    reads mapped rows only), so they are left uninitialized.
     """
-    return _relu2_eager(h, probs).to(out_dtype)
+    if valid_rows is None or not h.is_cuda:
+        return _relu2_eager(h, probs).to(out_dtype)
+    rows, f = h.shape
+    out = torch.empty((rows, f), dtype=out_dtype, device=h.device)
+    block = min(triton.next_power_of_2(f), 1024)
+    _relu2_probs_kernel[(rows, triton.cdiv(f, block))](
+        h.contiguous(),
+        probs.reshape(-1).float().contiguous(),
+        out,
+        f,
+        valid_rows,
+        BLOCK=block,
+        HAS_VALID=True,
+    )
+    return out
 
 
 class Relu2Probs(torch.autograd.Function):
@@ -491,14 +553,18 @@ def expert_activation(config: Any) -> str:
     )
 
 
-def _act_probs(module: Any, h, probs, out_dtype=None):
-    """The expert activation times the routing probability (fp32 math)."""
+def _act_probs(module: Any, h, probs, out_dtype=None, valid_rows=None):
+    """The expert activation times the routing probability (fp32 math).
+
+    ``valid_rows``: the engine's permuted-row end (device scalar); rows past it
+    are padding and are not computed.
+    """
     cfg = getattr(module, "config", None)
     kind = "swiglu" if cfg is None else expert_activation(cfg)
     if out_dtype is None:  # training: autograd
         return swiglu_probs(h, probs) if kind == "swiglu" else relu2_probs(h, probs)
     fwd = swiglu_probs_fwd if kind == "swiglu" else relu2_probs_fwd
-    return fwd(h, probs, out_dtype)
+    return fwd(h, probs, out_dtype, valid_rows=valid_rows)
 
 
 def unpermute_fp64(
@@ -778,7 +844,8 @@ def inference_experts_forward(
     if s:  # same prescale as training_experts_forward
         pp = pp * (2.0**-s)
     h = grouped_gemm_fp16w(xp, module._fc1_weight, offs, cfg)
-    a = _act_probs(module, h, pp, torch.float16)
+    # Rows past offs[-1] are CUDA-graph padding: never read by the fc2 GEMM.
+    a = _act_probs(module, h, pp, torch.float16, valid_rows=offs[-1:])
     y = grouped_gemm_fp16w(a, module._fc2_weight, offs, cfg)
     if s:
         y = y * (2.0**s)

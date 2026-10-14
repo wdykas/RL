@@ -24,9 +24,11 @@ group closes. At the barrier, the folded batch gradient is written back into
 the grad buffers and the regular ``finish_train_step`` runs unchanged.
 """
 
+import asyncio
 import functools
 import os
 import time
+import zlib
 from contextlib import nullcontext
 from typing import Any, Optional
 
@@ -43,6 +45,7 @@ from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.megatron_policy_worker import (
     MegatronPolicyWorkerImpl,
 )
+from thundersync_rl import engine_prof
 from thundersync_rl.draft_weights import (
     DraftSwap,
     EngineStage,
@@ -227,6 +230,24 @@ def snapshot_drafts(
     return out
 
 
+def _call_log(worker: Any, name: str) -> None:
+    """Debug (``THUNDERSYNC_CALL_LOG``): which learner call this rank starts, in order.
+
+    Every learner rank must start the same calls in the same order (their
+    collectives pair up); comparing the ranks' sequences finds a desync.
+    """
+    if os.environ.get("THUNDERSYNC_CALL_LOG"):
+        print(
+            f"[call log] rank={getattr(worker, 'rank', '?')} {name} t={time.time():.6f}",
+            flush=True,
+        )
+
+
+if engine_prof.enabled():
+    # Debug: engine step timing in every process that runs a dynamic engine.
+    engine_prof.install()
+
+
 @ray.remote(
     runtime_env=get_runtime_env_for_policy_worker("megatron_policy_worker")
 )  # pragma: no cover
@@ -358,6 +379,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         ``restore_training_weights``. The fp16 expert-weight cache keeps
         theta_k's casts, which are valid again after the bitwise restore.
         """
+        _call_log(self, "load_draft_weights")
         if getattr(self, "_draft_swap", None) is not None:
             raise RuntimeError("draft weights already loaded")
         self._draft_swap: Optional[DraftSwap] = load_draft(self.optimizer, kind)
@@ -366,6 +388,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
 
     def restore_training_weights(self) -> dict[str, float]:
         """Put the training weights theta_k back, bitwise (after ``load_draft_weights``)."""
+        _call_log(self, "restore_training_weights")
         swap, self._draft_swap = self._draft_swap, None
         if swap is None:
             raise RuntimeError("no draft weights loaded")
@@ -392,6 +415,84 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         return stage.load(
             self.model, checksum=bool(os.environ.get("THUNDERSYNC_MISMATCH_CHECK"))
         )
+
+    @torch.no_grad()
+    def engine_weight_checksum(self) -> float:
+        """Engine rank (debug): checksum of the weights this rank holds now.
+
+        Cohort lanes read it when a cohort is pinned and when it completes
+        (``LaneStepOps.fingerprint``); one pass over the rank's parameters.
+        """
+        return EngineStage._checksum(EngineStage._params(self.model))
+
+    async def ordered_call(self, seq: int, method: str, **kwargs) -> Any:
+        """Run learner method ``method`` as this rank's ``seq``-th ordered call.
+
+        The learner workers are asynchronous Ray actors (they have async
+        methods), which may start queued calls in a different order on each
+        rank. The driver numbers every learner call it sends while several are
+        in flight (training dispatches, verification forwards) and each rank
+        runs them strictly in that order: call ``seq`` waits until calls
+        0..seq-1 have run here. The method itself is synchronous and runs on
+        this actor's event loop, so calls never overlap. Every rank therefore
+        runs the same sequence, and their collectives pair up, by construction.
+        """
+        cv = getattr(self, "_ordered_cv", None)
+        if cv is None:
+            cv = self._ordered_cv = asyncio.Condition()
+            self._ordered_next = 0
+        async with cv:
+            while self._ordered_next != seq:
+                if seq < self._ordered_next:
+                    raise RuntimeError(f"ordered learner call {seq} arrived after {self._ordered_next}")
+                await cv.wait()
+        t0 = time.perf_counter()
+        try:
+            return getattr(self, method)(**kwargs)
+        finally:
+            # Learner seconds per method (``ordered_digest``): verification vs training.
+            busy = self.__dict__.setdefault("_ordered_busy", {})
+            busy[method] = busy.get(method, 0.0) + time.perf_counter() - t0
+            self._ordered_next += 1
+            # What this rank ran, in order (``ordered_digest``).
+            self._ordered_crc = zlib.crc32(
+                f"{seq}:{method};".encode(), getattr(self, "_ordered_crc", 0)
+            )
+            async with cv:
+                cv.notify_all()
+
+    def ordered_digest(self) -> tuple[int, int]:
+        """(ordered calls run, crc32 of their (number, method) sequence) on this rank."""
+        return getattr(self, "_ordered_next", 0), getattr(self, "_ordered_crc", 0)
+
+    def ordered_busy(self) -> dict[str, float]:
+        """Seconds this rank spent in each ordered method since the last call (reset)."""
+        busy, self._ordered_busy = self.__dict__.get("_ordered_busy", {}), {}
+        return busy
+
+    def engine_step_stats(self) -> dict[str, float]:
+        """Engine rank (debug, ``THUNDERSYNC_ENGINE_PROF``): step timing since the last call."""
+        from thundersync_rl import engine_prof
+
+        return engine_prof.summary()
+
+    def keep_refit_group(self, lane: int) -> None:
+        """Learner rank: file the live refit communicator under engine lane ``lane``.
+
+        Cohort lanes (lanes.py) give every engine lane its own refit
+        communicator (learner ranks + that lane's ranks). ``init_collective``
+        releases the previous ``model_update_group``, so the live one is moved
+        out first; the next lane's ``init_collective`` then builds a new one.
+        """
+        groups = self.__dict__.setdefault("_lane_refit_groups", {})
+        if self.model_update_group is None:
+            raise RuntimeError("keep_refit_group: no refit communicator to keep")
+        groups[lane] = self.model_update_group
+        self.model_update_group = None
+
+    def select_refit_group(self, lane: int) -> None:
+        """Learner rank: the next refit broadcast goes to engine lane ``lane`` only."""
+        self.model_update_group = self._lane_refit_groups[lane]
 
     def _log_mem(self, where: str) -> None:
         if os.environ.get("THUNDERSYNC_MEM_LOG"):
@@ -422,6 +523,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         pipeline parallelism a dispatch pays one fill/drain bubble per
         destination instead of one per chunk.
         """
+        _call_log(self, "stream_accumulate")
         t0 = time.perf_counter()
         fused_trained = fused_tokens = fused_fallback = 0
         state = self._train_step_state
@@ -554,6 +656,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
 
     def stream_finish_step(self) -> dict[str, Any]:
         """Barrier: write back, normalize, DP-reduce, clip, step."""
+        _call_log(self, "stream_finish_step")
         peak = self._train_step_state["grad_stream"].peak_open_buffers
         # Retained verification graphs never outlive the weights they were
         # taken at; any left (their rollout trained the regular way) go now.
@@ -2434,6 +2537,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         layers, fraction that kept the anchor, fraction whose experts differ
         from plain top-k).
         """
+        _call_log(self, "verify_drafts_block_engine")
         from megatron.core import parallel_state as ps
         from thundersync_rl.engine_q import (
             GatheredLogprobRows,

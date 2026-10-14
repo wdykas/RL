@@ -30,6 +30,7 @@ unchanged: a request for a prompt that has a verified plan returns immediately
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import itertools
 import math
 import os
@@ -1056,15 +1057,17 @@ class SpeculativeGeneration:
             ]
         )
 
-    def plans_cover(self, prompts: list[torch.Tensor]) -> bool:
+    def plans_cover(self, prompts: list[torch.Tensor], pending_ok: bool = False) -> bool:
         """Whether every rollout of ``prompts`` will be served by a complete plan.
 
         Then no rollout of this step decodes on the engine (``_one`` returns the
         plan), so the engine need not hold theta_k for the step.
+        ``pending_ok``: plans the continuation rounds are still completing
+        count (``begin_sticky`` before ``complete_tails``).
         """
         need = Counter(_key(p) for p in prompts)
         return all(
-            all(plan.complete for plan in self.plans.get(key, [])[:n])
+            all(pending_ok or plan.complete for plan in self.plans.get(key, [])[:n])
             and len(self.plans.get(key, [])) >= n
             for key, n in need.items()
         )
@@ -1287,52 +1290,83 @@ class SpeculativeGeneration:
         ranks by tokens (``lpt_owners``). ``null_envelopes`` (⊥-BV): every row
         is verified at each envelope; the driver decides (``_decide_null``).
         """
-        if True:
-            # Contiguous row slices per verifier pool, verified concurrently.
-            k = len(self.verifiers)
-            cuts = [round(j * len(flat) / k) for j in range(k + 1)]
-            futs = []
-            for g, a, b in zip(self.verifiers, cuts, cuts[1:]):
-                method, extra = self._verify_method(flat[a:b])
-                if method == "verify_drafts_block_engine":
-                    # Rows placed on the pool's data-parallel ranks by tokens.
-                    lengths = [r.numel() for r in rows[a:b]]
-                    ranks = data_parallel_size(g)
-                    owners = lpt_owners(lengths, ranks)
-                    extra = {**extra, "row_ranks": owners}
-                    self._count_balance(lengths, owners, ranks)
-                if null_envelopes is not None:
-                    extra = {**extra, "null_envelopes": list(null_envelopes)}
-                futs.append(
-                    (
-                        a,
-                        g.run_all_workers_single_data(
-                            method,
-                            **extra,
-                            rows=rows[a:b],
-                            prompt_lens=[d[0].numel() for _, d in flat[a:b]],
-                            segments=[d[5] for _, d in flat[a:b]],
-                            vocab_limit=self.vocab_limit,
-                            # A fresh counter value per call: verification
-                            # randomness is never reused across calls or steps
-                            # (``seed * 7 + a`` collided between consecutive
-                            # calls, e.g. (s, a=7) and (s+1, a=0), so a later
-                            # decision could reuse a stream that shaped the
-                            # update producing the policy it verifies against).
-                            seed=next(self._verify_seeds),
-                            keys=[d[4] for _, d in flat[a:b]],
-                            precision=self.verify_precision,
-                            batch_tokens=self.verify_batch_tokens,
-                            lazy=self.verify_lazy,
-                        ),
-                    )
+        futs = self._submit_verify_block(flat, rows, null_envelopes)
+        return self._verify_block_results(flat, [(a, ray.get(refs)) for a, refs in futs])
+
+    async def _verify_block_async(self, flat, rows) -> dict[int, dict[str, Any]]:
+        """``_verify_block`` without blocking the driver's event loop.
+
+        While streaming over the tails it is an ordered learner call
+        (``ordered_call``): learner actors are asynchronous Ray actors, which
+        may start queued calls in different orders on different ranks; the
+        numbered calls run in the same order everywhere.
+        """
+        futs = self._submit_verify_block(flat, rows, ordered=True)
+        done = []
+        for a, refs in futs:
+            # A worker thread waits on the results; the event loop keeps going.
+            done.append((a, await asyncio.to_thread(ray.get, refs)))
+        if getattr(self, "learner_ordered", False):
+            self._learner_inflight.difference_update(r for _, refs in futs for r in refs)
+        return self._verify_block_results(flat, done)
+
+    def _submit_verify_block(self, flat, rows, null_envelopes=None, ordered=False) -> list:
+        """Send ``flat``'s block verification to the verifier pools: [(first row, refs)].
+
+        ``ordered``: as numbered learner calls while streaming over the tails.
+        """
+        # Contiguous row slices per verifier pool, verified concurrently.
+        k = len(self.verifiers)
+        cuts = [round(j * len(flat) / k) for j in range(k + 1)]
+        futs = []
+        for g, a, b in zip(self.verifiers, cuts, cuts[1:]):
+            method, extra = self._verify_method(flat[a:b])
+            if method == "verify_drafts_block_engine":
+                # Rows placed on the pool's data-parallel ranks by tokens.
+                lengths = [r.numel() for r in rows[a:b]]
+                ranks = data_parallel_size(g)
+                owners = lpt_owners(lengths, ranks)
+                extra = {**extra, "row_ranks": owners}
+                self._count_balance(lengths, owners, ranks)
+            if null_envelopes is not None:
+                extra = {**extra, "null_envelopes": list(null_envelopes)}
+            seq = self.learner_seq() if ordered else None
+            call = (method,) if seq is None else ("ordered_call",)
+            if seq is not None:
+                extra = {**extra, "seq": seq, "method": method}
+            futs.append(
+                (
+                    a,
+                    g.run_all_workers_single_data(
+                        *call,
+                        **extra,
+                        rows=rows[a:b],
+                        prompt_lens=[d[0].numel() for _, d in flat[a:b]],
+                        segments=[d[5] for _, d in flat[a:b]],
+                        vocab_limit=self.vocab_limit,
+                        # A fresh counter value per call: verification
+                        # randomness is never reused across calls or steps
+                        # (``seed * 7 + a`` collided between consecutive
+                        # calls, e.g. (s, a=7) and (s+1, a=0), so a later
+                        # decision could reuse a stream that shaped the
+                        # update producing the policy it verifies against).
+                        seed=next(self._verify_seeds),
+                        keys=[d[4] for _, d in flat[a:b]],
+                        precision=self.verify_precision,
+                        batch_tokens=self.verify_batch_tokens,
+                        lazy=self.verify_lazy,
+                    ),
                 )
-            res = [
-                [(a + j, r) for j, r in rank_res]
-                for a, refs in futs
-                for rank_res in ray.get(refs)
-            ]
-        by_row = dict(x for rank_res in res for x in rank_res)
+            )
+            if seq is not None:
+                self.learner_track(futs[-1][1])
+        return futs
+
+    def _verify_block_results(self, flat, done) -> dict[int, dict[str, Any]]:
+        """Results by row from [(first row, per-rank results)] of ``_submit_verify_block``."""
+        by_row = dict(
+            (a + j, r) for a, ranks in done for rank_res in ranks for j, r in rank_res
+        )
         missing = sorted(set(range(len(flat))) - by_row.keys())
         if missing:
             raise RuntimeError(f"block verification returned no result for rows {missing}")
@@ -1824,6 +1858,20 @@ class SpeculativeGeneration:
         piece is exact block verification of a q draft against the fixed
         target p, so the final rollout is an exact sample of p.
         """
+        pending = await self.begin_sticky(drafts)
+        # Also with nothing pending (every draft whole-accepted and complete):
+        # the step then reports zero continuation rounds instead of no stats.
+        await self._continue_sticky(pending)
+
+    async def begin_sticky(self, drafts) -> list:
+        """``verify_sticky`` up to its continuation rounds; returns the pending plans.
+
+        Verifies the drafts (and, as a debug check, their routes) and stops
+        every draft stream an unfinished whole-accepted plan does not go on
+        with. ``complete_tails`` then runs the continuation rounds; rollouts
+        of complete plans may be served and trained meanwhile (their prefix,
+        log-probs and anchors are final).
+        """
         self._plan_cv = None
         if os.environ.get("THUNDERSYNC_ENGINE_Q_CHECK") == "1":
             await self._route_check(drafts)
@@ -1839,9 +1887,98 @@ class SpeculativeGeneration:
         # on with theirs, every other stream stops.
         kept = {id(plan.stream) for _, plan in pending if plan.stream is not None}
         self._stop_streams([x for x in streams if id(x) not in kept])
-        # Also with nothing pending (every draft whole-accepted and complete):
-        # the step then reports zero continuation rounds instead of no stats.
-        await self._continue_sticky(pending)
+        self._tail_plans = {id(plan) for _, plan in pending}
+        return pending
+
+    # -- streaming training over the tails (one engine, sticky) ------------------
+
+    def begin_streaming_tails(self) -> None:
+        """Rollouts of this step start before its tails are complete.
+
+        Called inside the step's event loop before its rollouts. A rollout
+        whose plan is incomplete waits for ``complete_tails`` to finish it; a
+        rollout with no plan (decoded at theta_k) waits for ``weights_ready``.
+        Training of complete groups therefore streams over the other rows'
+        continuation rounds: both are learner-side at theta_k, and a complete
+        plan's prefix, log-probs and anchors never change again.
+        """
+        self._tail_cv = asyncio.Condition()
+        self._tail_error: Optional[BaseException] = None
+        self._weights_ready = asyncio.Event()
+        # Learner calls in flight are numbered and run in that order on every
+        # rank (``learner_seq`` / ``ordered_call``); ``learner_drain`` waits
+        # for all of them before an unordered call (the refit).
+        self.learner_ordered = True
+        self._learner_inflight: set = set()
+        self.learner_wait = {"drain": 0.0}
+
+    def end_streaming_tails(self) -> None:
+        for k, v in getattr(self, "learner_wait", {}).items():
+            self.stats[f"learner/{k}_wait_s"] = v
+        self._tail_cv = None
+        self._weights_ready = None
+        self.learner_ordered = False
+
+    def learner_seq(self) -> Optional[int]:
+        """The next ordered-call number while streaming over the tails, else None.
+
+        Persistent across steps: the workers count every ordered call they run.
+        """
+        if not self.__dict__.get("learner_ordered", False):
+            return None
+        if "_learner_seq" not in self.__dict__:
+            self._learner_seq = itertools.count()
+        return next(self._learner_seq)
+
+    def learner_track(self, refs) -> None:
+        """Ordered learner calls in flight (``learner_drain`` waits for them)."""
+        self._learner_inflight.update(refs)
+
+    async def learner_drain(self) -> None:
+        """Wait until every ordered learner call sent so far has finished."""
+        t0 = time.perf_counter()
+        pending = list(self._learner_inflight)
+        if pending:
+            await asyncio.to_thread(ray.wait, pending, num_returns=len(pending))
+        self._learner_inflight.difference_update(pending)
+        self.learner_wait["drain"] += time.perf_counter() - t0
+
+    async def _notify_tails(self) -> None:
+        cv = getattr(self, "_tail_cv", None)
+        if cv is not None:
+            async with cv:
+                cv.notify_all()
+
+    async def complete_tails(self, pending) -> None:
+        """The continuation rounds of ``pending`` (``begin_sticky``), waking waiters."""
+        try:
+            await self._continue_sticky(pending)
+        except BaseException as exc:
+            self._tail_error = exc
+            raise
+        finally:
+            await self._notify_tails()
+
+    def weights_ready(self, error: Optional[BaseException] = None) -> None:
+        """The engine holds theta_k: rollouts without a plan may decode.
+
+        ``error``: the tails or the refit failed; waiting rollouts raise.
+        """
+        if error is not None:
+            self._tail_error = error
+        ev = getattr(self, "_weights_ready", None)
+        if ev is not None:
+            ev.set()
+
+    async def _await_plan(self, plan: Plan) -> None:
+        cv = getattr(self, "_tail_cv", None)
+        if cv is None or plan.complete:
+            return
+        async with cv:
+            while not plan.complete:
+                if self._tail_error is not None:
+                    raise RuntimeError("sticky continuation failed") from self._tail_error
+                await cv.wait()
 
     def _stop_streams(self, streams) -> None:
         """Abort engine draft streams and close their logs (rank 0 + every engine)."""
@@ -1983,16 +2120,15 @@ class SpeculativeGeneration:
                 live.append(dict(plan.stream, key=key, plan=plan))
                 plan.stream = None
         start([(key, plan) for key, plan in pending if not any(s["plan"] is plan for s in live)])
-        while live:
-            status = ray.get(rank0.draft_lengths.remote([s["idx"] for s in live]))
-            cand = [
-                s
-                for s, (n, done) in zip(live, status)
-                if done or n - s["taken"] >= chunk
-            ]
-            if not cand:
-                await asyncio.sleep(0.02)
-                continue
+        # Rounds do not block each other: a stream whose piece is being verified
+        # keeps decoding on the engine and gets its next piece only after the
+        # result (pieces of one plan are verified in order); pieces of other
+        # streams are cut and sent meanwhile.
+        inflight: dict[asyncio.Task, tuple[list, list]] = {}
+        busy: set[int] = set()
+
+        def pieces(cand):
+            """(flat drafts, rows, owner streams) of the ready pieces of ``cand``."""
             idx = [s["idx"] for s in cand]
             ids = ray.get(rank0.draft_request_ids.remote(idx))
             records: dict[int, tuple] = {}
@@ -2019,8 +2155,7 @@ class SpeculativeGeneration:
                         )
                     )
             if not ready:
-                await asyncio.sleep(0.02)
-                continue
+                return [], [], []
             routes = self._pop_routes(
                 [s["hkey"] for s, *_ in ready],
                 [s["length"] for s, *_ in ready],
@@ -2055,7 +2190,7 @@ class SpeculativeGeneration:
                 )
             )
             hid = [taken.get(id(c[0])) for c in cut]
-            flat, rows, owners, restart, stale = [], [], [], [], []
+            flat, rows, owners, stale = [], [], [], []
             for (s, toks, done, lps, plen, m), h in zip(cut, hid):
                 m = min(m, 0 if h is None else hidden_num_rows(h))
                 prompt = torch.cat(
@@ -2099,11 +2234,11 @@ class SpeculativeGeneration:
                 stats["retries"] += len(stale)
                 stop(stale)
                 start([(s["key"], s["plan"]) for s in stale])
-            if not flat:
-                continue
-            stats["rounds"] += 1
-            by_row = self._verify_block(flat, rows)
-            done_streams = []
+            return flat, rows, owners
+
+        async def apply(flat, owners, by_row) -> None:
+            """Extend or cut each owner's plan by its piece's verification result."""
+            done_streams, restart = [], []
             for r, ((_, d), s) in enumerate(zip(flat, owners)):
                 out = by_row[r]
                 plan, p, toks, done = s["plan"], d[0], d[2], d[3]
@@ -2136,8 +2271,45 @@ class SpeculativeGeneration:
                         restart.append(s)
             if done_streams:
                 stop(done_streams)
+                # Rollouts waiting on these plans can be served and trained.
+                await self._notify_tails()
             if restart:
                 start([(s["key"], s["plan"]) for s in restart])
+
+        try:
+            while live or inflight:
+                progressed = False
+                for task in [t for t in inflight if t.done()]:
+                    flat, owners = inflight.pop(task)
+                    for s in owners:
+                        busy.discard(id(s))
+                    await apply(flat, owners, task.result())
+                    progressed = True
+                idle = [s for s in live if id(s) not in busy]
+                if idle:
+                    status = ray.get(rank0.draft_lengths.remote([s["idx"] for s in idle]))
+                    cand = [
+                        s
+                        for s, (n, done) in zip(idle, status)
+                        if done or n - s["taken"] >= chunk
+                    ]
+                    flat, rows, owners = pieces(cand) if cand else ([], [], [])
+                    if flat:
+                        stats["rounds"] += 1
+                        task = asyncio.create_task(self._verify_block_async(flat, rows))
+                        inflight[task] = (flat, owners)
+                        busy.update(id(s) for s in owners)
+                        progressed = True
+                if not progressed:
+                    if inflight:
+                        await asyncio.wait(
+                            list(inflight), timeout=0.02, return_when=asyncio.FIRST_COMPLETED
+                        )
+                    else:
+                        await asyncio.sleep(0.02)
+        finally:
+            for task in inflight:
+                task.cancel()
         self.stats.update(
             {
                 "spec/sticky_rounds": float(stats["rounds"]),
@@ -2238,6 +2410,16 @@ class SpeculativeGeneration:
             if queue
             else Plan(seed=next(self._seeds) if self.verify_mode == "keyed" else -1)
         )
+        if getattr(self, "_tail_cv", None) is not None:
+            # Streaming over the tails: a drafted rollout is served once its
+            # continuation rounds complete it; one never drafted decodes at
+            # theta_k once the engine holds it.
+            if id(plan) in getattr(self, "_tail_plans", ()):
+                await self._await_plan(plan)
+            elif not plan.complete:
+                await self._weights_ready.wait()
+                if self._tail_error is not None:
+                    raise RuntimeError("sticky tails or refit failed") from self._tail_error
         gen = list(plan.prefix)
         lps = list(plan.prefix_logprobs)
         if plan.fused is not None:

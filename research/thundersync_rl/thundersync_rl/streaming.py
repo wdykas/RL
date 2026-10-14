@@ -171,6 +171,25 @@ class StreamPlanner:
         self.groups: dict[GroupId, _Group] = {}
         self.ready: list[Trajectory] = []
         self.num_dispatched = 0
+        # Canonical dispatch order (``set_order``): None = as rows arrive.
+        self.order: Optional[list[GroupId]] = None
+        self._next = 0
+
+    def set_order(self, order: list[GroupId]) -> None:
+        """Dispatch whole groups one at a time, in ``order``, whatever the arrival order.
+
+        Group granularity only. Each dispatch is then one group's rows, sorted
+        by trajectory index, chunked and placed on ranks by the same rules, so
+        which rows share a micro-batch, which rank backpropagates them and the
+        order their gradients add into the accumulator are functions of the
+        data, not of timing: the accumulated gradient is bitwise reproducible.
+        A group that closes early waits for every group before it in ``order``.
+        """
+        if self.max_open_groups:
+            raise ValueError("a canonical group order needs group granularity")
+        if sorted(map(repr, order)) != sorted(map(repr, self.groups)):
+            raise ValueError("the order must list every registered group once")
+        self.order, self._next = list(order), 0
 
     def register_group(self, group: GroupId, size: int) -> None:
         self.groups[group] = _Group(size=size)
@@ -223,6 +242,13 @@ class StreamPlanner:
         )
 
     def _pick(self, flush: bool = True) -> list[Trajectory]:
+        if self.order is not None:
+            if self._next >= len(self.order):
+                return []
+            gid = self.order[self._next]
+            if self.groups[gid].advantage_by_reward is None:
+                return []  # its rows are still arriving: later groups wait
+            return sorted((t for t in self.ready if t.group == gid), key=lambda t: t.index)
         rows = self.ready
         if not flush and self.holding():
             # Rows of closed groups wait; idle time still goes to bucket work.
@@ -268,6 +294,8 @@ class StreamPlanner:
 
     def next_dispatch(self, flush: bool = True) -> Dispatch:
         picked = self._pick(flush)
+        if self.order is not None and picked:
+            self._next += 1
         taken = {id(t) for t in picked}
         self.ready = [t for t in self.ready if id(t) not in taken]
         final: list[Trajectory] = []
@@ -510,14 +538,25 @@ class StreamingLearner:
         self,
         per_rank_items: list[list[dict[str, Any]]],
         closes: list[tuple[GroupId, dict[float, float]]],
+        seq: Optional[int] = None,
     ) -> list[ray.ObjectRef]:
+        """Send one dispatch; ``seq``: its place in the ordered learner calls."""
         assert len(per_rank_items) == self.dp_size
-        fut = self.worker_group.run_all_workers_sharded_data(
-            "stream_accumulate",
-            items=per_rank_items,
-            closes=[closes] * self.dp_size,
-            **_SHARD_AXES,
-        )
+        if seq is None:
+            fut = self.worker_group.run_all_workers_sharded_data(
+                "stream_accumulate",
+                items=per_rank_items,
+                closes=[closes] * self.dp_size,
+                **_SHARD_AXES,
+            )
+        else:
+            fut = self.worker_group.run_all_workers_sharded_data(
+                "ordered_call",
+                items=per_rank_items,
+                closes=[closes] * self.dp_size,
+                common_kwargs={"seq": seq, "method": "stream_accumulate"},
+                **_SHARD_AXES,
+            )
         return fut.futures
 
     def finish(self) -> dict[str, Any]:

@@ -27,6 +27,7 @@ from thundersync_rl.grpo_loop import (
     configure_sticky_policy,
     thundersync_grpo_train,
 )
+from thundersync_rl.lanes import build_engine_lanes
 from thundersync_rl.worker import WORKER_FQN
 
 from nemo_rl.algorithms.grpo import setup
@@ -78,7 +79,7 @@ def main() -> None:
         policy,
         policy_generation,
         _nemo_gym,
-        _clusters,
+        clusters,
         dataloader,
         _val_dataloader,
         loss_fn,
@@ -101,6 +102,21 @@ def main() -> None:
             json.dump(history, f, indent=1)
         os.replace(path + ".tmp", path)
 
+    lanes = None
+    if master_config.thundersync.cohort_lanes > 1:
+        # Cohort lanes (DESIGN.md section 14j): setup built lane 0 on
+        # policy.generation.colocated.resources; one more engine of that shape.
+        train_cluster, inference_cluster = clusters
+        lanes = build_engine_lanes(
+            policy,
+            policy_generation,
+            train_cluster,
+            inference_cluster,
+            master_config.policy,
+            tokenizer,
+            num_lanes=master_config.thundersync.cohort_lanes,
+        )
+
     try:
         history = thundersync_grpo_train(
             policy=policy,
@@ -112,6 +128,7 @@ def main() -> None:
             master_config=master_config,
             logger=logger,
             on_step=write_history,
+            lanes=lanes,
         )
     except BaseException:
         # A failed learner or engine rank can leave its peers blocked in a
@@ -131,7 +148,8 @@ def main() -> None:
     # interpreter finalization, after Ray's atexit teardown: the Ray calls there
     # reconnect a new driver to the cluster and crash in CoreWorkerProcess
     # (exit 1 after a completed run).
-    for obj in (policy_generation, policy, *(_clusters or ())):
+    extra_lanes = [lane.generation for lane in (lanes or [])[1:]]
+    for obj in (*extra_lanes, policy_generation, policy, *(clusters or ())):
         shutdown = getattr(obj, "shutdown", None)
         if shutdown is not None:
             try:

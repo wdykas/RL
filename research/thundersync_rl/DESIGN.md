@@ -641,6 +641,7 @@ hidden states and print how many drafted tokens' log q match the engine bitwise)
 | `thundersync_rl/block_verification.py` | Reference block verification, shared acceptance helpers, exact output law |
 | `thundersync_rl/block_verification_fused.py` | Block verification from raw logits with a Triton residual-mass kernel; lazy variant from per-position statistics |
 | `thundersync_rl/null_bv.py` | Pooled ⊥-BV: envelope policy (DP over drafts/slots left, Brownian tail-decode model), per-prompt slot state (section 14d) |
+| `thundersync_rl/lanes.py` | Cohort lanes: lane roles, the cohort pinning invariant, lane timeline, lane builder and per-lane refit (section 14j) |
 | `thundersync_rl/routes.py` | Sticky routing: engine route log, object-store route blocks (`RouteRefs`), per-stage fetch (section 14c); rule in `nemo_rl/models/megatron/sticky_routing.py` |
 | `thundersync_rl/engine_q.py` | Engine-sourced q under BI: engine hidden-state log, per-step row mapping, verification from engine log q + rows on demand |
 | `thundersync_rl/logit_free.py` | `ChunkedHead`: LM-head statistics from hidden states in fixed row chunks, rows recomputed on demand |
@@ -1373,7 +1374,12 @@ SCHED=async default | legacy), with the Mamba SSD parity port active: PASS with 
 under async and legacy scheduling (2026-10-14): train == engine mismatch 0 and exact_token_frac 1
 on every step, engine q exact, weights change every step, every sticky step's anchors equal a
 fresh engine prefill ([route check]) and the sticky rule changes routes against plain top-k
-(thundersync_work/research/agent_hybrid_integration.md).
+(thundersync_work/research/agent_hybrid_integration.md). With the integrated recipe (branch ts-hybrid-integ:
+sticky routing + momentum draft weights + pooled ⊥-BV, async scheduling) the same check PASSES (2026-10-14): sticky +
+momentum + ⊥-BV and its STICKY=0 control both give mismatch 0 and exact_token_frac 1 on all 4 steps, engine q exact,
+3 ⊥-BV steps (128 output slots from 192 drafts, no fresh slots), momentum drafts staged every step; with sticky every
+step's route check is exact (196608 / 57384 / 50028 tokens) and deadline-cut drafts are completed by 8–11 Mamba
+continuation rounds (thundersync_work/research/agent_nano_integ.md).
 
 **Full Nemotron-3-Nano (52 layers, 31.6B) per-rank layout** [derived from the HF config; TP=1, PP=1].
 Routed experts 29.4B, everything else 2.2B. Learner rank (N GPUs, EP=E, DistributedOptimizer, fp32 masters
@@ -1382,7 +1388,9 @@ outside TE): experts (2 B bf16 + 4 B fp32 main grad + 2 B fp16 expert cache) × 
 EP=8, N=8: ≈ 90 GB; EP=4, N=8: ≈ 119 GB; EP=4, N=4: ≈ 167 GB (no activation headroom); EP=2, N=2: ≈ 320 GB.
 Engine rank (same TP/EP): 58.8 GB/E experts + 4.4 GB dense; per request slot SSM state 46 MiB + BI Mamba
 replay buffers 116 MiB (not yet in MCore's state accounting) + KV 6 KiB/token. Smallest layout without optimizer
-offload: EP=8 on 8 learner + 8 engine GPUs (`thundersync_work/sbatch/submit_nano.sh`). Scaling: every term is
+offload: EP=8 on 8 learner + 8 engine GPUs (`thundersync_work/sbatch/submit_nano.sh`). Measured on one 4-GPU node
+(2026-10-14): EP=2 2+2 with the optimizer offloaded to host builds the engine (~76 GB/GPU incl. CUDA graphs) but the
+learner runs out of memory (~188 GB) in its first forward at micro batch 8 × 2048 tokens; micro batch 1 untested. Scaling: every term is
 per-rank and divides by EP (experts) or is replicated per engine replica (Mamba/attention state, ∝ slots); none
 grows with the number of nodes.
 
@@ -1978,6 +1986,284 @@ change a sum started at +0.0, and the eager backward is +0.0 + g per row. O(T·k
   1774 -> 0.87 ms (linear in tokens: ~14 s -> ~7 ms at 16384). Peak extra memory 2.6 -> 1.15 GiB (Nano), 3.0 -> 1.44
   GiB (Ultra-like, 2048 tokens): the output, its input gradient and [T, k] int32 maps. Per 16k-token micro-batch this
   removes ~2.0 s (Nano EP8, 23 MoE layers) / ~4.6 s (Qwen3 EP8, 48 layers) of learner time, more with MoE recompute.
+
+## 14j. Cohort lanes: two weight versions in the engine fleet (`thundersync.cohort_lanes: 2`)
+
+*Opt-in tool, not the default (`cohort_lanes: 1` = one engine; the plan of record is one engine with
+section 14k's scheduling). Built and unit-tested (CPU, fake engines:
+`tests/unit/test_lanes.py`); 4-GPU end-to-end results below. Notes, measurements and resume
+section: `thundersync_work/research/agent_lanes.md`.*
+
+**Why.** With sticky routing a cohort's continuation streams must decode on the version that
+drafted it (section 14c), and a single-version engine holds that version until every
+continuation of cohort k is verified. Drafting of cohort k+1 therefore starts only after
+cohort k's tails, and the drafts get only the learner's training time as their window
+(`grpo_loop.py`, sticky branch of the main loop). Two lanes remove that coupling: cohort k+1
+is drafted on the other lane from t_k, the top of step k. Window bound ≈
+(L_max·τ + T_verify + g)/2 instead of ≈ L_max·τ [derived, `agent_fp_async_floor.md` §1, §5];
+reconciled model: lanes ≈ 1.7–1.9x faster than today's single-version plan of record and
+0.88–0.97 of a non-exact two-cohort async-1 on the same fleet [derived,
+`agent_fp_reconcile.md` §2–3, `fp_reconcile/model.py`].
+
+**Construction (option 1: lanes are disjoint engine replicas).** A lane is one
+MegatronGeneration (its own MCore DP coordinator) over its own GPUs, one or more full TP/PP/EP
+replicas, holding one weight version at a time (`lanes.py`). Lane 0 is the engine `grpo.setup`
+builds on `policy.generation.colocated.resources`; `build_engine_lanes` adds lane 1 with the
+same placement shape and config (hence the same batch-invariant forward). Each lane has its own
+refit communicator: the learner keeps one process group per lane (`keep_refit_group`) and selects
+the lane's group before a refit (`select_refit_group`, `lanes.refit_lane`), through the same
+bucketed packed-collective refit as one engine. Each lane has its own `SpeculativeGeneration`
+(so its own draft-stream registry, route log, hidden log, ⊥-BV slot table, plans and route
+blocks). Step k (`CohortLanes.step`, `grpo_loop._train_on_lanes`):
+
+1. the drafting lane (k+1 mod 2) takes the drafter D_{k+1} of cohort k+1 (θ_k, or θ̂_{k+1}
+   with momentum: learner load, refit of this lane only, learner restore; no host stage),
+   is pinned to cohort k+1 and starts drafting it;
+2. the cohort lane (k mod 2), still at D_k, verifies cohort k's drafts and decodes + verifies
+   every continuation stream (`verify_sticky`, unchanged) — concurrently with step 1's drafts
+   on the other GPUs — and is unpinned when every rollout of cohort k is complete;
+3. only if some rollout of step k has no complete plan (step 0; a draft dropped for missing
+   logs) the cohort lane refits θ_k and decodes it there;
+4. rollouts are served from the cohort lane's plans, the learner trains, cohort k+1's drafts are
+   cut at the usual deadline (their streams keep running on their lane, section 14c).
+Roles alternate. Without fresh rows exactly one lane is refit per step (each lane every two
+steps), as with today's direct momentum path.
+
+**Option 2 (every engine rank holds two weight copies and two request pools) — not chosen.**
+Per-rank costs, W = engine weight bytes, r = GPUs per replica, s = state per request slot
+[derived]:
+
+| per engine rank | one engine (today) | option 1: lanes | option 2: two copies |
+|---|---|---|---|
+| weights | W/r | W/r | 2W/r |
+| request-slot state (KV, Mamba SSM, BI replay) | s per slot | s per slot (same slots per GPU) | s per slot, two pools in the HBM left after 2W/r |
+| refit bytes per step | W-stream on every rank | W-stream on the drafting lane's ranks only (each rank every 2 steps) | W-stream on every rank, received while the other copy decodes |
+| refit stall | whole fleet paused | drafting lane only; cohort lane keeps decoding tails | none, but receive contends with decode |
+| tail decode τ | — | unchanged | mixed-version batches re-read a second weight set per layer: +20–25% τ in the launch-bound tail (fp_async_floor §3) |
+| collectives across lanes | — | none | — |
+| minimum fleet | 1 replica | 2 replicas | 1 replica |
+| load balance | — | static half per role; idle when tails are short (measured, below) | dynamic |
+
+- Nemotron-3-Nano (31.6B; engine weights 58.8 GB experts / EP + 4.4 GB dense per rank, section
+  14c): 8 engine GPUs as 2 lanes × EP=4: 19.1 GB/rank; option 2 at EP=8 on the same 8 GPUs:
+  2 × 11.8 = 23.5 GB/rank. Lanes at EP=8 (16 engine GPUs): 11.8 GB/rank. Slots per GPU and
+  their 162 MiB + 6 KiB/token of state are unchanged.
+- Ultra-class (~1 TB fp16 engine weights, 16-GPU replicas, 186 GB HBM) [H shapes]: lanes keep
+  62.5 GB/GPU of weights; option 2 needs 125 GB/GPU, leaving ~55 GB for state (≈ 0.86–1.26 GB per
+  row: ~45–60 rows/GPU instead of ~100–120). At R = 128 engine GPUs each lane has 4 replicas.
+- Momentum drafts with lanes need no engine host stage (section 14f's `EngineStage`: a pinned host
+  copy of each engine rank's parameters, ~12 GB/rank at Nano EP=8): the drafting lane decodes
+  nothing at θ_k, so θ̂_{k+1} is refit into it directly.
+
+**Exactness (unchanged argument; only placement and start times change).** Section 14c's
+scheme is exact given R1 (anchors are plain top-k of the drafting version D_k on each rollout's
+own prefix, D_k fixed before θ_k's gradient exists), R2 (continuations after a rejection, and
+the undrafted remainder, decode with D_k's plain forward and log D_k's routes) and R3 (the
+learner verifies and trains with the logged anchors and logged q). Lanes keep all three:
+- *One version per cohort.* Cohort k is pinned to lane k mod 2 from the start of its drafts
+  (the lane was refit to D_k right before, `CohortLanes.pin` records the version) to the end of
+  its last continuation (`unpin`). `CohortLanes.refit` raises on a pinned lane and `check`
+  raises before completion if the lane no longer holds the cohort's version. So every draft
+  token, every continuation token and every logged route of cohort k comes from D_k, as with one
+  engine (which guarantees it by refitting only after `verify_sticky`).
+- *No cross-lane leakage.* Each lane's `SpeculativeGeneration` sends requests only to its own
+  engine (rank 0 of its DP coordinator) and pops routes / hidden rows / log-probs only from its
+  own workers; cohort k's draft tuples, streams and route blocks exist only in lane k mod 2's
+  object. The other lane never receives a cohort-k request: continuation streams of cohort k
+  never run on lane-(k+1) weights.
+- *R1 for D_{k+1}.* θ_k and θ̂_{k+1} = AdamW(θ_k, m_k, v_k; g = 0) exist at t_k and do not depend
+  on θ_{k+1}. Drafting earlier does not change what the drafts are proposals of; they are
+  verified against p_{k+1} with their logged q (any proposal law fixed before θ_{k+1} is valid),
+  cut at the same deadline (before the optimizer step).
+- *Fresh rows.* Rows without a complete plan decode at θ_k (p_k = F(θ_k; self)) on the cohort
+  lane after it is unpinned and refit, as today.
+- *Learner state.* Verification of cohort k needs the LM head of D_k (engine-sourced q). The
+  momentum stage of D_{k+1} now runs before cohort k's verification; it stashes head version k
+  and keeps k−1 (`stash_head(keep=[k−1, k])`, unchanged code), and restores θ_k bitwise before
+  verification starts. With current drafts θ_k's head is stashed at the end of step k, after
+  cohort k is verified.
+- *⊥-BV per lane.* A prompt's K·G drafts are all drafted on one lane in a fixed order, its slot
+  table lives in that lane's object; pooled verification is unchanged.
+Tested on fake engines (`test_lanes.py`): with current and momentum drafts and fresh-row steps,
+every cohort is drafted, continued and served on lane t mod 2 at its drafting version; the next
+cohort's drafts start before the current cohort completes; a refit of the cohort lane before its
+cohort completes raises; a cohort completing on a lane that changed weights or never drafted it
+raises.
+
+**Scaling.** Every per-rank cost above is per lane-local GPU and independent of the learner
+size; nothing per token passes through the driver (routes, hidden rows and log-probs stay in each
+lane's object-store blocks, section 14c); no collective spans lanes. The refit is the existing
+transport with one communicator per lane, so it is as bucketed (packed collective) as one engine;
+the per-lane selection is a pointer swap on each learner rank. Not built yet: per-lane selection for
+the sharded M-to-N transports (`refit_transport: nccl_reshard`, the learner's per-PP-stage
+communicators would be kept per lane the same way), a multi-node lane launcher (each lane = whole
+nodes of replicas; `build_engine_lanes` already takes multi-node placement shapes), lane
+rebalancing (static halves now; `lanes/idle_frac` is the metric), lookahead ≥ 2 (a+1 lanes, the
+version map of `agent_fp_async_floor.md` §2), and lanes without sticky routing (validated off).
+
+**Metrics** (per step, seconds from the top of the step): `lanes/draft_start_s` (cohort k+1's drafts
+start), `lanes/tail_end_s` (cohort k's last continuation verified), `lanes/overlap_s` = tail_end −
+draft_start (> 0: drafting overlapped the tails; one engine is ≤ 0), `lanes/cohort_lane_idle_s`,
+`lanes/drafting_lane_idle_s`, `lanes/idle_frac` (idle lane-seconds / (2 × step time)),
+`lanes/fresh_refit`, `lanes/refits`. One-engine runs report `time/draft_start` (drafter start from the
+top of the rollouts) for the same comparison.
+
+**4-GPU end to end** (`scripts/bi_tp/sticky_moe.sh LANES=2`, 2 training GPUs + two one-GPU lanes,
+EP=1; reference LANES=1 = one engine with DP=2 on the same two GPUs; tiny Qwen3-MoE d2048, BI, engine-sourced
+q, sticky routing, expert-grad noise, 16 prompts x 8, 1024 tokens, 4 steps, one run per arm, 2026-10-14) [measured]:
+
+| arm | mismatch / exact | engine q | route check s1/s2/s3 | accepted s1/s2/s3 | cohort lane | fingerprint held / moved | overlap s1/s2 | draft tok s2/s3 | iteration s1/s2/s3 |
+|---|---|---|---|---|---|---|---|---|---|
+| lanes, current | 0 / 1, 4 steps | 5 lines, 0 inexact | all exact (131072, 131072, 129893) | .903/.896/.920 | k mod 2 | every cohort / s2, s3 | +5.0 / +7.6 s | 117k / 117k | 7.12 / 9.65 / 5.42 s |
+| one engine, current | 0 / 1 | 6 lines, 0 inexact | exact | .906/1.0/1.0 | — | — | −0.31 / −0.82 s | 128 / 128 | 7.52 / 9.38 / 8.60 s |
+| lanes, momentum | 0 / 1 | 6 lines, 0 inexact | all exact (131072 each) | .903/.901/.933 | k mod 2 | every cohort / s2, s3 | +6.3 / +7.1 s | 117k / 118k | 8.58 / 9.26 / 8.01 s |
+| one engine, momentum | 0 / 1 | 5 lines, 0 inexact | exact | .897/.998/.986 | — | — | −0.34 / −2.10 s | 3.8k / 2.1k | 5.50 / 9.18 / 9.06 s |
+
+- *Each cohort on its version, read from the engine.* With `THUNDERSYNC_MISMATCH_CHECK` every lane's
+  engine ranks checksum their own weights when a cohort is pinned and again when it completes
+  (`engine_weight_checksum`, `LaneStepOps.fingerprint`); a difference raises. Both lane arms: held for
+  every cohort, and different from the previous cohort's at steps 2 and 3 (`lanes/fingerprint_moved`).
+  With current drafts the engine fingerprint of cohort k times the 2 learner replicas equals,
+  bit for bit, the learner's checksum of θ_{k−1} (cohorts 2 and 3; `research/lanes/summarize.py`):
+  every draft, continuation and logged route of cohort k ran on θ_{k−1}, the version its anchors
+  name. Non-vacuity as in section 14c: weights change every step, steps ≥ 1 accept drafts, the
+  sticky rule changed routes (max differs_from_plain .0054 / .0066).
+- *Overlap.* With lanes cohort k+1's drafts start 0.13–0.17 s into step k and run during cohort k's
+  5–7 s of tails (overlap +5.0…+7.6 s). One engine starts them 0.3–2.1 s after the tails end, inside
+  the training window only: cohorts 2 and 3 got 128 (current) / 2–4k (momentum) drafted tokens and
+  decoded the rest as continuation streams (85k–129k tokens) versus 117k drafted + 9–14k continuation
+  tokens with lanes.
+- *Step time: no difference measured on this setup.* Mean of steps 1–3: lanes 7.40 vs 8.50 s (current),
+  8.62 vs 7.91 s (momentum); one run each, step 3 of a lane run drafts nothing, so these are not
+  steady-state numbers. On this model the step is bound by the cohort's tail continuations (5–7 s for
+  9–14k tokens on one lane), which lanes do not shorten; the window the lanes free (drafting in
+  parallel with the tails instead of after them) is what the derived 1.7–1.9x rests on and needs a
+  model whose drafting time is comparable to the tails. Open: 8-step repeats and Nemotron-3-Nano L8
+  arms (cluster queue: `lanes-l2c-s8`, `lanes-l1c-s8`, `lanes-n2m-L8`, `lanes-n1m-L8`); why the lane's
+  tail phase (6.5–7.3 s, momentum) is longer than one engine's (4.1–6.1 s) on similar continuation
+  counts is not explained yet (one GPU per lane vs DP=2 for the tails is one candidate).
+- *8-step repeat and Nemotron-3-Nano L8 (single-node cluster jobs, same layout, RL-lanes 633119f2;
+  all PASS: mismatch 0, engine q exact, route check exact, sticky rule active).* Tiny MoE, current,
+  8 steps: mean iteration steps 1–7 lanes 8.66 s vs one engine 8.65 s; lanes drafted 115–119k tokens
+  per cohort vs 128–6.3k for one engine (cohorts 2–6), overlap +5.3…+7.5 s vs −0.3…−0.4 s; the
+  engine fingerprint × 2 equals the learner's θ_{k−1} checksum for cohorts 2–7. Nano L8 (EP=1,
+  momentum, fp16 recipe, 4 steps): lanes 6.78 / 18.16 / 11.58 s vs one engine 6.78 / 18.47 / 15.87 s
+  (mean steps 1–3 12.17 vs 13.71 s); tails (time/verify) lanes 3.41 / 9.82 / 9.25 s vs one engine
+  3.84 / 15.39 / 13.13 s; one engine drafted 766 / 1329 tokens for cohorts 2/3 (the rest decoded as
+  122k / 121k continuation tokens), lanes 55k / 117k. EP=1 skips zero-advantage training (learner
+  busy ≈ 0.1 s), so these runs do not exercise training overlap. Split lanes stay an opt-in tool; the
+  measured critical path (`thundersync_work/research/agent_critical_path_measured.md`) is the tail
+  and the serial post-tail chain, which lanes do not shorten; the one-engine work continues in
+  section 14k (branch ts-one-engine).
+
+## 14k. One engine under sticky routing: training streams over the tails
+
+*Default with sticky routing (`thundersync.stream_training_over_tails: true`,
+`thundersync.canonical_group_order: true`). Branch ts-one-engine; notes and measurements:
+`thundersync_work/research/agent_one_engine.md`; critical-path measurements that motivated it:
+`thundersync_work/research/agent_critical_path_measured.md`.*
+
+**Why one engine needs two versions anyway.** Under sticky routing a cohort's continuation streams
+(the tails) decode on its drafting version D_k (section 14c, R2): their anchors are D_k's plain
+routes. Drafts of cohort k+1 need D_{k+1}. So one engine holding one version serializes tails →
+refit → next drafts for any draft weights; a single-version engine with drafts overlapping the tails
+exists only without sticky routing (where it already runs). What one engine can overlap is the
+*learner*: before this section, `verify_sticky` (all tails) finished before `_run_one_step`, so
+training (2.1–2.5 s at Nano L8 EP=2) waited for the last tail [measured, critical_path_measured §3].
+
+**Streaming over the tails (exact).** Step k:
+1. `begin_sticky`: verify cohort k's drafts at θ_k (learner, engine-sourced q), stop the streams no
+   pending plan continues; the plans of rows still to complete are the step's *tails*.
+2. `_run_one_step` starts at once. Its pre-rollout task runs `complete_tails` (the continuation
+   rounds on D_k), then `finish_generation`, the momentum stage (if any) and the θ_k refit, then
+   `weights_ready`. A rollout with a complete plan is served immediately; a rollout whose plan is a
+   tail waits until the rounds complete it; a rollout never drafted (no plan) waits for
+   `weights_ready` and decodes at θ_k. Next-cohort drafts wait for the refit too
+   (`drafts_after_pre_rollout`).
+3. The streaming learner trains groups as they close, i.e. while other rows' tails still run.
+Exactness: training of step k and verification of the tail pieces are both learner-side at θ_k; θ
+changes only at `finish`; a complete plan's prefix, log-probs and anchors never change again
+(`claim_anchors`). The engine still holds one version at a time (D_k until the tails end, then θ_k).
+Learner calls of training and piece verification interleave on the actors in submission order (as
+the non-sticky chunked verification already does). The momentum stage loads θ̂ into the learner's
+parameters between training micro-batches: Ray runs the learner's calls in submission order, so no
+training forward sees θ̂ (load, refit and restore are issued from the driver's event loop as one
+synchronous sequence).
+
+**Tail-last canonical group order.** After verify0 the groups are ordered (ready now) < (pending
+tails) < (never drafted), by group index within each class, and the planner dispatches whole groups
+one at a time in that order (`StreamPlanner.set_order`), rows sorted by trajectory index. The order
+depends only on the verification results, so micro-batch composition, DP rank placement and the
+order gradients add into the fp32 accumulator are functions of the data, not of arrival times
+(arrival order changes fp32 summation order, hence the bits of θ_{k+1}). The exposed time after the
+last tail is the training of the tail groups still held (canonical order holds a tail group that
+finished early behind an earlier-index tail group still decoding) [unit test: identical dispatches
+under three arrival orders; GPU reproducibility runs queued]. Per-rank cost: none (no extra buffer;
+U/V buffers to remove the last group's training are agent_tail_exact_schemes §3.1(b), not built).
+
+**Continuation rounds (exact, faster).** `sticky_continuation_chunk_tokens` 2048 → 128 (256 at first; 128 per the tail agent's Nano L8
+measurement, 20.9 → 16.7 s per step; below the
+1024-token caps of the test runs; 2048 > cap meant every piece was a whole remainder, so a rejection
+was found only after the stream had decoded all of it). Rounds no longer block the driver:
+`_verify_block_async` sends a piece's verification and the loop keeps cutting other streams' pieces,
+serving rollouts and dispatching training; one piece per stream is in flight, so a plan's pieces are
+verified in order (same decisions as before; each is block verification of a q draft against the
+fixed target).
+
+**Perf mode.** `PERF=1` in `engine_q_tp.sh` / `sticky_moe.sh` turns the debug checks off (mismatch
+check, route check, engine-q and sticky checks, spec/mem profiling): timing runs; the checker prints
+"SKIPPED (PERF mode, checks off)". Exactness runs keep them on.
+
+**Measured, Nemotron-3-Nano L8, EP=2, 2+2 GPUs, PERF=1, 6 steps, one run per arm** (`time/iteration`,
+steps 2–5; `time/step_total` is only `_run_one_step` and excludes the tails when STREAM=0):
+
+| arm | iteration s (s2–s5) | mean | tails / V | train busy | after last rollout | drafted tok/cohort |
+|---|---|---|---|---|---|---|
+| baseline (STREAM=0, chunk 2048), current | 22.9 / 22.2 / 23.2 / 23.3 | 22.9 | V 18.1–19.4 | 2.4 (serial) | 2.5–3.1 | 24–33k |
+| streaming only (93195ee6), current | 18.7 / 19.0 / 15.2 / 23.8 | 19.1 | tails 12.4–22.2 | 2.9–4.2 | 0.4–4.8 | 2.4–39k |
+| streaming + rounds (29acacc8), current | 17.7 / 16.7 / 19.5 / 16.5 | 17.6 | tails 13.6–16.9 | 5.1–6.8 | 0.4–1.4 | 2.9–10k |
+| baseline, momentum | 23.9 / 22.1 / 20.7 / 23.3 | 22.5 | V 16.2–20.0 | 2.2–2.7 | 2.3–3.3 | 23–29k |
+| streaming + rounds, momentum | 17.8 / 17.4 / 17.5 / 15.9 | 17.1 | tails 14.2–14.8 | 3.2–5.9 | 0.4–1.2 | 2.7–8.6k |
+
+−23% (current) / −24% (momentum) per step. Training now overlaps the tails (its busy time grows:
+it shares the learner with piece verification). The drafting window shrinks to what follows the
+tails + refit (drafts 3–10k tokens instead of 24–33k), so more of the next cohort is decoded as
+continuation: the one-engine trade under sticky's two versions. Exactness (checks on, 29acacc8):
+Nano L8 current PASS 4/4 (mismatch 0, engine q exact, route check exact, sticky rule active).
+
+**Learner call order (exact by construction).** Learner workers are asynchronous Ray actors (they
+have async methods), which may start queued calls in different orders on different ranks. With
+training dispatches, piece verifications and the momentum stage queued at once, ranks paired
+collectives of different calls: Nano L8 momentum + streaming hung (rank 0 in a verification's EP
+all_gather_object, rank 1 in a MoE forward's all-gather), reproduced on the tiny MoE. While
+streaming, every training dispatch and piece verification is a numbered learner call
+(`SpeculativeGeneration.learner_seq`) and each rank runs them strictly in number order (worker
+`ordered_call`), several in flight; unordered calls (refit, momentum stage) first drain the ordered
+ones. After every streamed step the driver compares each rank's crc32 of its (number, method)
+sequence and raises on a difference. A global driver-side lock (one call batch in flight) was the
+interim fix; step time with it was the same within noise (11.8–12.0 s vs 12.1–12.2 s ordered).
+
+**In-loop decode (profiled).** At EP=2 the engine's decode step cost 11–14 ms at every row count
+(EP=1: 3.9–6.6 ms): each MoE layer ran ReLU², the probability multiply and the fp16 cast over the
+worst-case padded CUDA-graph buffer (every EP rank's tokens × top-k, ~102k rows × 1856 at Nano
+shapes), ~2.2 ms per layer per step [torch profiler]. `fp16_moe.relu2_probs_fwd` /
+`swiglu_probs_fwd` now take the permuted-row end (`offsets[-1]`, a device scalar) in the engine
+and skip padding rows (never read: the grouped GEMM stops there); bitwise the eager values (GPU
+tests incl. CUDA-graph replay). After: 5.1–5.5 ms (1–4 rows), 6.4–6.9 ms (17–64 rows). Another
+~1.7 ms/step is the LM head's per-step fp32 hi/lo copies, which engine package A's stacked head
+removes (not on this branch). Per rank: no memory change; the fix matters more with depth (full
+Nano: 23 MoE layers).
+
+**Measured after both (Nano L8, EP=2, PERF, 6 steps, `time/iteration` steps 2–5, one run each):**
+current 12.1 s, momentum 12.2 s (from 22.9 / 22.5 baseline and 17.6 / 17.1 before the decode fix).
+Steps 3–5 of the current-draft run: verify0 0.7–0.9 s; tails + refit + serving 5.6–6.7 s
+(continuation tokens 47–65k at 17–20 rounds, drafts 54–72k tokens); after the last rollout 3.5–4.5 s
+(the remaining training of the tail groups and draft collection 0.5–0.6 s); learner busy 5.8–6.1 s
+per step. The learner (training + piece verification at chunk 128) is now the longest resource on
+the step; the tail-last order leaves the tail groups' training exposed after the tails.
+Determinism: every L8 run so far had zero rewards, so all data gradients were zero and identical
+parameter checksums across arrival orders prove nothing; non-vacuous pairs
+(`THUNDERSYNC_DEBUG_PARITY_REWARD`) are queued.
 
 ## 15. Open work
 
