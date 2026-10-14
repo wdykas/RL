@@ -52,7 +52,7 @@ from thundersync_rl.engine_q import (
     ray_free,
 )
 from thundersync_rl.fused_train import FusedRef
-from thundersync_rl.null_bv import NullGroup, NullPolicy, envelopes, lpt_owners
+from thundersync_rl.null_bv import NullGroup, NullPolicy, envelopes
 from thundersync_rl.routes import (
     RouteRefs,
     anchored_draft_length,
@@ -78,6 +78,20 @@ def _null_result(res: dict[str, Any], m: Optional[float]) -> dict[str, Any]:
         "null": "out" if y >= 0 else "bot",
         "null_m": m,
     }
+
+
+def lpt_owners(lengths: list[int], ranks: int) -> list[int]:
+    """Rank of each row: longest first onto the least-loaded rank (by tokens).
+
+    Placement only: which rank forwards a row does not enter any decision.
+    """
+    load = [0] * ranks
+    owner = [0] * len(lengths)
+    for i in sorted(range(len(lengths)), key=lambda i: (-lengths[i], i)):
+        r = min(range(ranks), key=lambda r: (load[r], r))
+        owner[i] = r
+        load[r] += lengths[i]
+    return owner
 
 
 class PrefixClaims:
@@ -1121,10 +1135,12 @@ class SpeculativeGeneration:
             for g, a, b in zip(self.verifiers, cuts, cuts[1:]):
                 method, extra = self._verify_method(flat[a:b])
                 if method == "verify_drafts_block_engine":
+                    # Rows placed on the pool's data-parallel ranks by tokens.
                     lengths = [r.numel() for r in rows[a:b]]
-                    owners = lpt_owners(lengths, getattr(g, "dp_size", 1))
+                    ranks = getattr(g, "dp_size", 1)
+                    owners = lpt_owners(lengths, ranks)
                     extra = {**extra, "row_ranks": owners}
-                    self._count_balance(lengths, owners, getattr(g, "dp_size", 1))
+                    self._count_balance(lengths, owners, ranks)
                 if null_envelopes is not None:
                     extra = {**extra, "null_envelopes": list(null_envelopes)}
                 futs.append(
@@ -1159,6 +1175,14 @@ class SpeculativeGeneration:
         by_row = dict(x for rank_res in res for x in rank_res)
         self._verified_hidden(flat, by_row)
         return by_row
+
+    def _count_balance(self, lengths: list[int], owners: list[int], ranks: int) -> None:
+        """``spec/verify_load_max_over_mean``: busiest rank's tokens over the mean."""
+        load = [0] * ranks
+        for n, r in zip(lengths, owners):
+            load[r] += n
+        if sum(load):
+            self.stats["spec/verify_load_max_over_mean"] = max(load) * ranks / sum(load)
 
     def _finish_verify(self, drafts, flat, by_row, dropped) -> None:
         """Plans and acceptance statistics from verification results."""
@@ -1196,14 +1220,6 @@ class SpeculativeGeneration:
         self._age_stats(age_tok, age_kept)
         if self.verify_source == "engine":
             self.stats["spec/engine_q_dropped"] = float(dropped)
-
-    def _count_balance(self, lengths: list[int], owners: list[int], ranks: int) -> None:
-        """``spec/verify_load_max_over_mean``: busiest rank's tokens over the mean."""
-        load = [0] * ranks
-        for n, r in zip(lengths, owners):
-            load[r] += n
-        if sum(load):
-            self.stats["spec/verify_load_max_over_mean"] = max(load) * ranks / sum(load)
 
     def _verify_null(
         self, flat, rows, groups: list[str], slots: dict[str, int]

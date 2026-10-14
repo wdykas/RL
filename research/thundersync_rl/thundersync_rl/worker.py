@@ -2290,7 +2290,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         """Block verification with q from the engine and p from the training model.
 
         ``row_ranks[i]``: the data-parallel rank that verifies row i (the
-        driver balances tokens, ``null_bv.lpt_owners``); default: a stable
+        driver balances tokens, ``speculative.lpt_owners``); default: a stable
         hash of the key.
 
         Pooled ⊥-BV (``null_bv.py``): with ``null_envelopes`` every row is

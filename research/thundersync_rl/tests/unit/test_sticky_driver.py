@@ -957,3 +957,13 @@ def test_prefix_claims_match_generated_prefixes():
     assert c.claim(torch.tensor([4]), torch.tensor([4, 5])) is None
     c.clear()
     assert c.claim(torch.tensor([3]), torch.tensor([3, 5, 6, 7])) is None
+
+
+def test_verification_rows_are_placed_by_tokens():
+    from thundersync_rl.speculative import lpt_owners
+
+    lengths = [64000, 1000, 1000, 30000, 30000, 4000, 500, 62000]
+    owners = lpt_owners(lengths, 4)
+    load = [sum(n for n, r in zip(lengths, owners) if r == k) for k in range(4)]
+    assert max(load) == 64000 and min(load) >= 30000
+    assert lpt_owners([5, 5], 1) == [0, 0]

@@ -48,7 +48,6 @@ from thundersync_rl.null_bv import (
     decide_pools,
     drafts_per_prompt,
     envelopes,
-    lpt_owners,
     tail_decode_prob,
 )
 
@@ -326,6 +325,8 @@ def test_grid_sampler_marginals_match_each_envelope():
 
 
 def test_lpt_owners_balance_tokens():
+    from thundersync_rl.speculative import lpt_owners
+
     lengths = [64000, 1000, 1000, 30000, 30000, 4000, 500, 62000]
     owners = lpt_owners(lengths, 4)
     load = [sum(n for n, r in zip(lengths, owners) if r == k) for k in range(4)]

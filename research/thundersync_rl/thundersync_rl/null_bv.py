@@ -42,7 +42,7 @@ section 2.3, validated on real rows): log w_t under p is Brownian with drift
 d <= s (never risk a fresh decode while drafts suffice).
 
 Placement (scale): verification forwards are placed on data-parallel ranks
-by tokens (``lpt_owners``), independent of prompts. Each rank verifies its
+by tokens (``speculative.lpt_owners``), independent of prompts. Each rank verifies its
 rows for every M the policy can pick (``envelopes``) with one set of random
 draws per row, and the driver walks each prompt's drafts in index order
 (``decide_pools``), taking the outcome at the M the counts choose. Exactness
@@ -213,20 +213,6 @@ def envelopes(policy: NullPolicy) -> tuple[float, ...]:
     """Every M ``policy.m`` can return: 1 (d <= s) and the grid or the fixed M."""
     ms = {1.0} | ({float(policy.fixed_m)} if policy.fixed_m is not None else set(policy.grid))
     return tuple(sorted(ms))
-
-
-def lpt_owners(lengths: list[int], ranks: int) -> list[int]:
-    """Rank of each row: longest first onto the least-loaded rank (by tokens).
-
-    Placement only: which rank forwards a row does not enter any decision.
-    """
-    load = [0] * ranks
-    owner = [0] * len(lengths)
-    for i in sorted(range(len(lengths)), key=lambda i: (-lengths[i], i)):
-        r = min(range(ranks), key=lambda r: (load[r], r))
-        owner[i] = r
-        load[r] += lengths[i]
-    return owner
 
 
 def decide_pools(
