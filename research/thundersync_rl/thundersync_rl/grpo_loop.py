@@ -1624,7 +1624,7 @@ def thundersync_grpo_train(
                     tails_s.append(time.perf_counter() - t)
                     # The momentum stage and the refit call the learner: no
                     # training dispatch may be in flight meanwhile.
-                    async with spec.learner_lock:
+                    async with spec.learner_lock or contextlib.nullcontext():
                         refit_for_step()
                 except BaseException as exc:
                     spec.weights_ready(error=exc)

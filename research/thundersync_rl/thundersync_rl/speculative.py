@@ -1898,7 +1898,10 @@ class SpeculativeGeneration:
         self._tail_error: Optional[BaseException] = None
         self._weights_ready = asyncio.Event()
         # One learner call batch in flight at a time (``learner_lock``).
-        self.learner_lock = asyncio.Lock()
+        # THUNDERSYNC_DEBUG_NO_LEARNER_LOCK: control that lets them overlap.
+        self.learner_lock = (
+            None if os.environ.get("THUNDERSYNC_DEBUG_NO_LEARNER_LOCK") else asyncio.Lock()
+        )
 
     def end_streaming_tails(self) -> None:
         self._tail_cv = None
