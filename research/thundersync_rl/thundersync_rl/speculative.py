@@ -1064,24 +1064,23 @@ class SpeculativeGeneration:
         t4 = time.perf_counter()
         changed = sum(x["draft/changed_elems"] for x in loads)
         total = sum(x["draft/shard_elems"] for x in loads)
-        self.stats.update(
-            {
-                "draft/load_s": t1 - t0,
-                "draft/load_compute_s": max(x["draft/compute_s"] for x in loads),
-                "draft/load_gather_s": max(x["draft/gather_s"] for x in loads),
-                "draft/stash_s": t2 - t1,
-                "draft/refit_s": t3 - t2,
-                "draft/restore_s": t4 - t3,
-                "draft/restore_worker_s": max(x["draft/restore_s"] for x in restores),
-                "draft/total_s": t4 - t0,
-                "draft/peak_extra_gb": max(x["draft/peak_extra_bytes"] for x in loads) / 2**30,
-                "draft/changed_frac": changed / max(total, 1),
-            }
-        )
+        stats = {
+            "draft/load_s": t1 - t0,
+            "draft/load_compute_s": max(x["draft/compute_s"] for x in loads),
+            "draft/load_gather_s": max(x["draft/gather_s"] for x in loads),
+            "draft/stash_s": t2 - t1,
+            "draft/refit_s": t3 - t2,
+            "draft/restore_s": t4 - t3,
+            "draft/restore_worker_s": max(x["draft/restore_s"] for x in restores),
+            "draft/total_s": t4 - t0,
+            "draft/peak_extra_gb": max(x["draft/peak_extra_bytes"] for x in loads) / 2**30,
+            "draft/changed_frac": changed / max(total, 1),
+        }
+        self.stats.update(stats)
         print(
             f"[draft weights] {self.draft_weights} step={self.current_step} "
             f"changed={int(changed)}/{int(total)} "
-            + " ".join(f"{k}={v:.4g}" for k, v in self.stats.items() if k.startswith("draft/")),
+            + " ".join(f"{k}={v:.4g}" for k, v in stats.items()),
             flush=True,
         )
 

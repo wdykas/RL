@@ -21,7 +21,7 @@
 #
 # DRAFT_WEIGHTS=momentum (thundersync.draft_weights, DESIGN.md section 14f): the engine drafts
 # with the momentum-predicted weights; additionally every step that drafted must report
-# draft/changed_frac > 0 (the draft weights differ from theta_k).
+# a draft-weights refit, and from step 1 on draft/changed_frac > 0 (the draft differs from theta_k).
 #
 # Env: MODEL, EP (2), TP (1), PP (1), STEPS (4), PROMPTS (16), MAXLEN (1024), DELTA (0.03),
 # STICKY (1), NOISE (expert-grad noise, 1), SCHED (engine scheduling: legacy | async; legacy),
@@ -68,8 +68,12 @@ for i, h in enumerate(hist):
         why.append(f"step {i}: no accepted draft tokens")
     if i >= 1 and h.get("mismatch/param_checksum") == hist[i - 1].get("mismatch/param_checksum"):
         why.append(f"step {i}: weights unchanged")
-    if momentum and i + 1 < len(hist) and not (h.get("draft/changed_frac") or 0) > 0:
-        why.append(f"step {i}: momentum draft weights equal theta_k (or no draft refit)")
+    if momentum and i + 1 < len(hist):  # every step but the last drafts the next one
+        if h.get("draft/total_s") is None:
+            why.append(f"step {i}: no draft-weights refit")
+        # Step 0 has no momentum yet (theta_hat = theta_0 - lr wd theta_0, below a bf16 ulp).
+        elif i >= 1 and not h.get("draft/changed_frac", 0) > 0:
+            why.append(f"step {i}: momentum draft weights equal theta_k")
     tok, exact = h.get("spec/route_check_tokens"), h.get("spec/route_check_exact")
     if sticky and i >= 1 and not (tok and exact == tok):
         why.append(f"step {i}: route check {exact}/{tok}")
