@@ -300,7 +300,7 @@ def test_driver_passes_handles_and_frees_them_after_verification(_no_ray):
             "install_draft_hidden_log": lambda: True,
             "start_drafts": lambda prompts, budget, interval, hidden_keys: None,
             "draft_request_ids": lambda: {},
-            "collect_drafts": lambda records=None: [
+            "collect_drafts": lambda records=None, record_refs=None, request_ids=None: [
                 ([4, EOD], True, [-0.5, -0.25]),
                 ([4, 5, 6], False, [-0.5, -0.5, -0.5]),
                 ([4], False, [-0.5]),
@@ -337,7 +337,7 @@ def test_driver_cohort_segments_are_handles_and_freed(_no_ray):
     ]
     cur = {}
 
-    def collect(records=None):
+    def collect(records=None, record_refs=None, request_ids=None):
         res, cur["hid"] = rounds.pop(0)
         return res
 

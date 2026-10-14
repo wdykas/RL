@@ -32,6 +32,7 @@ import zlib
 from contextlib import nullcontext
 from typing import Any, Optional
 
+import numpy as np
 import ray
 import torch
 
@@ -216,16 +217,44 @@ def apply_draft_frame(
     return False
 
 
+def typed_tokens(t) -> np.ndarray:
+    """Token ids as one int64 array (no per-token Python objects in transport)."""
+    return np.asarray(t, dtype=np.int64)
+
+
+def typed_logq(lp) -> np.ndarray | None:
+    """Engine log-probs as one float array, bitwise.
+
+    The engine computes them in fp32, so float32 holds them exactly; any value
+    that does not round-trip (never expected) keeps the whole array float64.
+    """
+    if lp is None:
+        return None
+    a = np.asarray(lp, dtype=np.float64)
+    a32 = a.astype(np.float32)
+    return a32 if np.array_equal(a32.astype(np.float64), a, equal_nan=True) else a
+
+
 def snapshot_drafts(
     tokens: list[list[int]],
     logprobs: list[list[float] | None],
     done: list[bool],
-) -> list[tuple[list[int], bool, list[float] | None]]:
-    """(tokens, finished, engine logprobs or None) per draft, copied."""
+) -> list[tuple[np.ndarray, bool, np.ndarray | None]]:
+    """(tokens, finished, engine logprobs or None) per draft, copied as typed arrays."""
     out = []
     for t, lp, d in zip(tokens, logprobs, done):
         ok = lp is not None and len(lp) == len(t)
-        out.append((list(t), d, list(lp) if ok else None))
+        out.append((typed_tokens(t), d, typed_logq(lp) if ok else None))
+    return out
+
+
+def _merge_record_refs(records, record_refs, worker=None, request_ids=None) -> dict:
+    """``records``, this rank's own ``draft_records(request_ids)`` and the others' (refs)."""
+    out = dict(records or {})
+    if worker is not None and request_ids:
+        out.update(worker.draft_records(request_ids))
+    for r in ray.get(list(record_refs or [])):
+        out.update(r)
     return out
 
 
@@ -1154,15 +1183,24 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         return [(len(tokens[i]), bool(done[i])) for i in indices]
 
     def peek_drafts(
-        self, indices: list[int], records: dict[int, tuple] | None = None
-    ) -> list[tuple[list[int], bool, list[float] | None]]:
+        self,
+        indices: list[int],
+        records: dict[int, tuple] | None = None,
+        record_refs: list | None = None,
+        request_ids: list[int] | None = None,
+    ) -> list[tuple[np.ndarray, bool, np.ndarray | None]]:
         """(tokens, finished, engine logprobs) of the listed drafts, left running.
 
         Unfinished drafts read ``records`` (the engines' request records,
         ``draft_records``) when given, as ``collect_drafts`` does; finished ones
-        their final frame.
+        their final frame. ``record_refs``: the other engine ranks'
+        ``draft_records`` results as object refs, fetched here, and
+        ``request_ids`` this rank's own records to read (the records never pass
+        through the driver).
         """
         import asyncio
+
+        records = _merge_record_refs(records, record_refs, self, request_ids)
 
         tokens, logprobs, done, streams = (
             self._draft_tokens,
@@ -1182,7 +1220,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                     continue
                 toks, lps = rec
                 ok = lps is not None and len(lps) == len(toks)
-                out.append((list(toks), False, list(lps) if ok else None))
+                out.append((typed_tokens(toks), False, typed_logq(lps) if ok else None))
             return out
 
         return asyncio.run_coroutine_threadsafe(
@@ -1239,21 +1277,27 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 if entry is not None:
                     merged = entry.record.merge()
                     out[rid] = (
-                        list(merged.generated_tokens),
-                        _plain_floats(merged.generated_log_probs),
+                        typed_tokens(merged.generated_tokens),
+                        typed_logq(_plain_floats(merged.generated_log_probs)),
                     )
             return out
 
         return asyncio.run_coroutine_threadsafe(read(), loop).result()
 
     def collect_drafts(
-        self, records: dict[int, tuple] | None = None
-    ) -> list[tuple[list[int], bool, list[float] | None]]:
+        self,
+        records: dict[int, tuple] | None = None,
+        record_refs: list | None = None,
+        request_ids: list[int] | None = None,
+    ) -> list[tuple[np.ndarray, bool, np.ndarray | None]]:
         """Abort unfinished drafts; return (tokens, finished, engine logprobs) per draft.
 
         The log-probs are None when the engine did not report one per token.
+        ``record_refs``, ``request_ids``: as in ``peek_drafts``.
         """
         import asyncio
+
+        records = _merge_record_refs(records, record_refs, self, request_ids)
 
         tokens, logprobs, done, streams = (
             self._draft_tokens,
@@ -1273,9 +1317,11 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                     stats["fallback"] += 1
                 else:
                     toks, lps = rec
+                    toks = [int(t) for t in toks]
+                    lps = None if lps is None else [float(v) for v in lps]
                     stats["from_record"] += 1
-                    stats["differed"] += int(list(toks) != tokens[i])
-                    tokens[i][:] = list(toks)
+                    stats["differed"] += int(toks != tokens[i])
+                    tokens[i][:] = toks
                     if logprobs[i] is not None or lps is not None:
                         logprobs[i] = (
                             lps

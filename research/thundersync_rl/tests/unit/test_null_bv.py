@@ -634,7 +634,7 @@ def test_driver_pools_drafts_and_fills_slots_in_order(monkeypatch):
             (prompts, hidden_keys)
         ),
         "draft_request_ids": lambda: {},
-        "collect_drafts": lambda records=None: drafted,
+        "collect_drafts": lambda records=None, record_refs=None, request_ids=None: drafted,
         "pop_draft_hidden": lambda keys, lengths: {
             k: torch.ones(n, 4) for k, n in zip(keys, lengths) if n
         },
@@ -763,7 +763,7 @@ def test_driver_forwards_only_rows_that_can_be_used(monkeypatch):
         "install_draft_hidden_log": lambda: True,
         "start_drafts": lambda prompts, budget, interval, hidden_keys=None: None,
         "draft_request_ids": lambda: {},
-        "collect_drafts": lambda records=None: drafted,
+        "collect_drafts": lambda records=None, record_refs=None, request_ids=None: drafted,
         "pop_draft_hidden": lambda keys, lengths: {k: torch.ones(n, 4) for k, n in zip(keys, lengths) if n},
     }
     s = make_spec(
