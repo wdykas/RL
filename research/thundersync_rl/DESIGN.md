@@ -1489,7 +1489,7 @@ showing that anchoring continuations to self after a rejection (anchors dependin
 is biased.
 
 **Requirements** (`validate_sticky_routing`): speculate, verify_mode=block,
-verify_source=engine (BI), draft_lookahead=1, max_rollout_turns=1, no tail_lookup, no
+verify_source=engine (BI), draft_lookahead=1, no tail_lookup, no
 engine prefix caching, no R3 router replay, an MoE model (the engine must report a route
 log, else the driver raises).
 
@@ -1508,9 +1508,8 @@ scheme rests on the enumeration tests (`test_routes.py`).
 continuations. The engine refit waits for the continuation rounds, so rollouts no
 longer overlap verification (keeping θ_{k−1} available after the refit, e.g. as a sparse
 weight delta toggled per chunk, would restore the overlap; not built yet). Multi-version drafts
-(`draft_lookahead>1`), multi-turn rollouts (a later turn's prefill would need the anchors in
-the engine: sticky replay in engine prefill, not built yet) and a horizon c below the rollout
-cap (same engine feature) are not built yet.
+(`draft_lookahead>1`) are not built yet. Multi-turn rollouts: section 14l; a horizon c below the
+rollout cap with engine anchor apply: section 14i.
 
 ## 14d. Pooled null-augmented block verification (`thundersync.null_bv`)
 
@@ -2341,6 +2340,234 @@ the step; the tail-last order leaves the tail groups' training exposed after the
 Determinism: every L8 run so far had zero rewards, so all data gradients were zero and identical
 parameter checksums across arrival orders prove nothing; non-vacuous pairs
 (`THUNDERSYNC_DEBUG_PARITY_REWARD`) are queued.
+## 14l. Multi-turn rollouts under sticky routing, scheme A (`grpo.max_rollout_turns > 1`)
+
+*ts-nano-perf (2026-10-14):* multi-turn and the anchor horizon (14i) run with
+`thundersync.stream_training_over_tails=false` (14k): streaming over their tails is not built yet (a
+streamed rollout waits for its plan to complete in the continuation rounds; multi-turn plans complete
+through environment steps in `replay_row`, horizon plans on the refit engine). The validator rejects
+the combination and the multi-turn / horizon launchers set `STREAM=0`. The continuation rounds
+themselves are the shared non-blocking loop (chunk 128) with the environment steps folded in.
+
+*Built on branch `ts-multiturn-a` (from ts-integration 29064e90); on whenever sticky routing is on
+and `grpo.max_rollout_turns > 1`. Unit-tested on a fake engine; GPU end to end: see the status line
+at the end of this section.* Design brief and exactness proof by enumeration:
+`thundersync_work/research/agent_multiturn_sticky.md` (tests on RL-sticky b8212df1,
+`test_sticky_multi_turn_all_turns_at_drafter_weights_is_exact`, TV < 1e-12, prefix-dependent
+stochastic environment, 3 turns; control `..._later_turns_plain_at_new_weights_are_biased`);
+implementation notes: `thundersync_work/research/agent_multiturn_a.md`.
+
+**Why.** A token of turn 2 depends on the hidden states of every earlier position, i.e. on
+F(θ_k; A) there. Decoding turn 2 on the refit engine (θ_k, plain routing) re-routes turn 1
+without its anchors: the result is neither p_k nor any policy the learner trains on (control
+test: biased).
+
+**Scheme A: every turn of a drafted rollout at the drafting weights, before the refit**
+(`multi_turn.py`, `SpeculativeGeneration.verify_sticky` / `_continue_sticky`).
+Turn 1 is drafted and block-verified as before. When a VERIFIED prefix ends a turn (EOS, or
+the per-turn cap `_cap(prompt + earlier turns and observations)`, the same budget the plain
+multi-turn path gets), the driver steps the environment on it (`TurnEnvironment.step`: the same
+`env.step.remote` request `calculate_rewards` makes on the row's message log, awaited on the
+driver's event loop, so other rollouts' streams and environment steps keep going). Unverified draft tokens never reach the environment or its tools. Unless the rollout
+ends there (terminated, observation truncated at the total-length cap, or `max_rollout_turns`
+turns), the observation is appended to the plan and a new θ_{k−1} stream decodes the next
+turn from prompt + turns + observation; its pieces are verified exactly like continuations
+(chunks of `sticky_continuation_chunk_tokens`, residual token on a rejection, restart from
+the new prefix). The plan's `prefix` is the whole row after the prompt (turn tokens and
+observation tokens; observation log-probs are placeholders, masked from the loss);
+`Plan.turns` records each turn's span and the environment's answer.
+- Anchors of observation positions come from the continuation stream's own prefill (plain
+  θ_{k−1} on the actual prefix: the definition of A). Each new stream re-logs every position
+  of its row (prefix caching is off), so the plan's `RouteRefs` after its last verified piece
+  cover the whole row up to the last generated token; the final observation follows every
+  generated token and needs no anchor.
+- Rows: each drafted plan is paired with one rollout-loop row (`bind_rows` before
+  `verify_sticky`; rows with the same prompt take its plans in queue order, which does not
+  depend on the tokens), so the environment sees that row's `extra_env_info`/`task_name`.
+- Rollout loop (`grpo_loop._run_one_step`): a row with a finished drafted plan is rebuilt from
+  the recorded turns (`multi_turn.replay`: same message log, rewards, metadata and metrics as
+  `run_sample_multi_turn_rollout`, checked against it in `test_multi_turn_sticky.py`); the
+  environment is NOT stepped again (environments need not be deterministic; tools may have side
+  effects). Training anchors come with the plan. Rows without a plan (never drafted, dropped
+  drafts, ⊥-BV fresh slots) run `run_sample_multi_turn_rollout` unchanged at θ_k ("self"
+  everywhere, F(θ; self) = plain).
+- Exactness [proof by enumeration, brief]: each piece is a q draft given the current prefix,
+  block-verified against the fixed target p = F(θ_k; A); an environment step is a function of the
+  verified prefix and its own randomness. No new decision rule. ⊥-BV composes: its output
+  decisions are made on turn-1 drafts; every later token is conditional sampling given a
+  verified prefix [derived].
+- Not supported (raise): environment `next_stop_strings` and per-sample `stop_strings` (drafts
+  and continuations run without stop strings; same as single-turn speculation).
+
+**Per-rank / per-step costs at scale [derived].**
+- Driver: one environment step per verified turn end (the same count as plain multi-turn) and one
+  stream start per later turn; per turn only token lists cross the driver (the turn's tokens, the
+  observation's ids). Routes stay object-store handles (`RouteRefs`), never fetched by the driver.
+  Environment steps are awaited Ray calls (no thread per call, unlike the plain path's
+  `asyncio.to_thread(calculate_rewards)`, which caps concurrent steps at the default thread pool):
+  thousands of rollouts can wait on slow tools at once while every other rollout's stream decodes.
+- Engine (θ_{k−1}): each later turn is a new request whose prefill re-reads prompt + earlier turns
+  + observation: O(turns × S) prefill tokens per rollout without prefix caching, plus its route
+  log (L_local × K int16 per position on the logging rank, e.g. Ultra-like L=60/PP, K=22: 2.6 kB
+  per position per stage, all positions re-logged per turn). Step 4 of the brief (prefix
+  caching: prefill O(observation) per turn, only new positions logged) is not built yet; prefix
+  caching stays off under sticky routing. What it needs [C, D]: the route log records absolute
+  positions (`token_to_pos_ids`), so a cache hit would log from the first uncached position, and
+  `merge_route_refs(base=plan.anchors)` already splices such a log over the plan's anchors (same
+  θ_{k−1}, same prefix: bitwise equal under BI); the next-turn and restart streams would pass
+  `plan.anchors` as their base. Open: prefix caching is engine-global, so drafts of one GRPO group
+  would hit each other's prompt blocks and need a shared prompt-anchor base; the route checks'
+  prefills must bypass the cache (else they compare a log with itself); cache entries must never
+  cross a weight version. All untested on GPU.
+- Learner: unchanged per token: anchors for every row position (observations included) fetched
+  per pipeline stage from the object store; one verification forward per piece (as single-turn
+  continuations).
+- Critical path: the refit waits until every turn of every drafted rollout is done, so
+  ENVIRONMENT LATENCY (tool calls) now blocks the refit. Correct but slow for agentic tasks.
+  Fixes: θ_{k−1} retention after the refit (engine keeps θ_{k−1} as a second weight version or
+  sparse delta, continuations run on it while new rollouts run at θ_k), or scheme B (anchor
+  horizon H with sticky replay in engine prefill: θ_{k−1} work bounded by H tokens; another
+  branch, `ts-multiturn-b`).
+
+**Checks** (`scripts/bi_tp/sticky_multiturn_moe.sh`: `sticky_moe.sh` with the stochastic toy
+environment `toy_multi_turn_env.py`, `--toy-multi-turn-env TURNS`, small per-turn budget).
+Everything `sticky_moe.sh` asserts (mismatch 0 over every assistant token of every turn, engine q
+exact, drafts' route check exact, weights change, drafts accepted, sticky rule active) plus, every
+step after the first: drafted multi-turn rollouts replayed (`spec/replayed_multi_turn_rows`), the
+driver stepped the environment (`spec/sticky_env_turns`), some rollout ran > 1 turn
+(`max_turns`), and the finished plans' anchors equal a fresh engine prefill of their full rows
+(`[route check mt]`, `spec/route_check_mt_exact == spec/route_check_mt_tokens > 0`) with anchored
+observation positions among them (`spec/route_check_mt_obs_positions > 0`).
+
+*GPU status (2026-10-14, 4 GPUs, EP=2, 4 steps, 3 turns, 128 tokens/turn):* PASS on the tiny MoE,
+real Qwen3-30B-A3B layers (L4), ⊥-BV (K=1.5) and momentum draft weights: mismatch 0 over every
+assistant token of every turn, `[route check mt]` exact (51–55k positions per step, 2.0–2.5k of them
+observation positions), 128/128 rollouts per step replayed, environment stepped once per turn.
+Turns ended at the per-turn cap almost always (truncated models rarely emit EOS): EOS turn ends are
+unit-tested only. Environment latency on the refit path not measured (instant toy environment).
+
+*Hybrid Nemotron-3-Nano (branch ts-nano-multiturn = ts-hybrid-integ + ts-multiturn-ab, 2026-10-14):* L8
+(MEMEM*EM, sigmoid + expert-bias router, fp16 GEMM recipe, EP=2, async, 4 steps): PASS, mismatch 0 every step,
+engine q 8/8 exact, `[route check mt]` exact 53114/52003/55061 positions incl. 2194/1985/2381 observation
+positions, 128/128 rows replayed, 277–305 environment steps per step. Every later turn is a new engine request whose
+prefill rebuilds the Mamba conv/SSM state from prompt + turns + observations (no state truncation anywhere), and
+route layers are the MoE router instances (hybrid numbering from the route log); nothing in the multi-turn code
+is layer-type specific. With the anchor horizon (H = 160, section 14i): also PASS (below).
+
+## 14i. Sticky routing anchor horizon with engine anchor apply (`thundersync.sticky_anchor_horizon`)
+
+*Opt-in (unset: today's behaviour, anchors up to the rollout cap). Requires sticky routing (14c).
+Unit-tested (`tests/unit/test_anchor_horizon.py`); end-to-end exactness: see the status line at the end of this
+section. Notes: `thundersync_work/research/agent_multiturn_b.md`; the scheme's output law was proven by enumeration
+(`test_sticky_multi_turn_horizon_with_engine_replay_is_exact`, RL-sticky b8212df1 / RL-nullbv 7e3fbdb0, TV < 1e-12,
+observations on both sides of the horizon).*
+
+**Policy.** p_k = F(θ_k; A_H): A = the plain θ_{k−1} routes on the rollout's own prefix at positions
+t < c = P + min(H, cap) (P prompt tokens; content-independent), self at t ≥ c and for rollouts never drafted.
+With H unset c is the cap (14c). Everything else in 14c (the rule, δ, block verification, no bonus) is unchanged.
+
+**What the horizon buys.** Under 14c every drafted rollout is completed at θ_{k−1} before the refit (continuation
+rounds to EOS or the cap; for multi-turn rollouts every turn, environment latency included). With a horizon the
+θ_{k−1} part of a drafted rollout ends as soon as its anchors below c are logged: at most H + 1 continuation tokens
+per rollout (position c − 1 is routed by the forward that samples token H). The refit engine then samples the rest
+of the rollout from p_k directly, which needs only the anchors below c, re-applied in its forwards.
+
+**Driver** (`speculative.py`). `_horizon(P)` = c; draft and continuation anchors are cut to c (`_cut`:
+`RouteRefs.truncate(c)`, so the learner's verification and training forwards see self beyond c); a drafted token
+needs logged anchors only below c (`anchored_draft_length(..., horizon=c)`), so drafts longer than H are verified
+against p_k without θ_{k−1} routes past c. A plan is done at θ_{k−1} when complete or when its anchors are complete
+below c (`_horizon_done`); continuation streams decode at most H + 1 tokens; a stream that stops at that budget is
+not a finished rollout. After the continuation rounds (`verify_sticky`) every incomplete plan gets an anchor key and
+all generation workers receive {key: RouteRefs} (handles only, `register_engine_anchors`; the coordinator picks
+the data-parallel rank that runs a request, so every rank holds the small handle table). `_one` continues such a
+plan on the refit engine with the request tagged (`ts_anchor_key` sampling-params attribute, like the draft
+hidden-log tag). Training claims the plan's anchors (length c) as before.
+
+**Engine anchor apply** (`worker.py` `_install_anchor_apply` / `_wrap_anchor_apply`, `routes.EngineAnchors`,
+`sticky_routing.py`). Every engine rank with MoE layers (all TP ranks, each pipeline stage for its layers):
+- *Static buffer* [max_tokens, L_local, K] int16, attached to the routers before the engine captures its CUDA
+  graphs. In RECORD (engine) mode the sticky wrapper records the plain top-k as before (the drafter's route log is
+  unchanged) and then applies `sticky_select` (the learner's function, same arithmetic) against
+  `buffer[r·T : (r+1)·T]` (T the forward's token count; r the TP rank under sequence parallelism, else 0): a fixed
+  slice per graph, so graph replays read what the step wrote. Rows of -1 are self (bitwise plain top-k), so
+  untagged requests and drafts are routed exactly as before.
+- *Per-request pool*: the rank that admits a tagged request fetches its own stage's anchor blocks
+  (`fetch_anchors`, object store) when the request first appears in the context, into pages of 256 positions of a
+  device pool (grown by doubling); pages are freed once the request has left the engine (sweep every 64 forwards).
+- *Per forward* (wrapper of the controller's `_dynamic_step_forward_logits`, runs before each launch, eager or
+  graph, legacy or async scheduling): anchor id per slot from the context's CPU bookkeeping (`SlotTags`: Python
+  only for slots whose request is new), then numpy over the step's tokens (anchor id, absolute position; rows
+  below the request's c), one pinned non-blocking index copy, a fill of last step's rows with -1 and one gather
+  from the pool, all enqueued on the forward's stream. Prefill, chunked prefill and eviction re-prefill re-apply
+  anchors by absolute position; decode beyond c routes plainly. No host-device synchronization, no Python per
+  token, no driver traffic per token.
+- *Expert-parallel dummy steps* (MCore `dummy_forward` keeps the last real step's ids/positions): every row is
+  made self (`EngineAnchors.clear`), like the route log's dummy-step guard (14c).
+- MCore: no source change (the RouterReplay wrapper and the controller-method wrapper are ours). Upstream
+  candidate: a per-token "replay with rule" hook in MCore's RouterReplay for inference (record + apply).
+
+**Per-rank costs at scale** [D unless marked]. Notation: L_local MoE layers on the stage, K top-k, H horizon, P
+prompt, R anchored requests resident on an engine rank.
+- Pool memory: R × (P + H) × L_local × K × 2 B (pages of 256 positions). Ultra-like (60 MoE layers, K = 22,
+  PP = 8 → L_local ≈ 7.5, H = 4096, P small): ≈ 1.4 MB per request per stage; 256 resident anchored requests
+  ≈ 350 MB per rank. Only rollouts that were drafted, continued past c and are still running hold pages.
+- Static buffer: max_tokens × L_local × K × 2 B (16384 tokens: 5.4 MB at L_local 7.5, K 22).
+- Transport: each anchored request's stage blocks are fetched once per engine rank that runs it (TP ranks fetch
+  the same bytes; no driver gathers: the driver sends handles only). Per step on the device: 16 B of index per
+  anchored token H2D + a gather of L_local × K × 2 B per anchored token.
+- Compute: the rule per MoE layer and token, O(E) elementwise + a K-sort, inside the router; measured overhead and
+  the fill's host/device time: see the status line. Without a horizon nothing is installed (no change to engine
+  graphs).
+- θ_{k−1} work: ≤ H + 1 continuation tokens per drafted rollout (vs to EOS/cap); the refit no longer waits for
+  long continuations (and, with multi-turn, for environment latency past the horizon).
+
+**Multi-turn.** Turns below c run at θ_{k−1} exactly as in scheme A (14l, branch ts-multiturn-a: driver turn loop,
+observation anchors from the continuation's own prefill); once a row's anchors are complete below c, the rest of
+the rollout (later turns included) can be decoded by the refit engine with the request tagged, since each later
+turn's prefill re-applies the anchors below c by position. Built on branch ts-multiturn-ab (scheme A merged with
+this branch): `_horizon` is clipped by the total-length cap for multi-turn rollouts (max_new_tokens bounds one turn
+there); a turn that ends at or past the horizon is not sent to the environment at θ_{k−1}; the rollout loop finishes
+a handed-over row with `_finish_turns` (tagged engine requests per turn, one environment step per turn end, the same
+turn rules as below the horizon) and then rebuilds it with scheme A's `replay`.
+
+**Rule kernel.** The engine applies the rule in every MoE layer of every forward once the horizon is on, so it is
+one Triton kernel (`sticky_routing_fused.py`; a pure selection, bitwise equal to `sticky_select`: GPU unit test with
+exact ties, invalid anchor rows, unsorted plain top-k and anchor sets equal to the plain set). The kernel follows the
+rule's output order exactly: a kept anchor set equal to the plain set is returned in the plain top-k's order, a
+different kept set in descending score order (on the hybrid branch the torch rule gained the plain-order case; the
+kernel ported from ts-integration still sorted such rows, a bitwise mismatch caught by the GPU unit test and fixed). Measured [M] (GB200, CUDA graph, `thundersync_work/research/multiturn_b/
+bench_anchor_apply.py`): torch composition +53–82 µs per layer (Qwen3-30B-A3B shapes, 48 layers: +2.6 ms per decode
+forward), fused +2–8 µs per layer at T = 64–512 tokens (+0.10–0.20 ms per forward over 48 layers) and +14 µs at
+T = 8192 (+0.69 ms); Ultra-like (E 512, K 22, 15 layers per stage): +0.12 ms per decode forward. Fill: 6 µs host
+and device per forward without anchored tokens, 0.30 ms host + 0.30 ms device for an 8192-token fully anchored
+prefill; loading one request (P + H = 5120 positions) 0.5–1.7 ms.
+
+**Status.** [M] 4 GPUs, tiny MoE EP=2, async scheduling, 4 steps (`scripts/bi_tp/sticky_horizon_moe.sh`, H = 64):
+mismatch 0 and exact_token_frac 1 every step (the horizon continuations' engine log-probs equal the learner's
+training forward with the same anchors), route checks exact, 41–97 plans per step handed to the refit engine,
+15821 tokens routed with applied anchors. Control `NOAPPLY=1` (engine never applies): max |Δlog p| 0.30–0.44,
+exact_token_frac 0.80–0.84, i.e. the anchors below the horizon change the policy and the apply path is what
+reproduces it. Same check with the fused rule: PASS; also PASS at engine/learner PP = 2 (EP = 1; each stage applies
+its own layers' anchors, 42366 anchored tokens by step 3) and TP = 2 with sequence parallelism (EP = 2; each TP
+rank reads its token shard of the buffer, 37020 anchored tokens), mismatch 0 and route check exact every step. Multi-turn (branch ts-multiturn-ab = ts-multiturn-a +
+this branch, `_finish_turns`; toy stochastic environment, 3 turns × 128 tokens, H = 160, 4 steps): PASS, mismatch 0
+every step over every turn, route check over full rows exact incl. 1118–1382 anchored observation positions per
+step, 128 environment steps per step below the horizon (θ_{k−1}) and 234–280 turns finished on the refit engine
+beyond it; control without apply: max |Δlog p| 0.53–0.66. Runs and numbers: `thundersync_work/research/
+agent_multiturn_b.md`.
+
+*Nemotron-3-Nano L8 on ts-nano-multiturn* (hybrid, fp16 recipe, EP=2, async, 4 steps) [M]: single-turn H = 64
+PASS (mismatch 0, engine q 6/6 exact, 19/117/122 plans to the refit engine, 23204 anchored tokens by step 3);
+multi-turn H = 160 PASS (mismatch 0 over every turn, `[route check mt]` exact 32552/33680/33320 positions incl.
+1252/1118/1382 observation positions, 128 environment steps per step below the horizon, 261/234/280 turns finished
+on the refit engine, 85033 anchored tokens). No-apply controls on Nano: queued, not yet measured.
+
+**Nemotron-H (Nano/Super/Ultra) routers.** The rule acts on the scores MCore selects on (`compute_topk`'s input):
+sigmoid + expert bias for Nemotron-H, after which MCore gathers the sigmoid scores of the effective experts; engine
+apply and learner replay go through the same call (unit test with E = 128, top-6, expert bias, scaling factor:
+bitwise equal, rule active). Hybrid layer numbering: anchors exist per MoE router instance only (route layers =
+MoE layer numbers); Mamba and attention layers carry none. MCore's fused router (`moe_router_fusion`) bypasses
+RouterReplay and is not supported (as for route recording).
 
 ## 15. Open work
 

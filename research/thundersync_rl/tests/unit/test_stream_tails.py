@@ -25,6 +25,8 @@ def _spec():
     spec = SpeculativeGeneration.__new__(SpeculativeGeneration)
     spec._tail_cv = None
     spec._weights_ready = None
+    spec.turn_env = None  # single-turn
+    spec.anchor_horizon = None
     spec.stats = {}
     return spec
 
@@ -51,7 +53,7 @@ def test_complete_first_then_tails_then_fresh():
     spec._tail_plans = {id(tail)}
     order = []
 
-    async def continue_sticky(pending, trace=None):
+    async def continue_sticky(pending, trace=None, ended=()):
         await asyncio.sleep(0.01)
         order.append("tail rounds")
         for _, p in pending:
@@ -88,7 +90,7 @@ def test_failed_tails_wake_and_raise():
     tail, fresh = Plan(seed=-1, prefix=[1]), Plan(seed=-1)
     spec._tail_plans = {id(tail)}
 
-    async def boom(pending, trace=None):
+    async def boom(pending, trace=None, ended=()):
         raise ValueError("engine died")
 
     spec._continue_sticky = boom

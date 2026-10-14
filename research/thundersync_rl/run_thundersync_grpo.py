@@ -53,6 +53,15 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--history-json", type=str, default=None)
+    parser.add_argument(
+        "--toy-multi-turn-env",
+        type=int,
+        default=None,
+        metavar="MAX_TURNS",
+        help="Test runs: replace every task's environment with the stochastic "
+        "multi-turn toy environment (thundersync_rl/toy_multi_turn_env.py) ending "
+        "rollouts after at most MAX_TURNS turns.",
+    )
     args, overrides = parser.parse_known_args()
 
     register_omegaconf_resolvers()
@@ -75,6 +84,12 @@ def main() -> None:
     dataset, val_dataset, task_to_env, _ = setup_response_data(
         tokenizer, config.data, config.env
     )
+    if args.toy_multi_turn_env is not None:
+        from thundersync_rl.toy_multi_turn_env import ToyMultiTurnEnvironment
+
+        shutdown_environments(task_to_env)
+        toy = ToyMultiTurnEnvironment.remote(max_turns=args.toy_multi_turn_env)
+        task_to_env = {name: toy for name in task_to_env}
     (
         policy,
         policy_generation,

@@ -54,6 +54,9 @@ import torch
 
 # Sampling-params attribute that tags a draft request for hidden-state logging.
 HIDDEN_KEY_ATTR = "ts_hidden_key"
+# Sampling-params attribute of a request that continues an anchored rollout at
+# theta_k (anchor horizon): its key in ``register_engine_anchors``.
+ANCHOR_KEY_ATTR = "ts_anchor_key"
 
 
 def step_rows(

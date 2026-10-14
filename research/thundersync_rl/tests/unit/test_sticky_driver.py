@@ -515,6 +515,15 @@ def test_sticky_config_default_and_valid():
     validate_sticky_routing(m)
     configure_sticky_policy(m)
     assert m.policy["megatron_cfg"]["sticky_routing_delta"] == 0.03
+    m.grpo.max_rollout_turns = 3  # multi-turn: scheme A (multi_turn.py)
+    with pytest.raises(ValueError, match="stream_training_over_tails"):
+        validate_sticky_routing(m)  # streaming over multi-turn tails: not built yet
+    m = _master(stream_training_over_tails=False)
+    m.grpo.max_rollout_turns = 3
+    validate_sticky_routing(m)
+    with pytest.raises(ValueError, match="stream_training_over_tails"):
+        validate_sticky_routing(_master(sticky_anchor_horizon=64))
+    validate_sticky_routing(_master(sticky_anchor_horizon=64, stream_training_over_tails=False))
     m = _master(sticky_routing_delta=None)
     configure_sticky_policy(m)
     assert m.policy["megatron_cfg"]["sticky_routing_delta"] is None
@@ -528,7 +537,6 @@ def test_sticky_config_default_and_valid():
         ({"tail_lookup": True}, 1, False, "tail_lookup"),
         ({"speculate": False}, 1, False, "speculate"),
         ({"sticky_routing_delta": -1.0}, 1, False, ">= 0"),
-        ({}, 2, False, "max_rollout_turns"),
         ({}, 1, True, "prefix_caching"),
     ],
 )
