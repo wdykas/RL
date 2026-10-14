@@ -1731,10 +1731,14 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 worker._install_route_record(context)
                 if getattr(worker, "_route_record", None) is not None:
                     _drop_mcore_route_bookkeeping(controller)
+                    # Before graph capture: the routers read the buffer.
+                    worker._install_anchor_apply(context)
                 super().__init__(controller, context, *args, **kwargs)
                 if getattr(worker, "_route_log_state", None) is not None:
                     # An engine rebuilt after the route log was installed.
                     worker._wrap_route_log(controller, context)
+                if getattr(worker, "_anchor_apply", None) is not None:
+                    worker._wrap_anchor_apply(self, controller, context)
 
             def _validate_async_sched_support_for_config(self) -> None:
                 if getattr(worker, "_route_record", None) is None:
@@ -1995,6 +1999,194 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
 
         controller._dynamic_step_context_init = context_init
         controller._dynamic_step_forward_logits = forward_logits
+
+    # ---- Anchor horizon: sticky anchors applied by the engine (theta_k) ----
+
+    def _install_anchor_apply(self, context) -> None:
+        """Attach the per-token anchor buffer to the engine's routers.
+
+        Sticky routing with ``policy.megatron_cfg.sticky_anchor_horizon``: a
+        rollout drafted at theta_{k-1} whose anchors are complete below its
+        horizon continues on the refit engine, which must route positions
+        below the horizon with the sticky rule against those anchors.
+        ``routes.EngineAnchors`` keeps one static [max_tokens, L_local, K]
+        buffer filled per forward (``_wrap_anchor_apply``); every router reads
+        its layer's column inside its CUDA graphs
+        (``sticky_routing.engine_step_anchors``), so this runs before the
+        engine constructor captures them. Every engine rank with MoE layers
+        applies (pipeline stages: their layers; TP ranks: all, each routes
+        its own tokens).
+        """
+        from megatron.core import parallel_state as ps
+        from megatron.core.utils import get_model_config
+
+        from nemo_rl.models.megatron import sticky_routing
+        from thundersync_rl.routes import EngineAnchors
+
+        if sticky_routing.get_anchor_horizon() is None:
+            return
+        rec = self._route_record
+        cfg = get_model_config(self._gen_model())
+        state = getattr(self, "_anchor_apply", None)
+        if state is None or state["anchors"].buffer.shape[0] < int(context.max_tokens):
+            anchors = EngineAnchors(
+                int(context.max_tokens),
+                len(rec["replays"]),
+                int(cfg.moe_router_topk),
+                torch.device("cuda", torch.cuda.current_device()),
+                self._fetch_engine_anchors,
+            )
+            state = self._anchor_apply = {
+                "anchors": anchors,
+                "controller": None,
+                "requests": {},  # anchor key -> engine request id
+                "steps": 0,
+            }
+        rank = (
+            ps.get_tensor_model_parallel_rank()
+            if rec["sequence_parallel"] and ps.get_tensor_model_parallel_world_size() > 1
+            else 0
+        )
+        buf = state["anchors"].buffer
+        for j, replay in enumerate(rec["replays"]):
+            setattr(replay, sticky_routing.APPLY_ATTR, (buf[:, j, :], rank))
+
+    def register_engine_anchors(self, entries: dict[str, Any]) -> int:
+        """{anchor key: RouteRefs} of rollouts the engine continues at theta_k.
+
+        Generation workers (all of them: the coordinator picks the data-parallel
+        rank that runs a request). Only handles are stored; the rank that
+        admits a request fetches its own stage's blocks (``_fetch_engine_anchors``).
+        Replaces the previous step's entries (their rollouts have finished).
+        """
+        self._engine_anchor_refs = dict(entries)
+        return len(entries)
+
+    def _fetch_engine_anchors(self, key: str):
+        """Dense anchors [c, L_local, K] of one registered request (this stage)."""
+        from thundersync_rl.routes import fetch_anchors
+
+        refs = (getattr(self, "_engine_anchor_refs", None) or {}).get(key)
+        if refs is None:
+            return None
+        t0 = time.perf_counter()
+        rows = fetch_anchors(
+            refs,
+            self._route_record["layers"],
+            int(self._anchor_apply["anchors"].buffer.shape[-1]),
+            int(refs.length),
+            ray.get,
+        )
+        st = self._anchor_apply
+        st["fetch_s"] = st.get("fetch_s", 0.0) + time.perf_counter() - t0
+        return rows
+
+    def _wrap_anchor_apply(self, engine, controller, ctx) -> None:
+        """Fill the anchor buffer before every engine forward (once per controller).
+
+        Wraps ``_dynamic_step_forward_logits`` (runs in Python for every
+        forward, eager or graph replay, legacy or async scheduling, and for
+        expert-parallel dummy steps). Before the launch, from the context's CPU
+        bookkeeping of this forward: anchor id per slot (``routes.SlotTags``:
+        a lookup only for slots whose request is new; the first lookup of a
+        tagged request loads its anchors into the pool), then per token
+        (numpy) and ``EngineAnchors.fill``. A dummy step (MCore
+        ``dummy_forward``: request ids and positions are the last real
+        step's) makes every row self. Requests that left the engine release
+        their pool pages every 64 forwards.
+        """
+        from thundersync_rl.engine_q import ANCHOR_KEY_ATTR
+        from thundersync_rl.routes import SlotTags
+
+        state = self._anchor_apply
+        if state["controller"] is controller:
+            return
+        state["controller"] = controller
+        anchors, active = state["anchors"], state["requests"]
+
+        def lookup(rid):
+            entry = engine.requests.get(rid)
+            if entry is None:
+                return None
+            key = getattr(entry.record[-1].sampling_params, ANCHOR_KEY_ATTR, None)
+            if key is not None:
+                active[key] = rid
+            return key
+
+        tags = SlotTags(lookup, anchors.anchor_id)
+        # Debug control for the end-to-end check: never apply (the engine then
+        # samples plain routes on anchored prefixes; the mismatch check must
+        # fail where the rule changes a route).
+        skip = os.environ.get("THUNDERSYNC_DEBUG_NO_ANCHOR_APPLY") == "1"
+
+        def sweep():
+            for key in [k for k, rid in active.items() if rid not in engine.requests]:
+                anchors.release(key)
+                del active[key]
+
+        orig_init = controller._dynamic_step_context_init
+        orig = controller._dynamic_step_forward_logits
+        dummy = [False]
+
+        def context_init(*args, **kwargs):
+            dummy[0] = bool(kwargs.get("is_dummy_forward", False))
+            return orig_init(*args, **kwargs)
+
+        def forward_logits(*args, **kwargs):
+            if dummy[0] or skip:
+                anchors.clear()
+            else:
+                n = int(ctx.active_token_count)
+                e = int(ctx.total_request_count)
+                if n > 0 and e > 0:
+                    slot_aid = tags.refresh(
+                        ctx.request_ids[:e].numpy(),
+                        ctx.request_in_prefill_status_tensor[:e].numpy() != 0,
+                    )
+                    anchors.fill(
+                        slot_aid[ctx.token_to_request_idx[:n].numpy()],
+                        ctx.token_to_pos_ids[:n].numpy(),
+                    )
+                else:
+                    anchors.clear()
+            state["steps"] += 1
+            if active and state["steps"] % 64 == 0:
+                sweep()
+            return orig(*args, **kwargs)
+
+        controller._dynamic_step_context_init = context_init
+        controller._dynamic_step_forward_logits = forward_logits
+
+    def engine_anchor_stats(self) -> dict[str, float]:
+        """Anchor-apply counters of this engine rank (0s when not installed)."""
+        st = getattr(self, "_anchor_apply", None)
+        if st is None:
+            return {}
+        a = st["anchors"]
+        return {
+            "applied_tokens": float(a.applied_tokens),
+            "loaded_requests": float(a.loaded_requests),
+            "pool_bytes": float(a.pool_bytes),
+            "buffer_bytes": float(a.buffer.numel() * a.buffer.element_size()),
+            "fetch_s": float(st.get("fetch_s", 0.0)),
+        }
+
+    def _prepare_data_for_generation(self, data, greedy: bool = False):
+        """Tag requests that continue an anchored rollout (anchor horizon).
+
+        ``data["ts_anchor_key"][i]`` (optional): the request's key in
+        ``register_engine_anchors``; it travels with the serialized sampling
+        params to the engine rank that runs the request.
+        """
+        prompts, media, sps = super()._prepare_data_for_generation(data, greedy)
+        keys = data.get("ts_anchor_key") if data is not None else None
+        if keys:
+            from thundersync_rl.engine_q import ANCHOR_KEY_ATTR
+
+            for sp, key in zip(sps, keys):
+                if key:
+                    sp.add_attributes({ANCHOR_KEY_ATTR: key})
+        return prompts, media, sps
 
     def pop_draft_routes(self, keys: list[str], close: bool = True) -> dict[str, tuple]:
         """{key: (layer numbers, lo, run_end, [(ref, lo, hi, bytes)])}.

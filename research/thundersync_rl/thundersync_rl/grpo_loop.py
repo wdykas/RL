@@ -41,7 +41,7 @@ import os
 import time
 import warnings
 from types import SimpleNamespace
-from typing import Any, Callable, Literal, Optional
+from typing import Any, Awaitable, Callable, Literal, Optional
 
 import numpy as np
 import ray
@@ -65,6 +65,7 @@ from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.logger import Logger
 from thundersync_rl.fused_train import FusedRef
+from thundersync_rl.multi_turn import TurnEnvironment
 from thundersync_rl.null_bv import drafts_per_prompt
 from thundersync_rl.routes import RouteRefs
 from thundersync_rl.speculative import SpeculativeGeneration, cohort_draft
@@ -259,6 +260,15 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # tokens decoded past the verified piece (SpeculativeGeneration
     # ._continue_sticky). Fixed count: the cut is exogenous.
     sticky_continuation_chunk_tokens: int = 2048
+    # Sticky routing anchor horizon H (generated positions; DESIGN.md section
+    # 14i). None: anchors up to the rollout cap (every drafted rollout is
+    # completed at theta_{k-1} before the refit). Set: anchors only at
+    # positions < c = prompt + min(H, cap), self beyond; theta_{k-1} work per
+    # drafted rollout ends once its anchors below c are logged, and the refit
+    # engine samples the rest from p_k directly, re-applying the anchors with
+    # the sticky rule in its forwards (engine anchor apply). Bounds theta_{k-1}
+    # work (and the refit wait) by H tokens per rollout.
+    sticky_anchor_horizon: Optional[int] = None
     # Weights the engine drafts the next step's rollouts with (draft_weights.py,
     # DESIGN.md section 14f). "current": theta_k. "momentum": theta_hat_{k+1} =
     # the AdamW step of the optimizer state (theta_k, m_k, v_k) with gradient 0,
@@ -429,11 +439,9 @@ def validate_sticky_routing(master_config: ThunderSyncMasterConfig) -> None:
             "thundersync.tail_lookup must be false (continuations are theta_{k-1} "
             "drafting rounds, not engine lookup decoding)"
         )
-    if (master_config.grpo.max_rollout_turns or 1) != 1:
-        problems.append(
-            "grpo.max_rollout_turns must be 1 (a later turn would be decoded on a "
-            "prefix whose anchors the engine cannot apply yet: not built yet)"
-        )
+    # grpo.max_rollout_turns > 1: every turn of a drafted rollout is sampled
+    # at the drafting weights before the refit (scheme A, multi_turn.py);
+    # undrafted rollouts are "self" everywhere and take the plain path.
     if mcore_gen.get("enable_prefix_caching"):
         problems.append(
             "policy.generation.mcore_generation_config.enable_prefix_caching must be "
@@ -446,6 +454,9 @@ def validate_sticky_routing(master_config: ThunderSyncMasterConfig) -> None:
         problems.append("invalid expert_model_parallel_size")
     if (policy_cfg.get("router_replay") or {}).get("enabled"):
         problems.append("policy.router_replay.enabled (R3) must be false")
+    horizon = ts_cfg.sticky_anchor_horizon
+    if horizon is not None and int(horizon) < 0:
+        problems.append(f"thundersync.sticky_anchor_horizon must be >= 0 (got {horizon})")
     if problems:
         raise ValueError("thundersync.sticky_routing: " + "; ".join(problems) + ".")
 
@@ -599,6 +610,11 @@ def configure_sticky_policy(master_config: Any) -> None:
     master_config.policy["megatron_cfg"]["sticky_routing_delta"] = delta
     master_config.policy["megatron_cfg"]["sticky_rounding"] = bool(
         master_config.thundersync.sticky_rounding
+    )
+    # The generation workers apply anchors in their forwards (engine anchor
+    # apply) only with an anchor horizon.
+    master_config.policy["megatron_cfg"]["sticky_anchor_horizon"] = (
+        master_config.thundersync.sticky_anchor_horizon if delta is not None else None
     )
 
 
@@ -999,6 +1015,11 @@ async def _run_one_step(
     claim_anchors: Optional[
         Callable[[torch.Tensor, torch.Tensor], Optional[RouteRefs]]
     ] = None,
+    replay_row: Optional[
+        Callable[
+            [int], Awaitable[Optional[tuple[dict, dict, Optional[RouteRefs]]]]
+        ]
+    ] = None,
     draft_swap: Optional[Callable[[], None]] = None,
     draft_start_frac: Optional[float] = None,
 ) -> dict[str, Any]:
@@ -1067,7 +1088,16 @@ async def _run_one_step(
     # and what the learner did with them.
     fused_counts = collections.Counter()
 
+    replayed = [0]  # drafted multi-turn rollouts rebuilt from their records
+
     async def rollout(i: int):
+        drafted = await replay_row(i) if replay_row is not None else None
+        if drafted is not None:
+            # Multi-turn rollout sampled turn by turn before the refit (sticky
+            # routing, scheme A): rebuilt from its recorded turns, the
+            # environment is not stepped again.
+            replayed[0] += 1
+            return i, *drafted
         state, metrics = await run_sample_multi_turn_rollout(
             sample_idx=i,
             initial_sample_state=_initial_sample_state(repeated, i),
@@ -1078,7 +1108,7 @@ async def _run_one_step(
             max_rollout_turns=master_config.grpo.max_rollout_turns,
             greedy=False,
         )
-        return i, state, metrics
+        return i, state, metrics, None
 
     async def learner_loop():
         nonlocal learner_busy, num_dispatches, pipeline_calls
@@ -1167,7 +1197,7 @@ async def _run_one_step(
         verify_task.add_done_callback(_start_drafts)
     try:
         for fut in asyncio.as_completed([rollout(i) for i in range(n)]):
-            i, state, metrics = await fut
+            i, state, metrics, anchors = await fut
             n_done += 1
             if (
                 drafter is not None
@@ -1199,7 +1229,9 @@ async def _run_one_step(
                 "message_log": state["message_log"],
                 "loss_multiplier": loss_mult,
             }
-            if claim_anchors is not None:
+            if anchors is not None:
+                payload["anchors"] = anchors
+            elif claim_anchors is not None:
                 payload["anchors"] = claim_anchors(
                     torch.cat([m["token_ids"] for m in repeated["message_log"][i]]),
                     torch.cat([m["token_ids"] for m in state["message_log"]]),
@@ -1263,6 +1295,8 @@ async def _run_one_step(
         "max_gen_tokens": float(
             np.max([m["assistant_tokens"] for m in sample_metrics])
         ),
+        "mean_turns": float(np.mean([m["turn_count"] for m in sample_metrics])),
+        "max_turns": float(np.max([m["turn_count"] for m in sample_metrics])),
         "time/rollout": t_rollout_end - t_start,
         "time/post_rollout_to_step": t_end - t_rollout_end,
         # Barrier only: write-back, 1/N, DP reduce, clip, optimizer step.
@@ -1280,6 +1314,8 @@ async def _run_one_step(
         "_drafts": drafts,
         **mismatch,
     }
+    if replay_row is not None:
+        out["spec/replayed_multi_turn_rows"] = float(replayed[0])
     if claim_fused is not None:
         # Trajectories trained from their verification forward; each saved
         # one training forward of its row (fused/forward_tokens_saved tokens).
@@ -1341,9 +1377,20 @@ def thundersync_grpo_train(
             sticky_chunk_tokens=ts_cfg.sticky_continuation_chunk_tokens,
             draft_weights=ts_cfg.draft_weights,
             max_seq_len=master_config.policy["max_total_sequence_length"],
+            anchor_horizon=ts_cfg.sticky_anchor_horizon if sticky_delta(ts_cfg) is not None else None,
         )
     sticky = spec is not None and spec.sticky_delta is not None
     G = master_config.grpo.num_generations_per_prompt
+    multi_turn = sticky and (master_config.grpo.max_rollout_turns or 1) > 1
+    if multi_turn:
+        # Drafted rollouts finish every turn at the drafting weights; the
+        # driver steps the environment at each verified turn end.
+        spec.turn_env = TurnEnvironment(
+            tokenizer,
+            task_to_env,
+            master_config.policy["max_total_sequence_length"],
+            master_config.grpo.max_rollout_turns,
+        )
     if spec is not None and os.environ.get("THUNDERSYNC_SPEC_SELFTEST"):
         first = next(iter(dataloader))
         prompts = [
@@ -1389,6 +1436,11 @@ def thundersync_grpo_train(
             # supplies the anchors of continuation positions; refit after.
             t1 = time.perf_counter()
             policy_generation.prepare_for_generation()
+            if multi_turn:
+                rows = batch.repeat_interleave(G)
+                spec.bind_rows(
+                    [_initial_sample_state(rows, i) for i in range(rows.size)]
+                )
             asyncio.run(spec.verify_sticky(drafts))
             policy_generation.finish_generation()
             t_verify = time.perf_counter() - t1
@@ -1498,6 +1550,7 @@ def thundersync_grpo_train(
                 if spec is not None and ts_cfg.fused_verify_train
                 else None,
                 claim_anchors=spec.claim_anchors if sticky else None,
+                replay_row=spec.replay_row if multi_turn else None,
                 draft_swap=(
                     spec.load_staged_draft_weights if staged and not draft_now else None
                 ),
