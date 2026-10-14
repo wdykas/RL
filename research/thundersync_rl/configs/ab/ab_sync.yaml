@@ -9,3 +9,6 @@ policy:
   generation:
     colocated:
       enabled: true
+    refit_transport: mcore  # colocated Megatron generation reshards in place into its inference model
+    mcore_generation_config:
+      refit_backend: nccl

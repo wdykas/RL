@@ -651,10 +651,17 @@ def _validate_backend(config: PolicyConfig, out: ZeroTrainGenValidation) -> None
         )
         return
 
-    if generation["colocated"]["enabled"]:
+    # Colocated generation runs a dedicated inference-layout model (the inference
+    # transformer_impl below differs from training's) refreshed by MCore's in-place
+    # reshard on every wake.
+    if (
+        generation["colocated"]["enabled"]
+        and generation.get("refit_transport") != "mcore"
+    ):
         out.violations.append(
-            "zero_train_gen_mismatch does not support colocated generation; set "
-            "policy.generation.colocated.enabled=false."
+            "zero_train_gen_mismatch with colocated generation requires "
+            "policy.generation.refit_transport='mcore' (in-place reshard into the "
+            "dedicated inference model)."
         )
 
     inference_cfg = merged_inference_megatron_cfg(config)

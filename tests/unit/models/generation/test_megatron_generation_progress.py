@@ -135,3 +135,37 @@ def test_engine_reset_does_not_go_negative():
     clock.t = 60.0
     line = m.tick()
     assert "(+2)" in line and "(+500)" in line
+
+
+def test_stall_dumps_all_thread_stacks_and_exits_nonzero():
+    """The default on_stall in a real process: every thread's stack on stderr, exit 75."""
+    import subprocess
+    import sys
+    import textwrap
+
+    code = textwrap.dedent(
+        """
+        import threading, time
+        from types import SimpleNamespace
+        from collections import deque
+        from nemo_rl.models.generation.megatron.progress import GenerationProgressMonitor
+
+        def engine_loop_stuck_in_collective():
+            time.sleep(60)
+
+        threading.Thread(target=engine_loop_stuck_in_collective, daemon=True).start()
+        e = SimpleNamespace(
+            context=SimpleNamespace(total_request_count=1, paused_request_count=0, step_count=7),
+            requests={0: None}, waiting_request_ids=deque(), finished_request_count=0,
+            generated_token_count=10, state=SimpleNamespace(name="RUNNING"),
+        )
+        GenerationProgressMonitor(e, 3, interval_s=0.05, stall_timeout_s=0.2, log=False).start()
+        time.sleep(30)
+        """
+    )
+    p = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=60
+    )
+    assert p.returncode == 75
+    assert "[gen watchdog] rank 3" in p.stderr
+    assert "engine_loop_stuck_in_collective" in p.stderr

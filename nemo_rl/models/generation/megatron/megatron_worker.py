@@ -2242,17 +2242,22 @@ class MegatronGenerationRefitMixin:
             )
             self._swap_weights_plan_prepared = True
 
-        swap_model_weights(
-            self.model,
-            inference_model,
-            refit_method=self.cfg["generation"]["mcore_generation_config"][
-                "refit_backend"
-            ],
-            group=None,
-            src_rank_offset=0,
-            dst_rank_offset=0,
-            execution_batch_bytes=execution_batch_bytes,
-        )
+        # The inference model only runs under inference mode, where tensors it
+        # allocates lazily (e.g. the fp16 GEMM weight caches of the zero-mismatch
+        # recipe) become inference tensors; outside inference mode MCore's in-place
+        # copy into them raises. Write the new weights under inference mode too.
+        with torch.inference_mode():
+            swap_model_weights(
+                self.model,
+                inference_model,
+                refit_method=self.cfg["generation"]["mcore_generation_config"][
+                    "refit_backend"
+                ],
+                group=None,
+                src_rank_offset=0,
+                dst_rank_offset=0,
+                execution_batch_bytes=execution_batch_bytes,
+            )
         # Offload training model.
         self.model = self.move_model(
             self.model, "cpu", move_params=True, move_grads=False
