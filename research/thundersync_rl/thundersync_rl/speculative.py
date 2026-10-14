@@ -95,6 +95,17 @@ def lpt_owners(lengths: list[int], ranks: int) -> list[int]:
     return owner
 
 
+def data_parallel_size(group) -> int:
+    """Model data-parallel degree of a worker pool (the ranks rows are placed on).
+
+    Not ``RayWorkerGroup.dp_size``, which counts tied-worker groups: a
+    Megatron pool has one per worker, so tensor/pipeline-parallel ranks of
+    the same replica would be counted as replicas.
+    """
+    ann = getattr(group, "sharding_annotations", None)
+    return 1 if ann is None else int(ann.get_axis_size("data_parallel"))
+
+
 class PrefixClaims:
     """Values keyed by (prompt, generated tokens), claimed by a trajectory.
 
@@ -1282,7 +1293,7 @@ class SpeculativeGeneration:
                 if method == "verify_drafts_block_engine":
                     # Rows placed on the pool's data-parallel ranks by tokens.
                     lengths = [r.numel() for r in rows[a:b]]
-                    ranks = getattr(g, "dp_size", 1)
+                    ranks = data_parallel_size(g)
                     owners = lpt_owners(lengths, ranks)
                     extra = {**extra, "row_ranks": owners}
                     self._count_balance(lengths, owners, ranks)
@@ -1318,6 +1329,9 @@ class SpeculativeGeneration:
                 for rank_res in ray.get(refs)
             ]
         by_row = dict(x for rank_res in res for x in rank_res)
+        missing = sorted(set(range(len(flat))) - by_row.keys())
+        if missing:
+            raise RuntimeError(f"block verification returned no result for rows {missing}")
         self._verified_hidden(flat, by_row)
         return by_row
 

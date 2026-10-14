@@ -982,3 +982,24 @@ def test_verification_rows_are_placed_by_tokens():
     load = [sum(n for n, r in zip(lengths, owners) if r == k) for k in range(4)]
     assert max(load) == 64000 and min(load) >= 30000
     assert lpt_owners([5, 5], 1) == [0, 0]
+
+
+def test_rows_are_placed_on_model_data_parallel_ranks():
+    """A PP=2 pool of two workers is ONE data-parallel replica (not two)."""
+    import numpy as np
+    from nemo_rl.distributed.named_sharding import NamedSharding
+    from thundersync_rl.speculative import data_parallel_size
+
+    def pool(pp, dp, cp, tp):
+        layout = np.arange(pp * dp * cp * tp).reshape(pp, dp, cp, tp)
+        names = ["pipeline_parallel", "data_parallel", "context_parallel", "tensor_parallel"]
+        # RayWorkerGroup.dp_size counts workers for Megatron pools.
+        return SimpleNamespace(
+            sharding_annotations=NamedSharding(layout, names), dp_size=layout.size
+        )
+
+    assert data_parallel_size(pool(2, 1, 1, 1)) == 1
+    assert data_parallel_size(pool(2, 2, 1, 2)) == 2
+    assert data_parallel_size(pool(1, 4, 1, 1)) == 4
+    assert data_parallel_size(SimpleNamespace()) == 1
+
