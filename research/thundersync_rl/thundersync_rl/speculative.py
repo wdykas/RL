@@ -1869,10 +1869,11 @@ class SpeculativeGeneration:
             plans = [(_key(self._row_prompts[i]), p) for i, p in self._row_plans.items()]
         else:
             plans = [(key, plan) for key, queue in self.plans.items() for plan in queue]
+        waiting = {id(plan) for _, plan in ended}  # on the environment
         pending = [
             (key, plan)
             for key, plan in plans
-            if not plan.complete and not any(plan is q for _, q in ended)
+            if not plan.complete and id(plan) not in waiting
         ]
         # The drafts' streams still decode: whole-accepted unfinished plans go
         # on with theirs, every other stream stops.
