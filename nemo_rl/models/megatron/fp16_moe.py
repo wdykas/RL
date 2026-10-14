@@ -42,6 +42,7 @@ Backward: dgrad / wgrad per expert on bf16 casts with fp32 accumulation.
 
 from __future__ import annotations
 
+import collections
 import contextlib
 from typing import Any, Iterator, Optional
 
@@ -591,12 +592,18 @@ class GroupedFp16Linear(torch.autograd.Function):
 
 # fp16 copies of the training model's expert weights (cuBLAS needs both operands in
 # fp16; the Triton kernel converts in registers instead), stacked [E, N, K] per expert
-# linear for the grouped GEMM. Valid until the weights change: the policy worker calls
-# invalidate_weight_cache() after every optimizer step (checkpoints load only at init).
-# Costs 2 bytes per local expert parameter (29.4 GB per rank for Nemotron-3-Nano at
-# EP=2); ``set_weight_cache(False)`` (policy.megatron_cfg.fp16_expert_weight_cache=false)
-# casts one expert at a time in every forward instead.
-_WEIGHT_CACHE: dict[tuple[int, ...], tuple[tuple[int, ...], torch.Tensor]] = {}
+# linear for the grouped GEMM, cast just in time and kept for the most recent
+# _CACHE_LINEARS expert linears only: fc1 + fc2 of the two most recent MoE layers, so a
+# rank holds at most two layers' fp16 expert weights (Nemotron-3-Nano EP=8: 2 x 0.3 GiB)
+# instead of 2 B per local expert parameter (7.4 GB at EP=8, 29.4 GB at EP=2). A layer's
+# fc1 and fc2 are cast once per forward (the fp16 values are the same, so the GEMMs are
+# bitwise the same); evicted buffers are reused. Valid until the weights change: the
+# policy worker calls invalidate_weight_cache() after every optimizer step.
+# ``set_weight_cache(False)`` casts one expert at a time instead (no stacked buffer).
+_CACHE_LINEARS = 4
+_WEIGHT_CACHE: "collections.OrderedDict[tuple[int, ...], tuple[tuple[int, ...], torch.Tensor]]" = (
+    collections.OrderedDict()
+)
 # Sticky rounding's anchor forward runs on transient theta_n weights (streamed
 # from host): those must not enter the cache (ids and pointers get reused).
 # ``fc2_input``: sticky rounding's hook on the expert fc2 input rows.
@@ -609,7 +616,7 @@ def set_fc2_input_hook(hook: Optional[Any]) -> None:
 
 
 def set_weight_cache(enabled: bool) -> None:
-    """Process default for caching fp16 expert weights (see ``_WEIGHT_CACHE``)."""
+    """Process default for stacking fp16 expert weights (see ``_WEIGHT_CACHE``)."""
     _HOOKS["cache"] = enabled
     if not enabled:
         _WEIGHT_CACHE.clear()
@@ -636,8 +643,21 @@ def _stacked_fp16(weights: tuple[torch.Tensor, ...]) -> torch.Tensor:
     ptrs = tuple(w.data_ptr() for w in weights)
     hit = _WEIGHT_CACHE.get(key)
     if hit is not None and hit[0] == ptrs:
+        _WEIGHT_CACHE.move_to_end(key)
         return hit[1]
-    w16 = torch.stack([w.detach().to(torch.float16) for w in weights])
+    _WEIGHT_CACHE.pop(key, None)
+    shape = (len(weights), *weights[0].shape)
+    w16 = None
+    if len(_WEIGHT_CACHE) >= _CACHE_LINEARS:
+        # Reuse the least recent buffer when it fits (same stream: its readers
+        # are ordered before this cast).
+        _, (_, old) = _WEIGHT_CACHE.popitem(last=False)
+        if old.shape == shape and old.device == weights[0].device:
+            w16 = old
+    if w16 is None:
+        w16 = torch.empty(shape, dtype=torch.float16, device=weights[0].device)
+    for dst, w in zip(w16, weights):
+        dst.copy_(w.detach())
     _WEIGHT_CACHE[key] = (ptrs, w16)
     return w16
 

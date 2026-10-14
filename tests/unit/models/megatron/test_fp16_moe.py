@@ -247,3 +247,28 @@ def test_engine_expert_weights_become_fp16_views():
     with torch.no_grad():
         m.linear_fc1.weight1.copy_(new)
     assert torch.equal(m._fc1_weight[1], new.to(torch.float16))
+
+
+@needs_cuda
+def test_fp16_weight_cache_holds_two_layers_and_is_bitwise():
+    """The just-in-time cast keeps fc1 + fc2 of two layers and gives the same bits as .to(fp16)."""
+    dev = torch.device("cuda")
+    torch.manual_seed(0)
+    fm.invalidate_weight_cache()
+    layers = [
+        tuple((torch.randn(32, 64, device=dev) * 0.02).to(torch.bfloat16) for _ in range(3))
+        for _ in range(5)
+    ]
+    x = (torch.randn(12, 64, device=dev)).half()
+    for ws in layers:
+        y = fm._expert_gemm_cublas(x, [4, 4, 4], ws)
+        ref = torch.cat(
+            [torch.mm(x[4 * i : 4 * i + 4], w.to(torch.float16).t(), out_dtype=torch.float32)
+             for i, w in enumerate(ws)]
+        )
+        assert torch.equal(y, ref)
+        assert torch.equal(fm._stacked_fp16(ws), torch.stack([w.to(torch.float16) for w in ws]))
+        assert len(fm._WEIGHT_CACHE) <= fm._CACHE_LINEARS
+        with fm.weight_cache_disabled():
+            assert torch.equal(fm._expert_gemm_cublas(x, [4, 4, 4], ws), y)
+    fm.invalidate_weight_cache()

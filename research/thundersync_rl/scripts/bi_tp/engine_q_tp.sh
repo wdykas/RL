@@ -14,7 +14,7 @@
 #   >=4 GPUs per side (GPUS_PER_SIDE, default max(TP*PP, EP)): 2*GPS/4 nodes; run on the head of a Ray cluster (as
 #              tp_parity_submit.sh).
 #
-# Env: TP (2), PP (1), EP (1), STEPS (4), MODEL (Qwen/Qwen3-1.7B), PROMPTS (16), MAXLEN (2048), ACKPT (true),
+# Env: TP (2), PP (1), EP (1), STEPS (4), MODEL (Qwen/Qwen3-1.7B), PROMPTS (16), MAXLEN (2048), ACKPT (selective | full | false), RECOMPUTE_MODULES (moe),
 # TAG, RUNS (output directory name under thundersync_work, runs_engine_q_tp), ARGS (extra Hydra
 # overrides, appended last), RL_ROOT_OVERRIDE (code checkout; default: the one holding this
 # script). Output: thundersync_work/$RUNS/$TAG/{run.log,history.json}.
@@ -48,12 +48,24 @@ case $GPS in
             policy.generation.colocated.resources.gpus_per_node=4) ;;
 esac
 SP=$([ "$TP" -gt 1 ] && echo true || echo false)
-# Full-layer activation recompute in the learner (Megatron recompute_granularity=full, uniform, 1 layer):
-# a training micro-batch then keeps one fp32 [T, hidden] input per layer instead of every layer's activations
-# (~166 KB per token per Qwen3-30B-A3B layer: 128 GB at 16384 tokens x 48 layers, the 2026-10-14 multi-node
-# OOMs). Routes are replayed exactly in the recomputed forward (R3 REPLAY_BACKWARD). ACKPT=false: no recompute
-# (sticky rounding requires it: its anchor forward is not recomputed yet).
-ACKPT=${ACKPT:-true}
+# Learner activation recompute (ACKPT): without it a training micro-batch keeps every layer's activations
+# (Qwen3-30B-A3B: ~166 KB per token per layer, 95 KB of it in the MoE block -> ~122 GiB at 16384 tokens x 48
+# layers: the 2026-10-14 multi-node OOMs).
+#   selective (default): Megatron selective recompute of RECOMPUTE_MODULES (default "moe": the whole MoE block,
+#     router + dispatch + experts + combine, keeps only its fp32 input); routes replay exactly (R3 REPLAY_BACKWARD).
+#   full: every layer recomputed (recompute_granularity=full, uniform, 1 layer): a layer keeps only its fp32
+#     [T, hidden] input. Use when selective does not fit (e.g. PP=2 x EP=2 for Qwen3-30B-A3B).
+#   false: no recompute (sticky rounding requires it: its anchor forward is not recomputed yet).
+ACKPT=${ACKPT:-selective}
+case $ACKPT in
+  selective) RECOMPUTE=(policy.megatron_cfg.activation_checkpointing=true
+                        ++policy.megatron_cfg.recompute_granularity=selective
+                        "++policy.megatron_cfg.recompute_modules=[${RECOMPUTE_MODULES:-moe}]") ;;
+  full)      RECOMPUTE=(policy.megatron_cfg.activation_checkpointing=true
+                        ++policy.megatron_cfg.recompute_granularity=full) ;;
+  false)     RECOMPUTE=(policy.megatron_cfg.activation_checkpointing=false) ;;
+  *) echo "ACKPT must be selective, full or false (got $ACKPT)" >&2; exit 2 ;;
+esac
 PAR=(policy.megatron_cfg.tensor_model_parallel_size=$TP
      policy.megatron_cfg.pipeline_model_parallel_size=$PP
      policy.megatron_cfg.expert_model_parallel_size=$EP
@@ -63,7 +75,7 @@ PAR=(policy.megatron_cfg.tensor_model_parallel_size=$TP
      ++policy.generation.mcore_generation_config.pipeline_model_parallel_size=${GEN_PP:-$PP}
      ++policy.generation.mcore_generation_config.expert_model_parallel_size=$EP
      ++policy.generation.mcore_generation_config.materialize_only_last_token_logits=true
-     policy.megatron_cfg.activation_checkpointing=$ACKPT)
+     "${RECOMPUTE[@]}")
 read -r -a BIF < $W/bi_flags.txt
 BIF+=(++policy.generation.mcore_generation_config.transformer_impl=inference_optimized)
 SPEC=(++thundersync.speculate=true ++thundersync.verify_mode=block

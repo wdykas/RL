@@ -928,10 +928,10 @@ def install(
     Call before the models are built and before the inference engine captures
     its CUDA graphs, in every training and generation worker.
     ``expert_weight_cache`` (``policy.megatron_cfg.fp16_expert_weight_cache``):
-    the training model keeps fp16 copies of its local expert weights between
-    optimizer steps (2 B per local expert parameter); False casts each expert's
-    weight just in time in every forward instead (one expert's copy resident;
-    same fp16 values, so bitwise the same outputs).
+    the training model casts each MoE layer's expert weights to fp16 just in
+    time, stacked, and keeps the two most recent layers (fp16_moe._CACHE_LINEARS);
+    False casts one expert at a time instead (no stacked buffer). Same fp16
+    values either way, so bitwise the same outputs.
     """
     if _STATE["enabled"]:
         return
