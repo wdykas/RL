@@ -444,9 +444,13 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 if seq < self._ordered_next:
                     raise RuntimeError(f"ordered learner call {seq} arrived after {self._ordered_next}")
                 await cv.wait()
+        t0 = time.perf_counter()
         try:
             return getattr(self, method)(**kwargs)
         finally:
+            # Learner seconds per method (``ordered_digest``): verification vs training.
+            busy = self.__dict__.setdefault("_ordered_busy", {})
+            busy[method] = busy.get(method, 0.0) + time.perf_counter() - t0
             self._ordered_next += 1
             # What this rank ran, in order (``ordered_digest``).
             self._ordered_crc = zlib.crc32(
@@ -458,6 +462,11 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
     def ordered_digest(self) -> tuple[int, int]:
         """(ordered calls run, crc32 of their (number, method) sequence) on this rank."""
         return getattr(self, "_ordered_next", 0), getattr(self, "_ordered_crc", 0)
+
+    def ordered_busy(self) -> dict[str, float]:
+        """Seconds this rank spent in each ordered method since the last call (reset)."""
+        busy, self._ordered_busy = self.__dict__.get("_ordered_busy", {}), {}
+        return busy
 
     def engine_step_stats(self) -> dict[str, float]:
         """Engine rank (debug, ``THUNDERSYNC_ENGINE_PROF``): step timing since the last call."""

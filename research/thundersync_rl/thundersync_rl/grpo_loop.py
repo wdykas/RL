@@ -1195,6 +1195,8 @@ async def _run_one_step(
                 refs = learner.submit(per_rank, d.closes, seq=seq)
                 if seq is not None:
                     ordered.learner_track(refs)
+                if rollouts_done and not planner.has_work():
+                    last_sent.set()
                 rank_results = await asyncio.gather(*refs)
                 if seq is not None:
                     ordered._learner_inflight.difference_update(refs)
@@ -1220,8 +1222,12 @@ async def _run_one_step(
                 )
                 num_dispatches += 1
             if rollouts_done and not planner.has_work():
+                last_sent.set()
                 return
 
+    # The step's last training dispatch is on the learner (sticky streaming:
+    # the next cohort's drafts are cut meanwhile, ``cut_drafts``).
+    last_sent = asyncio.Event()
     verify_task = (
         asyncio.create_task(pre_rollout()) if pre_rollout is not None else None
     )
@@ -1265,6 +1271,7 @@ async def _run_one_step(
                 draft_task = asyncio.create_task(drafter())
 
         verify_task.add_done_callback(_start_drafts)
+    cut_task = None
     try:
         for fut in asyncio.as_completed([rollout(i) for i in range(n)]):
             i, state, metrics = await fut
@@ -1324,13 +1331,31 @@ async def _run_one_step(
             wake.set()
         rollouts_done = True
         wake.set()
+        if ordered is not None and draft_task is not None:
+            # Sticky streams go on decoding after the cut (their tokens become
+            # continuation pieces), so the cut time only moves tokens between
+            # the next verify0 and its continuation rounds: cut while the last
+            # training dispatch runs instead of after it.
+            async def cut_drafts():
+                await last_sent.wait()
+                t = time.perf_counter()
+                d = await draft_task
+                if callable(d):
+                    d = await asyncio.to_thread(d)
+                return d, time.perf_counter() - t
+
+            cut_task = asyncio.create_task(cut_drafts())
         await learner_task
         if verify_task is not None:
             await verify_task
         t_wait = time.perf_counter()
-        drafts = await draft_task if draft_task is not None else None
-        if callable(drafts):  # streaming drafts: cut them off at this deadline
-            drafts = drafts()
+        if cut_task is not None:
+            drafts, draft_cut_s = await cut_task
+        else:
+            drafts = await draft_task if draft_task is not None else None
+            if callable(drafts):  # streaming drafts: cut them off at this deadline
+                drafts = drafts()
+            draft_cut_s = None
         draft_wait = time.perf_counter() - t_wait
         t_score = time.perf_counter()
         if before_finish is not None and drafts is not None:
@@ -1339,6 +1364,8 @@ async def _run_one_step(
     except BaseException:
         if draft_task is not None:
             draft_task.cancel()
+        if cut_task is not None:
+            cut_task.cancel()
         learner_task.cancel()
         learner.abort()
         raise
@@ -1390,6 +1417,8 @@ async def _run_one_step(
             draft_started - t_start if draft_started is not None else float("nan")
         ),
         "time/draft_score": draft_score,
+        # Overlapped cut: its own duration (draft_wait is what it left exposed).
+        "time/draft_cut": draft_cut_s if draft_cut_s is not None else draft_wait,
         "_drafts": drafts,
         **mismatch,
     }
@@ -1728,6 +1757,10 @@ def thundersync_grpo_train(
             if len(set(map(tuple, digests))) != 1:
                 raise RuntimeError(f"learner ranks ran different call sequences: {digests}")
             metrics["learner/ordered_calls"] = float(digests[0][0])
+            busy = ray.get(policy.worker_group.run_all_workers_single_data("ordered_busy"))
+            for method in sorted({m for b in busy for m in b}):
+                # Max over ranks: learner seconds in training vs piece verification.
+                metrics[f"learner/busy_{method}_s"] = max(b.get(method, 0.0) for b in busy)
         if tails_s:
             # Continuation rounds, overlapped with this step's training.
             metrics["time/tails"] = tails_s[0]
