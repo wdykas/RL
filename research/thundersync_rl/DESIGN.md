@@ -641,6 +641,7 @@ hidden states and print how many drafted tokens' log q match the engine bitwise)
 | `thundersync_rl/block_verification.py` | Reference block verification, shared acceptance helpers, exact output law |
 | `thundersync_rl/block_verification_fused.py` | Block verification from raw logits with a Triton residual-mass kernel; lazy variant from per-position statistics |
 | `thundersync_rl/null_bv.py` | Pooled ⊥-BV: envelope policy (DP over drafts/slots left, Brownian tail-decode model), per-prompt slot state (section 14d) |
+| `thundersync_rl/lanes.py` | Cohort lanes: lane roles, the cohort pinning invariant, lane timeline, lane builder and per-lane refit (section 14j) |
 | `thundersync_rl/routes.py` | Sticky routing: engine route log, object-store route blocks (`RouteRefs`), per-stage fetch (section 14c); rule in `nemo_rl/models/megatron/sticky_routing.py` |
 | `thundersync_rl/engine_q.py` | Engine-sourced q under BI: engine hidden-state log, per-step row mapping, verification from engine log q + rows on demand |
 | `thundersync_rl/logit_free.py` | `ChunkedHead`: LM-head statistics from hidden states in fixed row chunks, rows recomputed on demand |
@@ -1875,6 +1876,129 @@ anchor forward stays the plain θ_{k−1} forward (the policy definition), indep
 **Measured value (emulation, ledger T).** Qwen3-30B-A3B 16 layers, steady-state AdamW: sticky rounding on top of
 sticky routing lowers Var_q(log p/q) 1.3x for θ_{k−1} drafts and 3–10x for momentum / oracle drafts (all three
 site kinds needed); ~20% of activation elements are rounded toward the anchor at steady state.
+
+## 14j. Cohort lanes: two weight versions in the engine fleet (`thundersync.cohort_lanes: 2`)
+
+*Opt-in (`cohort_lanes: 1` = one engine, the default). Built and unit-tested (CPU, fake engines:
+`tests/unit/test_lanes.py`); 4-GPU end-to-end results below. Notes, measurements and resume
+section: `thundersync_work/research/agent_lanes.md`.*
+
+**Why.** With sticky routing a cohort's continuation streams must decode on the version that
+drafted it (section 14c), and a single-version engine holds that version until every
+continuation of cohort k is verified. Drafting of cohort k+1 therefore starts only after
+cohort k's tails, and the drafts get only the learner's training time as their window
+(`grpo_loop.py`, sticky branch of the main loop). Two lanes remove that coupling: cohort k+1
+is drafted on the other lane from t_k, the top of step k. Window bound ≈
+(L_max·τ + T_verify + g)/2 instead of ≈ L_max·τ [derived, `agent_fp_async_floor.md` §1, §5];
+reconciled model: lanes ≈ 1.7–1.9x faster than today's single-version plan of record and
+0.88–0.97 of a non-exact two-cohort async-1 on the same fleet [derived,
+`agent_fp_reconcile.md` §2–3, `fp_reconcile/model.py`].
+
+**Construction (option 1: lanes are disjoint engine replicas).** A lane is one
+MegatronGeneration (its own MCore DP coordinator) over its own GPUs, one or more full TP/PP/EP
+replicas, holding one weight version at a time (`lanes.py`). Lane 0 is the engine `grpo.setup`
+builds on `policy.generation.colocated.resources`; `build_engine_lanes` adds lane 1 with the
+same placement shape and config (hence the same batch-invariant forward). Each lane has its own
+refit communicator: the learner keeps one process group per lane (`keep_refit_group`) and selects
+the lane's group before a refit (`select_refit_group`, `lanes.refit_lane`), through the same
+bucketed packed-collective refit as one engine. Each lane has its own `SpeculativeGeneration`
+(so its own draft-stream registry, route log, hidden log, ⊥-BV slot table, plans and route
+blocks). Step k (`CohortLanes.step`, `grpo_loop._train_on_lanes`):
+
+1. the drafting lane (k+1 mod 2) takes the drafter D_{k+1} of cohort k+1 (θ_k, or θ̂_{k+1}
+   with momentum: learner load, refit of this lane only, learner restore; no host stage),
+   is pinned to cohort k+1 and starts drafting it;
+2. the cohort lane (k mod 2), still at D_k, verifies cohort k's drafts and decodes + verifies
+   every continuation stream (`verify_sticky`, unchanged) — concurrently with step 1's drafts
+   on the other GPUs — and is unpinned when every rollout of cohort k is complete;
+3. only if some rollout of step k has no complete plan (step 0; a draft dropped for missing
+   logs) the cohort lane refits θ_k and decodes it there;
+4. rollouts are served from the cohort lane's plans, the learner trains, cohort k+1's drafts are
+   cut at the usual deadline (their streams keep running on their lane, section 14c).
+Roles alternate. Without fresh rows exactly one lane is refit per step (each lane every two
+steps), as with today's direct momentum path.
+
+**Option 2 (every engine rank holds two weight copies and two request pools) — not chosen.**
+Per-rank costs, W = engine weight bytes, r = GPUs per replica, s = state per request slot
+[derived]:
+
+| per engine rank | one engine (today) | option 1: lanes | option 2: two copies |
+|---|---|---|---|
+| weights | W/r | W/r | 2W/r |
+| request-slot state (KV, Mamba SSM, BI replay) | s per slot | s per slot (same slots per GPU) | s per slot, two pools in the HBM left after 2W/r |
+| refit bytes per step | W-stream on every rank | W-stream on the drafting lane's ranks only (each rank every 2 steps) | W-stream on every rank, received while the other copy decodes |
+| refit stall | whole fleet paused | drafting lane only; cohort lane keeps decoding tails | none, but receive contends with decode |
+| tail decode τ | — | unchanged | mixed-version batches re-read a second weight set per layer: +20–25% τ in the launch-bound tail (fp_async_floor §3) |
+| collectives across lanes | — | none | — |
+| minimum fleet | 1 replica | 2 replicas | 1 replica |
+| load balance | — | static half per role; idle when tails are short (measured, below) | dynamic |
+
+- Nemotron-3-Nano (31.6B; engine weights 58.8 GB experts / EP + 4.4 GB dense per rank, section
+  14c): 8 engine GPUs as 2 lanes × EP=4: 19.1 GB/rank; option 2 at EP=8 on the same 8 GPUs:
+  2 × 11.8 = 23.5 GB/rank. Lanes at EP=8 (16 engine GPUs): 11.8 GB/rank. Slots per GPU and
+  their 162 MiB + 6 KiB/token of state are unchanged.
+- Ultra-class (~1 TB fp16 engine weights, 16-GPU replicas, 186 GB HBM) [H shapes]: lanes keep
+  62.5 GB/GPU of weights; option 2 needs 125 GB/GPU, leaving ~55 GB for state (≈ 0.86–1.26 GB per
+  row: ~45–60 rows/GPU instead of ~100–120). At R = 128 engine GPUs each lane has 4 replicas.
+- Momentum drafts with lanes need no engine host stage (section 14f's `EngineStage`: a pinned host
+  copy of each engine rank's parameters, ~12 GB/rank at Nano EP=8): the drafting lane decodes
+  nothing at θ_k, so θ̂_{k+1} is refit into it directly.
+
+**Exactness (unchanged argument; only placement and start times change).** Section 14c's
+scheme is exact given R1 (anchors are plain top-k of the drafting version D_k on each rollout's
+own prefix, D_k fixed before θ_k's gradient exists), R2 (continuations after a rejection, and
+the undrafted remainder, decode with D_k's plain forward and log D_k's routes) and R3 (the
+learner verifies and trains with the logged anchors and logged q). Lanes keep all three:
+- *One version per cohort.* Cohort k is pinned to lane k mod 2 from the start of its drafts
+  (the lane was refit to D_k right before, `CohortLanes.pin` records the version) to the end of
+  its last continuation (`unpin`). `CohortLanes.refit` raises on a pinned lane and `check`
+  raises before completion if the lane no longer holds the cohort's version. So every draft
+  token, every continuation token and every logged route of cohort k comes from D_k, as with one
+  engine (which guarantees it by refitting only after `verify_sticky`).
+- *No cross-lane leakage.* Each lane's `SpeculativeGeneration` sends requests only to its own
+  engine (rank 0 of its DP coordinator) and pops routes / hidden rows / log-probs only from its
+  own workers; cohort k's draft tuples, streams and route blocks exist only in lane k mod 2's
+  object. The other lane never receives a cohort-k request: continuation streams of cohort k
+  never run on lane-(k+1) weights.
+- *R1 for D_{k+1}.* θ_k and θ̂_{k+1} = AdamW(θ_k, m_k, v_k; g = 0) exist at t_k and do not depend
+  on θ_{k+1}. Drafting earlier does not change what the drafts are proposals of; they are
+  verified against p_{k+1} with their logged q (any proposal law fixed before θ_{k+1} is valid),
+  cut at the same deadline (before the optimizer step).
+- *Fresh rows.* Rows without a complete plan decode at θ_k (p_k = F(θ_k; self)) on the cohort
+  lane after it is unpinned and refit, as today.
+- *Learner state.* Verification of cohort k needs the LM head of D_k (engine-sourced q). The
+  momentum stage of D_{k+1} now runs before cohort k's verification; it stashes head version k
+  and keeps k−1 (`stash_head(keep=[k−1, k])`, unchanged code), and restores θ_k bitwise before
+  verification starts. With current drafts θ_k's head is stashed at the end of step k, after
+  cohort k is verified.
+- *⊥-BV per lane.* A prompt's K·G drafts are all drafted on one lane in a fixed order, its slot
+  table lives in that lane's object; pooled verification is unchanged.
+Tested on fake engines (`test_lanes.py`): with current and momentum drafts and fresh-row steps,
+every cohort is drafted, continued and served on lane t mod 2 at its drafting version; the next
+cohort's drafts start before the current cohort completes; a refit of the cohort lane before its
+cohort completes raises; a cohort completing on a lane that changed weights or never drafted it
+raises.
+
+**Scaling.** Every per-rank cost above is per lane-local GPU and independent of the learner
+size; nothing per token passes through the driver (routes, hidden rows and log-probs stay in each
+lane's object-store blocks, section 14c); no collective spans lanes. The refit is the existing
+transport with one communicator per lane, so it is as bucketed (packed collective) as one engine;
+the per-lane selection is a pointer swap on each learner rank. Not built yet: per-lane selection for
+the sharded M-to-N transports (`refit_transport: nccl_reshard`, the learner's per-PP-stage
+communicators would be kept per lane the same way), a multi-node lane launcher (each lane = whole
+nodes of replicas; `build_engine_lanes` already takes multi-node placement shapes), lane
+rebalancing (static halves now; `lanes/idle_frac` is the metric), lookahead ≥ 2 (a+1 lanes, the
+version map of `agent_fp_async_floor.md` §2), and lanes without sticky routing (validated off).
+
+**Metrics** (per step, seconds from the top of the step): `lanes/draft_start_s` (cohort k+1's drafts
+start), `lanes/tail_end_s` (cohort k's last continuation verified), `lanes/overlap_s` = tail_end −
+draft_start (> 0: drafting overlapped the tails; one engine is ≤ 0), `lanes/cohort_lane_idle_s`,
+`lanes/drafting_lane_idle_s`, `lanes/idle_frac` (idle lane-seconds / (2 × step time)),
+`lanes/fresh_refit`, `lanes/refits`. One-engine runs report `time/draft_start` (drafter start from the
+top of the rollouts) for the same comparison.
+
+**4-GPU end to end** (`scripts/bi_tp/sticky_moe.sh LANES=2`, 2 training GPUs + two one-GPU lanes,
+EP=1; reference LANES=1 = one engine with DP=2 on the same two GPUs): results below as they land.
 
 ## 15. Open work
 
