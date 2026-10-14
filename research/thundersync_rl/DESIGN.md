@@ -1514,6 +1514,94 @@ forwards of unused drafts, multi-version (cohort) pools, the scorer path, variab
 approval). Not measured yet: acceptance/step time on a real MoE with K drafts (engine capacity is
 the price: `agent_multi_draft.md` §3).
 
+## 14f. Momentum-predicted draft weights (`thundersync.draft_weights: momentum`)
+
+*Opt-in, default `current`. Unit-tested (formula, Megatron DistributedOptimizer on 1 and 2 ranks
+with TP / EP / DP sharding, driver order, config); end-to-end runs: see "Measurements".*
+Implementation notes: `thundersync_work/research/agent_momentum_draft.md`; offline numbers:
+`ACCEPTANCE_LEDGER.md` section T (per-token Var log p/q of a θ_n draft vs a momentum draft:
+~10–15x lower with momentum on Qwen3-30B-A3B layers).
+
+**What changes.** The engine drafts the rollouts of step k+1 with
+
+    θ̂_{k+1} = round_dtype( θ_k − lr·( m̂/(√v̂ + ε) + wd·θ_k ) ),  m̂ = β1 m_k/(1−β1^t), v̂ = β2 v_k/(1−β2^t)
+
+i.e. the AdamW step of the optimizer state (θ_k, m_k, v_k) with gradient 0, t = steps taken + 1,
+lr / wd / β / ε of each parameter's group (lr = the scheduler value for the coming update; NeMo RL
+steps the scheduler after the optimizer), rounded to the parameter dtype. The expression and its
+operation order are the research harness's `draft_master_fn("mom")`
+(`research/sticky/adam_draft_gpu.py`), so the draft is bitwise the one the offline numbers were
+measured with (`tests/unit/test_draft_weights.py`). θ̂ is a function of the optimizer state
+before step k's gradient, so it is available as soon as step k starts.
+
+**Exactness: the drafter is only a different proposal q.** Block verification (section 4) and
+⊥-BV (14d) are exact for any proposal law q, provided q is the law the tokens were actually sampled
+from and is known to the verifier. With engine-sourced q (section 14) both hold by construction:
+log q of each drafted token is the engine's own log-prob of the forward that sampled it, and full q
+rows are rebuilt from the engine's logged final hidden states with the drafting LM head. The target
+p = π_{k+1} = F(θ_{k+1}; A) is untouched (θ_{k+1} is the real optimizer step). Every place that
+assumed "the drafter holds θ_k" was checked:
+
+| Place | Assumption before | With momentum draft weights |
+|---|---|---|
+| Engine-q rows (lazy residuals, residual sample) | LM-head stash of version k = θ_k's head, taken in `score_prev` at the end of step k | the head is stashed by `refit_draft_weights` while θ̂ is loaded on the learner, as version k; `score_prev` does not overwrite it. `[engine q check]` (logged log q == hidden × stashed head) fails if the two ever differ |
+| Scorer q (`verify_source=scorer`) | recomputes q from a θ_k weight stash | rejected by validation (would be the wrong q) |
+| Sticky anchors (14c) | A = plain drafter routes = plain θ_{k−1} | A = plain θ̂_k routes. R1: θ̂_k depends only on the state before g_k, never on θ_k's update outcome or on the draft. R2: anchors are the drafter's routes on the rollout's own prefix; R3: the learner applies the logged anchors, as before |
+| Sticky continuation rounds | engine still at the drafting weights when `verify_sticky` runs; continuations draft + anchor with them | unchanged: the engine keeps θ̂ from the draft refit until the top-of-loop refit, which runs after `verify_sticky`; the route check (`[route check]`) re-prefills on θ̂ and must match the logged anchors |
+| Rollouts of step k (sampled from p_k = θ_k) | engine at θ_k during the step | drafting (and the θ̂ refit) starts only after the step's last rollout returns; drafted rollouts' plans were all published before (each rollout waits for its plan), chunked verification is awaited |
+| Tail decodes after a rejection (non-sticky) | on the refit engine (θ_{k+1}) | unchanged |
+| Refit ordering | one refit per step (θ_{k+1} at the top of the loop) | two: θ̂_{k+1} mid-step k, θ_{k+1} at the top of step k+1 |
+| Learner training forwards during the swap | n/a | the learner's parameters hold θ̂ only inside one critical section (load → stash → refit → restore) guarded by the learner lock that every training dispatch holds; restore is the optimizer's own main → model copy + all-gather, bitwise θ_k (tested); grads/main params are never touched; the fp16 expert-weight cache keeps θ_k's casts (valid again after restore; no forward runs while swapped) |
+| Prefix caching | — | engine prefix-cache hits on KV computed by another version change q, but q is still the engine's logged law (the hidden state the head is applied to is the one actually computed), so exactness holds; sticky routing requires prefix caching off anyway |
+| Lookahead > 1 (cohorts) | drafts span versions | rejected (a two-step momentum draft is not built yet) |
+| Mismatch check | learner vs itself under the same anchors | unchanged (p never depended on the drafter) |
+
+**Implementation.**
+- `draft_weights.py`: `momentum_draft_master` (the formula); `load_draft(optimizer, "momentum")`
+  walks every DistributedOptimizer of the (Chained) optimizer and, on each rank, only the main-
+  parameter shards that rank owns (dense and expert optimizers, any TP / PP / EP / DP layout: the
+  shards are already partitioned by Megatron), computes the draft in chunks of `CHUNK_ELEMS`
+  (16M) elements, rounds it into that shard's slice of the DDP parameter buffer (what the
+  optimizer's main → model copy does after a step), then all-gathers the buffers over the data-
+  parallel groups (`start_param_sync(force_sync=True)`, the post-step gather). fp32 model
+  parameters, whose main shard *is* the buffer slice, are saved before and restored after.
+  `restore_training` = restore those + `quantize_and_sync_model_params_from_main_params()`.
+- Worker: `load_draft_weights(kind)`, `restore_training_weights()`.
+- Driver: `SpeculativeGeneration.refit_draft_weights(refit)`: load → stash LM head (version k)
+  → `refit` (the existing `refit_policy_generation`, unchanged transport) → restore (also on
+  failure). Metrics `draft/*`.
+- Loop: with `draft_weights=momentum`, the drafter task starts when the step's last rollout
+  returns (instead of `draft_start_frac`), awaits the chunked verification task, takes the
+  learner lock (held by every training dispatch) and runs the draft refit in a thread, then
+  drafts. Validation (`validate_draft_weights`): speculate, block, engine q, verify_on=learner,
+  lookahead 1, no draft_after_verify, no fused_verify_train, distributed optimizer, Adam, no
+  precision-aware optimizer (its masters live inside TE FusedAdam: not built yet).
+
+**Per-rank cost** (P parameters, learner world W = TP·PP·DP for dense / EP·ETP·PP·DP_exp for
+experts; each rank owns ≈ P/W main elements, P/(TP·PP·EP-share) model elements) [derived]:
+- compute: ≈ 10 elementwise flops per owned element (≈ P/W), memory-bound: reads master, m, v
+  (12 B) and writes the 2 B param → ≈ 14·P/W bytes of HBM traffic, twice-ish counting the
+  restore copy (6·P/W B). For a 500B model on 512 learner GPUs: ≈ 1e9 owned elements → ≈ 20 GB of
+  HBM traffic ≈ 5–10 ms.
+- memory: chunk temporaries ≈ 5 × 4 B × min(CHUNK_ELEMS, largest owned shard) ≤ 320 MB
+  (independent of model size), plus a copy of the rank's fp32 *model* parameters (norm weights;
+  ≈ 0 for a bf16 model), plus the existing LM-head stash (V/TP × d × 2 B). No copy of the model,
+  master or moments; nothing is gathered except the parameters themselves.
+- communication: two extra parameter all-gathers over each DP group (θ̂, then θ_k), each equal to
+  the gather Megatron already does after every optimizer step (2·P_local·(DP−1)/DP bytes per rank,
+  P_local = model elements on the rank); plus one extra engine refit per step through the
+  existing sharded refit path (model bytes per engine rank; with the sparse-delta refit of
+  `agent_system_structure.md` this becomes ~0.03 B/param).
+- critical path: the draft refit runs after the step's last rollout, between learner
+  dispatches; it delays the learner's remaining dispatches by load + stash + refit + restore
+  (measured below) and the start of drafting by the same amount.
+
+**Measurements.** (filled below as runs complete)
+
+**Not built yet.** Precision-aware optimizer (masters in TE FusedAdam), Megatron-FSDP,
+fp8/fp4 param gather, a two-step draft for lookahead > 1, overlapping the draft refit with the
+learner's tail (e.g. a sparse delta applied on the engine without the learner-side swap).
+
 ## 15. Open work
 
 - **Stragglers.** About one rejected draft per step decodes its remainder at about 3 ms
