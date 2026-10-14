@@ -1466,15 +1466,21 @@ constant (still 1 when d ≤ s).
   policies, TV < 1e-9), a control that picks a row's M from its own outcomes (TV > 1e-3), a
   chi-square of the grid sampler's marginal at each M, and the worker's grid results against the
   reference sampler on GPU. Cost: the forward is shared; per row up to |envelopes| (≤ 13) lazy
-  scans and emissions, each scan re-using the cached rows. All rows are still forwarded (EP
-  lockstep counts are fixed up front); skipping forwards of unused rows is not built yet.
+  scans and emissions, each scan re-using the cached rows.
+- Waves (`_verify_null`): each wave forwards, per prompt with slots left, its next ⌈s·M⌉ rows in
+  drafting order (s slots left, M the current envelope: the expected number of drafts that fill
+  s slots); decisions run between waves. Rows past the filled slots are never forwarded (their
+  hidden states are freed; `spec/null_skipped_drafts`, `spec/null_waves`). Which rows are
+  forwarded depends on counts only, so the decisions equal the one-shot process (tested against
+  `decide_pools` on random outcomes).
 - Driver (`speculative.py`): `draft_streaming(prompts, null_slots)` records the slots of the next
   step (the drafting order is the verification order); `verify` builds the pools and plans only
   for outputs (in drafting order); rollouts without a plan decode fresh (exact). Sticky routing
   composes unchanged: anchors stay per draft, and outputs with a rejection are completed by the
   θ_{k−1} continuation rounds of section 14c.
-- Loop (`grpo_loop.py`): K·G drafts per group; ⊥-BV verification is one call before the rollouts
-  (chunked/overlapped publication of pools is not built yet).
+- Loop (`grpo_loop.py`): K·G drafts per group; ⊥-BV verification runs before the rollouts, in
+  waves (publishing each prompt's plans as soon as its pool is decided, overlapped with the
+  rollouts, is not built yet).
 - Requirements (`validate_null_bv`): speculate, verify_mode=block, verify_source=engine,
   verify_on=learner, draft_lookahead=1, no fused_verify_train, no tail_lookup.
 

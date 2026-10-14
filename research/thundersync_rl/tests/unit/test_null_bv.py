@@ -733,3 +733,85 @@ def test_worker_verifies_every_row_at_every_envelope(monkeypatch):
         assert res[i]["null_grid"] == grid, i
         tau = max(t for t, _, _ in grid.values())
         assert res[i]["token_logprobs"] == lpx[:tau].tolist()
+
+def test_driver_forwards_only_rows_that_can_be_used(monkeypatch):
+    """Waves: per prompt the next ceil(s * M) drafts are forwarded; drafts past
+    the filled slots are never forwarded and their hidden states are freed."""
+    from test_speculative_driver import EOD, _spec as make_spec
+
+    monkeypatch.setattr(spec_mod.ray, "get", lambda x: x)
+    N, G = 6, 2
+    drafted = [([4 + j, EOD], True, [-0.1] * 2) for j in range(N)]
+    sent = []
+
+    def verify(rows, prompt_lens, segments, keys, engine_logq, hidden, **kw):
+        sent.append(list(keys))
+        return [
+            (
+                i,
+                {
+                    "null_grid": {M: (2, 0, -1.0) for M in kw["null_envelopes"]},
+                    "token_logprobs": [-1.0, -1.0],
+                    "draft_logq": engine_logq[i][:2],
+                },
+            )
+            for i in range(len(keys))
+        ]
+
+    engine = {
+        "install_draft_hidden_log": lambda: True,
+        "start_drafts": lambda prompts, budget, interval, hidden_keys=None: None,
+        "draft_request_ids": lambda: {},
+        "collect_drafts": lambda records=None: drafted,
+        "pop_draft_hidden": lambda keys, lengths: {k: torch.ones(n, 4) for k, n in zip(keys, lengths) if n},
+    }
+    s = make_spec(
+        {"verify_drafts_block_engine": verify, "stash_head": lambda **kw: 1},
+        base_handlers=engine,
+        verify_source="engine",
+        hidden_transport="driver",
+        null_bv=True,
+        null_bv_policy={"fixed_m": 2.0},
+    )
+    freed = []
+    s._free_hidden = lambda hs: freed.extend(hs)
+    s.current_step = 0
+    collect = asyncio.run(s.draft_streaming([torch.tensor([1])] * N, null_slots={(1,): G}))
+    drafts = collect()
+    s.current_step = 1
+    s.verify(drafts)
+    # one wave of ceil(2 * 2.0) = 4 drafts; both slots filled by the first two
+    assert sent == [["1:0", "1:1", "1:2", "1:3"]]
+    assert [p.prefix for p in s.plans[(1,)]] == [[4, EOD], [5, EOD]]
+    assert s.stats["spec/null_skipped_drafts"] == 2.0 and s.stats["spec/null_waves"] == 1.0
+    assert s.stats["spec/null_unused_drafts"] == 4.0  # 2 forwarded + 2 never forwarded
+    assert len(freed) >= 2
+
+
+@pytest.mark.parametrize("seed", range(5))
+def test_wave_decisions_equal_the_one_shot_process(seed):
+    """``_verify_null`` (waves, incremental decisions) takes every row at the
+    envelope ``decide_pools`` gives it over the same outcomes."""
+    from thundersync_rl.speculative import SpeculativeGeneration
+
+    rng = np.random.default_rng(seed)
+    policy = NullPolicy(logratio_var=0.2, ref_len=3)
+    ms = envelopes(policy)
+    groups = [f"g{int(k)}" for k in rng.integers(0, 3, size=24)]
+    slots = {g: int(rng.integers(1, 5)) for g in set(groups)}
+    grid = [{M: (0, 0 if rng.random() < 1 / M else NULL_TOKEN, -1.0) for M in ms} for _ in groups]
+    s = object.__new__(SpeculativeGeneration)
+    s._null_policy, s.stats = policy, {}
+    s._release_hidden = lambda ds: list(ds)
+
+    def verify_block(flat, rows, null_envelopes):
+        return {
+            j: {"null_grid": grid[i], "token_logprobs": [], "draft_logq": []}
+            for j, (i, _) in enumerate(flat)
+        }
+
+    s._verify_block = verify_block
+    flat = [(i, (None,) * 8) for i in range(len(groups))]
+    out = s._verify_null(flat, [None] * len(groups), groups, slots)
+    want = decide_pools(groups, slots, [{M: o[1] >= 0 for M, o in g.items()} for g in grid], policy)
+    assert [out[i].get("null_m") for i in range(len(groups))] == want

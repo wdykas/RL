@@ -52,7 +52,7 @@ from thundersync_rl.engine_q import (
     ray_free,
 )
 from thundersync_rl.fused_train import FusedRef
-from thundersync_rl.null_bv import NullPolicy, decide_pools, envelopes, lpt_owners
+from thundersync_rl.null_bv import NullGroup, NullPolicy, envelopes, lpt_owners
 from thundersync_rl.routes import (
     RouteRefs,
     anchored_draft_length,
@@ -61,6 +61,23 @@ from thundersync_rl.routes import (
     merge_route_refs,
     splice_refs,
 )
+
+
+def _null_result(res: dict[str, Any], m: Optional[float]) -> dict[str, Any]:
+    """A ⊥-BV row's result at envelope ``m`` from its grid (None: unused)."""
+    base = {"hidden_bytes_fetched": res.get("hidden_bytes_fetched", 0)}
+    if m is None:
+        return {**base, "null": "unused", "accepted": 0, "next": -1, "logprobs": []}
+    tau, y, lp_y = res["null_grid"][m]
+    return {
+        **base,
+        "accepted": tau,
+        "next": y,
+        "logprobs": res["token_logprobs"][:tau] + ([] if y < 0 else [lp_y]),
+        "draft_logq": res["draft_logq"][:tau],
+        "null": "out" if y >= 0 else "bot",
+        "null_m": m,
+    }
 
 
 class PrefixClaims:
@@ -1005,11 +1022,7 @@ class SpeculativeGeneration:
             flat, rows = self._flat_rows(drafts)
             self._record_siblings(flat)
             groups = [names[_key(d[0])] for _, d in flat]
-            by_row = self._decide_null(
-                self._verify_block(flat, rows, null_envelopes=envelopes(self._null_policy)),
-                groups,
-                slots,
-            )
+            by_row = self._verify_null(flat, rows, groups, slots)
             self._finish_verify_null(flat, by_row, groups, slots, dropped, n_empty)
             return
         flat, rows = self._flat_rows(drafts)
@@ -1132,38 +1145,57 @@ class SpeculativeGeneration:
         if sum(load):
             self.stats["spec/verify_load_max_over_mean"] = max(load) * ranks / sum(load)
 
-    def _decide_null(
-        self, by_row: dict[int, dict[str, Any]], groups: list[str], slots: dict[str, int]
+    def _verify_null(
+        self, flat, rows, groups: list[str], slots: dict[str, int]
     ) -> dict[int, dict[str, Any]]:
-        """Each row's ⊥-BV result at the envelope the count process gives it.
+        """⊥-BV of the pools in waves: forward only rows that can still be used.
 
-        Rows come back verified at every envelope with one set of draws per
-        row (``null_grid``); each prompt's rows are then walked in drafting
-        order (``decide_pools``). Rows after the slots fill are "unused".
+        Each wave forwards, per prompt with slots left, its next
+        ceil(s * M) rows in drafting order (s slots left, M the envelope the
+        counts give now: the expected number of drafts that fill s slots).
+        Every forwarded row is verified at every envelope with one set of
+        draws (``null_grid``); the driver then walks each prompt's rows in
+        drafting order with the count process (``NullGroup``) and takes each
+        row's outcome at the M it gets. Which rows are forwarded depends on
+        counts only, so the decisions are those of the one-shot process
+        (``decide_pools``); rows after the slots fill are "unused", and those
+        never forwarded cost nothing (their hidden states are freed).
         """
-        rows = sorted(by_row)
-        outcomes = [
-            {m: y >= 0 for m, (_, y, _) in by_row[r]["null_grid"].items()} for r in rows
-        ]
-        chosen = decide_pools([groups[r] for r in rows], slots, outcomes, self._null_policy)
-        out = {}
-        for r, m in zip(rows, chosen):
-            res = by_row[r]
-            base = {"hidden_bytes_fetched": res.get("hidden_bytes_fetched", 0)}
-            if m is None:
-                out[r] = {**base, "null": "unused", "accepted": 0, "next": -1, "logprobs": []}
-                continue
-            tau, y, lp_y = res["null_grid"][m]
-            logp = res["token_logprobs"][:tau] + ([] if y < 0 else [lp_y])
-            out[r] = {
-                **base,
-                "accepted": tau,
-                "next": y,
-                "logprobs": logp,
-                "draft_logq": res["draft_logq"][:tau],
-                "null": "out" if y >= 0 else "bot",
-                "null_m": m,
-            }
+        policy = self._null_policy
+        ms = envelopes(policy)
+        queue: dict[str, list[int]] = defaultdict(list)
+        for i, g in enumerate(groups):
+            queue[g].append(i)
+        state = {g: NullGroup(len(q), int(slots[g]), policy) for g, q in queue.items()}
+        out: dict[int, dict[str, Any]] = {}
+        waves = 0
+        while True:
+            batch = []
+            for g, q in queue.items():
+                m = state[g].next_m()
+                if m is None or not q:
+                    continue
+                k = min(len(q), math.ceil(state[g].s * m))
+                batch += q[:k]
+                del q[:k]
+            if not batch:
+                break
+            waves += 1
+            res = self._verify_block(
+                [flat[i] for i in batch], [rows[i] for i in batch], null_envelopes=ms
+            )
+            for j in sorted(range(len(batch)), key=lambda j: batch[j]):
+                i, r = batch[j], res[j]
+                m = state[groups[i]].next_m()
+                if m is not None:
+                    state[groups[i]].record(r["null_grid"][m][1] >= 0)
+                out[i] = _null_result(r, m)
+        skipped = [i for q in queue.values() for i in q]
+        self._release_hidden(flat[i][1] for i in skipped)
+        for i in skipped:
+            out[i] = _null_result({}, None)
+        self.stats["spec/null_waves"] = float(waves)
+        self.stats["spec/null_skipped_drafts"] = float(len(skipped))
         return out
 
     def _finish_verify_null(self, flat, by_row, groups, slots, dropped, n_empty):
