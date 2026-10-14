@@ -50,6 +50,8 @@ def main() -> None:
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--history-json", type=str, default=None)
     args, overrides = parser.parse_known_args()
+    if args.history_json:
+        os.makedirs(os.path.dirname(os.path.abspath(args.history_json)), exist_ok=True)
 
     register_omegaconf_resolvers()
     config = load_config(args.config)
@@ -97,6 +99,7 @@ def main() -> None:
             task_to_env=task_to_env,
             master_config=master_config,
             logger=logger,
+            history_path=args.history_json,
         )
     finally:
         shutdown_environments(task_to_env)

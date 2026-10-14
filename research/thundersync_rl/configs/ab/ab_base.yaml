@@ -1,0 +1,88 @@
+# ThunderSync at-scale A/B kit: settings shared by EVERY arm (baselines included), so arms differ
+# only in the algorithm block of their own file (ab_<arm>.yaml). Launch: thundersync_work/sbatch/submit_ab.sh;
+# arms and metrics: thundersync_work/sbatch/README_ab.md.
+#
+# Shared: real math RL data (DAPO-Math-17k, DAPO verifier rewards), the model's chat template in
+# thinking mode, long rollout caps (policy.max_total_sequence_length, 8k–32k), fixed GRPO group size G,
+# the exact-numerics recipe on training AND inference (fp16-GEMM forward with fp32 residual/norms/logits,
+# batch-invariant kernels, inference-optimized engine, fp32 router), the same non-colocated Megatron
+# engine and the same Megatron learner. Parallelism and node counts come from submit_ab.sh (Hydra overrides).
+defaults: "../grpo_math_1.5b_thundersync_megatron.yaml"
+
+grpo:
+  num_prompts_per_step: 64
+  num_generations_per_prompt: 8  # fixed G (plan of record)
+  max_num_steps: 6  # short runs only (4–8) until acceptance/overhead/scale issues are settled
+  seed: 42
+  val_period: -1
+  val_at_start: false
+  val_at_end: false
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  skip_zero_advantage_rows: true
+
+policy:
+  model_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template_kwargs:
+      enable_thinking: true
+  max_total_sequence_length: 16384
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  make_sequence_length_divisible_by: 128
+  megatron_cfg:
+    activation_checkpointing: false
+    expert_tensor_parallel_size: 1
+    # Exact-numerics recipe (V8b): fp16 GEMM operands, fp32 GEMM outputs / residual / norms / logits.
+    forward_gemm_precision: fp16
+    fp32_residual_connection: true
+    optimizer:
+      use_precision_aware_optimizer: false
+    moe_router_dtype: fp32
+    moe_permute_fusion: false
+    bias_activation_fusion: false
+    defer_fp32_logits: true
+    # Batch invariance (NeMo-RL PR 3208): training forward == engine forward bitwise.
+    zero_train_gen_mismatch: true
+    batch_invariant_mode: true
+    batch_invariant_backend: te_native
+    batch_invariant_collective: ordered
+    attention_backend: flash
+    flash_attention_version: 4
+    env_vars:
+      CUBLASLT_WORKSPACE_SIZE: "0"
+      CUBLAS_WORKSPACE_CONFIG: ":0:0"
+  generation:
+    max_new_tokens: ${policy.max_total_sequence_length}
+    mcore_generation_config:
+      transformer_impl: inference_optimized
+      logprobs_mode: raw_logprobs
+      enable_chunked_prefill: false
+      enable_prefix_caching: false  # sticky routing forbids it; off on every arm for parity
+      materialize_only_last_token_logits: true
+      async_sched_mode: async
+
+data:
+  max_input_seq_length: 2048
+  shuffle: true
+  train:
+    dataset_name: DAPOMath17K
+  validation: null
+  default:
+    prompt_file: null
+    system_prompt_file: null
+    processor: math_hf_data_processor
+    env_name: math
+
+env:
+  math:
+    num_workers: 16
+    math_verify_impl: dapo_math_verify
+
+logger:
+  log_dir: logs/thundersync_ab
+  wandb_enabled: false
+  tensorboard_enabled: false
+  monitor_gpus: false

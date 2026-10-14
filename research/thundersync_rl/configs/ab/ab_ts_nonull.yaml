@@ -1,0 +1,17 @@
+# Arm "ts_nonull": ThunderSync exact speculation WITHOUT pooled ⊥-BV: sticky MoE routing anchored to the
+# drafter (DESIGN §14c) + momentum-predicted draft weights (§14f), engine-sourced q under batch
+# invariance, learner-side block verification, one-step lookahead, continuations after a rejection.
+defaults: ab_base.yaml
+
+thundersync:
+  granularity: group  # open-group gradient buckets are not exact under expert parallelism
+  speculate: true
+  verify_mode: block
+  verify_source: engine
+  verify_on: learner
+  verify_precision: model
+  draft_lookahead: 1
+  draft_budget: ${policy.generation.max_new_tokens}
+  sticky_routing: true
+  sticky_routing_delta: 0.03
+  draft_weights: momentum

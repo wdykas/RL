@@ -1,0 +1,8 @@
+# Arm "sync": synchronous GRPO, speculation off. Every rollout of step k is generated at theta_k, then
+# the learner trains on the whole batch (thundersync.granularity=batch: the batch-synchronous loop of
+# run_thundersync_grpo.py, same learner/engine/metrics as the ThunderSync arms). Exact on-policy.
+defaults: ab_base.yaml
+
+thundersync:
+  granularity: batch
+  speculate: false

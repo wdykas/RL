@@ -1391,9 +1391,11 @@ class SpeculativeGeneration:
         # ones), token-weighted: drafted and kept tokens per age bucket.
         age_tok: dict[int, int] = {}
         age_kept: dict[int, int] = {}
+        pairs: list[tuple[int, int]] = []
         for i in range(len(drafts)):
             d, r = best[i]
             plan = self._plan(d, r)
+            pairs.append((len(d[2]), r["accepted"]))
             full += plan.complete and r["accepted"] == len(d[2])
             kept += r["accepted"]
             total += len(d[2])
@@ -1409,6 +1411,7 @@ class SpeculativeGeneration:
         )
         self._age_stats(age_tok, age_kept)
         self._band_stats()
+        self._longest_stats(pairs)
         if self.verify_source == "engine":
             self.stats["spec/engine_q_dropped"] = float(dropped)
 
@@ -1479,6 +1482,7 @@ class SpeculativeGeneration:
         age_tok: dict[int, int] = {}
         age_kept: dict[int, int] = {}
         decided_len: list[int] = []
+        out_pairs: list[tuple[int, int]] = []
         rejected: list[tuple[int, int]] = []  # (draft length, tau) of tail decodes
         for r, (_, d) in enumerate(flat):
             res = by_row[r]
@@ -1500,6 +1504,7 @@ class SpeculativeGeneration:
             full += plan.complete and res["accepted"] == g
             kept += res["accepted"]
             total += g
+            out_pairs.append((g, res["accepted"]))
             if res["accepted"] < g:
                 n_tail += 1
                 rejected.append((g, res["accepted"]))
@@ -1548,6 +1553,7 @@ class SpeculativeGeneration:
         )
         self._age_stats(age_tok, age_kept)
         self._band_stats()
+        self._longest_stats(out_pairs)
         if self.verify_source == "engine":
             self.stats["spec/engine_q_dropped"] = float(dropped)
 
@@ -1687,6 +1693,33 @@ class SpeculativeGeneration:
             age_tok[age] = age_tok.get(age, 0) + (b - a)
             age_kept[age] = age_kept.get(age, 0) + max(0, min(b, accepted) - a)
 
+    def _longest_stats(self, pairs: list[tuple[int, int]]) -> None:
+        """Earliest rejection among the longest verified drafts (``spec/longest_*``).
+
+        ``pairs`` = (draft length, accepted tokens) of every verified draft. The
+        longest drafts (top decile by length, at least one) are the step's likely
+        stragglers: a rejection at position t leaves (length - t) tokens to
+        decode after verification, so the step waits on the earliest one
+        (research note agent_short_acceptance.md, falsifier 1).
+        """
+        if not pairs:
+            return
+        lens = sorted((g for g, _ in pairs), reverse=True)
+        cut = lens[max(1, len(lens) // 10) - 1]
+        top = [(g, t) for g, t in pairs if g >= cut]
+        rej = [(g, t) for g, t in top if t < g]
+        self.stats.update(
+            {
+                "spec/longest_len_cut": float(cut),
+                "spec/longest_drafts": float(len(top)),
+                "spec/longest_rejections": float(len(rej)),
+                "spec/longest_min_reject_pos": float(min((t for _, t in rej), default=-1)),
+                "spec/longest_min_reject_frac": min((t / max(g, 1) for g, t in rej), default=1.0),
+                "spec/longest_max_remaining": float(max((g - t for g, t in rej), default=0)),
+                "spec/longest_accepted_frac": sum(t for _, t in top) / max(sum(g for g, _ in top), 1),
+            }
+        )
+
     def _age_stats(self, age_tok: dict, age_kept: dict) -> None:
         """spec/age{a}_token_frac and spec/age{a}_accepted_frac per draft age."""
         n_aged = sum(age_tok.values())
@@ -1799,6 +1832,7 @@ class SpeculativeGeneration:
             calls.append((a, refs))
         kept = total = full = fused = 0
         age_tok: dict[int, int] = {}
+        pairs: list[tuple[int, int]] = []
         age_kept: dict[int, int] = {}
 
         async def fetch(a, refs):
@@ -1842,6 +1876,7 @@ class SpeculativeGeneration:
                 for j, r in by_row.items():
                     d = flat[a + j][1]
                     plan = self._plan(d, r)
+                    pairs.append((len(d[2]), r["accepted"]))
                     full += plan.complete and r["accepted"] == len(d[2])
                     fused += plan.fused is not None
                     kept += r["accepted"]
@@ -1859,6 +1894,7 @@ class SpeculativeGeneration:
         )
         self._age_stats(age_tok, age_kept)
         self._band_stats()
+        self._longest_stats(pairs)
         if self.fused_verify_train:
             self.stats["fused/retained"] = float(fused)
         if self.verify_source == "engine":
@@ -1887,7 +1923,10 @@ class SpeculativeGeneration:
         """
         self._plan_cv = None
         if os.environ.get("THUNDERSYNC_ENGINE_Q_CHECK") == "1":
+            t_check = time.perf_counter()
             await self._route_check(drafts)
+            # Debug re-prefill inside time/verify: reported so it can be subtracted.
+            self.stats["time/route_check"] = time.perf_counter() - t_check
         streams = [d[9] for v in drafts for d in v if len(d) > 9 and d[9] is not None]
         self.verify(drafts)
         pending = [
@@ -1927,6 +1966,14 @@ class SpeculativeGeneration:
         not. Counted in ``spec/route_check_tokens`` / ``spec/route_check_exact``.
         """
         ds = [d for v in drafts for d in v if len(d) > 8 and d[8] is not None and d[2]]
+        # THUNDERSYNC_ROUTE_CHECK_ROWS=n: check a seeded random sample of n drafts
+        # (bounded cost at scale; unset: every draft).
+        sample = int(os.environ.get("THUNDERSYNC_ROUTE_CHECK_ROWS", "0") or 0)
+        if 0 < sample < len(ds):
+            import random
+
+            pick = sorted(random.Random(self.current_step).sample(range(len(ds)), sample))
+            ds = [ds[j] for j in pick]
         if not ds:
             return
         rank0 = self.base._policy.worker_group.workers[0]

@@ -38,6 +38,7 @@ import asyncio
 import collections
 import itertools
 import math
+import json
 import os
 import time
 import warnings
@@ -1299,11 +1300,16 @@ async def _run_one_step(
         raise
     assert planner.all_done()
     t_rollout_end = last_rollout_t
+    t_check = time.perf_counter()
     mismatch = (
         train_gen_mismatch(all_trajectories, learner, tokenizer, master_config)
         if os.environ.get("THUNDERSYNC_MISMATCH_CHECK")
         else {}
     )
+    if mismatch:
+        # Debug forward on the step's critical path: reported so step-time
+        # comparisons can subtract it (``time/mismatch_check``).
+        mismatch["time/mismatch_check"] = time.perf_counter() - t_check
     t_finish = time.perf_counter()
     results = learner.finish()
     t_end = time.perf_counter()
@@ -1316,8 +1322,19 @@ async def _run_one_step(
 
     # No "loss" metric: bucket chunks are backpropagated with advantage 1, so
     # the per-chunk loss values the worker sums are not the GRPO loss.
+    # Rollout-token entropy estimate E[-log pi(token)] from the rollouts' own
+    # log-probs (the same definition for every A/B arm; on-policy it equals
+    # the stock loss's approx_entropy).
+    nll = n_tok = 0.0
+    for t in all_trajectories:
+        for m in t.payload["message_log"]:
+            lp = m.get("generation_logprobs") if m.get("role") == "assistant" else None
+            if lp is not None and len(lp):
+                nll -= float(torch.as_tensor(lp).float().sum())
+                n_tok += len(lp)
     out = {
         "reward": float(np.mean(rewards)),
+        "rollout_entropy": nll / max(n_tok, 1),
         "grad_norm": float(torch.as_tensor(results["grad_norm"]).float().mean()),
         "mean_gen_tokens": float(
             np.mean([m["assistant_tokens"] for m in sample_metrics])
@@ -1366,6 +1383,7 @@ def thundersync_grpo_train(
     task_to_env: dict[str, EnvironmentInterface],
     master_config: ThunderSyncMasterConfig,
     logger: Optional[Logger] = None,
+    history_path: Optional[str] = None,
 ) -> list[dict[str, Any]]:
     validate_config(master_config)
     ts_cfg = master_config.thundersync
@@ -1587,6 +1605,12 @@ def thundersync_grpo_train(
         metrics["time/refit"] = t_refit
         metrics["time/iteration"] = time.perf_counter() - t0
         history.append(metrics)
+        if history_path:
+            # Rewritten every step: a run cut short by its time limit keeps
+            # the steps it finished.
+            with open(history_path + ".tmp", "w") as f:
+                json.dump(history, f, indent=1)
+            os.replace(history_path + ".tmp", history_path)
         scalars = {k: v for k, v in metrics.items() if isinstance(v, (int, float))}
         print(
             f"[thundersync step {step}] "
