@@ -10,6 +10,7 @@
 #   SCHED=legacy bash .../nano_hybrid_fp16.sh                               # MCore legacy engine scheduling (default async)
 #   DRAFT_WEIGHTS=momentum bash .../nano_hybrid_fp16.sh                     # momentum draft weights (DESIGN 14f)
 #   NULL_BV=1 bash .../nano_hybrid_fp16.sh                                  # + pooled ⊥-BV (null_bv_moe.sh checks)
+#   EP=1 LANES=2 bash .../nano_hybrid_fp16.sh                               # two one-GPU cohort lanes (DESIGN 14j)
 #
 # Pass (exit 0): as sticky_moe.sh (mismatch 0, exact_token_frac 1, engine-q exact, no scorer
 # fallback; non-vacuity: weights change every step (expert-grad noise), steps >= 1 accept draft
@@ -35,7 +36,7 @@ export RUNS=${RUNS:-runs_nano_hybrid}
 export SCHED=${SCHED:-async}
 export DRAFT_WEIGHTS=${DRAFT_WEIGHTS:-current}
 NULL_BV=${NULL_BV:-0}
-export TAG=${TAG:-nano-L$L-fp16-sticky${STICKY:-1}-ep$EP-$SCHED-dw$DRAFT_WEIGHTS$([ "$NULL_BV" = 1 ] && echo -nullbv)${TF32:+-$TF32}}
+export TAG=${TAG:-nano-L$L-fp16-sticky${STICKY:-1}-ep$EP-$SCHED-dw$DRAFT_WEIGHTS$([ "$NULL_BV" = 1 ] && echo -nullbv)$([ "${LANES:-1}" != 1 ] && echo -lanes$LANES)${TF32:+-$TF32}}
 RECIPE="++policy.megatron_cfg.optimizer.use_precision_aware_optimizer=false
  ++policy.megatron_cfg.fp32_residual_connection=true ++policy.megatron_cfg.forward_gemm_precision=fp16
  policy.megatron_cfg.bias_activation_fusion=false"
