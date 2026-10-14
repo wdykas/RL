@@ -1300,7 +1300,10 @@ def thundersync_grpo_train(
     task_to_env: dict[str, EnvironmentInterface],
     master_config: ThunderSyncMasterConfig,
     logger: Optional[Logger] = None,
+    on_step: Optional[Callable[[list[dict[str, Any]]], None]] = None,
 ) -> list[dict[str, Any]]:
+    """``on_step(history)`` runs after every completed step (e.g. to persist the
+    per-step history, so a run cut short still has every finished step's metrics)."""
     validate_config(master_config)
     ts_cfg = master_config.thundersync
     adv_fn = make_group_advantage_fn(master_config)
@@ -1526,7 +1529,13 @@ def thundersync_grpo_train(
             ),
             flush=True,
         )
+        print(
+            f"[thundersync step {step} done] {time.strftime('%Y-%m-%dT%H:%M:%S')}",
+            flush=True,
+        )
         if logger is not None:
             logger.log_metrics(scalars, step + 1, prefix="thundersync")
+        if on_step is not None:
+            on_step(history)
         step += 1
     return history

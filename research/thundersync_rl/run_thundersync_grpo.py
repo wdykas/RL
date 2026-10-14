@@ -90,6 +90,17 @@ def main() -> None:
         _aliases,
     ) = setup(config, tokenizer, dataset, val_dataset)
 
+    def write_history(history) -> None:
+        # Rewritten after every step (atomic rename): a run cut short (timeout,
+        # crash) still leaves every completed step's metrics for the checkers.
+        if not args.history_json:
+            return
+        path = os.path.abspath(args.history_json)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path + ".tmp", "w") as f:
+            json.dump(history, f, indent=1)
+        os.replace(path + ".tmp", path)
+
     try:
         history = thundersync_grpo_train(
             policy=policy,
@@ -100,6 +111,7 @@ def main() -> None:
             task_to_env=task_to_env,
             master_config=master_config,
             logger=logger,
+            on_step=write_history,
         )
     except BaseException:
         # A failed learner or engine rank can leave its peers blocked in a
@@ -113,10 +125,7 @@ def main() -> None:
         os._exit(1)
     finally:
         shutdown_environments(task_to_env)
-    if args.history_json:
-        os.makedirs(os.path.dirname(os.path.abspath(args.history_json)), exist_ok=True)
-        with open(args.history_json, "w") as f:
-            json.dump(history, f, indent=1)
+    write_history(history)
     # Release the workers and placement groups while Ray is still connected.
     # Left to garbage collection they are shut down from __del__ during
     # interpreter finalization, after Ray's atexit teardown: the Ray calls there

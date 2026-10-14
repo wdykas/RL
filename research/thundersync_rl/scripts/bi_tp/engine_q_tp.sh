@@ -86,7 +86,7 @@ read -r -a USER_ARGS <<< "${ARGS:-}"
 
 OUT=$W/$RUNS/$TAG
 mkdir -p "$OUT"
-rm -f "$OUT/history.json"  # written at the end of training: never check a previous run's
+rm -f "$OUT/history.json"  # rewritten after every step: never check a previous run's
 echo "[engine_q] TP=$TP PP=$PP EP=$EP STEPS=$STEPS MODEL=$MODEL RL_ROOT=$RL_ROOT -> $OUT"
 timeout 2400 python research/thundersync_rl/run_thundersync_grpo.py \
   --config research/thundersync_rl/configs/grpo_math_1.5b_thundersync_megatron.yaml \
