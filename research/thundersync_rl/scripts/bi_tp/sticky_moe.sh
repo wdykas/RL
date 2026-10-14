@@ -27,8 +27,9 @@
 # one-GPU engine lanes (needs TP=PP=EP=1 here; multi-node lanes take whole replicas per lane).
 # Cohort k+1 is drafted on the other lane from the top of step k; additionally every step after
 # the first must overlap that drafting with cohort k's continuation streams (lanes/overlap_s > 0)
-# and complete cohort k on lane k % 2. LANES=1 on the same layout (one engine, DP=2 over the same
-# 2 GPUs) is the single-version reference for step time.
+# and complete cohort k on lane k % 2, its lane's engine weight checksum equal at its drafts and
+# at its completion and different from cohort k-1's (lanes/fingerprint*). LANES=1 on the same
+# layout (one engine, DP=2 over the same 2 GPUs) is the single-version reference for step time.
 #
 # Env: MODEL, EP (2), TP (1), PP (1), STEPS (4), PROMPTS (16), MAXLEN (1024), DELTA (0.03),
 # STICKY (1), NOISE (expert-grad noise, 1), SCHED (engine scheduling: async | legacy; async),
@@ -81,7 +82,7 @@ for i, h in enumerate(hist):
             "time/verify", "time/refit", "time/draft_start", "time/iteration",
             "lanes/cohort_lane", "lanes/draft_start_s", "lanes/tail_end_s", "lanes/overlap_s",
             "lanes/cohort_lane_idle_s", "lanes/drafting_lane_idle_s", "lanes/idle_frac",
-            "lanes/fresh_refit", "lanes/refits")
+            "lanes/fresh_refit", "lanes/refits", "lanes/fingerprint", "lanes/fingerprint_moved")
     print(f"[sticky] step {i}: " + " ".join(f"{k.split('/')[-1]}={h.get(k)}" for k in keys))
     if sticky and h.get("spec/draft_tokens") and h.get("spec/sticky_rounds") is None:
         why.append(f"step {i}: no sticky stats")
@@ -101,6 +102,12 @@ for i, h in enumerate(hist):
         # Drafting of cohort i+1 must overlap cohort i's continuation streams.
         if 1 <= i < len(hist) - 1 and not (h.get("lanes/overlap_s") or 0) > 0:
             why.append(f"step {i}: no lane overlap ({h.get('lanes/overlap_s')})")
+        # The engine's own weights: equal at the cohort's drafts and at its completion
+        # (else the run raises), and different from the previous cohort's.
+        if i >= 1 and h.get("lanes/fingerprint") is None:
+            why.append(f"step {i}: no engine weight fingerprint")
+        if i >= 2 and h.get("lanes/fingerprint_moved") != 1.0:
+            why.append(f"step {i}: cohort ran on the previous cohort's engine weights")
     tok, exact = h.get("spec/route_check_tokens"), h.get("spec/route_check_exact")
     if sticky and i >= 1 and not (tok and exact == tok):
         why.append(f"step {i}: route check {exact}/{tok}")

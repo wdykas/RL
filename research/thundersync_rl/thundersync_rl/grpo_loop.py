@@ -1656,6 +1656,18 @@ def _train_on_lanes(
             lane.generation, policy, tokenizer, master_config
         )
     sched = CohortLanes(lanes)
+    check_weights = bool(os.environ.get("THUNDERSYNC_MISMATCH_CHECK"))
+
+    def lane_fingerprint(lane):
+        # Debug: the weights the lane's engine ranks hold, read from the engine.
+        return sum(
+            ray.get(
+                lane.generation._policy.worker_group.run_all_workers_single_data(
+                    "engine_weight_checksum"
+                )
+            )
+        )
+
     batches = iter(dataloader)
     batch, next_batch = next(batches, None), next(batches, None)
     drafts = None
@@ -1731,6 +1743,7 @@ def _train_on_lanes(
             complete_cohort=complete_cohort,
             needs_current=needs_current,
             run_step=run_step,
+            fingerprint=lane_fingerprint if check_weights else None,
         )
         draft_next = next_batch is not None and step + 1 < max_steps
         metrics, drafts = sched.step(step, drafts, draft_next, ops)

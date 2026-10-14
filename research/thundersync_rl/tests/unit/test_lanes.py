@@ -263,3 +263,46 @@ def test_validate_cohort_lanes_rejects(gen, ts, msg):
 
     with pytest.raises(ValueError, match=msg):
         validate_cohort_lanes(_master(gen, **ts))
+
+
+def _fingerprinted(fleet: FakeFleet, lanes: CohortLanes, step: int, draft_next: bool):
+    ops = fleet.ops(lanes, step, draft_next)
+    ops.fingerprint = lambda lane: hash(fleet.engine[lane.index])  # read from the engine
+    return ops
+
+
+@pytest.mark.parametrize("momentum", [False, True])
+def test_engine_fingerprint_held_per_cohort_and_moves(momentum):
+    fleet = FakeFleet(momentum, fresh_steps=(0,))
+    lanes = CohortLanes(
+        [Lane(i, None, version=("theta", 0)) for i in range(2)], clock=fleet.clock
+    )
+    drafts, out = None, []
+    for step in range(5):
+        ops = _fingerprinted(fleet, lanes, step, step + 1 < 5)
+        m, drafts = lanes.step(step, drafts, step + 1 < 5, ops)
+        out.append(m)
+    assert "lanes/fingerprint" not in out[0]  # cohort 0 is fresh rows, no drafts
+    for t in range(1, 5):
+        want = ("theta_hat", t) if momentum else ("theta", t - 1)
+        assert out[t]["lanes/fingerprint"] == hash(want)
+    assert [m["lanes/fingerprint_moved"] for m in out[1:]] == [0.0, 1.0, 1.0, 1.0]
+
+
+def test_engine_weights_moving_under_a_pinned_cohort_raise():
+    """The engine's own weights changed (not via CohortLanes.refit): caught at completion."""
+    fleet = FakeFleet(momentum=False, fresh_steps=(0,))
+    lanes = CohortLanes(
+        [Lane(i, None, version=("theta", 0)) for i in range(2)], clock=fleet.clock
+    )
+    _, drafts = lanes.step(0, None, True, _fingerprinted(fleet, lanes, 0, True))
+    ops = _fingerprinted(fleet, lanes, 1, True)
+    complete = ops.complete_cohort
+
+    def complete_after_stray_refit(lane, d):
+        fleet.engine[lane.index] = ("theta", 1)  # bypasses the scheduler
+        complete(lane, d)
+
+    ops.complete_cohort = complete_after_stray_refit
+    with pytest.raises(RuntimeError, match="engine weights changed"):
+        lanes.step(1, drafts, True, ops)

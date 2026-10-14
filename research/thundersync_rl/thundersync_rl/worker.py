@@ -391,6 +391,15 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             self.model, checksum=bool(os.environ.get("THUNDERSYNC_MISMATCH_CHECK"))
         )
 
+    @torch.no_grad()
+    def engine_weight_checksum(self) -> float:
+        """Engine rank (debug): checksum of the weights this rank holds now.
+
+        Cohort lanes read it when a cohort is pinned and when it completes
+        (``LaneStepOps.fingerprint``); one pass over the rank's parameters.
+        """
+        return EngineStage._checksum(EngineStage._params(self.model))
+
     def keep_refit_group(self, lane: int) -> None:
         """Learner rank: file the live refit communicator under engine lane ``lane``.
 

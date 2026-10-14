@@ -61,6 +61,8 @@ class Lane:
     # the version they were started on.
     cohort: Optional[int] = None
     cohort_version: Optional[Version] = None
+    # Engine weight fingerprint taken when the cohort was pinned (``fingerprint`` op).
+    cohort_fingerprint: Optional[float] = None
     refits: int = 0
 
 
@@ -83,6 +85,12 @@ class LaneStepOps:
     ``run_step(lane, collector)``: this step's rollouts (served from
     ``lane``'s plans) and training; the collector is called at the deadline;
     returns the step metrics with the next cohort's drafts under ``"_drafts"``.
+    ``fingerprint(lane)`` (optional, debug): a checksum of the weights the
+    lane's engine ranks hold, read from the engine itself. Taken when a cohort
+    is pinned and again when it completes; they must be equal (the cohort's
+    drafts, continuations and anchors ran on one set of weights; raises
+    otherwise). ``lanes/fingerprint_moved`` reports whether it differs from
+    the previous cohort's (the lanes really hold different versions).
     """
 
     drafter_version: Callable[[int], Version]
@@ -92,6 +100,7 @@ class LaneStepOps:
     complete_cohort: Callable[[Lane, Any], None]
     needs_current: Callable[[Lane], bool]
     run_step: Callable[[Lane, Optional[Any]], dict[str, Any]]
+    fingerprint: Optional[Callable[[Lane], float]] = None
 
 
 @dataclass
@@ -101,6 +110,8 @@ class CohortLanes:
     lanes: list[Lane]
     clock: Callable[[], float] = time.perf_counter
     history: list[dict[str, float]] = field(default_factory=list)
+    # Fingerprint of the last cohort that completed (``LaneStepOps.fingerprint``).
+    last_fingerprint: Optional[float] = None
 
     def __post_init__(self):
         if len(self.lanes) != 2:
@@ -160,7 +171,23 @@ class CohortLanes:
     def unpin(self, lane: Lane, cohort: int) -> None:
         """Every rollout of cohort ``cohort`` is complete: ``lane`` is free."""
         self.check(lane, cohort)
-        lane.cohort = lane.cohort_version = None
+        lane.cohort = lane.cohort_version = lane.cohort_fingerprint = None
+
+    def _check_fingerprint(self, lane: Lane, cohort: int, now: float) -> dict[str, float]:
+        """The engine of ``lane`` still holds the weights that drafted ``cohort``."""
+        start = lane.cohort_fingerprint
+        if now != start:
+            raise RuntimeError(
+                f"cohort {cohort}: lane {lane.index}'s engine weights changed while it "
+                f"served the cohort (fingerprint {start!r} at its drafts, {now!r} at "
+                "completion)"
+            )
+        prev, self.last_fingerprint = self.last_fingerprint, now
+        return {
+            "lanes/fingerprint": now,
+            # 1: this cohort ran on other weights than the previous cohort.
+            "lanes/fingerprint_moved": float(prev is not None and now != prev),
+        }
 
     # -- one step -----------------------------------------------------------------
 
@@ -190,12 +217,17 @@ class CohortLanes:
                 lambda: ops.put_drafter(y, step + 1, lambda: ops.refit_lane(y)),
             )
             self.pin(y, step + 1)
+            if ops.fingerprint is not None:
+                y.cohort_fingerprint = ops.fingerprint(y)
             collector = ops.start_drafts(y, step + 1)
         t_draft = self.clock()
         if drafts is not None:
             self.check(x, step)
             ops.complete_cohort(x, drafts)
+        checked = {}
         if x.cohort == step:
+            if ops.fingerprint is not None and x.cohort_fingerprint is not None:
+                checked = self._check_fingerprint(x, step, ops.fingerprint(x))
             self.unpin(x, step)
         t_tail = self.clock()
         fresh = ops.needs_current(x)
@@ -218,6 +250,7 @@ class CohortLanes:
             "lanes/drafting_lane_idle_s": (t_draft - t0) if draft_next else t_end - t0,
             "lanes/fresh_refit": float(fresh),
             "lanes/cohort_lane": float(x.index),
+            **checked,
         }
         span = max(t_end - t0, 1e-9)
         timeline["lanes/idle_frac"] = (
