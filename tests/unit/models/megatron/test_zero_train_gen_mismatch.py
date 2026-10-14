@@ -710,11 +710,14 @@ def test_enable_batch_invariant_kernels_passes_the_recipe_settings(monkeypatch):
         zgm, "allow_installed_flash_attn_4", lambda: opened.append(True)
     )
     monkeypatch.setattr(zgm, "_use_inference_log_softmax", lambda: shimmed.append(True))
+    mamba: list[bool] = []
+    monkeypatch.setattr(zgm.mamba_ssd_parity, "install", lambda: mamba.append(True))
 
     zgm.enable_batch_invariant_kernels(_policy_config())
 
     assert opened == [True]
     assert shimmed == [True]
+    assert mamba == [True]
     assert calls == [
         ("assert_te", (), {}),
         ("enable", (), {"backend": "te_native", "collective": "ordered"}),

@@ -744,6 +744,26 @@ learner recomputes the batch's log-probs and compares them with the rollout log-
 The PR's exclusion of hybrid Mamba models is an untested-scope limit: MCore's
 batch-invariant Mamba decode (buffered chunk replay) already makes them exact.
 
+**Mamba SSD kernels: train == engine by construction** (`nemo_rl/models/megatron/mamba_ssd_parity.py`,
+installed by `enable_batch_invariant_kernels`). The Nano-9B row above held because the two
+libraries' Triton autotuning happened to pick the same tiles: training ran mamba_ssm's fused
+split-conv1d-scan, the engine runs MCore's copy of the SSD kernels, and with each library
+pinned on its own (MAMBA_DETERMINISTIC=1) 2-3% of the outputs differ [measured, one Nano
+layer; thundersync_work/research/agent_nemotron_hybrid.md section 6]. The dA cumsum head
+tiling changes the bits at bf16 and fp32, the chunk-scan warp count at fp32 [measured, GB200].
+In BI mode the learner's `MambaMixer._ssm_training` now runs the conv, then the engine's
+varlen SSD forward (gate inside the scan, fp32 chunk states) with mamba_ssm's backward, and
+the engine's SSD forward kernels and varlen conv are pinned to constant configs in every
+process (`PINNED_CONFIGS`, built explicitly so an import-time candidate list cannot change
+them). Same change upstream: Megatron-LM branch `fix/mamba-ssd-train-inference-parity`
+(draft PR text: thundersync_work/research/pr_mamba_parity.md); this Megatron-Core cannot
+store the pre-gate output, so the backward recomputes it (one extra SSD forward per layer).
+Cost of the pinned configs vs Triton autotune on the SSD forward: -10..+17% (bf16), +4..+12%
+(fp32) at Nano/Super/Ultra-scale per-rank shapes [measured, GB200; PR text]. Test:
+`tests/unit/models/megatron/test_mamba_ssd_parity.py` (mixer training == engine prefill +
+decode bitwise, bf16 and fp32 inputs; control: unpatched training on another cumsum tiling
+differs).
+
 **Speculation under BI.**
 
 - *Scorer precision.* BI kernels are BF16-only (`TransformerConfig` asserts it), so an fp32
