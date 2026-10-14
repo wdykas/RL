@@ -1616,13 +1616,11 @@ experts; each rank owns ≈ P/W main elements, P/(TP·PP·EP-share) model elemen
 - Draft-refit cost on this toy (2+2 GPUs): load 22 ms, refit 138 ms (same as the regular refit,
   `time/refit` 124 ms), restore 4 ms, peak extra learner memory 0.41 GB [measured]. Draft compute
   alone: 15 ms per 1e9 owned elements, 0.42 GB (`bench_draft.py`) [measured].
-- Acceptance: steps 1–3 `spec/accepted_frac` .967/.953/.980 with momentum vs .921/.917/.969 in the
-  earlier θ_k run of the same script (moe-null-bv, 17:38) — NOT a paired comparison (that run used
-  the precision-aware optimizer and drafting from the first finished rollout: 2–4x more draft
-  tokens) [measured, unpaired]. The paired arms (`sticky_cur`, ⊥-BV, TP2/EP2, L4) are queued in
-  `thundersync_work/research/momdraft/queue_exactness.sh` and did not get the node lock before the
-  reservation ended. On this random tiny model the drafter/target gap is dominated by the injected
-  gradient noise; the ledger-T numbers on real layers are the relevant acceptance evidence.
+- Acceptance, paired (same script, `draft_start_frac=1` in both arms): `spec/accepted_frac` steps 1–3
+  θ_k .936/.965/.967 vs momentum .967/.954/.980 [measured]; no consistent difference on this toy (3 steps,
+  different draft lengths, drafter/target gap dominated by injected random expert-gradient noise that momentum
+  cannot predict). The acceptance evidence is ledger T on real layers with real Adam; a real-model paired run
+  (L4 arms queued) is next.
 
 **Not built yet.** Precision-aware optimizer (masters in TE FusedAdam), Megatron-FSDP,
 fp8/fp4 param gather, a two-step draft for lookahead > 1, overlapping the draft refit with the
