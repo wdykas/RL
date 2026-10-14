@@ -1187,9 +1187,12 @@ async def _run_one_step(
                     ]
                     for chunks in d.per_rank
                 ]
+                t_lock = time.perf_counter()
                 async with (
                     learner_lock if learner_lock is not None else contextlib.nullcontext()
                 ):
+                    if learner_lock is not None:
+                        learner_lock_owner.lock_wait["train"] += time.perf_counter() - t_lock
                     t0 = time.perf_counter()
                     rank_results = await asyncio.gather(
                         *learner.submit(per_rank, d.closes)
@@ -1624,7 +1627,9 @@ def thundersync_grpo_train(
                     tails_s.append(time.perf_counter() - t)
                     # The momentum stage and the refit call the learner: no
                     # training dispatch may be in flight meanwhile.
+                    t_lock = time.perf_counter()
                     async with spec.learner_lock or contextlib.nullcontext():
+                        spec.lock_wait["refit"] += time.perf_counter() - t_lock
                         refit_for_step()
                 except BaseException as exc:
                     spec.weights_ready(error=exc)

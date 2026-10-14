@@ -1303,7 +1303,10 @@ class SpeculativeGeneration:
         orders on different ranks and pair their collectives wrongly.
         """
         lock = getattr(self, "learner_lock", None)
+        t0 = time.perf_counter()
         async with lock if lock is not None else contextlib.nullcontext():
+            # Time this verification waited for a training dispatch (lock cost).
+            self.lock_wait["verify"] += time.perf_counter() - t0
             futs = self._submit_verify_block(flat, rows)
             done = []
             for a, refs in futs:
@@ -1902,8 +1905,12 @@ class SpeculativeGeneration:
         self.learner_lock = (
             None if os.environ.get("THUNDERSYNC_DEBUG_NO_LEARNER_LOCK") else asyncio.Lock()
         )
+        self.lock_wait = {"verify": 0.0, "train": 0.0, "refit": 0.0}
 
     def end_streaming_tails(self) -> None:
+        for k, v in getattr(self, "lock_wait", {}).items():
+            # Seconds each kind of learner call waited for the learner lock.
+            self.stats[f"learner/lock_wait_{k}_s"] = v
         self._tail_cv = None
         self._weights_ready = None
         self.learner_lock = None
