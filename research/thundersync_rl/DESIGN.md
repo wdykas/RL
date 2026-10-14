@@ -1998,7 +1998,39 @@ draft_start (> 0: drafting overlapped the tails; one engine is ≤ 0), `lanes/co
 top of the rollouts) for the same comparison.
 
 **4-GPU end to end** (`scripts/bi_tp/sticky_moe.sh LANES=2`, 2 training GPUs + two one-GPU lanes,
-EP=1; reference LANES=1 = one engine with DP=2 on the same two GPUs): results below as they land.
+EP=1; reference LANES=1 = one engine with DP=2 on the same two GPUs; tiny Qwen3-MoE d2048, BI, engine-sourced
+q, sticky routing, expert-grad noise, 16 prompts x 8, 1024 tokens, 4 steps, one run per arm, 2026-10-14) [measured]:
+
+| arm | mismatch / exact | engine q | route check s1/s2/s3 | accepted s1/s2/s3 | cohort lane | fingerprint held / moved | overlap s1/s2 | draft tok s2/s3 | iteration s1/s2/s3 |
+|---|---|---|---|---|---|---|---|---|---|
+| lanes, current | 0 / 1, 4 steps | 5 lines, 0 inexact | all exact (131072, 131072, 129893) | .903/.896/.920 | k mod 2 | every cohort / s2, s3 | +5.0 / +7.6 s | 117k / 117k | 7.12 / 9.65 / 5.42 s |
+| one engine, current | 0 / 1 | 6 lines, 0 inexact | exact | .906/1.0/1.0 | — | — | −0.31 / −0.82 s | 128 / 128 | 7.52 / 9.38 / 8.60 s |
+| lanes, momentum | 0 / 1 | 6 lines, 0 inexact | all exact (131072 each) | .903/.901/.933 | k mod 2 | every cohort / s2, s3 | +6.3 / +7.1 s | 117k / 118k | 8.58 / 9.26 / 8.01 s |
+| one engine, momentum | 0 / 1 | 5 lines, 0 inexact | exact | .897/.998/.986 | — | — | −0.34 / −2.10 s | 3.8k / 2.1k | 5.50 / 9.18 / 9.06 s |
+
+- *Each cohort on its version, read from the engine.* With `THUNDERSYNC_MISMATCH_CHECK` every lane's
+  engine ranks checksum their own weights when a cohort is pinned and again when it completes
+  (`engine_weight_checksum`, `LaneStepOps.fingerprint`); a difference raises. Both lane arms: held for
+  every cohort, and different from the previous cohort's at steps 2 and 3 (`lanes/fingerprint_moved`).
+  With current drafts the engine fingerprint of cohort k times the 2 learner replicas equals,
+  bit for bit, the learner's checksum of θ_{k−1} (cohorts 2 and 3; `research/lanes/summarize.py`):
+  every draft, continuation and logged route of cohort k ran on θ_{k−1}, the version its anchors
+  name. Non-vacuity as in section 14c: weights change every step, steps ≥ 1 accept drafts, the
+  sticky rule changed routes (max differs_from_plain .0054 / .0066).
+- *Overlap.* With lanes cohort k+1's drafts start 0.13–0.17 s into step k and run during cohort k's
+  5–7 s of tails (overlap +5.0…+7.6 s). One engine starts them 0.3–2.1 s after the tails end, inside
+  the training window only: cohorts 2 and 3 got 128 (current) / 2–4k (momentum) drafted tokens and
+  decoded the rest as continuation streams (85k–129k tokens) versus 117k drafted + 9–14k continuation
+  tokens with lanes.
+- *Step time: no difference measured on this setup.* Mean of steps 1–3: lanes 7.40 vs 8.50 s (current),
+  8.62 vs 7.91 s (momentum); one run each, step 3 of a lane run drafts nothing, so these are not
+  steady-state numbers. On this model the step is bound by the cohort's tail continuations (5–7 s for
+  9–14k tokens on one lane), which lanes do not shorten; the window the lanes free (drafting in
+  parallel with the tails instead of after them) is what the derived 1.7–1.9x rests on and needs a
+  model whose drafting time is comparable to the tails. Open: 8-step repeats and Nemotron-3-Nano L8
+  arms (cluster queue: `lanes-l2c-s8`, `lanes-l1c-s8`, `lanes-n2m-L8`, `lanes-n1m-L8`); why the lane's
+  tail phase (6.5–7.3 s, momentum) is longer than one engine's (4.1–6.1 s) on similar continuation
+  counts is not explained yet (one GPU per lane vs DP=2 for the tails is one candidate).
 
 ## 15. Open work
 
