@@ -25,6 +25,7 @@ import pytest
 import thundersync_rl.speculative as spec_mod
 import torch
 from thundersync_rl.engine_q import (
+    HIDDEN_STATS_KEY,
     GatheredLogprobRows,
     HiddenLog,
     gathered_log_softmax,
@@ -154,6 +155,7 @@ def test_hidden_log_hook_on_a_fake_engine(monkeypatch):
         ctx.request_kv_length_offsets += ctx.request_query_lengths
         ctx.request_query_lengths = torch.tensor([1, 1])
     out = w.pop_draft_hidden(["d|0", "x"], [3, 1])
+    out.pop(HIDDEN_STATS_KEY)  # per-call transport stats
     assert list(out) == ["d|0"]
     assert torch.equal(out["d|0"], torch.stack(steps))
 
@@ -745,10 +747,10 @@ def _spec(learner, base, **kw):
 
 
 def test_engine_source_falls_back_when_the_engine_cannot_log(_no_ray, capsys):
-    s = _spec({}, {"install_draft_hidden_log": lambda: False})
+    s = _spec({}, {"install_draft_hidden_log": lambda **_: False})
     assert s.verify_source == "scorer"
     assert "falling back" in capsys.readouterr().out
-    s = _spec({}, {"install_draft_hidden_log": lambda: True})
+    s = _spec({}, {"install_draft_hidden_log": lambda **_: True})
     assert s.verify_source == "engine"
 
 
@@ -788,7 +790,7 @@ def test_engine_source_drafts_stash_and_verify_driver_transport(_no_ray):
             "stash_head": lambda **kw: stashes.append(kw) or 1,
         },
         {
-            "install_draft_hidden_log": lambda: True,
+            "install_draft_hidden_log": lambda **_: True,
             "start_drafts": start,
             "draft_request_ids": lambda: {},
             "collect_drafts": lambda records=None: [
@@ -827,7 +829,7 @@ def test_cohort_hidden_states_follow_segments_driver_transport(_no_ray):
     s = _spec(
         {},
         {
-            "install_draft_hidden_log": lambda: True,
+            "install_draft_hidden_log": lambda **_: True,
             "start_drafts": lambda prompts, budgets, interval, hidden_keys: None,
             "draft_request_ids": lambda: {},
             "collect_drafts": lambda records=None: collected.pop(0),

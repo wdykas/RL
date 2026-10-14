@@ -630,7 +630,7 @@ def test_driver_pools_drafts_and_fills_slots_in_order(monkeypatch):
         ]
 
     engine = {
-        "install_draft_hidden_log": lambda: True,
+        "install_draft_hidden_log": lambda **_: True,
         "start_drafts": lambda prompts, budget, interval, hidden_keys=None: started.append(
             (prompts, hidden_keys)
         ),
@@ -761,7 +761,7 @@ def test_driver_forwards_only_rows_that_can_be_used(monkeypatch):
         ]
 
     engine = {
-        "install_draft_hidden_log": lambda: True,
+        "install_draft_hidden_log": lambda **_: True,
         "start_drafts": lambda prompts, budget, interval, hidden_keys=None: None,
         "draft_request_ids": lambda: {},
         "collect_drafts": lambda records=None: drafted,

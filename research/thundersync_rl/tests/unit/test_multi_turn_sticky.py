@@ -299,7 +299,7 @@ def test_rows_without_a_plan_take_the_plain_path_and_unfinished_plans_fail_loud(
     s = make_spec(
         {},
         base_handlers={
-            "install_draft_hidden_log": lambda: True,
+            "install_draft_hidden_log": lambda **_: True,
             "install_draft_route_log": lambda: [1],
         },
         verify_source="engine",
@@ -385,7 +385,7 @@ def test_multi_turn_horizon_is_bounded_by_the_total_length_cap():
     clipped by the total-length cap only."""
     s = make_spec(
         {},
-        base_handlers={"install_draft_hidden_log": lambda: True, "install_draft_route_log": lambda: [1]},
+        base_handlers={"install_draft_hidden_log": lambda **_: True, "install_draft_route_log": lambda: [1]},
         verify_source="engine",
         sticky_delta=0.03,
         anchor_horizon=40,

@@ -26,6 +26,7 @@ import ray
 import thundersync_rl.speculative as spec_mod
 import torch
 from thundersync_rl.engine_q import (
+    HIDDEN_STATS_KEY,
     HiddenLog,
     HiddenRefs,
     HiddenRows,
@@ -133,6 +134,8 @@ def test_worker_pop_draft_hidden_as_refs(monkeypatch):
     w._hidden_log.record([(r, "a", r) for r in range(3)], h[:3])
     w._hidden_log.record([(0, "b", 0)], h[3:4])
     out = w.pop_draft_hidden(["a", "b", "c"], [3, 2, 1], as_refs=True)
+    stats = out.pop(HIDDEN_STATS_KEY)
+    assert stats["put_bytes"] == (3 + 1) * 3 * 4  # storage bytes, not whole drafts
     # b has only its first row (a 1-row prefix; the driver truncates it), c none.
     assert set(out) == {"a", "b"}
     ((ref_b, n_b, _),) = out["b"]
@@ -297,7 +300,7 @@ def test_driver_passes_handles_and_frees_them_after_verification(_no_ray):
     s = _spec(
         {"verify_drafts_block_engine": verify, "stash_head": lambda **kw: 1},
         {
-            "install_draft_hidden_log": lambda: True,
+            "install_draft_hidden_log": lambda **_: True,
             "start_drafts": lambda prompts, budget, interval, hidden_keys: None,
             "draft_request_ids": lambda: {},
             "collect_drafts": lambda records=None: [
@@ -352,7 +355,7 @@ def test_driver_cohort_segments_are_handles_and_freed(_no_ray):
     s = _spec(
         learner,
         {
-            "install_draft_hidden_log": lambda: True,
+            "install_draft_hidden_log": lambda **_: True,
             "start_drafts": lambda prompts, budgets, interval, hidden_keys: None,
             "draft_request_ids": lambda: {},
             "collect_drafts": collect,
@@ -400,10 +403,10 @@ def test_driver_cohort_segments_are_handles_and_freed(_no_ray):
 
 
 def test_driver_transport_is_selectable(_no_ray):
-    s = _spec({}, {"install_draft_hidden_log": lambda: True}, hidden_transport="driver")
+    s = _spec({}, {"install_draft_hidden_log": lambda **_: True}, hidden_transport="driver")
     assert s.hidden_transport == "driver"
     with pytest.raises(ValueError, match="hidden_transport"):
-        _spec({}, {"install_draft_hidden_log": lambda: True}, hidden_transport="x")
+        _spec({}, {"install_draft_hidden_log": lambda **_: True}, hidden_transport="x")
 
 
 def test_verify_row_batches_respect_the_padded_token_budget():
