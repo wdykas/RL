@@ -208,7 +208,8 @@ def test_distopt_draft_matches_harness_and_restores(mcore, moe, steps, chunk):
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs")
 @pytest.mark.parametrize("tp,ep", [(2, 1), (1, 2)])
-def test_distopt_draft_sharded_two_ranks(tp, ep):
+@pytest.mark.parametrize("pa", ["none", "remainders"])
+def test_distopt_draft_sharded_two_ranks(tp, ep, pa):
     """TP- / EP+DP-sharded optimizer state on 2 ranks (draft_weights_multirank.py)."""
     import subprocess
     import sys
@@ -218,7 +219,7 @@ def test_distopt_draft_sharded_two_ranks(tp, ep):
     out = subprocess.run(
         [sys.executable, "-m", "torch.distributed.run", "--nproc_per_node=2",
          f"--master_port={port}", os.path.join(here, "draft_weights_multirank.py"),
-         f"--tp={tp}", f"--ep={ep}"],
+         f"--tp={tp}", f"--ep={ep}", f"--pa={pa}"],
         capture_output=True, text=True, timeout=600,
     )
     assert out.returncode == 0 and "MULTIRANK OK" in out.stdout, out.stdout[-3000:] + out.stderr[-3000:]

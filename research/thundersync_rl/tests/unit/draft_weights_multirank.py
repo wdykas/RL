@@ -33,7 +33,12 @@ import torch.distributed as dist
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_draft_weights import _toy, _train_step, harness_mom  # noqa: E402
 
-from thundersync_rl.draft_weights import _shards, load_draft, restore_training  # noqa: E402
+from thundersync_rl.draft_weights import (  # noqa: E402
+    _master_chunks,
+    _shards,
+    load_draft,
+    restore_training,
+)
 
 
 def main():
@@ -41,6 +46,7 @@ def main():
     ap.add_argument("--tp", type=int, default=1)
     ap.add_argument("--ep", type=int, default=1)
     ap.add_argument("--steps", type=int, default=3)
+    ap.add_argument("--pa", choices=["none", "fp32", "remainders"], default="none")
     args = ap.parse_args()
     from megatron.core import parallel_state as ps
     from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -53,7 +59,9 @@ def main():
     # MoE when EP > 1 (all-bf16); TP > 1 runs the dense model (fp32 norms under
     # autocast: the aliased fp32 path; Megatron's MoE + TP needs sequence parallel).
     moe = args.ep > 1
-    ddp, opt = _toy(moe, tp=args.tp, ep=args.ep)
+    ddp, opt = _toy(
+        moe, tp=args.tp, ep=args.ep, precision_aware=None if args.pa == "none" else args.pa
+    )
     for s in range(args.steps):
         _train_step(ddp, opt, s, autocast=not moe)
     params = dict(ddp.module.named_parameters())
@@ -62,9 +70,16 @@ def main():
     # Expected draft of every owned shard (harness formula), keyed by its buffer slice.
     expected = []
     for sh in _shards(opt):
-        st = sh.inner.state[sh.main]
+        n = sh.target.numel()
+        master = _master_chunks(sh)(slice(0, n))
+        m, v = (
+            sh.inner.get_unscaled_state(sh.key, k).view(-1)
+            if args.pa != "none"
+            else sh.inner.state[sh.key][k].view(-1)
+            for k in ("exp_avg", "exp_avg_sq")
+        )
         b1, b2 = sh.group["betas"]
-        w = harness_mom(sh.main, st["exp_avg"], st["exp_avg_sq"], int(sh.group["step"]),
+        w = harness_mom(master, m, v, int(sh.group["step"]),
                         sh.group["lr"], b1, b2, sh.group["eps"], sh.group["weight_decay"])
         expected.append((sh.target, w.to(sh.target.dtype)))
     owned = sum(t.numel() for t, _ in expected)
