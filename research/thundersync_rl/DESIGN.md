@@ -1306,7 +1306,10 @@ its synchronous host copy of every step's routes, per-KV-block host storage and 
 rejects routing replay under async scheduling only for that bookkeeping, and the engine
 subclass (`_engine_class`) passes its check when the route record is installed. No MCore
 source change; an MCore option to record routes without the bookkeeping would replace the
-override. `install_draft_route_log` wraps the controller's
+override. Measured engine decode step (L16 Qwen3-30B-A3B, one GPU, every token logged): async
+with the route log 17.27 ms at 512 concurrent decodes vs 17.25 ms without routing replay
+(6.89 vs 6.90 ms at 1); legacy with MCore's bookkeeping 20.28 ms (8.16 ms at 1)
+(`thundersync_work/research/agent_scaling_fixes.md`). `install_draft_route_log` wraps the controller's
 `_dynamic_step_forward_logits` (Python on every forward, graphed or eager): before the launch
 it selects the step's tagged tokens from the context's CPU bookkeeping (slot and absolute
 position of each token, i.e. the forward being launched) with numpy, looking up draft keys
