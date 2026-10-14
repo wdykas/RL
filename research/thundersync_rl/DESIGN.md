@@ -1508,7 +1508,7 @@ scheme rests on the enumeration tests (`test_routes.py`).
 continuations. The engine refit waits for the continuation rounds, so rollouts no
 longer overlap verification (keeping θ_{k−1} available after the refit, e.g. as a sparse
 weight delta toggled per chunk, would restore the overlap; not built yet). Multi-version drafts
-(`draft_lookahead>1`) are not built yet. Multi-turn rollouts: section 14l; a horizon c below the
+(`draft_lookahead>1`) are not built yet. Multi-turn rollouts: section 14m; a horizon c below the
 rollout cap with engine anchor apply: section 14i.
 
 ## 14d. Pooled null-augmented block verification (`thundersync.null_bv`)
@@ -2421,7 +2421,7 @@ the step; the tail-last order leaves the tail groups' training exposed after the
 Determinism: every L8 run so far had zero rewards, so all data gradients were zero and identical
 parameter checksums across arrival orders prove nothing; non-vacuous pairs
 (`THUNDERSYNC_DEBUG_PARITY_REWARD`) are queued.
-## 14l. Multi-turn rollouts under sticky routing, scheme A (`grpo.max_rollout_turns > 1`)
+## 14m. Multi-turn rollouts under sticky routing, scheme A (`grpo.max_rollout_turns > 1`)
 
 *ts-nano-perf (2026-10-14):* multi-turn and the anchor horizon (14i) run with
 `thundersync.stream_training_over_tails=false` (14k): streaming over their tails is not built yet (a
@@ -2602,7 +2602,7 @@ prompt, R anchored requests resident on an engine rank.
 - θ_{k−1} work: ≤ H + 1 continuation tokens per drafted rollout (vs to EOS/cap); the refit no longer waits for
   long continuations (and, with multi-turn, for environment latency past the horizon).
 
-**Multi-turn.** Turns below c run at θ_{k−1} exactly as in scheme A (14l, branch ts-multiturn-a: driver turn loop,
+**Multi-turn.** Turns below c run at θ_{k−1} exactly as in scheme A (14m, branch ts-multiturn-a: driver turn loop,
 observation anchors from the continuation's own prefill); once a row's anchors are complete below c, the rest of
 the rollout (later turns included) can be decoded by the refit engine with the request tagged, since each later
 turn's prefill re-applies the anchors below c by position. Built on branch ts-multiturn-ab (scheme A merged with

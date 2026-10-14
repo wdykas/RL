@@ -2948,7 +2948,7 @@ class SpeculativeGeneration:
             }
         )
         if self.turn_env is not None:
-            # Environment latency now sits before the refit (DESIGN 14l).
+            # Environment latency now sits before the refit (DESIGN 14m).
             self.stats["spec/sticky_env_s"] = self.turn_env.env_s
             self.turn_env.env_s = 0.0
 
