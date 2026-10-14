@@ -8,6 +8,8 @@
 #   STICKY=0 bash .../nano_hybrid_fp16.sh                                   # plain routing A/B
 #   TF32=ieee bash .../nano_hybrid_fp16.sh                                  # IEEE fp32 Mamba SSD dots
 #   SCHED=legacy bash .../nano_hybrid_fp16.sh                               # MCore legacy engine scheduling (default async)
+#   DRAFT_WEIGHTS=momentum bash .../nano_hybrid_fp16.sh                     # momentum draft weights (DESIGN 14f)
+#   NULL_BV=1 bash .../nano_hybrid_fp16.sh                                  # + pooled ⊥-BV (null_bv_moe.sh checks)
 #
 # Pass (exit 0): as sticky_moe.sh (mismatch 0, exact_token_frac 1, engine-q exact, no scorer
 # fallback; non-vacuity: weights change every step (expert-grad noise), steps >= 1 accept draft
@@ -26,7 +28,9 @@ fi
 export EP=${EP:-2} TP=${TP:-1} PP=${PP:-1} MAXLEN=${MAXLEN:-1024} STEPS=${STEPS:-4}
 export RUNS=${RUNS:-runs_nano_hybrid}
 export SCHED=${SCHED:-async}
-export TAG=${TAG:-nano-L$L-fp16-sticky${STICKY:-1}-ep$EP-$SCHED${TF32:+-$TF32}}
+export DRAFT_WEIGHTS=${DRAFT_WEIGHTS:-current}
+NULL_BV=${NULL_BV:-0}
+export TAG=${TAG:-nano-L$L-fp16-sticky${STICKY:-1}-ep$EP-$SCHED-dw$DRAFT_WEIGHTS$([ "$NULL_BV" = 1 ] && echo -nullbv)${TF32:+-$TF32}}
 RECIPE="++policy.megatron_cfg.optimizer.use_precision_aware_optimizer=false
  ++policy.megatron_cfg.fp32_residual_connection=true ++policy.megatron_cfg.forward_gemm_precision=fp16
  policy.megatron_cfg.bias_activation_fusion=false"
@@ -35,4 +39,5 @@ if [ -n "${TF32:-}" ]; then
   RECIPE+=" ++policy.megatron_cfg.env_vars.TRITON_F32_DEFAULT=$TF32"
 fi
 export ARGS="$(echo $RECIPE) ${ARGS:-}"
+if [ "$NULL_BV" = 1 ]; then exec bash "$HERE/null_bv_moe.sh"; fi
 exec bash "$HERE/sticky_moe.sh"
