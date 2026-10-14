@@ -31,9 +31,12 @@
 # at its completion and different from cohort k-1's (lanes/fingerprint*). LANES=1 on the same
 # layout (one engine, DP=2 over the same 2 GPUs) is the single-version reference for step time.
 #
+# PERF=1: timing run with the debug checks off (no mismatch check, route check, engine-q check,
+# sticky check; engine_q_tp.sh): passes when the run completes; prints the step breakdown only.
+#
 # Env: MODEL, EP (2), TP (1), PP (1), STEPS (4), PROMPTS (16), MAXLEN (1024), DELTA (0.03),
 # STICKY (1), NOISE (expert-grad noise, 1), SCHED (engine scheduling: async | legacy; async),
-# DRAFT_WEIGHTS (current), LANES (1), ARGS (extra overrides).
+# DRAFT_WEIGHTS (current), LANES (1), STREAM (1), PERF (0), ARGS (extra overrides).
 W=/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/wdykas/code/on-olicy-rl/thundersync_work
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 export MODEL=${MODEL:-$W/models/tiny-qwen3-moe-d2048}
@@ -47,9 +50,11 @@ fi
 if [ "$NOISE" != 0 ]; then export THUNDERSYNC_DEBUG_EXPERT_GRAD_NOISE=$NOISE; fi
 export RUNS=${RUNS:-runs_sticky_moe}
 SCHED=${SCHED:-async}
-export TAG=${TAG:-sticky$STICKY-d$DELTA-ep$EP-tp$TP-pp$PP-$SCHED-dw$DRAFT_WEIGHTS$([ "$LANES" != 1 ] && echo -lanes$LANES)-$(basename "$MODEL")}
+export TAG=${TAG:-sticky$STICKY-d$DELTA-ep$EP-tp$TP-pp$PP-$SCHED-dw$DRAFT_WEIGHTS$([ "$LANES" != 1 ] && echo -lanes$LANES)$([ "${STREAM:-1}" != 1 ] && echo -nostream)$([ "${PERF:-0}" = 1 ] && echo -perf)-$(basename "$MODEL")}
 STICKY_ARGS="++thundersync.draft_lookahead=1 ++policy.generation.mcore_generation_config.async_sched_mode=$SCHED"
 STICKY_ARGS+=" ++thundersync.draft_weights=$DRAFT_WEIGHTS"
+# STREAM (1): train complete groups while other rows' sticky tails still run (DESIGN 14k); 0 = after the last tail.
+STICKY_ARGS+=" ++thundersync.stream_training_over_tails=$([ "${STREAM:-1}" = 1 ] && echo true || echo false)"
 if [ "$STICKY" = 1 ]; then
   STICKY_ARGS+=" ++thundersync.sticky_routing=true ++thundersync.sticky_routing_delta=$DELTA"
 fi
@@ -63,6 +68,18 @@ export ARGS="policy.megatron_cfg.moe_router_dtype=fp32 policy.generation.mcore_g
 bash "$HERE/engine_q_tp.sh"
 rc=$?
 OUT=$W/$RUNS/$TAG
+if [ "${PERF:-0}" = 1 ]; then
+  python - "$OUT/history.json" <<'EOF'
+import json, sys
+hist = json.load(open(sys.argv[1]))
+keys = ("time/iteration", "time/verify", "time/tails", "time/refit", "time/rollout", "learner/busy_s",
+        "time/post_rollout_to_step", "time/draft_wait", "time/draft_start", "time/draft_window",
+        "spec/draft_tokens", "spec/accepted_frac", "spec/sticky_cont_draft_tokens", "spec/sticky_rounds")
+for i, h in enumerate(hist):
+    print(f"[perf] step {i}: " + " ".join(f"{k.split('/')[-1]}={h.get(k)}" for k in keys))
+EOF
+  exit $rc
+fi
 python - "$OUT/history.json" "$OUT/run.log" "$STICKY" "$DRAFT_WEIGHTS" "$LANES" <<'EOF'
 import json, re, sys
 path, log, sticky = sys.argv[1], sys.argv[2], sys.argv[3] == "1"

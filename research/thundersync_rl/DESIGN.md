@@ -2031,6 +2031,19 @@ q, sticky routing, expert-grad noise, 16 prompts x 8, 1024 tokens, 4 steps, one 
   arms (cluster queue: `lanes-l2c-s8`, `lanes-l1c-s8`, `lanes-n2m-L8`, `lanes-n1m-L8`); why the lane's
   tail phase (6.5–7.3 s, momentum) is longer than one engine's (4.1–6.1 s) on similar continuation
   counts is not explained yet (one GPU per lane vs DP=2 for the tails is one candidate).
+- *8-step repeat and Nemotron-3-Nano L8 (single-node cluster jobs, same layout, RL-lanes 633119f2;
+  all PASS: mismatch 0, engine q exact, route check exact, sticky rule active).* Tiny MoE, current,
+  8 steps: mean iteration steps 1–7 lanes 8.66 s vs one engine 8.65 s; lanes drafted 115–119k tokens
+  per cohort vs 128–6.3k for one engine (cohorts 2–6), overlap +5.3…+7.5 s vs −0.3…−0.4 s; the
+  engine fingerprint × 2 equals the learner's θ_{k−1} checksum for cohorts 2–7. Nano L8 (EP=1,
+  momentum, fp16 recipe, 4 steps): lanes 6.78 / 18.16 / 11.58 s vs one engine 6.78 / 18.47 / 15.87 s
+  (mean steps 1–3 12.17 vs 13.71 s); tails (time/verify) lanes 3.41 / 9.82 / 9.25 s vs one engine
+  3.84 / 15.39 / 13.13 s; one engine drafted 766 / 1329 tokens for cohorts 2/3 (the rest decoded as
+  122k / 121k continuation tokens), lanes 55k / 117k. EP=1 skips zero-advantage training (learner
+  busy ≈ 0.1 s), so these runs do not exercise training overlap. Split lanes stay an opt-in tool; the
+  measured critical path (`thundersync_work/research/agent_critical_path_measured.md`) is the tail
+  and the serial post-tail chain, which lanes do not shorten; the one-engine work continues in
+  section 14k (branch ts-one-engine).
 
 ## 15. Open work
 

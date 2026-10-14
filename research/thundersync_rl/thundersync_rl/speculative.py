@@ -1056,15 +1056,17 @@ class SpeculativeGeneration:
             ]
         )
 
-    def plans_cover(self, prompts: list[torch.Tensor]) -> bool:
+    def plans_cover(self, prompts: list[torch.Tensor], pending_ok: bool = False) -> bool:
         """Whether every rollout of ``prompts`` will be served by a complete plan.
 
         Then no rollout of this step decodes on the engine (``_one`` returns the
         plan), so the engine need not hold theta_k for the step.
+        ``pending_ok``: plans the continuation rounds are still completing
+        count (``begin_sticky`` before ``complete_tails``).
         """
         need = Counter(_key(p) for p in prompts)
         return all(
-            all(plan.complete for plan in self.plans.get(key, [])[:n])
+            all(pending_ok or plan.complete for plan in self.plans.get(key, [])[:n])
             and len(self.plans.get(key, [])) >= n
             for key, n in need.items()
         )
@@ -1824,6 +1826,20 @@ class SpeculativeGeneration:
         piece is exact block verification of a q draft against the fixed
         target p, so the final rollout is an exact sample of p.
         """
+        pending = await self.begin_sticky(drafts)
+        # Also with nothing pending (every draft whole-accepted and complete):
+        # the step then reports zero continuation rounds instead of no stats.
+        await self._continue_sticky(pending)
+
+    async def begin_sticky(self, drafts) -> list:
+        """``verify_sticky`` up to its continuation rounds; returns the pending plans.
+
+        Verifies the drafts (and, as a debug check, their routes) and stops
+        every draft stream an unfinished whole-accepted plan does not go on
+        with. ``complete_tails`` then runs the continuation rounds; rollouts
+        of complete plans may be served and trained meanwhile (their prefix,
+        log-probs and anchors are final).
+        """
         self._plan_cv = None
         if os.environ.get("THUNDERSYNC_ENGINE_Q_CHECK") == "1":
             await self._route_check(drafts)
@@ -1839,9 +1855,65 @@ class SpeculativeGeneration:
         # on with theirs, every other stream stops.
         kept = {id(plan.stream) for _, plan in pending if plan.stream is not None}
         self._stop_streams([x for x in streams if id(x) not in kept])
-        # Also with nothing pending (every draft whole-accepted and complete):
-        # the step then reports zero continuation rounds instead of no stats.
-        await self._continue_sticky(pending)
+        self._tail_plans = {id(plan) for _, plan in pending}
+        return pending
+
+    # -- streaming training over the tails (one engine, sticky) ------------------
+
+    def begin_streaming_tails(self) -> None:
+        """Rollouts of this step start before its tails are complete.
+
+        Called inside the step's event loop before its rollouts. A rollout
+        whose plan is incomplete waits for ``complete_tails`` to finish it; a
+        rollout with no plan (decoded at theta_k) waits for ``weights_ready``.
+        Training of complete groups therefore streams over the other rows'
+        continuation rounds: both are learner-side at theta_k, and a complete
+        plan's prefix, log-probs and anchors never change again.
+        """
+        self._tail_cv = asyncio.Condition()
+        self._tail_error: Optional[BaseException] = None
+        self._weights_ready = asyncio.Event()
+
+    def end_streaming_tails(self) -> None:
+        self._tail_cv = None
+        self._weights_ready = None
+
+    async def _notify_tails(self) -> None:
+        cv = getattr(self, "_tail_cv", None)
+        if cv is not None:
+            async with cv:
+                cv.notify_all()
+
+    async def complete_tails(self, pending) -> None:
+        """The continuation rounds of ``pending`` (``begin_sticky``), waking waiters."""
+        try:
+            await self._continue_sticky(pending)
+        except BaseException as exc:
+            self._tail_error = exc
+            raise
+        finally:
+            await self._notify_tails()
+
+    def weights_ready(self, error: Optional[BaseException] = None) -> None:
+        """The engine holds theta_k: rollouts without a plan may decode.
+
+        ``error``: the tails or the refit failed; waiting rollouts raise.
+        """
+        if error is not None:
+            self._tail_error = error
+        ev = getattr(self, "_weights_ready", None)
+        if ev is not None:
+            ev.set()
+
+    async def _await_plan(self, plan: Plan) -> None:
+        cv = getattr(self, "_tail_cv", None)
+        if cv is None or plan.complete:
+            return
+        async with cv:
+            while not plan.complete:
+                if self._tail_error is not None:
+                    raise RuntimeError("sticky continuation failed") from self._tail_error
+                await cv.wait()
 
     def _stop_streams(self, streams) -> None:
         """Abort engine draft streams and close their logs (rank 0 + every engine)."""
@@ -2136,6 +2208,8 @@ class SpeculativeGeneration:
                         restart.append(s)
             if done_streams:
                 stop(done_streams)
+                # Rollouts waiting on these plans can be served and trained.
+                await self._notify_tails()
             if restart:
                 start([(s["key"], s["plan"]) for s in restart])
         self.stats.update(
@@ -2238,6 +2312,16 @@ class SpeculativeGeneration:
             if queue
             else Plan(seed=next(self._seeds) if self.verify_mode == "keyed" else -1)
         )
+        if getattr(self, "_tail_cv", None) is not None:
+            # Streaming over the tails: a drafted rollout is served once its
+            # continuation rounds complete it; one never drafted decodes at
+            # theta_k once the engine holds it.
+            if id(plan) in getattr(self, "_tail_plans", ()):
+                await self._await_plan(plan)
+            elif not plan.complete:
+                await self._weights_ready.wait()
+                if self._tail_error is not None:
+                    raise RuntimeError("sticky tails or refit failed") from self._tail_error
         gen = list(plan.prefix)
         lps = list(plan.prefix_logprobs)
         if plan.fused is not None:

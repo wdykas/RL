@@ -260,6 +260,11 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # tokens decoded past the verified piece (SpeculativeGeneration
     # ._continue_sticky). Fixed count: the cut is exogenous.
     sticky_continuation_chunk_tokens: int = 2048
+    # Sticky, one engine: serve and train every rollout whose plan is complete
+    # while the continuation rounds of the other rows still run (both are
+    # learner-side at theta_k; DESIGN.md section 14k). False: training starts
+    # after the last tail (the refit and the rollouts follow verify_sticky).
+    stream_training_over_tails: bool = True
     # Weights the engine drafts the next step's rollouts with (draft_weights.py,
     # DESIGN.md section 14f). "current": theta_k. "momentum": theta_hat_{k+1} =
     # the AdamW step of the optimizer state (theta_k, m_k, v_k) with gradient 0,
@@ -1040,7 +1045,14 @@ async def _run_one_step(
     ] = None,
     draft_swap: Optional[Callable[[], None]] = None,
     draft_start_frac: Optional[float] = None,
+    drafts_after_pre_rollout: bool = False,
 ) -> dict[str, Any]:
+    """One step: rollouts, streaming training and the next step's drafts.
+
+    ``drafts_after_pre_rollout``: the drafter also waits for ``pre_rollout``
+    (sticky streaming over the tails: the continuation rounds and the refit
+    that puts the drafter's weights on the engine).
+    """
     G = master_config.grpo.num_generations_per_prompt
     repeated = batch.repeat_interleave(G)
     n = repeated.size
@@ -1189,9 +1201,18 @@ async def _run_one_step(
             await asyncio.to_thread(draft_swap)
             return await draft_after()
 
+    if drafts_after_pre_rollout and verify_task is not None and drafter is not None:
+        draft_when_ready = drafter
+
+        async def drafter():
+            nonlocal draft_started
+            await asyncio.shield(verify_task)
+            draft_started = time.perf_counter()  # the drafter's weights are in
+            return await draft_when_ready()
+
+    draft_started = None
     learner_task = asyncio.create_task(learner_loop())
     draft_task = None
-    draft_started = None
     n_done = 0
     after_verify = (
         ts_cfg.draft_after_verify and verify_task is not None and drafter is not None
@@ -1479,6 +1500,7 @@ def thundersync_grpo_train(
         t_verify = 0.0
         if spec is not None:
             spec.current_step = step
+        tails = None  # pending plans whose continuation rounds overlap training
         if sticky and drafts is not None:
             # Sticky routing: verify and complete every drafted rollout while
             # the engine still holds the drafting weights (theta_{step-1}, or
@@ -1486,8 +1508,13 @@ def thundersync_grpo_train(
             # supplies the anchors of continuation positions; refit after.
             t1 = time.perf_counter()
             policy_generation.prepare_for_generation()
-            asyncio.run(spec.verify_sticky(drafts))
-            policy_generation.finish_generation()
+            if ts_cfg.stream_training_over_tails:
+                # Only the drafts' verification here; the continuation rounds
+                # run inside the step, under the training of complete groups.
+                tails = asyncio.run(spec.begin_sticky(drafts))
+            else:
+                asyncio.run(spec.verify_sticky(drafts))
+                policy_generation.finish_generation()
             t_verify = time.perf_counter() - t1
             drafts = None
         staged = (
@@ -1496,25 +1523,53 @@ def thundersync_grpo_train(
             and next_batch is not None
             and step + 1 < max_steps
         )
-        # Sticky: verify_sticky completed every drafted rollout. When every
-        # rollout of this step is served by a complete plan the engine decodes
-        # nothing at theta_k, so it takes theta_hat_{step+1} directly and
-        # drafts from the start of the step (no theta_k refit, no host stage).
-        draft_now = staged and sticky and spec.plans_cover(_prompts(batch))
-        if staged:
-            # theta_hat_{step+1} needs only the state after the last update:
-            # stage it on the engine now, while learner and engine are idle.
-            spec.stage_draft_weights(
-                lambda: refit_policy_generation(policy, policy_generation, False),
-                stage_on_engine=not draft_now,
-            )
-        t_r = time.perf_counter()
-        if (stale or staged) and not draft_now:
-            refit_policy_generation(policy, policy_generation, False)
+        # Sticky: every drafted rollout is (or, streaming, will be) complete.
+        # When every rollout of this step is served by a complete plan the
+        # engine decodes nothing at theta_k, so it takes theta_hat_{step+1}
+        # directly and drafts from the start of the step (no theta_k refit,
+        # no host stage).
+        draft_now = (
+            staged
+            and sticky
+            and spec.plans_cover(_prompts(batch), pending_ok=tails is not None)
+        )
+        refit_s = []
+
+        def refit_for_step(staged=staged, draft_now=draft_now):
+            if staged:
+                # theta_hat_{step+1} needs only the state after the last
+                # update; the learner and the engine are idle (streaming: the
+                # actor queue orders it between training micro-batches).
+                spec.stage_draft_weights(
+                    lambda: refit_policy_generation(policy, policy_generation, False),
+                    stage_on_engine=not draft_now,
+                )
+            t_r = time.perf_counter()
+            if (stale or staged) and not draft_now:
+                refit_policy_generation(policy, policy_generation, False)
+            else:
+                policy_generation.prepare_for_generation()
+            refit_s.append(time.perf_counter() - t_r)
+
+        tails_s = []
+        if tails is None:
+            refit_for_step()
         else:
-            policy_generation.prepare_for_generation()
-        t_refit = time.perf_counter() - t_r
-        pre_rollout = None
+
+            async def tails_then_refit(pending=tails):
+                # Continuation rounds on the drafting weights, then theta_k:
+                # rollouts never drafted and the next cohort's drafts wait for it.
+                t = time.perf_counter()
+                try:
+                    await spec.complete_tails(pending)
+                    policy_generation.finish_generation()
+                    tails_s.append(time.perf_counter() - t)
+                    refit_for_step()
+                except BaseException as exc:
+                    spec.weights_ready(error=exc)
+                    raise
+                spec.weights_ready()
+        pre_rollout = None if tails is None else tails_then_refit
         chunked = (
             spec is not None
             and ts_cfg.verify_mode == "block"
@@ -1561,6 +1616,7 @@ def thundersync_grpo_train(
             )
         policy.prepare_for_training()
         metrics = asyncio.run(
+            _run_streaming_tails(spec, tails is not None)(
             _run_one_step(
                 step=step,
                 batch=batch,
@@ -1583,8 +1639,13 @@ def thundersync_grpo_train(
                     spec.load_staged_draft_weights if staged and not draft_now else None
                 ),
                 draft_start_frac=0.0 if draft_now else None,
-            )
+                drafts_after_pre_rollout=tails is not None,
+            ))
         )
+        t_refit = refit_s[0]
+        if tails_s:
+            # Continuation rounds, overlapped with this step's training.
+            metrics["time/tails"] = tails_s[0]
         drafts = metrics.pop("_drafts")
         if sticky:
             # This step's training has replayed every anchor targeted at it.
@@ -1611,6 +1672,21 @@ def thundersync_grpo_train(
             logger.log_metrics(scalars, step + 1, prefix="thundersync")
         step += 1
     return history
+
+
+def _run_streaming_tails(spec, on: bool):
+    """Run a step coroutine with ``spec``'s streaming-over-tails state (if ``on``)."""
+
+    async def run(coro):
+        if not on:
+            return await coro
+        spec.begin_streaming_tails()
+        try:
+            return await coro
+        finally:
+            spec.end_streaming_tails()
+
+    return run
 
 
 def _log_step(step: int, metrics: dict[str, Any], logger: Optional[Logger]) -> None:
