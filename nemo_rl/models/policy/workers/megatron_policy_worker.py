@@ -623,6 +623,14 @@ class MegatronPolicyWorkerImpl(
         os.environ["LOCAL_RANK"] = str(local_rank)
         # Batch-invariant / zero-KL kernels must be enabled before CUDA init.
         enable_batch_invariant_mode(config)
+        if config["megatron_cfg"].get("batch_invariant_mode") and config[
+            "megatron_cfg"
+        ].get("fused_bi_unpermute", False):
+            # One Triton kernel for the AlltoAll batch-invariant unpermute
+            # (bitwise the same as Megatron's EP x top-k eager loop).
+            from nemo_rl.models.megatron import bi_unpermute
+
+            bi_unpermute.install()
         if config["megatron_cfg"].get("fp32_residual_connection"):
             from nemo_rl.models.megatron import fp32_residual
 
