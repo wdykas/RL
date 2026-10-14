@@ -1301,7 +1301,17 @@ per-slot buffers of the current chunk's x, z, dt, B, C (fp32 under the recipe). 
 - It counts the remaining replay buffers in `DynamicInferenceContext`'s Mamba share (MCore counts only conv + SSM
   state), keeping the KV share, so `max_requests` sized from memory cannot overcommit. Per rank, no communication.
 
-The same z change inside the chunk-scan kernel is the Megatron-LM draft PR `fix/mamba-bi-decode-drop-z-buffer`.
+The same z change inside the chunk-scan kernel is the Megatron-LM draft PR NVIDIA/Megatron-LM#8221
+(`fix/mamba-bi-decode-drop-z-buffer`).
+
+**Measured (one GPU, async scheduler, CUDA graphs; thundersync_work ledger X-engA).** Engine outputs (tokens and
+logprobs) are bitwise identical to the per-call-cast engine with the z buffer, across two refits, a momentum
+stage/load and prompts straddling the Mamba chunk, on Qwen3-30B-A3B L16 and Nemotron-3-Nano L8/L16. Only GEMM linears
+are held in fp16: the patched TE RMSNorm reads its weight in fp32, and an fp16 copy changed logprobs by up to 0.19.
+Decode ms/step, before -> after: Nano L16 5.77 -> 2.88 at 1 row and 8k context, 10.49 -> 7.45 at 128 rows and 8k; Qwen3
+L16 7.84 -> 5.48 and 15.86 -> 13.49. The gain is in the intercept: the per-call weight casts (Nano L16 4.5 -> 1.6 ms of
+elementwise kernels per step). The slope per row is unchanged except for Mamba, where it drops 9% because there are no
+z reads (1.44 -> 1.31 us per row per layer at 8k).
 
 **fp16 range.** Max |GEMM input| over 16 MATH prompts x 512 greedy tokens (HF bf16, decode
 included; `thundersync_work/fp16_range_probe.py`): Qwen3-8B 10752 (6.1x headroom to 65504),
