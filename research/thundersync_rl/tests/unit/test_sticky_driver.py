@@ -94,7 +94,7 @@ class _Engine:
     def _by_key(self, k):
         return next(s for s in self.streams if s["key"] == k)
 
-    def collect(self, records=None):
+    def collect(self, records=None, record_refs=None, request_ids=None):
         return [(s["tokens"], s["done"], s["logq"]) for s in self.streams]
 
     def _finish(self, s):
@@ -111,7 +111,7 @@ class _Engine:
             self._finish(self.streams[i])
         return [(len(self.streams[i]["tokens"]), True) for i in indices]
 
-    def peek(self, indices, records=None):
+    def peek(self, indices, records=None, record_refs=None, request_ids=None):
         out = []
         for i in indices:
             s = self.streams[i]
@@ -278,7 +278,7 @@ class _DecodingEngine(_Engine):
             out.append((self._vis(s), self._vis(s) == len(self._full(s))))
         return out
 
-    def peek(self, indices, records=None):
+    def peek(self, indices, records=None, record_refs=None, request_ids=None):
         out = []
         for i in indices:
             s = self.streams[i]

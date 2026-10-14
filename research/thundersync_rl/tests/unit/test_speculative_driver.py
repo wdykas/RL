@@ -132,7 +132,7 @@ def test_cohort_drafts_resume_and_track_versions():
                 (prompts, budgets)
             ),
             "draft_request_ids": lambda: {},
-            "collect_drafts": lambda records=None: collected.pop(0),
+            "collect_drafts": lambda records=None, record_refs=None, request_ids=None: collected.pop(0),
         },
     )
     p0, p1 = torch.tensor([1, 1]), torch.tensor([3, 3])
@@ -332,7 +332,7 @@ def test_streamed_drafts_carry_engine_logprobs():
         base_handlers={
             "start_drafts": lambda prompts, budget, interval: None,
             "draft_request_ids": lambda: {},
-            "collect_drafts": lambda records=None: [
+            "collect_drafts": lambda records=None, record_refs=None, request_ids=None: [
                 ([4, EOD], True, [-0.5, -0.25]),
                 ([4, 5], False, [-0.5]),  # misaligned: dropped
                 ([6], False),  # engine without log-probs
@@ -359,7 +359,7 @@ def test_cohort_drafts_keep_engine_logprobs_across_resumptions():
         base_handlers={
             "start_drafts": lambda prompts, budgets, interval: None,
             "draft_request_ids": lambda: {},
-            "collect_drafts": lambda records=None: collected.pop(0),
+            "collect_drafts": lambda records=None, record_refs=None, request_ids=None: collected.pop(0),
         },
     )
     p0, p1 = torch.tensor([1, 1]), torch.tensor([3, 3])

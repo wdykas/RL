@@ -16,6 +16,7 @@
 from types import SimpleNamespace
 
 import torch
+import numpy as np
 from thundersync_rl.worker import apply_draft_frame, snapshot_drafts
 
 
@@ -31,8 +32,11 @@ def test_partial_frames_accumulate_logprobs_and_snapshot():
     assert not apply_draft_frame(_partial([4, 5], [-0.1, -0.2]), tokens[0], logprobs, 0)
     assert not apply_draft_frame(_partial([6], [-0.3]), tokens[0], logprobs, 0)
     snap = snapshot_drafts(tokens, logprobs, done)
-    assert snap == [([4, 5, 6], False, [-0.1, -0.2, -0.3])]
-    snap[0][2].append(0.0)  # a copy: later frames must not alias it
+    (toks, d, lps), = snap
+    # Typed arrays; these log-probs are not fp32 values, so they stay float64 (bitwise).
+    assert toks.tolist() == [4, 5, 6] and d is False and lps.dtype == np.float64
+    assert lps.tolist() == [-0.1, -0.2, -0.3]
+    lps[0] = 0.0  # a copy: later frames must not alias it
     assert logprobs[0] == [-0.1, -0.2, -0.3]
 
 
@@ -42,7 +46,21 @@ def test_partial_without_logprobs_drops_them():
     apply_draft_frame(_partial([5]), tokens[0], logprobs, 0)
     apply_draft_frame(_partial([6], [-0.3]), tokens[0], logprobs, 0)
     assert tokens[0] == [4, 5, 6] and logprobs[0] is None
-    assert snapshot_drafts(tokens, logprobs, [False]) == [([4, 5, 6], False, None)]
+    (toks, d, lps), = snapshot_drafts(tokens, logprobs, [False])
+    assert toks.tolist() == [4, 5, 6] and d is False and lps is None
+
+
+def test_typed_logq_is_bitwise():
+    from thundersync_rl.worker import typed_logq
+
+    import torch
+
+    fp32 = torch.randn(1000).float().tolist()  # engine log-probs: fp32 values as Python floats
+    a = typed_logq(fp32)
+    assert a.dtype == np.float32 and [float(v) for v in a] == fp32
+    mixed = fp32[:10] + [0.1]  # 0.1 is not an fp32 value: the array stays float64
+    b = typed_logq(mixed)
+    assert b.dtype == np.float64 and b.tolist() == mixed
 
 
 def test_final_frame_replaces_tokens_and_logprobs():
