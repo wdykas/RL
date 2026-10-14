@@ -32,6 +32,7 @@ import torch
 import triton
 import triton.language as tl
 
+from thundersync_rl.prof import timed
 from thundersync_rl.block_verification import (
     acceptance_weights,
     check_null_m,
@@ -255,22 +256,23 @@ def block_verify_stats_lazy_grid(
     """
     g = lpx.numel()
     dev = lse_p.device
-    eta = torch.rand(g + 1, generator=generator, dtype=torch.float64, device=dev)
-    u = float(torch.rand(1, generator=generator, dtype=torch.float64, device=dev))
-    slack = lazy_slack(lse_p[:g])
-    slack_h = slack.cpu() if isinstance(slack, torch.Tensor) else slack
-    eta_h = eta.cpu()
     weights: dict[float, torch.Tensor] = {}
     tau: dict[float, int] = {}
     cand: dict[float, torch.Tensor] = {}  # descending candidate positions per M
-    for M in envelopes:
-        check_null_m(M, g)
-        weights[M] = b = acceptance_weights(lpx - lqx, M)
-        b_h = b.cpu()
-        if bool(eta_h[g] <= b_h[g]):
-            tau[M] = g
-        else:
-            cand[M] = torch.nonzero(eta_h[:g] <= b_h[:g] * (1 + slack_h)).flatten().flip(0)
+    with timed("scan_setup"):
+        eta = torch.rand(g + 1, generator=generator, dtype=torch.float64, device=dev)
+        u = float(torch.rand(1, generator=generator, dtype=torch.float64, device=dev))
+        slack = lazy_slack(lse_p[:g])
+        slack_h = slack.cpu() if isinstance(slack, torch.Tensor) else slack
+        eta_h = eta.cpu()
+        for M in envelopes:
+            check_null_m(M, g)
+            weights[M] = b = acceptance_weights(lpx - lqx, M)
+            b_h = b.cpu()
+            if bool(eta_h[g] <= b_h[g]):
+                tau[M] = g
+            else:
+                cand[M] = torch.nonzero(eta_h[:g] <= b_h[:g] * (1 + slack_h)).flatten().flip(0)
     rows: dict[tuple[str, int], torch.Tensor] = {}
     n_eval = 0
     done = {M: 0 for M in cand}
@@ -284,7 +286,10 @@ def block_verify_stats_lazy_grid(
         idx = pending.flip(0)[:chunk]
         lo = int(idx[-1])
         idx_d = idx.to(dev)
-        P, Q = p_rows(idx_d), q_rows(idx_d)
+        with timed("p_rows"):
+            P = p_rows(idx_d)
+        with timed("q_rows"):
+            Q = q_rows(idx_d)
         n_eval += idx.numel()
         where = {int(t): k for k, t in enumerate(idx.tolist())}
         for M in live:
@@ -300,8 +305,9 @@ def block_verify_stats_lazy_grid(
             def mass(i, bi, sel=sel):
                 return residual_masses(P[sel], Q[sel], lse_p[i], lse_q[i], bi)
 
-            h = stop_probability(null_root_residual(mass, b, M)(c_d), b[c_d])
-            hit = torch.nonzero((eta[c_d] <= h).cpu()).flatten()
+            with timed("residual"):
+                h = stop_probability(null_root_residual(mass, b, M)(c_d), b[c_d])
+                hit = torch.nonzero((eta[c_d] <= h).cpu()).flatten()
             if hit.numel():
                 tau[M] = int(c[hit[0]])
         for k, t in enumerate(idx.tolist()):  # keep the stop rows for the emissions
@@ -315,14 +321,15 @@ def block_verify_stats_lazy_grid(
         return rows[(kind, t)]
 
     out: dict[float, tuple[int, int, float | None]] = {}
-    for M in envelopes:
-        t, b = tau[M], weights[M]
-        p_row = row("p", t)
-        q = None if t == g else _probs(row("q", t), lse_q[t])
-        m = M if t == 0 and t < g else 1.0
-        dist = emit_distribution(_probs(p_row, lse_p[t]), q, b[t], m)
-        y = emitted_token(sample_by_inversion(dist, u), p_row.shape[-1])
-        out[M] = (t, y, None if y < 0 else float(p_row[y].float() - lse_p[t]))
+    with timed("emission"):
+        for M in envelopes:
+            t, b = tau[M], weights[M]
+            p_row = row("p", t)
+            q = None if t == g else _probs(row("q", t), lse_q[t])
+            m = M if t == 0 and t < g else 1.0
+            dist = emit_distribution(_probs(p_row, lse_p[t]), q, b[t], m)
+            y = emitted_token(sample_by_inversion(dist, u), p_row.shape[-1])
+            out[M] = (t, y, None if y < 0 else float(p_row[y].float() - lse_p[t]))
     return out, n_eval
 
 
