@@ -526,5 +526,25 @@ class StreamingLearner:
         )
         return results[0]
 
-    def abort(self) -> None:
-        ray.get(self.worker_group.run_all_workers_single_data("stream_abort_step"))
+    def abort(self, timeout_s: float = 60.0) -> bool:
+        """Drop the open streamed step on every learner rank; False if some rank did not answer.
+
+        After a rank fails inside a model forward (e.g. CUDA OOM), its peers can be
+        blocked in a collective with it (EP all-to-all, PP send/recv) and never run
+        this call, so the wait is bounded; the caller then ends the run (the
+        driver's exit tears the workers down and frees their GPU memory).
+        """
+        refs = self.worker_group.run_all_workers_single_data("stream_abort_step")
+        ready, pending = ray.wait(refs, num_returns=len(refs), timeout=timeout_s)
+        for ref in ready:
+            try:
+                ray.get(ref)
+            except Exception as exc:  # the failed rank's actor may be gone
+                print(f"[thundersync] stream_abort_step failed: {exc!r}", flush=True)
+        if pending:
+            print(
+                f"[thundersync] {len(pending)}/{len(refs)} learner ranks did not abort "
+                f"within {timeout_s:.0f} s (blocked in a collective with a failed rank)",
+                flush=True,
+            )
+        return not pending

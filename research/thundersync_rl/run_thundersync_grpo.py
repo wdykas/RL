@@ -17,6 +17,8 @@ import argparse
 import json
 import os
 import pprint
+import sys
+import traceback
 
 from omegaconf import OmegaConf
 from thundersync_rl.grpo_loop import (
@@ -98,6 +100,16 @@ def main() -> None:
             master_config=master_config,
             logger=logger,
         )
+    except BaseException:
+        # A failed learner or engine rank can leave its peers blocked in a
+        # collective (EP all-to-all, PP send/recv) while holding their GPU memory,
+        # and Ray's normal teardown waits on them. Exit the driver at once instead:
+        # Ray then kills every worker actor this job owns, which frees the GPUs and
+        # ends the job.
+        traceback.print_exc()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(1)
     finally:
         shutdown_environments(task_to_env)
     if args.history_json:

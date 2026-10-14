@@ -49,6 +49,7 @@ from thundersync_rl.draft_weights import (
     load_draft,
     restore_training,
 )
+from thundersync_rl import mem_debug
 from thundersync_rl.fused_train import (
     FusedGraph,
     FusedGraphStore,
@@ -295,9 +296,10 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         return data
 
     def train_microbatches(self, datas, *args, **kwargs):
-        return super().train_microbatches(
-            [self._with_routes(d) for d in datas], *args, **kwargs
-        )
+        datas = [self._with_routes(d) for d in datas]
+        shapes = [tuple(d["input_ids"].shape) for d in datas if "input_ids" in d]
+        with mem_debug.capture(self.rank, f"train_microbatches {shapes}"):
+            return super().train_microbatches(datas, *args, **kwargs)
 
     def get_logprobs(self, *, data, **kwargs):
         return super().get_logprobs(data=self._with_routes(data), **kwargs)
