@@ -34,7 +34,7 @@ import itertools
 import math
 import os
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field, replace
 from typing import Any, AsyncGenerator, Callable, Optional
 
@@ -1040,7 +1040,22 @@ class SpeculativeGeneration:
             ]
         )
 
-    def stage_draft_weights(self, refit: Callable[[], Any]) -> None:
+    def plans_cover(self, prompts: list[torch.Tensor]) -> bool:
+        """Whether every rollout of ``prompts`` will be served by a complete plan.
+
+        Then no rollout of this step decodes on the engine (``_one`` returns the
+        plan), so the engine need not hold theta_k for the step.
+        """
+        need = Counter(_key(p) for p in prompts)
+        return all(
+            all(plan.complete for plan in self.plans.get(key, [])[:n])
+            and len(self.plans.get(key, [])) >= n
+            for key, n in need.items()
+        )
+
+    def stage_draft_weights(
+        self, refit: Callable[[], Any], stage_on_engine: bool = True
+    ) -> None:
         """Stage the draft weights of this step's drafts on the engine.
 
         ``draft_weights=momentum``: theta_hat_{k+1} needs only the optimizer
@@ -1055,9 +1070,11 @@ class SpeculativeGeneration:
         its host staging buffer while the learner restores theta_k bitwise.
         The caller then refits theta_k for this step's rollouts;
         ``load_staged_draft_weights`` puts the staged weights back once those
-        rollouts are done, without the learner. The engine keeps them until the
-        next refit: drafting, the route check and the sticky continuation
-        rounds all run on them.
+        rollouts are done, without the learner. ``stage_on_engine=False`` (no
+        rollout of this step decodes on the engine, ``plans_cover``): no host
+        copy and no theta_k refit; the engine drafts with the refit weights
+        right away. The engine keeps them until the next refit: drafting, the
+        route check and the sticky continuation rounds all run on them.
         """
         group = self.learner_policy.worker_group
         engine = self.base._policy.worker_group
@@ -1074,13 +1091,14 @@ class SpeculativeGeneration:
             t2 = time.perf_counter()
             refit()
             t3 = time.perf_counter()
-            stage_refs = engine.run_all_workers_single_data("stage_engine_weights")
+            if stage_on_engine:
+                stage_refs = engine.run_all_workers_single_data("stage_engine_weights")
         finally:
             # The learner's restore overlaps the engine's device -> host copy.
             restores = ray.get(group.run_all_workers_single_data("restore_training_weights"))
             stages = ray.get(stage_refs) if stage_refs is not None else []
         t4 = time.perf_counter()
-        self._staged_version = self.current_step
+        self._staged_version = self.current_step if stage_on_engine else None
         self._staged_checksums = [x.get("checksum") for x in stages]
         changed = sum(x["draft/changed_elems"] for x in loads)
         total = sum(x["draft/shard_elems"] for x in loads)
@@ -1091,8 +1109,10 @@ class SpeculativeGeneration:
             "draft/stash_s": t2 - t1,
             "draft/refit_s": t3 - t2,
             "draft/stage_restore_s": t4 - t3,
-            "draft/engine_stage_s": max(x["stage_s"] for x in stages),
-            "draft/engine_stage_gb": max(x["stage_bytes"] for x in stages) / 2**30,
+            "draft/engine_stage_s": max((x["stage_s"] for x in stages), default=0.0),
+            "draft/engine_stage_gb": max((x["stage_bytes"] for x in stages), default=0.0)
+            / 2**30,
+            "draft/direct": float(not stage_on_engine),
             "draft/restore_worker_s": max(x["draft/restore_s"] for x in restores),
             "draft/total_s": t4 - t0,
             "draft/peak_extra_gb": max(x["draft/peak_extra_bytes"] for x in loads) / 2**30,

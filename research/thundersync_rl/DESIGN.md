@@ -1626,9 +1626,16 @@ experts; each rank owns ≈ P/W main elements, P/(TP·PP·EP-share) model elemen
   host → device copy, ~0.1 s, is the only delay) instead of from `draft_start_frac`. Drafting while
   the rollout tail decodes needs a second weight version on the engine (a θ̂ replica, or
   per-request weight versions via a sparse delta): not built yet.
-- remaining waits (not built yet; critical-path scout #6): (1) drafting still starts only after the
-  step's *last* rollout, so one long fresh decode delays all next-step drafting by up to a full decode
-  (the learner-lock wait is gone). Design: at `draft_start_frac` the engine loads θ̂_{k+1} and starts
+- no fresh rows (built, sticky routing): after `verify_sticky` every drafted rollout is complete;
+  when every rollout of step k is served by a complete plan (`plans_cover`; measured
+  `null_fresh_slots` is 0 in recent runs), no rollout decodes on the engine, so the θ_k refit and the
+  host stage are skipped: the stage's refit leaves θ̂_{k+1} live and drafting starts at the step's
+  first rollout (`draft/direct` = 1). Exactness: rollouts are the plans either way; only the drafts'
+  start time changes, and it depends on step k's outcomes, which precede drafting (a draft's cut
+  points only need to be independent of that draft's own tokens). Saves one refit per such step.
+- remaining waits (not built yet; critical-path scout #6): (1) with fresh rows, drafting still starts
+  only after the step's *last* rollout, so one long fresh decode delays all next-step drafting by up to
+  a full decode (the learner-lock wait is gone). Design: at `draft_start_frac` the engine loads θ̂_{k+1} and starts
   drafting; every step-k rollout still decoding continues on the engine as a q = θ̂_{k+1} draft that
   the learner block-verifies in pieces against p_k (the streamed-continuation machinery of 14c:
   rejection → residual sample → restart from the new prefix). Exact for any q (section 4); such rows

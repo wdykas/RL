@@ -199,3 +199,27 @@ def test_config_rejections(opt, ts, msg):
 
     with pytest.raises(ValueError, match=msg):
         validate_draft_weights(_master(opt, **ts))
+
+
+def test_plans_cover_only_when_every_rollout_has_a_complete_plan():
+    from thundersync_rl.speculative import Plan
+
+    s = _momentum_spec([])
+    a, b = torch.tensor([1, 2]), torch.tensor([3])
+    s.plans = {(1, 2): [Plan(-1, [5], complete=True), Plan(-1, [6], complete=True)]}
+    assert s.plans_cover([a, a])
+    assert not s.plans_cover([a, a, a])  # a third rollout would decode fresh
+    assert not s.plans_cover([a, b])  # no plan for b
+    s.plans[(1, 2)].insert(0, Plan(-1, [7], complete=False))
+    assert not s.plans_cover([a])  # the first plan popped needs the engine
+
+
+def test_direct_stage_skips_the_engine_host_copy():
+    order = []
+    s = _momentum_spec(order)
+    s.current_step = 3
+    s.stage_draft_weights(lambda: order.append(("refit",)), stage_on_engine=False)
+    assert ("stage",) not in order and order[-1] == ("restore",)
+    assert s.stats["draft/direct"] == 1.0
+    with pytest.raises(RuntimeError, match="no draft weights staged"):
+        s.load_staged_draft_weights()

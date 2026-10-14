@@ -1000,6 +1000,7 @@ async def _run_one_step(
         Callable[[torch.Tensor, torch.Tensor], Optional[RouteRefs]]
     ] = None,
     draft_swap: Optional[Callable[[], None]] = None,
+    draft_start_frac: Optional[float] = None,
 ) -> dict[str, Any]:
     G = master_config.grpo.num_generations_per_prompt
     repeated = batch.repeat_interleave(G)
@@ -1136,7 +1137,8 @@ async def _run_one_step(
     verify_task = (
         asyncio.create_task(pre_rollout()) if pre_rollout is not None else None
     )
-    draft_start_frac = ts_cfg.draft_start_frac
+    if draft_start_frac is None:
+        draft_start_frac = ts_cfg.draft_start_frac
     if draft_swap is not None and drafter is not None:
         # Draft weights other than theta_k (staged on the engine at the top of
         # the step): the engine loads them once every rollout of this step
@@ -1360,6 +1362,13 @@ def thundersync_grpo_train(
         and ts_cfg.verify_mode == "block"
         and ts_cfg.draft_lookahead > 1
     )
+    def _prompts(b):
+        r = b.repeat_interleave(G)
+        return [
+            torch.cat([m["token_ids"] for m in r["message_log"][i]])
+            for i in range(r.size)
+        ]
+
     while upcoming:
         batch = upcoming.popleft()
         nb = next(batches, None)
@@ -1389,14 +1398,20 @@ def thundersync_grpo_train(
             and next_batch is not None
             and step + 1 < max_steps
         )
+        # Sticky: verify_sticky completed every drafted rollout. When every
+        # rollout of this step is served by a complete plan the engine decodes
+        # nothing at theta_k, so it takes theta_hat_{step+1} directly and
+        # drafts from the start of the step (no theta_k refit, no host stage).
+        draft_now = staged and sticky and spec.plans_cover(_prompts(batch))
         if staged:
             # theta_hat_{step+1} needs only the state after the last update:
             # stage it on the engine now, while learner and engine are idle.
             spec.stage_draft_weights(
-                lambda: refit_policy_generation(policy, policy_generation, False)
+                lambda: refit_policy_generation(policy, policy_generation, False),
+                stage_on_engine=not draft_now,
             )
         t_r = time.perf_counter()
-        if stale or staged:
+        if (stale or staged) and not draft_now:
             refit_policy_generation(policy, policy_generation, False)
         else:
             policy_generation.prepare_for_generation()
@@ -1427,13 +1442,6 @@ def thundersync_grpo_train(
             spec.verify(drafts)
             t_verify = time.perf_counter() - t1
         drafter = None
-
-        def _prompts(b):
-            r = b.repeat_interleave(G)
-            return [
-                torch.cat([m["token_ids"] for m in r["message_log"][i]])
-                for i in range(r.size)
-            ]
 
         if cohort_mode:
             ahead = list(upcoming)[: ts_cfg.draft_lookahead]
@@ -1489,7 +1497,10 @@ def thundersync_grpo_train(
                 if spec is not None and ts_cfg.fused_verify_train
                 else None,
                 claim_anchors=spec.claim_anchors if sticky else None,
-                draft_swap=spec.load_staged_draft_weights if staged else None,
+                draft_swap=(
+                    spec.load_staged_draft_weights if staged and not draft_now else None
+                ),
+                draft_start_frac=0.0 if draft_now else None,
             )
         )
         drafts = metrics.pop("_drafts")
