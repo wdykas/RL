@@ -208,7 +208,7 @@ def load_draft(optimizer, kind: str, chunk: int = CHUNK_ELEMS) -> DraftSwap:
             swap.saved.append((shard.target, shard.target.clone()))
         target = shard.target.view(-1)
         for sl, new in _draft_chunks(shard, chunk):
-            changed += int((new != target[sl]).sum())
+            changed += (new != target[sl]).sum()  # on device: no sync per chunk
             total += new.numel()
             target[sl].copy_(new)
     torch.cuda.synchronize()
@@ -219,7 +219,7 @@ def load_draft(optimizer, kind: str, chunk: int = CHUNK_ELEMS) -> DraftSwap:
         "draft/compute_s": t1 - t0,
         "draft/gather_s": time.perf_counter() - t1,
         "draft/peak_extra_bytes": float(torch.cuda.max_memory_allocated() - base),
-        "draft/changed_elems": float(changed),
+        "draft/changed_elems": float(changed),  # one sync, after the gather
         "draft/shard_elems": float(total),
     }
     return swap

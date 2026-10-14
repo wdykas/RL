@@ -1581,9 +1581,11 @@ assumed "the drafter holds θ_k" was checked:
 experts; each rank owns ≈ P/W main elements, P/(TP·PP·EP-share) model elements) [derived]:
 - compute: ≈ 10 elementwise flops per owned element (≈ P/W), memory-bound: reads master, m, v
   (12 B) and writes the 2 B param → ≈ 14·P/W bytes of HBM traffic, twice-ish counting the
-  restore copy (6·P/W B). For a 500B model on 512 learner GPUs: ≈ 1e9 owned elements → ≈ 20 GB of
-  HBM traffic ≈ 5–10 ms.
-- memory: chunk temporaries ≈ 5 × 4 B × min(CHUNK_ELEMS, largest owned shard) ≤ 320 MB
+  restore copy (6·P/W B). Measured on one GB200 GPU (`thundersync_work/research/momdraft/bench_draft.py`,
+  unfused torch ops, 16M-element chunks): 15 ms per 1e9 owned elements, 0.42 GB extra
+  [measured]. A 500B model on 512 learner GPUs owns ≈ 1e9 elements per rank → ≈ 15 ms
+  [derived].
+- memory: chunk temporaries ≈ 24 B × min(CHUNK_ELEMS, largest owned shard) ≤ 0.42 GB [measured]
   (independent of model size), plus a copy of the rank's fp32 *model* parameters (norm weights;
   ≈ 0 for a bf16 model), plus the existing LM-head stash (V/TP × d × 2 B). No copy of the model,
   master or moments; nothing is gathered except the parameters themselves.
