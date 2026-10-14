@@ -1,0 +1,14 @@
+# Arm "async1_nrl": stock NeMo-RL async GRPO (nemo_rl.algorithms.grpo.async_grpo_train via run_ab_baseline.py),
+# trajectories at most one policy version old. NOT exact on-policy: the throughput reference.
+# Off-policy correction as NeMo-RL requires for async (importance-sampling correction on, PPO ratio).
+defaults: ab_base.yaml
+
+grpo:
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 1
+    in_flight_weight_updates: false
+
+loss_fn:
+  use_importance_sampling_correction: true
+  force_on_policy_ratio: false

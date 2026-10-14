@@ -88,6 +88,14 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     #   "batch": after every rollout of the batch (batch-synchronous baseline).
     # All three produce the identical update; only the overlap differs.
     granularity: Literal["trajectory", "group", "batch"] = "trajectory"
+    # Rollout staleness, for the async baseline on THIS learner path (A/B kit arm
+    # "async1"): 0 = exact on-policy (every step's rollouts sampled at theta_k);
+    # 1 = the rollouts trained at step k were sampled at theta_{k-1}: the engine
+    # generates step k+1's batch at theta_k while the learner trains step k, with no
+    # verification (NeMo-RL async GRPO with max_trajectory_age_steps=1). Off-policy:
+    # pair it with loss_fn.use_importance_sampling_correction (weights
+    # exp(curr - generation_logprobs) from the training forward itself).
+    rollout_lag: Literal[0, 1] = 0
     # Where per-group gradient accumulators live: "cuda", or "cpu" for pinned
     # host memory (the paper's placement; trades H2D/D2H traffic for HBM).
     storage_device: Literal["cuda", "cpu"] = "cuda"
@@ -391,6 +399,9 @@ def validate_config(master_config: ThunderSyncMasterConfig) -> None:
     )
     assert not megatron_cfg.get("moe_router_bias_update_rate", 0.0), (
         "gradient streaming needs policy.megatron_cfg.moe_router_bias_update_rate=0"
+    )
+    assert not (master_config.thundersync.rollout_lag and master_config.thundersync.speculate), (
+        "thundersync.rollout_lag=1 is the unverified async baseline; it excludes speculate"
     )
     validate_speculation(master_config.thundersync, master_config.policy)
     validate_expert_parallel(master_config.thundersync, master_config.policy)
@@ -1031,6 +1042,41 @@ def _initial_sample_state(batch: BatchedDataDict, i: int) -> dict[str, Any]:
     }
 
 
+async def _generate_rollouts(
+    batch: BatchedDataDict,
+    policy_generation: GenerationInterface,
+    tokenizer,
+    task_to_env: dict[str, EnvironmentInterface],
+    master_config: ThunderSyncMasterConfig,
+) -> tuple[list[tuple[int, dict, dict]], float]:
+    """Every rollout of ``batch`` (G per prompt) at the engine's current weights.
+
+    Returns ``(i, final_state, metrics)`` per rollout and the wall time.
+    """
+    repeated = batch.repeat_interleave(master_config.grpo.num_generations_per_prompt)
+    t0 = time.perf_counter()
+
+    async def one(i: int):
+        state, metrics = await run_sample_multi_turn_rollout(
+            sample_idx=i,
+            initial_sample_state=_initial_sample_state(repeated, i),
+            policy_generation=policy_generation,
+            tokenizer=tokenizer,
+            task_to_env=task_to_env,
+            max_seq_len=master_config.policy["max_total_sequence_length"],
+            max_rollout_turns=master_config.grpo.max_rollout_turns,
+            greedy=False,
+        )
+        return i, state, metrics
+
+    out = await asyncio.gather(*(one(i) for i in range(repeated.size)))
+    return list(out), time.perf_counter() - t0
+
+
+async def _ready(x):
+    return x
+
+
 async def _run_one_step(
     *,
     step: int,
@@ -1055,7 +1101,13 @@ async def _run_one_step(
     draft_swap: Optional[Callable[[], None]] = None,
     draft_start_frac: Optional[float] = None,
     claim_log_weight: Optional[Callable[[torch.Tensor, torch.Tensor], float]] = None,
+    stale_rollouts: Optional[list[tuple[int, dict, dict]]] = None,
+    generate_next: Optional[Callable[[], Any]] = None,
 ) -> dict[str, Any]:
+    """One training step. ``stale_rollouts`` (rollout_lag=1): this batch's rollouts,
+    already generated at theta_{k-1}, are trained instead of sampling new ones, while
+    ``generate_next()`` samples the next batch at theta_k on the engine concurrently
+    (returned as ``_next_rollouts``)."""
     G = master_config.grpo.num_generations_per_prompt
     repeated = batch.repeat_interleave(G)
     n = repeated.size
@@ -1206,6 +1258,9 @@ async def _run_one_step(
             return await draft_after()
 
     learner_task = asyncio.create_task(learner_loop())
+    next_task = (
+        asyncio.create_task(generate_next()) if generate_next is not None else None
+    )
     draft_task = None
     n_done = 0
     after_verify = (
@@ -1221,7 +1276,12 @@ async def _run_one_step(
 
         verify_task.add_done_callback(_start_drafts)
     try:
-        for fut in asyncio.as_completed([rollout(i) for i in range(n)]):
+        sources = (
+            asyncio.as_completed([rollout(i) for i in range(n)])
+            if stale_rollouts is None
+            else [_ready(r) for r in stale_rollouts]
+        )
+        for fut in sources:
             i, state, metrics = await fut
             n_done += 1
             if (
@@ -1281,6 +1341,9 @@ async def _run_one_step(
         rollouts_done = True
         wake.set()
         await learner_task
+        t_next = time.perf_counter()
+        next_rollouts = await next_task if next_task is not None else None
+        next_wait = time.perf_counter() - t_next
         if verify_task is not None:
             await verify_task
         t_wait = time.perf_counter()
@@ -1293,6 +1356,8 @@ async def _run_one_step(
             before_finish(drafts)  # learner still holds theta_k
         draft_score = time.perf_counter() - t_score
     except BaseException:
+        if next_task is not None:
+            next_task.cancel()
         if draft_task is not None:
             draft_task.cancel()
         learner_task.cancel()
@@ -1359,6 +1424,10 @@ async def _run_one_step(
         "_drafts": drafts,
         **mismatch,
     }
+    if next_rollouts is not None:
+        # rollout_lag=1: the next batch, sampled at theta_k during this step.
+        out["_next_rollouts"], out["time/next_rollout"] = next_rollouts
+        out["time/next_rollout_wait"] = next_wait
     if claim_log_weight is not None:
         # Unbiased for the policy's mean reward (plain "reward" is the mean
         # under the rows' own law p / w).
@@ -1448,6 +1517,8 @@ def thundersync_grpo_train(
         and ts_cfg.verify_mode == "block"
         and ts_cfg.draft_lookahead > 1
     )
+    lag = ts_cfg.rollout_lag
+    pending = None  # rollout_lag=1: rollouts of the next step's batch
     def _prompts(b):
         r = b.repeat_interleave(G)
         return [
@@ -1465,6 +1536,17 @@ def thundersync_grpo_train(
             break
         t0 = time.perf_counter()
         t_verify = 0.0
+        t_first = 0.0
+        if lag and pending is None:
+            # Step 0 of the lagged baseline: its rollouts come from theta_0.
+            t1 = time.perf_counter()
+            policy_generation.prepare_for_generation()
+            pending, _ = asyncio.run(
+                _generate_rollouts(
+                    batch, policy_generation, tokenizer, task_to_env, master_config
+                )
+            )
+            t_first = time.perf_counter() - t1
         if spec is not None:
             spec.current_step = step
         if sticky and drafts is not None:
@@ -1590,9 +1672,22 @@ def thundersync_grpo_train(
                 claim_log_weight=spec.claim_log_weight
                 if spec is not None and ts_cfg.banded_is_band is not None
                 else None,
+                stale_rollouts=pending,
+                generate_next=(
+                    (
+                        lambda b=next_batch: _generate_rollouts(
+                            b, policy_generation, tokenizer, task_to_env, master_config
+                        )
+                    )
+                    if lag and next_batch is not None and step + 1 < max_steps
+                    else None
+                ),
             )
         )
         drafts = metrics.pop("_drafts")
+        if lag:
+            pending = metrics.pop("_next_rollouts", None)
+            metrics["time/first_rollout"] = t_first
         if sticky:
             # This step's training has replayed every anchor targeted at it.
             spec.release_routes(step)

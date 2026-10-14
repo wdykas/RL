@@ -2,10 +2,10 @@
 # Run ONE arm of the ThunderSync A/B kit (configs/ab/ab_<ARM>.yaml) on the head node of a Ray cluster
 # (sbatch via thundersync_work/sbatch/submit_ab.sh) or on one 4-GPU node (2 engine + 2 learner GPUs).
 #
-#   ARM=sync|async1|ts_nonull|ts_por|ts_banded MODEL=<hf id or path> TP=1 PP=1 EP=8 \
+#   ARM=sync|async1|ts_nonull|ts_por|ts_banded|sync_coloc|async1_nrl [MBS=8 LPBS=4] MODEL=<hf id or path> TP=1 PP=1 EP=8 \
 #     MAXLEN=8192 STEPS=6 PROMPTS=64 RUNS=runs_ab TAG=<tag> bash run_ab_arm.sh
 #
-# GPUS_PER_SIDE (default lcm(TP, EP) * PP) GPUs per side, 4 GPUs per node. sync (stock NeMo-RL GRPO)
+# GPUS_PER_SIDE (default lcm(TP, EP) * PP) GPUs per side, 4 GPUs per node. sync_coloc (stock NeMo-RL GRPO)
 # is colocated: learner and engine share GPUS_PER_SIDE GPUs. Every other arm is split: GPUS_PER_SIDE
 # learner + GPUS_PER_SIDE engine GPUs (1-2 per side share one node). The engine uses the learner's
 # TP/PP/EP (GEN_PP overrides the engine's PP).
@@ -13,7 +13,7 @@
 # forward of the step's rollouts vs their rollout log-probs, timed as time/mismatch_check),
 # THUNDERSYNC_ENGINE_Q_CHECK (engine q vs the verification forward, per verified token) and a
 # route check of ROUTE_CHECK_ROWS (16) sampled drafts per step (timed as time/route_check).
-# The stock arms (sync, async1) report NeMo-RL's token_mult_prob_error / gen_kl_error.
+# The stock arms (sync_coloc, async1_nrl) report NeMo-RL's token_mult_prob_error / gen_kl_error.
 # Generation progress (every 60 s, engine rank 0) and the 10-min stall watchdog: ab_base.yaml.
 # Output: thundersync_work/$RUNS/$TAG/{run.log,history.json} (history rewritten every step).
 # Summarize: python thundersync_work/research/ab/summarize_ab.py thundersync_work/$RUNS/<tags...>
@@ -31,13 +31,14 @@ export NVIDIA_TF32_OVERRIDE=1
 CFG=research/thundersync_rl/configs/ab/ab_$ARM.yaml
 [ -f "$CFG" ] || { echo "no config $CFG" >&2; exit 2; }
 case $ARM in
-  sync|async1) ENTRY=research/thundersync_rl/run_ab_baseline.py ;;  # stock NeMo-RL GRPO loops
-  *)           ENTRY=research/thundersync_rl/run_thundersync_grpo.py ;;
+  sync_coloc|async1_nrl) ENTRY=research/thundersync_rl/run_ab_baseline.py ;;  # stock NeMo-RL GRPO loops
+  *)                     ENTRY=research/thundersync_rl/run_thundersync_grpo.py ;;  # ThunderSync learner path
 esac
-# sync is colocated (learner and engine share GPUS_PER_SIDE GPUs); every other arm is split
+# sync_coloc is colocated (learner and engine share GPUS_PER_SIDE GPUs); every other arm is split
 # (GPUS_PER_SIDE learner + GPUS_PER_SIDE engine GPUs).
-COLOCATED=$([ "$ARM" = sync ] && echo 1 || echo 0)
-if [ "$CHECKS" = 1 ] && [ "$ENTRY" = research/thundersync_rl/run_thundersync_grpo.py ]; then
+COLOCATED=$([ "$ARM" = sync_coloc ] && echo 1 || echo 0)
+# Exactness checks on the exact ThunderSync-loop arms (async1 is one step stale by design).
+if [ "$CHECKS" = 1 ] && [ "$ENTRY" = research/thundersync_rl/run_thundersync_grpo.py ] && [ "$ARM" != async1 ]; then
   export THUNDERSYNC_MISMATCH_CHECK=1 THUNDERSYNC_ENGINE_Q_CHECK=1
   export THUNDERSYNC_ROUTE_CHECK_ROWS=${ROUTE_CHECK_ROWS:-16}
 fi
@@ -67,6 +68,9 @@ PAR=(policy.megatron_cfg.tensor_model_parallel_size=$TP
      ++policy.generation.mcore_generation_config.pipeline_model_parallel_size=${GEN_PP:-$PP}
      ++policy.generation.mcore_generation_config.expert_model_parallel_size=$EP)
 (( PP > 1 || ${GEN_PP:-$PP} > 1 )) && PAR+=(++policy.megatron_cfg.pipeline_dtype=float32)
+# Micro-batch sizes (default: ab_base.yaml, 1 / 1 for long caps; the 1k-cap single-node runs use 8 / 4).
+[ -n "${MBS:-}" ] && PAR+=(policy.train_micro_batch_size=$MBS)
+[ -n "${LPBS:-}" ] && PAR+=(policy.logprob_batch_size=$LPBS)
 read -r -a USER_ARGS <<< "${ARGS:-}"
 OUT=$W/$RUNS/$TAG
 mkdir -p "$OUT"
