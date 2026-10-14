@@ -6,6 +6,7 @@
 # TURNS turns at most) and a per-turn budget (TURN_TOKENS) small enough for several turns.
 #
 #   bash research/thundersync_rl/scripts/bi_tp/sticky_multiturn_moe.sh
+#   INNER=nano_hybrid_fp16.sh bash .../sticky_multiturn_moe.sh     # hybrid Nemotron-3-Nano L8 (Mamba re-prefill)
 #
 # Pass (exit 0): sticky_moe.sh passes (mismatch 0 / exact_token_frac 1 over every assistant token of
 # every turn, engine q checks exact, route check of the drafts exact, weights change, drafts
@@ -16,14 +17,16 @@
 # spec/route_check_mt_exact == spec/route_check_mt_tokens > 0) with observation positions among them
 # (spec/route_check_mt_obs_positions > 0).
 #
-# Env: TURNS (3), TURN_TOKENS (128), MAXLEN (1024) + sticky_moe.sh's.
+# Env: TURNS (3), TURN_TOKENS (128), INNER (the exactness script this wraps: sticky_moe.sh, or a
+# wrapper of it such as nano_hybrid_fp16.sh), MAXLEN (1024) + the inner script's.
 W=/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/wdykas/code/on-olicy-rl/thundersync_work
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 TURNS=${TURNS:-3} TURN_TOKENS=${TURN_TOKENS:-128}
 export RUNS=${RUNS:-runs_sticky_multiturn}
+INNER=${INNER:-sticky_moe.sh}
 export TAG=${TAG:-mt$TURNS-t$TURN_TOKENS-$(basename "${MODEL:-tiny-qwen3-moe-d2048}")}
 export ARGS="--toy-multi-turn-env $TURNS grpo.max_rollout_turns=$TURNS policy.generation.max_new_tokens=$TURN_TOKENS ${ARGS:-}"
-bash "$HERE/sticky_moe.sh"
+bash "$HERE/$INNER"
 rc=$?
 OUT=$W/$RUNS/$TAG
 python - "$OUT/history.json" <<'EOF'
