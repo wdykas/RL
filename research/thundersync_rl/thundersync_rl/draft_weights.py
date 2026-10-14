@@ -29,6 +29,12 @@ exactly as after an optimizer step. The existing refit path then streams the
 buffer to the engine, and the training weights are restored bitwise by the
 optimizer's own main -> model copy + all-gather. No extra full copy of the
 model is materialized.
+
+Precision-aware optimizer (``use_precision_aware_optimizer``): the masters live
+in TE FusedAdam's state (fp32, fp16-scaled, or bf16 parameter + int16 remainder
+bits); they are read per chunk the same way, and since TE writes the parameter
+slice inside its step (no main -> model copy to redo), the owned slice is saved
+before the draft is written (2 bytes per owned element) and copied back.
 """
 
 from __future__ import annotations
@@ -72,9 +78,30 @@ def momentum_draft_master(
 class _Shard:
     inner: torch.optim.Optimizer  # the Adam over main-parameter shards
     group: dict
-    main: torch.Tensor  # fp32 main-parameter shard
+    key: torch.Tensor  # the inner optimizer's parameter (its state key)
     target: torch.Tensor  # this rank's slice of the DDP parameter buffer
-    aliased: bool  # fp32 model param: the main shard *is* the buffer slice
+    # True when the buffer slice must be saved to be restored bitwise: an fp32
+    # model param (the main shard *is* the slice), or any param under the
+    # precision-aware optimizer (TE FusedAdam writes the slice in its step; there
+    # is no separate main -> model copy to redo).
+    aliased: bool
+    # fp32 main shard (default optimizer); None: masters inside TE FusedAdam.
+    main: torch.Tensor | None = None
+
+
+def master_from_remainders(param: torch.Tensor, remainder: torch.Tensor) -> torch.Tensor:
+    """fp32 master of TE FusedAdam ``store_param_remainders`` (bf16 param + int16 low bits).
+
+    TE keeps the high 16 bits in the bf16 parameter, rounded up when the low
+    16 bits (the int16 remainder) have their top bit set (negative as int16),
+    so the high half is ``param bits - (remainder < 0)``. Inverse of
+    ``multi_tensor_adam_param_remainder``'s split; elementwise.
+    """
+    if param.dtype != torch.bfloat16 or remainder.dtype != torch.int16:
+        raise TypeError(f"expected bf16 param + int16 remainder, got {param.dtype}, {remainder.dtype}")
+    hi = param.view(torch.int16).to(torch.int32) - (remainder < 0).to(torch.int32)
+    bits = (hi << 16) | (remainder.to(torch.int32) & 0xFFFF)
+    return bits.view(torch.float32)
 
 
 def _dist_optimizers(optimizer) -> list:
@@ -89,10 +116,12 @@ def _dist_optimizers(optimizer) -> list:
             )
         if opt.ddp_config.use_megatron_fsdp:
             raise NotImplementedError("draft_weights=momentum: Megatron-FSDP not built yet")
-        if opt.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+        if opt.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8 and not hasattr(
+            opt.optimizer, "get_unscaled_state"
+        ):
             raise NotImplementedError(
-                "draft_weights=momentum: precision-aware optimizer not built yet "
-                "(main params live inside TE FusedAdam)"
+                "draft_weights=momentum: the precision-aware optimizer is built for "
+                f"TE FusedAdam (master weights in its state); got {type(opt.optimizer).__name__}"
             )
         if opt.ddp_config.fp8_param_gather or opt.ddp_config.fp4_param_gather:
             raise NotImplementedError("draft_weights=momentum: fp8/fp4 params not built yet")
@@ -109,12 +138,21 @@ def _shards(optimizer) -> Iterator[_Shard]:
         group_of = {
             id(p): g for g in opt.optimizer.param_groups for p in g["params"]
         }
-        for mains, models, aliased in (
-            (opt.shard_fp32_from_float16_groups, opt.model_float16_groups, False),
-            (opt.shard_fp32_groups, opt.model_fp32_groups, True),
-        ):
-            for main_group, model_group in zip(mains, models):
-                for main, model_param in zip(main_group, model_group):
+        if opt.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+            # The inner optimizer's params are the model-param shards (views of
+            # the buffer); TE FusedAdam holds their masters.
+            pairs = (
+                (opt.shard_float16_groups, opt.model_float16_groups, True, False),
+                (opt.shard_fp32_groups, opt.model_fp32_groups, True, False),
+            )
+        else:
+            pairs = (
+                (opt.shard_fp32_from_float16_groups, opt.model_float16_groups, False, True),
+                (opt.shard_fp32_groups, opt.model_fp32_groups, True, True),
+            )
+        for keys, models, aliased, has_main in pairs:
+            for key_group, model_group in zip(keys, models):
+                for key, model_param in zip(key_group, model_group):
                     world_range = opt._get_model_param_range_map(model_param)[
                         "gbuf_world_in_bucket"
                     ]
@@ -122,10 +160,11 @@ def _shards(optimizer) -> Iterator[_Shard]:
                     buf = opt.buffers[gbuf_index].buckets[bucket_id].param_data
                     yield _Shard(
                         inner=opt.optimizer,
-                        group=group_of[id(main)],
-                        main=main,
+                        group=group_of[id(key)],
+                        key=key,
                         target=buf.view(-1)[world_range.start : world_range.end],
                         aliased=aliased,
+                        main=key if has_main else None,
                     )
 
 
@@ -148,16 +187,36 @@ def _adam_state(inner, main: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 CHUNK_ELEMS = 1 << 24
 
 
+def _master_chunks(shard: _Shard):
+    """Callable slice -> fp32 master values of the shard (no full fp32 copy if avoidable)."""
+    if shard.main is not None:
+        w = shard.main.view(-1)
+        return lambda sl: w[sl]
+    state = shard.inner.state.get(shard.key)
+    param = shard.key.view(-1)
+    if not state or "master_param" not in state:
+        # fp32 param (its own master), or before the first step: the master is
+        # the parameter itself.
+        return lambda sl: param[sl].float()
+    master = state["master_param"]
+    if master.dtype == torch.int16:  # store_param_remainders
+        rem = master.view(-1)
+        return lambda sl: master_from_remainders(param[sl], rem[sl])
+    full = shard.inner.get_unscaled_state(shard.key, "master_param").view(-1)
+    return lambda sl: full[sl].float()
+
+
 def _draft_chunks(shard: _Shard, chunk: int) -> Iterator[tuple[slice, torch.Tensor]]:
     """(slice, rounded draft) of one main shard, ``chunk`` elements at a time."""
     g = shard.group
     beta1, beta2 = g["betas"]
-    m, v = _adam_state(shard.inner, shard.main)
-    w = shard.main.view(-1)
-    for start in range(0, w.numel(), chunk):
-        sl = slice(start, min(start + chunk, w.numel()))
+    m, v = _adam_state(shard.inner, shard.key)
+    master = _master_chunks(shard)
+    n = shard.target.numel()
+    for start in range(0, n, chunk):
+        sl = slice(start, min(start + chunk, n))
         draft = momentum_draft_master(
-            w[sl],
+            master(sl),
             m[sl].float(),  # no-op for fp32 states
             v[sl].float(),
             lr=g["lr"],
@@ -227,7 +286,7 @@ def load_draft(optimizer, kind: str, chunk: int = CHUNK_ELEMS) -> DraftSwap:
 
 @torch.no_grad()
 def restore_training(swap: DraftSwap) -> dict[str, float]:
-    """Put theta_n back, bitwise: the optimizer's own main -> model copy + all-gather."""
+    """Put theta_n back, bitwise: saved slices, the optimizer's main -> model copy, all-gather."""
     t0 = time.perf_counter()
     for target, orig in swap.saved:
         target.copy_(orig)

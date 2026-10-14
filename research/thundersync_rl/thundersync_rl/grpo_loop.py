@@ -274,7 +274,8 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # next refit (sticky anchors and continuation rounds use it). Requires speculate,
     # verify_mode=block, verify_source=engine, verify_on=learner,
     # draft_lookahead=1, no draft_after_verify, no fused_verify_train,
-    # Megatron's distributed optimizer without the precision-aware optimizer.
+    # Megatron's distributed optimizer (Adam; with or without the
+    # precision-aware optimizer).
     draft_weights: Literal["current", "momentum"] = "current"
 
 
@@ -570,11 +571,6 @@ def validate_draft_weights(master_config: ThunderSyncMasterConfig) -> None:
     if not opt_cfg.get("use_distributed_optimizer", False):
         problems.append(
             "policy.megatron_cfg.optimizer.use_distributed_optimizer must be true"
-        )
-    if opt_cfg.get("use_precision_aware_optimizer", False):
-        problems.append(
-            "policy.megatron_cfg.optimizer.use_precision_aware_optimizer must be false "
-            "(not built yet)"
         )
     if opt_cfg.get("optimizer", "adam") != "adam":
         problems.append("policy.megatron_cfg.optimizer.optimizer must be 'adam'")

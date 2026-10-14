@@ -178,6 +178,7 @@ def test_config_default_current_and_momentum_valid():
     assert ThunderSyncConfig().draft_weights == "current"
     validate_draft_weights(_master())
     validate_draft_weights(_master(draft_weights="current", speculate=False))
+    validate_draft_weights(_master({"use_precision_aware_optimizer": True}))
 
 
 @pytest.mark.parametrize(
@@ -190,7 +191,6 @@ def test_config_default_current_and_momentum_valid():
         ({}, {"fused_verify_train": True}, "fused_verify_train"),
         ({}, {"speculate": False}, "speculate"),
         ({"use_distributed_optimizer": False}, {}, "use_distributed_optimizer"),
-        ({"use_precision_aware_optimizer": True}, {}, "precision_aware"),
         ({"optimizer": "sgd"}, {}, "'adam'"),
     ],
 )

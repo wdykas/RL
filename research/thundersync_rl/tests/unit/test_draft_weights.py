@@ -79,9 +79,12 @@ def mcore():
         dist.destroy_process_group()
 
 
-def _toy(moe: bool, tp: int = 1, ep: int = 1):
+def _toy(moe: bool, tp: int = 1, ep: int = 1, precision_aware: str | None = None):
     """Tiny bf16 GPT (MoE: expert + dense DistOpts in a ChainedOptimizer) with
-    Megatron DDP + DistributedOptimizer, as the learner builds it."""
+    Megatron DDP + DistributedOptimizer, as the learner builds it.
+
+    ``precision_aware``: None (fp32 main shards), "fp32" (TE FusedAdam fp32
+    masters) or "remainders" (TE FusedAdam bf16 param + int16 remainders)."""
     from megatron.core.distributed import (
         DistributedDataParallel,
         DistributedDataParallelConfig,
@@ -128,10 +131,17 @@ def _toy(moe: bool, tp: int = 1, ep: int = 1):
         ),
         model,
     )
+    pa = {}
+    if precision_aware is not None:
+        pa = dict(
+            use_precision_aware_optimizer=True,
+            store_param_remainders=precision_aware == "remainders",
+        )
     opt = get_megatron_optimizer(
         OptimizerConfig(
             optimizer="adam", lr=1e-3, weight_decay=0.01, adam_beta1=0.9,
             adam_beta2=0.999, adam_eps=1e-8, bf16=True, use_distributed_optimizer=True,
+            **pa,
         ),
         [ddp],
     )
@@ -234,3 +244,69 @@ def test_engine_stage_round_trip_keeps_parameter_storage():
         assert torch.equal(p, d)
     with pytest.raises(RuntimeError, match="not staged"):
         EngineStage().load(model)
+
+
+def test_master_from_remainders_inverts_the_split():
+    from thundersync_rl.draft_weights import master_from_remainders
+
+    g = torch.Generator().manual_seed(0)
+    x = torch.randn(4096, generator=g) * torch.logspace(-8, 8, 4096)
+    x = torch.cat([x, torch.tensor([0.0, -0.0, 1.0, -1.0, 65504.0, 1e-40])])
+    bits = x.view(torch.int32)
+    rem = (bits & 0xFFFF).to(torch.int16)  # low half, two's complement
+    hi = ((bits >> 16) + (rem < 0).to(torch.int32)).to(torch.int16)  # rounded up
+    out = master_from_remainders(hi.view(torch.bfloat16), rem)
+    assert torch.equal(out.view(torch.int32), bits)
+
+
+@cuda
+@pytest.mark.parametrize("moe", [False, True])
+@pytest.mark.parametrize("mode", ["fp32", "remainders"])
+def test_precision_aware_draft_matches_harness_and_restores(mcore, moe, mode):
+    """TE FusedAdam masters (fp32 state, or bf16 param + int16 remainders): the
+    draft is the harness formula on those masters; theta_n comes back bitwise."""
+    from thundersync_rl.draft_weights import master_from_remainders
+
+    ddp, opt = _toy(moe, precision_aware=mode)
+    for s in range(3):
+        _train_step(ddp, opt, s, autocast=not moe)
+    params = dict(ddp.module.named_parameters())
+    before = {n: p.detach().clone() for n, p in params.items()}
+    ref, remainder_masters = {}, 0
+    for o in getattr(opt, "chained_optimizers", [opt]):
+        inner = o.optimizer
+        pairs = list(zip(o.shard_float16_groups, o.model_float16_groups))
+        pairs += list(zip(o.shard_fp32_groups, o.model_fp32_groups))
+        for keys, models in pairs:
+            for key, mp in zip(keys, models):
+                grp = next(g for g in inner.param_groups if any(p is key for p in g["params"]))
+                st = inner.state[key]
+                if "master_param" not in st:
+                    w = key.detach().float().view(-1)
+                elif st["master_param"].dtype == torch.int16:
+                    w = master_from_remainders(key.detach().view(-1), st["master_param"].view(-1))
+                    # Independent of the decode: the master rounds to the bf16 param
+                    # (|master - param| <= half a bf16 ulp; a wrong high half is 1 ulp off).
+                    p32 = key.detach().float().view(-1)
+                    ulp = (p32.abs() * 2.0**-7).clamp_min(2.0**-133)
+                    assert ((w - p32).abs() <= ulp / 2 * (1 + 2.0**-10)).all()
+                    remainder_masters += 1
+                else:
+                    w = inner.get_unscaled_state(key, "master_param").view(-1)
+                b1, b2 = grp["betas"]
+                ref[id(mp)] = harness_mom(
+                    w,
+                    inner.get_unscaled_state(key, "exp_avg").view(-1),
+                    inner.get_unscaled_state(key, "exp_avg_sq").view(-1),
+                    int(grp.get("step", 0)), grp["lr"], b1, b2,
+                    grp["eps"], grp["weight_decay"],
+                ).to(mp.dtype).view(mp.shape)
+    assert (remainder_masters > 0) == (mode == "remainders")
+    assert len(ref) == sum(p.requires_grad for p in params.values())
+    swap = load_draft(opt, "momentum", chunk=1000)
+    assert swap.stats["draft/changed_elems"] > 0
+    for n, p in params.items():
+        assert torch.equal(p.detach(), ref[id(p)]), n
+    restore_training(swap)
+    for n, p in params.items():
+        assert torch.equal(p.detach(), before[n]), n
