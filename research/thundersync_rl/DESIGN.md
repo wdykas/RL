@@ -1879,7 +1879,8 @@ site kinds needed); ~20% of activation elements are rounded toward the anchor at
 
 ## 14j. Cohort lanes: two weight versions in the engine fleet (`thundersync.cohort_lanes: 2`)
 
-*Opt-in (`cohort_lanes: 1` = one engine, the default). Built and unit-tested (CPU, fake engines:
+*Opt-in tool, not the default (`cohort_lanes: 1` = one engine; the plan of record is one engine with
+section 14k's scheduling). Built and unit-tested (CPU, fake engines:
 `tests/unit/test_lanes.py`); 4-GPU end-to-end results below. Notes, measurements and resume
 section: `thundersync_work/research/agent_lanes.md`.*
 
@@ -2044,6 +2045,81 @@ q, sticky routing, expert-grad noise, 16 prompts x 8, 1024 tokens, 4 steps, one 
   measured critical path (`thundersync_work/research/agent_critical_path_measured.md`) is the tail
   and the serial post-tail chain, which lanes do not shorten; the one-engine work continues in
   section 14k (branch ts-one-engine).
+
+## 14k. One engine under sticky routing: training streams over the tails
+
+*Default with sticky routing (`thundersync.stream_training_over_tails: true`,
+`thundersync.canonical_group_order: true`). Branch ts-one-engine; notes and measurements:
+`thundersync_work/research/agent_one_engine.md`; critical-path measurements that motivated it:
+`thundersync_work/research/agent_critical_path_measured.md`.*
+
+**Why one engine needs two versions anyway.** Under sticky routing a cohort's continuation streams
+(the tails) decode on its drafting version D_k (section 14c, R2): their anchors are D_k's plain
+routes. Drafts of cohort k+1 need D_{k+1}. So one engine holding one version serializes tails →
+refit → next drafts for any draft weights; a single-version engine with drafts overlapping the tails
+exists only without sticky routing (where it already runs). What one engine can overlap is the
+*learner*: before this section, `verify_sticky` (all tails) finished before `_run_one_step`, so
+training (2.1–2.5 s at Nano L8 EP=2) waited for the last tail [measured, critical_path_measured §3].
+
+**Streaming over the tails (exact).** Step k:
+1. `begin_sticky`: verify cohort k's drafts at θ_k (learner, engine-sourced q), stop the streams no
+   pending plan continues; the plans of rows still to complete are the step's *tails*.
+2. `_run_one_step` starts at once. Its pre-rollout task runs `complete_tails` (the continuation
+   rounds on D_k), then `finish_generation`, the momentum stage (if any) and the θ_k refit, then
+   `weights_ready`. A rollout with a complete plan is served immediately; a rollout whose plan is a
+   tail waits until the rounds complete it; a rollout never drafted (no plan) waits for
+   `weights_ready` and decodes at θ_k. Next-cohort drafts wait for the refit too
+   (`drafts_after_pre_rollout`).
+3. The streaming learner trains groups as they close, i.e. while other rows' tails still run.
+Exactness: training of step k and verification of the tail pieces are both learner-side at θ_k; θ
+changes only at `finish`; a complete plan's prefix, log-probs and anchors never change again
+(`claim_anchors`). The engine still holds one version at a time (D_k until the tails end, then θ_k).
+Learner calls of training and piece verification interleave on the actors in submission order (as
+the non-sticky chunked verification already does). The momentum stage loads θ̂ into the learner's
+parameters between training micro-batches: Ray runs the learner's calls in submission order, so no
+training forward sees θ̂ (load, refit and restore are issued from the driver's event loop as one
+synchronous sequence).
+
+**Tail-last canonical group order.** After verify0 the groups are ordered (ready now) < (pending
+tails) < (never drafted), by group index within each class, and the planner dispatches whole groups
+one at a time in that order (`StreamPlanner.set_order`), rows sorted by trajectory index. The order
+depends only on the verification results, so micro-batch composition, DP rank placement and the
+order gradients add into the fp32 accumulator are functions of the data, not of arrival times
+(arrival order changes fp32 summation order, hence the bits of θ_{k+1}). The exposed time after the
+last tail is the training of the tail groups still held (canonical order holds a tail group that
+finished early behind an earlier-index tail group still decoding) [unit test: identical dispatches
+under three arrival orders; GPU reproducibility runs queued]. Per-rank cost: none (no extra buffer;
+U/V buffers to remove the last group's training are agent_tail_exact_schemes §3.1(b), not built).
+
+**Continuation rounds (exact, faster).** `sticky_continuation_chunk_tokens` 2048 → 256 (below the
+1024-token caps of the test runs; 2048 > cap meant every piece was a whole remainder, so a rejection
+was found only after the stream had decoded all of it). Rounds no longer block the driver:
+`_verify_block_async` sends a piece's verification and the loop keeps cutting other streams' pieces,
+serving rollouts and dispatching training; one piece per stream is in flight, so a plan's pieces are
+verified in order (same decisions as before; each is block verification of a q draft against the
+fixed target).
+
+**Perf mode.** `PERF=1` in `engine_q_tp.sh` / `sticky_moe.sh` turns the debug checks off (mismatch
+check, route check, engine-q and sticky checks, spec/mem profiling): timing runs; the checker prints
+"SKIPPED (PERF mode, checks off)". Exactness runs keep them on.
+
+**Measured, Nemotron-3-Nano L8, EP=2, 2+2 GPUs, PERF=1, 6 steps, one run per arm** (`time/iteration`,
+steps 2–5; `time/step_total` is only `_run_one_step` and excludes the tails when STREAM=0):
+
+| arm | iteration s (s2–s5) | mean | tails / V | train busy | after last rollout | drafted tok/cohort |
+|---|---|---|---|---|---|---|
+| baseline (STREAM=0, chunk 2048), current | 22.9 / 22.2 / 23.2 / 23.3 | 22.9 | V 18.1–19.4 | 2.4 (serial) | 2.5–3.1 | 24–33k |
+| streaming only (93195ee6), current | 18.7 / 19.0 / 15.2 / 23.8 | 19.1 | tails 12.4–22.2 | 2.9–4.2 | 0.4–4.8 | 2.4–39k |
+| streaming + rounds (29acacc8), current | 17.7 / 16.7 / 19.5 / 16.5 | 17.6 | tails 13.6–16.9 | 5.1–6.8 | 0.4–1.4 | 2.9–10k |
+| baseline, momentum | 23.9 / 22.1 / 20.7 / 23.3 | 22.5 | V 16.2–20.0 | 2.2–2.7 | 2.3–3.3 | 23–29k |
+| streaming + rounds, momentum | 17.8 / 17.4 / 17.5 / 15.9 | 17.1 | tails 14.2–14.8 | 3.2–5.9 | 0.4–1.2 | 2.7–8.6k |
+
+−23% (current) / −24% (momentum) per step. Training now overlaps the tails (its busy time grows:
+it shares the learner with piece verification). The drafting window shrinks to what follows the
+tails + refit (drafts 3–10k tokens instead of 24–33k), so more of the next cohort is decoded as
+continuation: the one-engine trade under sticky's two versions. Exactness (checks on, 29acacc8):
+Nano L8 current PASS 4/4 (mismatch 0, engine q exact, route check exact, sticky rule active).
+Results of the canonical order, determinism and the in-loop decode profile: agent_one_engine.md.
 
 ## 15. Open work
 
