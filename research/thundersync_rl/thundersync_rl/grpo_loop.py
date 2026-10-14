@@ -258,8 +258,11 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # many decoded tokens while the engine keeps decoding them; a rejection
     # restarts the continuation from the new prefix, so it wastes at most the
     # tokens decoded past the verified piece (SpeculativeGeneration
-    # ._continue_sticky). Fixed count: the cut is exogenous.
-    sticky_continuation_chunk_tokens: int = 2048
+    # ._continue_sticky). Fixed count: the cut is exogenous. Below the rollout
+    # cap, so a rejection is found before the stream decodes its whole
+    # remainder (2048 > a 1024 cap re-decoded the remainder: 1.2-1.9x plain
+    # decode per kept token, DESIGN.md section 14k).
+    sticky_continuation_chunk_tokens: int = 256
     # Sticky, one engine: serve and train every rollout whose plan is complete
     # while the continuation rounds of the other rows still run (both are
     # learner-side at theta_k; DESIGN.md section 14k). False: training starts

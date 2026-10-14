@@ -1289,52 +1289,66 @@ class SpeculativeGeneration:
         ranks by tokens (``lpt_owners``). ``null_envelopes`` (⊥-BV): every row
         is verified at each envelope; the driver decides (``_decide_null``).
         """
-        if True:
-            # Contiguous row slices per verifier pool, verified concurrently.
-            k = len(self.verifiers)
-            cuts = [round(j * len(flat) / k) for j in range(k + 1)]
-            futs = []
-            for g, a, b in zip(self.verifiers, cuts, cuts[1:]):
-                method, extra = self._verify_method(flat[a:b])
-                if method == "verify_drafts_block_engine":
-                    # Rows placed on the pool's data-parallel ranks by tokens.
-                    lengths = [r.numel() for r in rows[a:b]]
-                    ranks = data_parallel_size(g)
-                    owners = lpt_owners(lengths, ranks)
-                    extra = {**extra, "row_ranks": owners}
-                    self._count_balance(lengths, owners, ranks)
-                if null_envelopes is not None:
-                    extra = {**extra, "null_envelopes": list(null_envelopes)}
-                futs.append(
-                    (
-                        a,
-                        g.run_all_workers_single_data(
-                            method,
-                            **extra,
-                            rows=rows[a:b],
-                            prompt_lens=[d[0].numel() for _, d in flat[a:b]],
-                            segments=[d[5] for _, d in flat[a:b]],
-                            vocab_limit=self.vocab_limit,
-                            # A fresh counter value per call: verification
-                            # randomness is never reused across calls or steps
-                            # (``seed * 7 + a`` collided between consecutive
-                            # calls, e.g. (s, a=7) and (s+1, a=0), so a later
-                            # decision could reuse a stream that shaped the
-                            # update producing the policy it verifies against).
-                            seed=next(self._verify_seeds),
-                            keys=[d[4] for _, d in flat[a:b]],
-                            precision=self.verify_precision,
-                            batch_tokens=self.verify_batch_tokens,
-                            lazy=self.verify_lazy,
-                        ),
-                    )
+        futs = self._submit_verify_block(flat, rows, null_envelopes)
+        return self._verify_block_results(flat, [(a, ray.get(refs)) for a, refs in futs])
+
+    async def _verify_block_async(self, flat, rows) -> dict[int, dict[str, Any]]:
+        """``_verify_block`` without blocking the driver's event loop."""
+        futs = self._submit_verify_block(flat, rows)
+        done = []
+        for a, refs in futs:
+            # A worker thread waits on the results; the event loop keeps going.
+            done.append((a, await asyncio.to_thread(ray.get, refs)))
+        return self._verify_block_results(flat, done)
+
+    def _submit_verify_block(self, flat, rows, null_envelopes=None) -> list:
+        """Send ``flat``'s block verification to the verifier pools: [(first row, refs)]."""
+        # Contiguous row slices per verifier pool, verified concurrently.
+        k = len(self.verifiers)
+        cuts = [round(j * len(flat) / k) for j in range(k + 1)]
+        futs = []
+        for g, a, b in zip(self.verifiers, cuts, cuts[1:]):
+            method, extra = self._verify_method(flat[a:b])
+            if method == "verify_drafts_block_engine":
+                # Rows placed on the pool's data-parallel ranks by tokens.
+                lengths = [r.numel() for r in rows[a:b]]
+                ranks = data_parallel_size(g)
+                owners = lpt_owners(lengths, ranks)
+                extra = {**extra, "row_ranks": owners}
+                self._count_balance(lengths, owners, ranks)
+            if null_envelopes is not None:
+                extra = {**extra, "null_envelopes": list(null_envelopes)}
+            futs.append(
+                (
+                    a,
+                    g.run_all_workers_single_data(
+                        method,
+                        **extra,
+                        rows=rows[a:b],
+                        prompt_lens=[d[0].numel() for _, d in flat[a:b]],
+                        segments=[d[5] for _, d in flat[a:b]],
+                        vocab_limit=self.vocab_limit,
+                        # A fresh counter value per call: verification
+                        # randomness is never reused across calls or steps
+                        # (``seed * 7 + a`` collided between consecutive
+                        # calls, e.g. (s, a=7) and (s+1, a=0), so a later
+                        # decision could reuse a stream that shaped the
+                        # update producing the policy it verifies against).
+                        seed=next(self._verify_seeds),
+                        keys=[d[4] for _, d in flat[a:b]],
+                        precision=self.verify_precision,
+                        batch_tokens=self.verify_batch_tokens,
+                        lazy=self.verify_lazy,
+                    ),
                 )
-            res = [
-                [(a + j, r) for j, r in rank_res]
-                for a, refs in futs
-                for rank_res in ray.get(refs)
-            ]
-        by_row = dict(x for rank_res in res for x in rank_res)
+            )
+        return futs
+
+    def _verify_block_results(self, flat, done) -> dict[int, dict[str, Any]]:
+        """Results by row from [(first row, per-rank results)] of ``_submit_verify_block``."""
+        by_row = dict(
+            (a + j, r) for a, ranks in done for rank_res in ranks for j, r in rank_res
+        )
         missing = sorted(set(range(len(flat))) - by_row.keys())
         if missing:
             raise RuntimeError(f"block verification returned no result for rows {missing}")
@@ -2055,16 +2069,15 @@ class SpeculativeGeneration:
                 live.append(dict(plan.stream, key=key, plan=plan))
                 plan.stream = None
         start([(key, plan) for key, plan in pending if not any(s["plan"] is plan for s in live)])
-        while live:
-            status = ray.get(rank0.draft_lengths.remote([s["idx"] for s in live]))
-            cand = [
-                s
-                for s, (n, done) in zip(live, status)
-                if done or n - s["taken"] >= chunk
-            ]
-            if not cand:
-                await asyncio.sleep(0.02)
-                continue
+        # Rounds do not block each other: a stream whose piece is being verified
+        # keeps decoding on the engine and gets its next piece only after the
+        # result (pieces of one plan are verified in order); pieces of other
+        # streams are cut and sent meanwhile.
+        inflight: dict[asyncio.Task, tuple[list, list]] = {}
+        busy: set[int] = set()
+
+        def pieces(cand):
+            """(flat drafts, rows, owner streams) of the ready pieces of ``cand``."""
             idx = [s["idx"] for s in cand]
             ids = ray.get(rank0.draft_request_ids.remote(idx))
             records: dict[int, tuple] = {}
@@ -2091,8 +2104,7 @@ class SpeculativeGeneration:
                         )
                     )
             if not ready:
-                await asyncio.sleep(0.02)
-                continue
+                return [], [], []
             routes = self._pop_routes(
                 [s["hkey"] for s, *_ in ready],
                 [s["length"] for s, *_ in ready],
@@ -2127,7 +2139,7 @@ class SpeculativeGeneration:
                 )
             )
             hid = [taken.get(id(c[0])) for c in cut]
-            flat, rows, owners, restart, stale = [], [], [], [], []
+            flat, rows, owners, stale = [], [], [], []
             for (s, toks, done, lps, plen, m), h in zip(cut, hid):
                 m = min(m, 0 if h is None else hidden_num_rows(h))
                 prompt = torch.cat(
@@ -2171,11 +2183,11 @@ class SpeculativeGeneration:
                 stats["retries"] += len(stale)
                 stop(stale)
                 start([(s["key"], s["plan"]) for s in stale])
-            if not flat:
-                continue
-            stats["rounds"] += 1
-            by_row = self._verify_block(flat, rows)
-            done_streams = []
+            return flat, rows, owners
+
+        async def apply(flat, owners, by_row) -> None:
+            """Extend or cut each owner's plan by its piece's verification result."""
+            done_streams, restart = [], []
             for r, ((_, d), s) in enumerate(zip(flat, owners)):
                 out = by_row[r]
                 plan, p, toks, done = s["plan"], d[0], d[2], d[3]
@@ -2212,6 +2224,41 @@ class SpeculativeGeneration:
                 await self._notify_tails()
             if restart:
                 start([(s["key"], s["plan"]) for s in restart])
+
+        try:
+            while live or inflight:
+                progressed = False
+                for task in [t for t in inflight if t.done()]:
+                    flat, owners = inflight.pop(task)
+                    for s in owners:
+                        busy.discard(id(s))
+                    await apply(flat, owners, task.result())
+                    progressed = True
+                idle = [s for s in live if id(s) not in busy]
+                if idle:
+                    status = ray.get(rank0.draft_lengths.remote([s["idx"] for s in idle]))
+                    cand = [
+                        s
+                        for s, (n, done) in zip(idle, status)
+                        if done or n - s["taken"] >= chunk
+                    ]
+                    flat, rows, owners = pieces(cand) if cand else ([], [], [])
+                    if flat:
+                        stats["rounds"] += 1
+                        task = asyncio.create_task(self._verify_block_async(flat, rows))
+                        inflight[task] = (flat, owners)
+                        busy.update(id(s) for s in owners)
+                        progressed = True
+                if not progressed:
+                    if inflight:
+                        await asyncio.wait(
+                            list(inflight), timeout=0.02, return_when=asyncio.FIRST_COMPLETED
+                        )
+                    else:
+                        await asyncio.sleep(0.02)
+        finally:
+            for task in inflight:
+                task.cancel()
         self.stats.update(
             {
                 "spec/sticky_rounds": float(stats["rounds"]),
