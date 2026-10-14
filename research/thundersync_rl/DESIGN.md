@@ -1967,6 +1967,14 @@ observation positions), 128/128 rollouts per step replayed, environment stepped 
 Turns ended at the per-turn cap almost always (truncated models rarely emit EOS): EOS turn ends are
 unit-tested only. Environment latency on the refit path not measured (instant toy environment).
 
+*Hybrid Nemotron-3-Nano (branch ts-nano-multiturn = ts-hybrid-integ + ts-multiturn-ab, 2026-10-14):* L8
+(MEMEM*EM, sigmoid + expert-bias router, fp16 GEMM recipe, EP=2, async, 4 steps): PASS, mismatch 0 every step,
+engine q 8/8 exact, `[route check mt]` exact 53114/52003/55061 positions incl. 2194/1985/2381 observation
+positions, 128/128 rows replayed, 277–305 environment steps per step. Every later turn is a new engine request whose
+prefill rebuilds the Mamba conv/SSM state from prompt + turns + observations (no state truncation anywhere), and
+route layers are the MoE router instances (hybrid numbering from the route log); nothing in the multi-turn code
+is layer-type specific. With the anchor horizon (H = 160, section 14i): also PASS (below).
+
 ## 14i. Sticky routing anchor horizon with engine anchor apply (`thundersync.sticky_anchor_horizon`)
 
 *Opt-in (unset: today's behaviour, anchors up to the rollout cap). Requires sticky routing (14c).
@@ -2068,6 +2076,12 @@ every step over every turn, route check over full rows exact incl. 1118–1382 a
 step, 128 environment steps per step below the horizon (θ_{k−1}) and 234–280 turns finished on the refit engine
 beyond it; control without apply: max |Δlog p| 0.53–0.66. Runs and numbers: `thundersync_work/research/
 agent_multiturn_b.md`.
+
+*Nemotron-3-Nano L8 on ts-nano-multiturn* (hybrid, fp16 recipe, EP=2, async, 4 steps) [M]: single-turn H = 64
+PASS (mismatch 0, engine q 6/6 exact, 19/117/122 plans to the refit engine, 23204 anchored tokens by step 3);
+multi-turn H = 160 PASS (mismatch 0 over every turn, `[route check mt]` exact 32552/33680/33320 positions incl.
+1252/1118/1382 observation positions, 128 environment steps per step below the horizon, 261/234/280 turns finished
+on the refit engine, 85033 anchored tokens). No-apply controls on Nano: queued, not yet measured.
 
 **Nemotron-H (Nano/Super/Ultra) routers.** The rule acts on the scores MCore selects on (`compute_topk`'s input):
 sigmoid + expert bias for Nemotron-H, after which MCore gathers the sigmoid scores of the effective experts; engine
