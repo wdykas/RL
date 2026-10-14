@@ -32,7 +32,6 @@ environment terminates it or after ``max_turns`` turns.
 
 from __future__ import annotations
 
-import asyncio
 import copy
 import time
 from dataclasses import dataclass
@@ -40,8 +39,7 @@ from typing import Any, Union
 
 import torch
 
-from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.experience.rollouts import calculate_rewards
+from nemo_rl.data.llm_message_utils import get_keys_from_message_log
 
 
 @dataclass
@@ -154,23 +152,24 @@ class TurnEnvironment:
         )
         log = self.message_log(row, prefix, turns)
         log.append(self._assistant(prefix[turn_start:], None, record))
-        batch = BatchedDataDict(
-            {
-                "message_log": [log],
-                "extra_env_info": [copy.deepcopy(self.env_info(row, turns))],
-                "task_name": [self.rows[row]["task_name"]],
-            }
-        )
-        # calculate_rewards blocks on the environment actors.
+        task = self.rows[row]["task_name"]
+        if task not in self.task_to_env:
+            raise ValueError(f"No environment found for task type: {task}")
+        # One environment call per verified turn end, awaited on the driver's
+        # event loop (no thread per call: thousands of rollouts may wait on
+        # slow tools at once). Same request as ``calculate_rewards`` makes.
         t0 = time.perf_counter()
-        out = await asyncio.to_thread(calculate_rewards, batch, self.task_to_env)
+        out = await self.task_to_env[task].step.remote(
+            [get_keys_from_message_log(log, ["role", "content"])],
+            [copy.deepcopy(self.env_info(row, turns))],
+        )
         self.env_s += time.perf_counter() - t0
         self.steps += 1
         if isinstance(out.rewards, dict):
-            record.reward = {k: float(r[0].item()) for k, r in out.rewards.items()}
+            record.reward = {k: float(r[0]) for k, r in out.rewards.items()}
         else:
-            record.reward = float(out.rewards[0].item())
-        record.terminated = bool(out.terminateds[0].item())
+            record.reward = float(out.rewards[0])
+        record.terminated = bool(out.terminateds[0])
         content = out.observations[0]["content"]
         obs = self.tokenizer(
             content, return_tensors="pt", add_special_tokens=False
@@ -182,7 +181,7 @@ class TurnEnvironment:
         record.obs = [int(t) for t in obs.tolist()]
         record.obs_message = {"role": out.observations[0]["role"], "content": content}
         if not record.last:
-            if out.next_stop_strings[0] is not None:
+            if out.next_stop_strings is not None and out.next_stop_strings[0] is not None:
                 raise ValueError(
                     "thundersync.speculate does not support environment stop strings "
                     "(drafts and continuations run without them)"

@@ -37,6 +37,12 @@ class _Ref:
     def __init__(self, value):
         self.value = value
 
+    def __await__(self):
+        return self._get().__await__()
+
+    async def _get(self):
+        return self.value
+
 
 def _get(x):
     if isinstance(x, list) and x and isinstance(x[0], _Ref):

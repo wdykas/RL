@@ -1825,9 +1825,9 @@ test: biased).
 (`multi_turn.py`, `SpeculativeGeneration.verify_sticky` / `_continue_sticky`).
 Turn 1 is drafted and block-verified as before. When a VERIFIED prefix ends a turn (EOS, or
 the per-turn cap `_cap(prompt + earlier turns and observations)`, the same budget the plain
-multi-turn path gets), the driver steps the environment on it (`TurnEnvironment.step`:
-`calculate_rewards` on the row's message log, in a thread so other rollouts' streams keep
-going). Unverified draft tokens never reach the environment or its tools. Unless the rollout
+multi-turn path gets), the driver steps the environment on it (`TurnEnvironment.step`: the same
+`env.step.remote` request `calculate_rewards` makes on the row's message log, awaited on the
+driver's event loop, so other rollouts' streams and environment steps keep going). Unverified draft tokens never reach the environment or its tools. Unless the rollout
 ends there (terminated, observation truncated at the total-length cap, or `max_rollout_turns`
 turns), the observation is appended to the plan and a new θ_{k−1} stream decodes the next
 turn from prompt + turns + observation; its pieces are verified exactly like continuations
@@ -1862,7 +1862,9 @@ observation tokens; observation log-probs are placeholders, masked from the loss
 - Driver: one environment step per verified turn end (the same count as plain multi-turn) and one
   stream start per later turn; per turn only token lists cross the driver (the turn's tokens, the
   observation's ids). Routes stay object-store handles (`RouteRefs`), never fetched by the driver.
-  Environment steps run concurrently (one thread each) with every other rollout's streams.
+  Environment steps are awaited Ray calls (no thread per call, unlike the plain path's
+  `asyncio.to_thread(calculate_rewards)`, which caps concurrent steps at the default thread pool):
+  thousands of rollouts can wait on slow tools at once while every other rollout's stream decodes.
 - Engine (θ_{k−1}): each later turn is a new request whose prefill re-reads prompt + earlier turns
   + observation: O(turns × S) prefill tokens per rollout without prefix caching, plus its route
   log (L_local × K int16 per position on the logging rank, e.g. Ultra-like L=60/PP, K=22: 2.6 kB
