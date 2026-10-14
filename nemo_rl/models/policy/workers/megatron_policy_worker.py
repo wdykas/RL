@@ -633,6 +633,7 @@ class MegatronPolicyWorkerImpl(
             fp16_gemm.install(
                 config["megatron_cfg"].get("lm_head_precision"),
                 config["megatron_cfg"].get("down_proj_prescale_log2") or 0,
+                config["megatron_cfg"].get("fp16_expert_weight_cache", True),
             )
         torch.cuda.set_device(local_rank)
 

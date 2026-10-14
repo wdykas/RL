@@ -886,15 +886,25 @@ def _tag_down_projections() -> None:
 
 
 def install(
-    lm_head_precision: Optional[str] = None, down_proj_prescale_log2: int = 0
+    lm_head_precision: Optional[str] = None,
+    down_proj_prescale_log2: int = 0,
+    expert_weight_cache: bool = True,
 ) -> None:
     """Install the fp16 GEMM forward for this process (idempotent).
 
     Call before the models are built and before the inference engine captures
     its CUDA graphs, in every training and generation worker.
+    ``expert_weight_cache`` (``policy.megatron_cfg.fp16_expert_weight_cache``):
+    the training model keeps fp16 copies of its local expert weights between
+    optimizer steps (2 B per local expert parameter); False casts each expert's
+    weight just in time in every forward instead (one expert's copy resident;
+    same fp16 values, so bitwise the same outputs).
     """
     if _STATE["enabled"]:
         return
+    from nemo_rl.models.megatron import fp16_moe
+
+    fp16_moe.set_weight_cache(bool(expert_weight_cache))
     head = FP32_HEAD if lm_head_precision is None else lm_head_precision
     if head not in HEAD_PRECISIONS:
         raise ValueError(

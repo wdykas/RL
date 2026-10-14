@@ -593,7 +593,9 @@ class GroupedFp16Linear(torch.autograd.Function):
 # fp16; the Triton kernel converts in registers instead), stacked [E, N, K] per expert
 # linear for the grouped GEMM. Valid until the weights change: the policy worker calls
 # invalidate_weight_cache() after every optimizer step (checkpoints load only at init).
-# Costs 2 bytes per local expert parameter.
+# Costs 2 bytes per local expert parameter (29.4 GB per rank for Nemotron-3-Nano at
+# EP=2); ``set_weight_cache(False)`` (policy.megatron_cfg.fp16_expert_weight_cache=false)
+# casts one expert at a time in every forward instead.
 _WEIGHT_CACHE: dict[tuple[int, ...], tuple[tuple[int, ...], torch.Tensor]] = {}
 # Sticky rounding's anchor forward runs on transient theta_n weights (streamed
 # from host): those must not enter the cache (ids and pointers get reused).
@@ -604,6 +606,13 @@ _HOOKS: dict[str, Any] = {"cache": True, "fc2_input": None}
 def set_fc2_input_hook(hook: Optional[Any]) -> None:
     """Install (None: remove) sticky rounding's expert fc2-input hook."""
     _HOOKS["fc2_input"] = hook
+
+
+def set_weight_cache(enabled: bool) -> None:
+    """Process default for caching fp16 expert weights (see ``_WEIGHT_CACHE``)."""
+    _HOOKS["cache"] = enabled
+    if not enabled:
+        _WEIGHT_CACHE.clear()
 
 
 @contextlib.contextmanager
