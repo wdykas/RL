@@ -1994,6 +1994,58 @@ def _create_checkpoint_config(
     return CheckpointConfig(**kwargs)
 
 
+# NCCL timeout of every collective issued while the initial checkpoint loads.
+DEFAULT_CHECKPOINT_LOAD_TIMEOUT_MINUTES = 60
+
+
+@contextlib.contextmanager
+def _checkpoint_load_collective_timeout(minutes: Optional[float]):
+    """Give every collective issued during the checkpoint load ``minutes`` of NCCL timeout.
+
+    Megatron's fully-parallel load (fully_parallel.py) has each data-parallel rank
+    read its share of the checkpoint from storage with no collectives
+    (``no_dist=True``) and then enqueue the broadcast exchange
+    (exchange_loaded_tensors_broadcast). The NCCL watchdog therefore times the
+    fastest rank's broadcast from the moment it is enqueued until the slowest
+    rank in the group finishes reading, and later world collectives likewise wait
+    for the slowest data-parallel group. That gap is storage time, set by the
+    filesystem and the bytes per rank, not by the parallel layout's
+    ``distributed_timeout_minutes`` (10 min). On a shared Lustre a rank of the
+    multi-node Qwen3-30B-A3B runs fell more than 10 min behind its peer
+    (NCCL watchdog on the first exchange broadcast; 2x per-rank read-time spread
+    measured even on an idle node).
+
+    Raises the timeout of this rank's NCCL/Gloo process groups for the load (the
+    process-group timeout applies to work created while it is set) and restores
+    each group's previous value afterwards. ``minutes`` None or <= 0 keeps the
+    groups' timeouts. Cost: one Python call per process group per rank.
+    """
+    if not minutes or minutes <= 0 or not torch.distributed.is_initialized():
+        yield
+        return
+    import datetime
+
+    from torch.distributed.distributed_c10d import _set_pg_timeout, _world
+
+    load_timeout = datetime.timedelta(minutes=float(minutes))
+    previous = []
+    for pg in list(_world.pg_map):
+        timeouts = [
+            pg._get_backend(device).options._timeout
+            for device in pg._device_types
+            if hasattr(pg._get_backend(device), "options")
+        ]
+        if not timeouts:
+            continue
+        previous.append((pg, timeouts[0]))
+        _set_pg_timeout(max(load_timeout, timeouts[0]), pg)
+    try:
+        yield
+    finally:
+        for pg, timeout in previous:
+            _set_pg_timeout(timeout, pg)
+
+
 @contextlib.contextmanager
 def _checkpoint_load_debug_logging():
     """NRL_CKPT_LOAD_DEBUG=1: per-rank timestamped timings of every dist-checkpoint
@@ -2669,7 +2721,15 @@ def setup_model_and_optimizer(
         if pre_load_checkpoint_hook is not None:
             pre_load_checkpoint_hook(state, model)
         load_start = time.time()
-        with _checkpoint_load_debug_logging():
+        with (
+            _checkpoint_load_debug_logging(),
+            _checkpoint_load_collective_timeout(
+                policy_cfg["megatron_cfg"].get(
+                    "checkpoint_load_timeout_minutes",
+                    DEFAULT_CHECKPOINT_LOAD_TIMEOUT_MINUTES,
+                )
+            ),
+        ):
             load_checkpoint(
                 state,
                 model,
@@ -2679,9 +2739,15 @@ def setup_model_and_optimizer(
                 skip_load_to_model_and_opt=HAVE_FSDP2
                 and megatron_cfg.dist.use_torch_fsdp2,
             )
+            own_s = time.time() - load_start
+            # Every rank leaves the load window together (see
+            # _checkpoint_load_collective_timeout): ranks whose groups finished
+            # early must not enter a normal-timeout collective while another
+            # group is still reading.
+            torch.distributed.barrier()
         print(
             f"Checkpoint loaded (rank {torch.distributed.get_rank()}: "
-            f"{time.time() - load_start:.1f} s)",
+            f"{own_s:.1f} s own, {time.time() - load_start:.1f} s all ranks)",
             flush=True,
         )
 
