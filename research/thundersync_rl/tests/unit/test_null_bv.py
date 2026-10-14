@@ -563,6 +563,7 @@ def test_null_config_default_off_and_policy_args():
         "logratio_var": 8e-7,
         "ref_len": 2048,
         "fixed_m": 1.5,
+        "prompt_drop": False,
     }
 
 
@@ -803,6 +804,7 @@ def test_wave_decisions_equal_the_one_shot_process(seed):
     grid = [{M: (0, 0 if rng.random() < 1 / M else NULL_TOKEN, -1.0) for M in ms} for _ in groups]
     s = object.__new__(SpeculativeGeneration)
     s._null_policy, s.stats = policy, {}
+    s.null_bv_drop_is = False
     s._release_hidden = lambda ds: list(ds)
 
     def verify_block(flat, rows, null_envelopes):

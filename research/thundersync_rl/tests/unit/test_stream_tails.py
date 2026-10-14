@@ -51,7 +51,7 @@ def test_complete_first_then_tails_then_fresh():
     spec._tail_plans = {id(tail)}
     order = []
 
-    async def continue_sticky(pending):
+    async def continue_sticky(pending, trace=None):
         await asyncio.sleep(0.01)
         order.append("tail rounds")
         for _, p in pending:
@@ -88,7 +88,7 @@ def test_failed_tails_wake_and_raise():
     tail, fresh = Plan(seed=-1, prefix=[1]), Plan(seed=-1)
     spec._tail_plans = {id(tail)}
 
-    async def boom(pending):
+    async def boom(pending, trace=None):
         raise ValueError("engine died")
 
     spec._continue_sticky = boom
@@ -155,6 +155,40 @@ def test_canonical_group_order_is_independent_of_arrival():
     assert sigs[0] == sigs[1] == sigs[2]
     # One group per dispatch, in the canonical order.
     assert [{r[0][0] for cs in d for r in cs if r} for d in sigs[0]] == [{(0, 2)}, {(0, 0)}, {(0, 1)}]
+
+
+def test_canonical_order_with_tail_excluded_baseline_dispatches_whole_groups():
+    """The tail-excluded baseline closes a group before its tail rows arrive;
+    a canonical dispatch still waits for (and sends) the whole group."""
+    from thundersync_rl.streaming import StreamPlanner, Trajectory
+
+    pl = StreamPlanner(
+        lambda rewards: [r - sum(rewards) / len(rewards) for r in rewards],
+        dp_size=1,
+        max_chunk_trajectories=8,
+        max_open_groups=0,
+        micro_batch_size=1,
+        equal_rank_microbatches=False,
+        tail_excluded_baseline=lambda r, others: r - sum(others) / len(others),
+    )
+    pl.register_group((0, 0), 3, tails=1)
+    pl.register_group((0, 1), 3, tails=0)
+    pl.set_order([(0, 0), (0, 1)])
+    row = lambda p, i, tail=False: Trajectory(  # noqa: E731
+        group=(0, p), index=3 * p + i, reward=float(i), payload=None, num_tokens=5, tail=tail
+    )
+    for t in (row(0, 0), row(0, 1)):  # group 0 closes (its non-tail rows are in)
+        pl.add(t)
+    assert not pl.has_work(flush=False)  # but its tail row is missing
+    pl.add(row(0, 2, tail=True))
+    got = _dispatch_signature(pl)
+    assert [sorted(r for cs in d for c in cs for r in c) for d in got] == [
+        [((0, 0), 0), ((0, 0), 1), ((0, 0), 2)]
+    ]
+    for i in range(3):
+        pl.add(row(1, i))
+    _dispatch_signature(pl)
+    assert pl.all_done()
 
 
 def test_canonical_order_needs_group_granularity_and_all_groups():

@@ -42,13 +42,16 @@ ok, seen = True, 0
 keys = ("spec/null_drafts", "spec/null_slots", "spec/null_outputs", "spec/null_bot_frac",
         "spec/null_tail_frac", "spec/null_fresh_slots", "spec/null_unused_drafts",
         "spec/null_drafts_per_output", "spec/null_mean_m", "spec/null_longest_min_reject_frac",
-        "spec/null_empty_dropped", "spec/accepted_frac", "mismatch/max_abs_logprob_diff")
+        "spec/null_empty_dropped", "spec/accepted_frac", "mismatch/max_abs_logprob_diff",
+        "spec/null_dropped_prompts", "spec/drop_is_ess", "spec/drop_is_weighted_frac")
 for i, h in enumerate(hist):
     print(f"[null_bv] step {i}: " + " ".join(f"{k.split('/')[-1]}={h.get(k)}" for k in keys))
     if h.get("spec/null_slots") is not None:
         seen += 1
         ok &= h["spec/null_outputs"] <= h["spec/null_slots"]
-        ok &= h["spec/null_outputs"] + h["spec/null_fresh_slots"] == h["spec/null_slots"]
+        # prompt drop (opt-in): a dropped prompt's G = 8 slots are neither filled nor fresh
+        dropped = 8 * (h.get("spec/null_dropped_prompts") or 0)
+        ok &= h["spec/null_outputs"] + h["spec/null_fresh_slots"] + dropped == h["spec/null_slots"]
     if i >= 1:  # drafts reach the pools and fill slots (no vacuous all-fresh pass)
         ok &= (h.get("spec/null_drafts") or 0) > 0 and (h.get("spec/null_outputs") or 0) > 0
 ok &= seen >= max(1, len(hist) - 1)  # every step after the first verifies drafts

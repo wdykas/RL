@@ -2654,8 +2654,11 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                     p_lp, draft, lq, q_rows, gen, tuple(null_envelopes)
                 )
                 tau = max(t for t, _, _ in grid.values())
+                # log W* = max_t log prod_{u<=t} p/q over the draft (drop-IS weights).
+                lr = torch.cumsum(lpx.double() - lq.to(lpx.device).double(), 0)
                 res = {
                     "null_grid": grid,
+                    "null_log_wstar": float(lr.max()) if lr.numel() else 0.0,
                     "token_logprobs": lpx[:tau].tolist(),
                     "draft_logq": lq[:tau].tolist(),
                 }

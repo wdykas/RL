@@ -38,6 +38,7 @@ import asyncio
 import collections
 import contextlib
 import itertools
+import math
 import os
 import time
 import zlib
@@ -77,6 +78,7 @@ from thundersync_rl.streaming import (
     StreamPlanner,
     Trajectory,
     pad_batch_to_multiple,
+    tail_excluded_advantages,
 )
 
 
@@ -256,6 +258,32 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     null_bv_drafts_per_output: float = 1.5
     null_bv_logratio_var: float = 8e-7
     null_bv_fixed_m: Optional[float] = None
+    # Opt-in (agent_tail.md; agent_tail_exact_schemes.md section 3.2): constant
+    # envelope null_bv_fixed_m at every count (never the forced M = 1), and a
+    # prompt whose pool can no longer fill its G slots is DROPPED. The drop
+    # depends on success counts only (law the same for every prompt), so the
+    # kept groups are exact; the dataloader batch carries
+    # null_bv_spare_prompts extra prompts and the step trains on the first
+    # (batch - spares) prompts that were not dropped, in batch order (dropped
+    # prompts decode fresh only if too few survive). It shifts the prompt mix
+    # through the spare order, like DAPO's dynamic-sampling filter.
+    # grpo.num_prompts_per_step is the trained count; the loop re-batches the
+    # data stream into batches of num_prompts_per_step + spares prompts.
+    null_bv_prompt_drop: bool = False
+    null_bv_spare_prompts: int = 0
+    # Opt-in, NOT exact samples (unbiased gradient, like banded IS): a ⊥-BV
+    # output rejected inside its draft is discarded like BOT (no tail decode)
+    # and every kept row's advantage is weighted by max(1, W*/M), W* = the
+    # draft's max prefix ratio p/q. Logs spec/drop_is_ess and the weighted
+    # fraction. Requires null_bv.
+    null_bv_drop_is: bool = False
+    # Opt-in estimator change: each row's baseline (and std) is computed over
+    # the group's OTHER rows that needed no continuation after verification
+    # (all other rows if none), so a group's tail-free rows can train before
+    # its tails return; the gradient stays unbiased (streaming.
+    # tail_excluded_advantages). Requires speculation and group or batch
+    # granularity. Default: the standard GRPO estimator.
+    tail_excluded_baseline: bool = False
     # Sticky routing: continuations at theta_{k-1} are block-verified every this
     # many decoded tokens while the engine keeps decoding them; a rejection
     # restarts the continuation from the new prefix, so it wastes at most the
@@ -276,6 +304,12 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # index)), so the accumulated gradient is bitwise independent of arrival
     # times (StreamPlanner.set_order). False: dispatch as rows arrive.
     canonical_group_order: bool = True
+    # Measurement only (research/agent_tail.md): the drafting deadline waits
+    # until every draft finished (EOS or the cap), so each step verifies whole
+    # rollouts and its post-refit tail is the rejection tail alone. Exact (no
+    # draft is cut, so none is truncated by content); serializes drafting
+    # after training, so never for step-time runs. Requires sticky_routing.
+    draft_until_complete: bool = False
     # Weights the engine drafts the next step's rollouts with (draft_weights.py,
     # DESIGN.md section 14f). "current": theta_k. "momentum": theta_hat_{k+1} =
     # the AdamW step of the optimizer state (theta_k, m_k, v_k) with gradient 0,
@@ -409,6 +443,14 @@ def validate_config(master_config: ThunderSyncMasterConfig) -> None:
     validate_sticky_routing(master_config)
     validate_sticky_rounding(master_config)
     validate_null_bv(master_config)
+    validate_tail_tools(master_config)
+    if master_config.thundersync.draft_until_complete and not (
+        master_config.thundersync.sticky_routing
+    ):
+        raise ValueError(
+            "thundersync.draft_until_complete requires sticky_routing (the only "
+            "path that keeps draft streams running past the deadline)"
+        )
     validate_draft_weights(master_config)
     validate_cohort_lanes(master_config)
 
@@ -582,8 +624,29 @@ def validate_null_bv(master_config: ThunderSyncMasterConfig) -> None:
         problems.append("thundersync.null_bv_fixed_m must be >= 1")
     if not ts_cfg.null_bv_logratio_var >= 0:
         problems.append("thundersync.null_bv_logratio_var must be >= 0")
+    if ts_cfg.null_bv_prompt_drop and ts_cfg.null_bv_fixed_m is None:
+        problems.append("thundersync.null_bv_prompt_drop needs null_bv_fixed_m (a constant envelope)")
+    if ts_cfg.null_bv_spare_prompts < 0:
+        problems.append("thundersync.null_bv_spare_prompts must be >= 0")
+    if ts_cfg.null_bv_spare_prompts and not ts_cfg.null_bv_prompt_drop:
+        problems.append("thundersync.null_bv_spare_prompts needs null_bv_prompt_drop")
     if problems:
         raise ValueError("thundersync.null_bv: " + "; ".join(problems) + ".")
+
+
+def validate_tail_tools(master_config: ThunderSyncMasterConfig) -> None:
+    """Opt-in tail tools that need other features (agent_tail.md)."""
+    ts_cfg = master_config.thundersync
+    problems = []
+    if (ts_cfg.null_bv_prompt_drop or ts_cfg.null_bv_drop_is) and not ts_cfg.null_bv:
+        problems.append("null_bv_prompt_drop / null_bv_drop_is need thundersync.null_bv")
+    if ts_cfg.tail_excluded_baseline:
+        if not ts_cfg.speculate:
+            problems.append("tail_excluded_baseline needs thundersync.speculate")
+        if ts_cfg.granularity == "trajectory":
+            problems.append("tail_excluded_baseline needs granularity group or batch")
+    if problems:
+        raise ValueError("thundersync: " + "; ".join(problems) + ".")
 
 
 def validate_draft_weights(master_config: ThunderSyncMasterConfig) -> None:
@@ -640,6 +703,7 @@ def null_bv_policy(master_config: Any) -> dict[str, Any]:
         "logratio_var": float(ts_cfg.null_bv_logratio_var),
         "ref_len": int(master_config.policy["generation"]["max_new_tokens"]),
         "fixed_m": ts_cfg.null_bv_fixed_m,
+        "prompt_drop": bool(ts_cfg.null_bv_prompt_drop),
     }
 
 
@@ -935,6 +999,52 @@ def make_group_advantage_fn(master_config: MasterConfig):
     return fn
 
 
+def rebatch(batches, size: int):
+    """Re-chunk a stream of prompt batches into batches of ``size`` prompts (in order)."""
+    buf, n = [], 0
+    for b in batches:
+        buf.append(b)
+        n += b.size
+        while n >= size:
+            whole = BatchedDataDict.from_batches(buf)
+            yield whole.slice(0, size)
+            rest = whole.slice(size, n) if n > size else None
+            buf, n = ([rest] if rest is not None else []), n - size
+
+
+def select_null_prompts(batch: BatchedDataDict, spec, spares: int) -> BatchedDataDict:
+    """⊥-BV prompt drop: the first (batch - spares) prompts whose pools were not dropped.
+
+    Batch order is fixed before drafting and the drop is a function of success
+    counts only, so the kept prompts are an independent thinning of the batch.
+    If too few survive, dropped prompts fill the rest in batch order and decode
+    fresh (no plan: exact p-samples).
+    """
+    selected = None if spec is None else spec.null_selected_keys
+    if selected is None:  # no verified pools this step: the first prompts
+        return batch.select_indices(list(range(batch.size - spares)))
+    keys = [
+        tuple(int(t) for t in torch.cat([m["token_ids"] for m in batch["message_log"][i]]).tolist())
+        for i in range(batch.size)
+    ]
+    want = set(selected)
+    rows = [i for i, k in enumerate(keys) if k in want]
+    if len(rows) != batch.size - spares:
+        raise RuntimeError("null_bv prompt drop: selected prompts do not match the batch")
+    return batch.select_indices(rows)
+
+
+def make_tail_excluded_fn(master_config: MasterConfig):
+    """Per-row advantage against the other tail-free rows (opt-in estimator)."""
+    normalize = bool(master_config.grpo.normalize_rewards)
+
+    def fn(reward: float, others: list[float]) -> float:
+        adv = tail_excluded_advantages(reward, others, normalize)
+        return float(_clip_grpo_advantages(torch.tensor([[adv]]), master_config.grpo)[0, 0])
+
+    return fn
+
+
 def build_chunk_data(
     chunk: Chunk,
     tokenizer,
@@ -961,6 +1071,11 @@ def build_chunk_data(
         adv = torch.tensor(chunk.advantages, dtype=torch.float32)
     else:
         adv = torch.ones(n, dtype=torch.float32)
+    # Drop-IS (opt-in): a row's importance weight multiplies its advantage (a
+    # detached per-row constant, as banded IS on moe-banded-is).
+    adv = adv * torch.tensor(
+        [float(t.payload.get("is_weight", 1.0)) for t in chunk.trajectories]
+    )
     data = BatchedDataDict(
         {
             "input_ids": flat["token_ids"],
@@ -1060,6 +1175,8 @@ async def _run_one_step(
     group_order: Optional[list[int]] = None,
     tail_groups: Optional[list[int]] = None,
     ordered_learner: Optional[Any] = None,
+    claim_row: Optional[Callable[[torch.Tensor, torch.Tensor], Any]] = None,
+    tail_count: Optional[Callable[[torch.Tensor], int]] = None,
 ) -> dict[str, Any]:
     """One step: rollouts, streaming training and the next step's drafts.
 
@@ -1110,9 +1227,17 @@ async def _run_one_step(
             and not expert_parallel
         ),
         min_pipeline_microbatches=min_pipeline_microbatches,
+        tail_excluded_baseline=(
+            make_tail_excluded_fn(master_config) if ts_cfg.tail_excluded_baseline else None
+        ),
     )
     for p in range(n // G):
-        planner.register_group((step, p), G)
+        prompt = torch.cat([m["token_ids"] for m in repeated["message_log"][p * G]])
+        planner.register_group(
+            (step, p),
+            G,
+            tails=tail_count(prompt) if ts_cfg.tail_excluded_baseline and tail_count else 0,
+        )
     if group_order is not None:
         planner.set_order([(step, p) for p in group_order])
 
@@ -1318,6 +1443,14 @@ async def _run_one_step(
                     torch.cat([m["token_ids"] for m in repeated["message_log"][i]]),
                     torch.cat([m["token_ids"] for m in state["message_log"]]),
                 )
+            info = None
+            if claim_row is not None:
+                info = claim_row(
+                    torch.cat([m["token_ids"] for m in repeated["message_log"][i]]),
+                    torch.cat([m["token_ids"] for m in state["message_log"]]),
+                )
+                if info is not None and info.log_weight:
+                    payload["is_weight"] = math.exp(info.log_weight)
             traj = Trajectory(
                 group=(step, i // G),
                 index=i,
@@ -1325,6 +1458,7 @@ async def _run_one_step(
                 payload=payload,
                 num_tokens=ntok,
                 fused=fused,
+                tail=bool(info is not None and info.tail),
             )
             all_trajectories.append(traj)
             planner.add(traj)
@@ -1491,7 +1625,10 @@ def make_speculative_generation(
         sticky_delta=sticky_delta(ts_cfg),
         null_bv=ts_cfg.null_bv,
         null_bv_policy=null_bv_policy(master_config) if ts_cfg.null_bv else None,
+        null_bv_drop_is=ts_cfg.null_bv_drop_is,
+        null_bv_spare_prompts=ts_cfg.null_bv_spare_prompts,
         sticky_chunk_tokens=ts_cfg.sticky_continuation_chunk_tokens,
+        draft_until_complete=ts_cfg.draft_until_complete,
         draft_weights=ts_cfg.draft_weights,
         max_seq_len=master_config.policy["max_total_sequence_length"],
     )
@@ -1549,6 +1686,12 @@ def thundersync_grpo_train(
         print("[spec selftest]", asyncio.run(spec.self_test(prompts)), flush=True)
         spec.draft_budget = budget
     batches = iter(dataloader)
+    if ts_cfg.null_bv_prompt_drop and ts_cfg.null_bv_spare_prompts:
+        # Prompt drop: every step's batch carries the spares (the trained
+        # prompts stay grpo.num_prompts_per_step).
+        batches = rebatch(
+            batches, master_config.grpo.num_prompts_per_step + ts_cfg.null_bv_spare_prompts
+        )
     upcoming = collections.deque(
         b for b in itertools.islice(batches, max(1, ts_cfg.draft_lookahead) + 1)
     )
@@ -1594,6 +1737,8 @@ def thundersync_grpo_train(
                 policy_generation.finish_generation()
             t_verify = time.perf_counter() - t1
             drafts = None
+        if ts_cfg.null_bv_prompt_drop and (sticky or drafts is None):
+            batch = select_null_prompts(batch, spec, ts_cfg.null_bv_spare_prompts)
         staged = (
             spec is not None
             and spec.draft_weights != "current"
@@ -1700,6 +1845,8 @@ def thundersync_grpo_train(
             t1 = time.perf_counter()
             spec.verify(drafts)
             t_verify = time.perf_counter() - t1
+            if ts_cfg.null_bv_prompt_drop:
+                batch = select_null_prompts(batch, spec, ts_cfg.null_bv_spare_prompts)
         drafter = None
 
         if cohort_mode:
@@ -1741,6 +1888,8 @@ def thundersync_grpo_train(
                 if spec is not None and ts_cfg.fused_verify_train
                 else None,
                 claim_anchors=spec.claim_anchors if sticky else None,
+                claim_row=spec.claim_row if spec is not None else None,
+                tail_count=spec.tail_count if spec is not None else None,
                 draft_swap=(
                     spec.load_staged_draft_weights if staged and not draft_now else None
                 ),

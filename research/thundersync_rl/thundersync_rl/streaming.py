@@ -49,6 +49,32 @@ class Trajectory:
     # Fused verification + training: the retained verification forward this
     # trajectory trains from (None: regular training forward).
     fused: Optional[FusedRef] = None
+    # Needed a continuation after verification (``tail_excluded_advantages``).
+    tail: bool = False
+
+
+def tail_excluded_advantages(
+    reward: float, others: list[float], normalize_std: bool, eps: float = 1e-6
+) -> float:
+    """Advantage of one row against the baseline set ``others`` (opt-in estimator).
+
+    ``others`` = the group's OTHER rows that did not need a tail (all other
+    rows if none): a function of the other rows' (value, tail flag) pairs
+    only, never of this row, so E[(r_i - b_i) grad log p(y_i)] is exactly the
+    policy gradient (leave-one-out baseline), and with std normalization a
+    positive multiple of it (sigma_i is independent of y_i as well). The tail
+    flag itself depends on y (P(tail | y) is a function of W*(y)), so the
+    baseline must not change with the row's OWN flag: GRPO's self-inclusive
+    mean over a flag-selected subset would be biased.
+    """
+    if not others:
+        return 0.0
+    b = sum(others) / len(others)
+    adv = reward - b
+    if normalize_std and len(others) >= 2:
+        var = sum((x - b) ** 2 for x in others) / (len(others) - 1)
+        adv /= math.sqrt(var) + eps
+    return adv
 
 
 @dataclass
@@ -105,6 +131,10 @@ class _Group:
     advantage_by_reward: Optional[dict[float, float]] = None
     streaming: bool = False  # holds gradient buckets on the workers
     close_sent: bool = False
+    # Tail-excluded baseline (opt-in): rows that need a tail, and the rewards
+    # of arrived rows that did not (index -> reward).
+    tails: int = 0
+    nontail: dict[int, float] = field(default_factory=dict)
 
 
 class StreamPlanner:
@@ -159,7 +189,11 @@ class StreamPlanner:
         equal_rank_microbatches: bool,
         skip_zero_advantage_chunks: bool = False,
         min_pipeline_microbatches: int = 0,
+        tail_excluded_baseline: Optional[Callable[[float, list[float]], float]] = None,
     ):
+        if tail_excluded_baseline is not None and max_open_groups > 0:
+            raise ValueError("the tail-excluded baseline closes groups early; no open-group buckets")
+        self.tail_excluded_baseline = tail_excluded_baseline
         self.compute_group_advantages = compute_group_advantages
         self.min_pipeline_microbatches = min_pipeline_microbatches
         self.skip_zero_advantage_chunks = skip_zero_advantage_chunks
@@ -191,13 +225,27 @@ class StreamPlanner:
             raise ValueError("the order must list every registered group once")
         self.order, self._next = list(order), 0
 
-    def register_group(self, group: GroupId, size: int) -> None:
-        self.groups[group] = _Group(size=size)
+    def register_group(self, group: GroupId, size: int, tails: int = 0) -> None:
+        """``tails``: rows of the group that need a continuation (tail-excluded baseline)."""
+        self.groups[group] = _Group(size=size, tails=tails)
 
     def add(self, traj: Trajectory) -> None:
         g = self.groups[traj.group]
         assert traj.index not in g.rewards, f"duplicate trajectory {traj.index}"
         g.rewards[traj.index] = float(traj.reward)
+        if self.tail_excluded_baseline is not None:
+            if not traj.tail:
+                g.nontail[traj.index] = float(traj.reward)
+                if len(g.nontail) > g.size - g.tails:
+                    raise RuntimeError(f"group {traj.group}: more non-tail rows than registered")
+            # Every row's baseline set is known once the non-tail rows are in
+            # (with fewer than 2 of them, some rows fall back to all others).
+            need = g.size if g.size - g.tails < 2 else g.size - g.tails
+            done = len(g.rewards) if g.size - g.tails < 2 else len(g.nontail)
+            if done == need and g.advantage_by_reward is None:
+                g.advantage_by_reward = {}  # closed: advantages per row (_advantage)
+            self.ready.append(traj)
+            return
         if len(g.rewards) == g.size:
             rewards = [g.rewards[i] for i in sorted(g.rewards)]
             advantages = self.compute_group_advantages(rewards)
@@ -205,7 +253,13 @@ class StreamPlanner:
         self.ready.append(traj)
 
     def _advantage(self, t: Trajectory) -> float:
-        return self.groups[t.group].advantage_by_reward[t.reward]
+        g = self.groups[t.group]
+        if self.tail_excluded_baseline is not None:
+            others = [r for i, r in g.nontail.items() if i != t.index]
+            if not others:
+                others = [r for i, r in g.rewards.items() if i != t.index]
+            return float(self.tail_excluded_baseline(float(t.reward), others))
+        return g.advantage_by_reward[t.reward]
 
     def final_microbatches(self, trajs: list[Trajectory]) -> int:
         """Micro-batches the learner runs for these closed-group rows.
@@ -246,8 +300,12 @@ class StreamPlanner:
             if self._next >= len(self.order):
                 return []
             gid = self.order[self._next]
-            if self.groups[gid].advantage_by_reward is None:
-                return []  # its rows are still arriving: later groups wait
+            g = self.groups[gid]
+            # Its rows are still arriving: later groups wait. (The
+            # tail-excluded baseline closes a group before its tail rows
+            # arrive; a canonical dispatch is still the whole group.)
+            if g.advantage_by_reward is None or len(g.rewards) < g.size:
+                return []
             return sorted((t for t in self.ready if t.group == gid), key=lambda t: t.index)
         rows = self.ready
         if not flush and self.holding():
@@ -255,7 +313,7 @@ class StreamPlanner:
             rows = [t for t in rows if self.groups[t.group].advantage_by_reward is None]
         return pick_final_first(
             [(t.group, t.reward, t) for t in rows],
-            closed={gid for gid, g in self.groups.items() if g.advantage_by_reward},
+            closed={gid for gid, g in self.groups.items() if g.advantage_by_reward is not None},
             streaming={
                 gid
                 for gid, g in self.groups.items()
