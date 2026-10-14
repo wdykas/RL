@@ -41,11 +41,14 @@ from thundersync_rl.block_verification import (
     block_verify_lazy,
     output_distribution_given_draft,
 )
-from thundersync_rl.engine_q import verify_engine_q
+from thundersync_rl.engine_q import verify_engine_q, verify_engine_q_grid
 from thundersync_rl.null_bv import (
     NullGroup,
     NullPolicy,
+    decide_pools,
     drafts_per_prompt,
+    envelopes,
+    lpt_owners,
     tail_decode_prob,
 )
 
@@ -192,6 +195,142 @@ def test_pooled_slots_are_iid_p_by_enumeration(policy):
     assert tv < 1e-9, tv
     if not isinstance(policy, _RulePolicy) and policy.fixed_m is None:
         assert len(Ms) > 2, Ms  # the DP really varies M
+
+
+def _coupled_outcomes(P, Q, V, L, Ms):
+    """Joint law of one row's outcomes at every M in ``Ms``: {(o_M, ...): prob}.
+
+    The outcomes at the different M are coupled comonotonically through one
+    shared uniform (inverse CDFs in a fixed outcome order), as the grid
+    sampler couples them through shared draws.
+    """
+    order = ["BOT"] + list(itertools.product(range(V), repeat=L))
+    joint: dict = {}
+    for x in itertools.product(range(V), repeat=L):
+        qx = _seq_prob(Q, x)
+        cdfs = []
+        for M in Ms:
+            law = _draft_outcome_law(P, Q, x, M, V, L)
+            acc, pts = 0.0, []
+            for o in order:
+                if law.get(o, 0.0) > 0:
+                    acc += law[o]
+                    pts.append((acc, o))
+            assert abs(acc - 1.0) < 1e-12
+            pts[-1] = (1.0, pts[-1][1])  # rounding: every CDF ends at 1
+            cdfs.append(pts)
+        cuts = sorted({c for pts in cdfs for c, _ in pts} | {0.0})
+        for lo, hi in zip(cuts, cuts[1:]):
+            mid = 0.5 * (lo + hi)
+            vec = tuple(next(o for c, o in pts if mid <= c) for pts in cdfs)
+            joint[vec] = joint.get(vec, 0.0) + qx * (hi - lo)
+    return joint
+
+
+@pytest.mark.parametrize(
+    "policy", [NullPolicy(fixed_m=2.0), _RulePolicy()], ids=["fixed2", "d_over_s"]
+)
+def test_driver_decisions_over_coupled_grid_outcomes_are_iid_p(policy):
+    """Exactness of grid verification + driver decisions, by enumeration.
+
+    Every row is verified at every envelope with one set of draws (outcomes
+    coupled across M) and ``decide_pools`` takes each row's outcome at the M
+    the counts give; the G slots must be iid p for any coupling.
+    """
+    V, L, N, G = 2, 2, 3, 2
+    P, Q = _model(V, L, 7, conc=0.5), _model(V, L, 8, conc=0.5)
+    seqs = list(itertools.product(range(V), repeat=L))
+    p1 = {z: _seq_prob(P, z) for z in seqs}
+    Ms = envelopes(policy) if policy.fixed_m is not None else (1.0, 1.5, 2.0, 3.0)
+    row = list(_coupled_outcomes(P, Q, V, L, Ms).items())
+    assert abs(sum(v for _, v in row) - 1.0) < 1e-12
+    joint: dict = {}
+    for combo in itertools.product(row, repeat=N):
+        pr = math.prod(v for _, v in combo)
+        outcomes = [{M: vec[k] != "BOT" for k, M in enumerate(Ms)} for vec, _ in combo]
+        chosen = decide_pools(["a"] * N, {"a": G}, outcomes, policy)
+        outs = tuple(
+            vec[Ms.index(m)]
+            for (vec, _), m in zip(combo, chosen)
+            if m is not None and vec[Ms.index(m)] != "BOT"
+        )
+        fill = G - len(outs)  # drafts ran out: fresh p decodes
+        for tail in itertools.product(seqs, repeat=fill):
+            key = outs + tail
+            joint[key] = joint.get(key, 0.0) + pr * math.prod(p1[z] for z in tail)
+    tv = 0.5 * sum(
+        abs(joint.get(zs, 0.0) - math.prod(p1[z] for z in zs))
+        for zs in itertools.product(seqs, repeat=G)
+    )
+    assert tv < 1e-9, tv
+
+
+def test_outcome_based_envelope_choice_is_biased():
+    """Control: taking a row's outcome at the M that yields an output (a
+    choice that depends on the row's own draws) is biased."""
+    V, L, N, G = 2, 2, 3, 2
+    P, Q = _model(V, L, 7, conc=0.5), _model(V, L, 8, conc=0.5)
+    seqs = list(itertools.product(range(V), repeat=L))
+    p1 = {z: _seq_prob(P, z) for z in seqs}
+    Ms = (1.0, 2.0, 3.0)
+    row = list(_coupled_outcomes(P, Q, V, L, Ms).items())
+    joint: dict = {}
+    for combo in itertools.product(row, repeat=N):
+        pr = math.prod(v for _, v in combo)
+        outs = []
+        for vec, _ in combo:
+            if len(outs) < G:
+                # prefer the largest M whose outcome is not BOT (forbidden)
+                ok = [o for o in reversed(vec) if o != "BOT"]
+                if ok:
+                    outs.append(ok[0])
+        for tail in itertools.product(seqs, repeat=G - len(outs)):
+            key = tuple(outs) + tail
+            joint[key] = joint.get(key, 0.0) + pr * math.prod(p1[z] for z in tail)
+    tv = 0.5 * sum(
+        abs(joint.get(zs, 0.0) - math.prod(p1[z] for z in zs))
+        for zs in itertools.product(seqs, repeat=G)
+    )
+    assert tv > 1e-3, tv
+
+
+def test_grid_sampler_marginals_match_each_envelope():
+    """``verify_engine_q_grid``: at every M, the outcome law of the M sampler
+    (Monte Carlo, chi-square per M against the exact per-draft law)."""
+    V, L, n = 3, 2, 6000
+    P, Q = _model(V, L, 3), _model(V, L, 4)
+    Ms = (1.0, 1.5, 3.0)
+    x = (1, 2)
+    lp, lq = _rows(P, x, L + 1), _rows(Q, x, L)
+    gen = torch.Generator().manual_seed(0)
+    keys = {M: {} for M in Ms}
+    for _ in range(n):
+        grid, _, _ = verify_engine_q_grid(
+            lp, torch.tensor(x), lq[torch.arange(L), torch.tensor(x)], lambda i: lq[i], gen, Ms
+        )
+        for M, (tau, y, _) in grid.items():
+            k = (tau, y)
+            keys[M][k] = keys[M].get(k, 0) + 1
+    for M in Ms:
+        exact = {}
+        lp64, lq64 = _rows(P, x, L + 1, torch.float64), _rows(Q, x, L, torch.float64)
+        for tau, probs in output_distribution_given_draft(lp64, lq64, torch.tensor(x), M):
+            for y, py in enumerate(probs.double().tolist()):
+                if py > 0:
+                    yy = NULL_TOKEN if y == V else y
+                    exact[(tau, yy)] = exact.get((tau, yy), 0.0) + py
+        chi2 = sum((keys[M].get(k, 0) - n * v) ** 2 / (n * v) for k, v in exact.items())
+        dof = len(exact) - 1
+        assert (chi2 - dof) / math.sqrt(2 * dof) < 4, (M, chi2, dof)
+        assert set(keys[M]) <= set(exact)
+
+
+def test_lpt_owners_balance_tokens():
+    lengths = [64000, 1000, 1000, 30000, 30000, 4000, 500, 62000]
+    owners = lpt_owners(lengths, 4)
+    load = [sum(n for n, r in zip(lengths, owners) if r == k) for k in range(4)]
+    assert max(load) == 64000 and sorted(load)[0] >= 30000
+    assert lpt_owners([5, 5], 1) == [0, 0]
 
 
 def test_content_dependent_m_is_biased_by_enumeration():
@@ -471,31 +610,22 @@ def test_driver_pools_drafts_and_fills_slots_in_order(monkeypatch):
     script = {"1:0": (0, -1), "1:1": (2, 0), "1:2": (1, 9), "1:3": (2, 0), "1:5": (0, -1)}
 
     def verify(rows, prompt_lens, segments, keys, engine_logq, hidden, **kw):
+        # Every row at every envelope (the script: same outcome at each M).
         calls.append(kw)
-        groups, slots = kw["null_groups"], kw["null_slots"]
-        state = {g: NullGroup(groups.count(g), slots[g], NullPolicy(**kw["null_policy"])) for g in slots}
-        out = []
-        for i, k in enumerate(keys):
-            m = state[groups[i]].next_m()
-            if m is None:
-                out.append((i, {"accepted": 0, "next": -1, "logprobs": [], "null": "unused"}))
-                continue
-            a, y = script[k]
-            state[groups[i]].record(y >= 0)
-            out.append(
-                (
-                    i,
-                    {
-                        "accepted": a,
-                        "next": y,
-                        "logprobs": [-1.0] * (a + (y >= 0)),
-                        "draft_logq": engine_logq[i][:a],
-                        "null": "out" if y >= 0 else "bot",
-                        "null_m": m,
+        return [
+            (
+                i,
+                {
+                    "null_grid": {
+                        M: (script[k][0], script[k][1], None if script[k][1] < 0 else -1.0)
+                        for M in kw["null_envelopes"]
                     },
-                )
+                    "token_logprobs": [-1.0] * script[k][0],
+                    "draft_logq": engine_logq[i][: script[k][0]],
+                },
             )
-        return out
+            for i, k in enumerate(keys)
+        ]
 
     engine = {
         "install_draft_hidden_log": lambda: True,
@@ -525,9 +655,9 @@ def test_driver_pools_drafts_and_fills_slots_in_order(monkeypatch):
     s.current_step = 1
     s.verify(drafts)
     (kw,) = calls
-    # Pools: B1 (empty) dropped; drafting order kept; one group per prompt.
-    assert kw["null_groups"] == ["1:0", "1:0", "1:0", "1:1", "1:1"]
-    assert kw["null_slots"] == {"1:0": 2, "1:1": 2}
+    # Every row verified at every envelope the policy can pick (B1, empty,
+    # dropped), on the ranks the driver placed it on; the driver decided.
+    assert kw["null_envelopes"] == [1.0, 2.0] and kw["row_ranks"] == [0] * 5
     plans_a = s.plans[tuple(pa)]
     assert [p.prefix for p in plans_a] == [[6, EOD], [7, 9]]
     assert plans_a[0].complete and not plans_a[1].complete
@@ -559,76 +689,47 @@ def test_driver_pools_drafts_and_fills_slots_in_order(monkeypatch):
 
 
 @cuda
-def test_worker_decides_groups_in_order_with_the_policy(monkeypatch):
-    from test_engine_q import _engine_drafts, _engine_worker
+def test_worker_verifies_every_row_at_every_envelope(monkeypatch):
+    """The worker's grid results equal the reference grid sampler on the same
+    generator stream, rows in the worker's order (its rows by length)."""
+    from test_engine_q import _engine_drafts, _engine_worker, _hidden, _logits
 
     w, emb, heads = _engine_worker(monkeypatch)
     rows, plens, segs, lqs, hids, keys = _engine_drafts(emb, heads, n=20, seed=5)
-    nonempty = [i for i in range(20) if rows[i].numel() > plens[i]]
-    groups = [None] * 20
-    for j, i in enumerate(nonempty):
-        groups[i] = f"g{j % 3}"
-    slots = {"g0": 2, "g1": 1, "g2": 3}
-    policy = {"fixed_m": 2.0}
-    kw = dict(
-        rows=rows,
-        prompt_lens=plens,
-        segments=segs,
-        engine_logq=lqs,
-        hidden=hids,
-        vocab_limit=1 << 30,
-        seed=11,
-        keys=keys,
-        batch_tokens=64,
+    keep = [i for i in range(20) if rows[i].numel() > plens[i]]
+    rows, plens, segs, lqs, hids, keys = (
+        [x[i] for i in keep] for x in (rows, plens, segs, lqs, hids, keys)
     )
-    res = dict(w.verify_drafts_block_engine(**kw, null_groups=groups, null_slots=slots, null_policy=policy))
-    assert len(res) == 20
-    # Reference: same generator stream, rows in the worker's order (groups by
-    # their longest row, then index; ungrouped rows as their own group).
-    from thundersync_rl.null_bv import NullGroup as NG
-
-    longest, count = {}, {}
-    for i in range(20):
-        if groups[i] is not None:
-            longest[groups[i]] = max(longest.get(groups[i], 0), rows[i].numel())
-            count[groups[i]] = count.get(groups[i], 0) + 1
-    order = sorted(
-        sorted(range(20), key=lambda i: rows[i].numel()),
-        key=lambda i: (longest.get(groups[i], rows[i].numel()), groups[i] or "", i),
+    Ms = (1.0, 1.5, 2.0)
+    res = dict(
+        w.verify_drafts_block_engine(
+            rows=rows,
+            prompt_lens=plens,
+            segments=segs,
+            engine_logq=lqs,
+            hidden=hids,
+            vocab_limit=1 << 30,
+            seed=11,
+            keys=keys,
+            batch_tokens=64,
+            null_envelopes=list(Ms),
+            row_ranks=[0] * len(rows),
+        )
     )
-    state = {g: NG(n, slots[g], NullPolicy(**policy)) for g, n in count.items()}
+    assert sorted(res) == list(range(len(rows)))
     gen = torch.Generator(device="cuda").manual_seed(11 * 1_000_003)
-    from test_engine_q import _hidden, _logits
-
-    n_out = {g: 0 for g in slots}
-    for i in order:
-        grp = groups[i]
-        M = 1.0
-        if grp is not None:
-            M = state[grp].next_m()
-            if M is None:
-                assert res[i]["null"] == "unused"
-                continue
+    for i in sorted(range(len(rows)), key=lambda i: rows[i].numel()):
         n, plen = rows[i].numel(), plens[i]
         h_all = _hidden(rows[i].cuda(), emb)
         lp = torch.log_softmax(_logits(h_all[plen - 1 : n], heads[-1]).float(), -1)
         vers = [v for v, a, b in segs[i] for _ in range(a, b)]
-        lq = (
-            torch.stack(
-                [torch.log_softmax(_logits(h_all[plen - 1 + t], heads[v]).float(), -1) for t, v in enumerate(vers)]
-            )
-            if vers
-            else lp[:0]
+        lq = torch.stack(
+            [torch.log_softmax(_logits(h_all[plen - 1 + t], heads[v]).float(), -1) for t, v in enumerate(vers)]
         )
         draft = rows[i][plen:].cuda()
-        tau, y, _, _ = verify_engine_q(lp, draft, torch.tensor(lqs[i], device="cuda"), lambda j: lq[j], gen, M)
-        assert (res[i]["accepted"], res[i]["next"]) == (tau, y), i
-        if grp is not None:
-            state[grp].record(y >= 0)
-            assert res[i]["null"] == ("out" if y >= 0 else "bot")
-            assert res[i]["null_m"] == M
-            n_out[grp] += y >= 0
-        else:
-            assert "null" not in res[i]
-    for g, s in slots.items():
-        assert n_out[g] <= s
+        grid, lpx, _ = verify_engine_q_grid(
+            lp, draft, torch.tensor(lqs[i], device="cuda"), lambda j: lq[j], gen, Ms
+        )
+        assert res[i]["null_grid"] == grid, i
+        tau = max(t for t, _, _ in grid.values())
+        assert res[i]["token_logprobs"] == lpx[:tau].tolist()

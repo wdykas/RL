@@ -1447,11 +1447,27 @@ constant (still 1 when d ≤ s).
   engine-q paths are draw-for-draw identical (tested). Empty drafts are rejected by the sampler
   and dropped from pools by the driver (⊥ lives at the first drafted position; emptiness is a
   deadline fact, not a function of the tokens).
-- Worker (`verify_drafts_block_engine(null_groups, null_slots, null_policy)`): a prompt's rows
-  are owned by one data-parallel rank (hash of the group name; TP ranks of the replica decide in
-  lockstep as before) and decided in drafting order with a `NullGroup` state; rows after the
-  slots fill return `"null": "unused"`. All rows are still forwarded (EP lockstep counts are
-  fixed up front); skipping forwards of unused rows is not built yet.
+- Placement and decisions are decoupled (scale). The driver places verification rows on the
+  learner's data-parallel ranks by tokens (`lpt_owners`, longest first onto the least-loaded
+  rank; `spec/verify_load_max_over_mean`), not by prompt: with all of a prompt's drafts on one
+  rank, the busiest rank carried 1.43× the mean at DP 8, 1.93× at 16, 2.62× at 32 and 4.16× at 64
+  in the review's simulation [derived], LPT ≈ 1.00×. The worker
+  (`verify_drafts_block_engine(null_envelopes, row_ranks)`) verifies each of its rows at every
+  envelope the policy can pick (`envelopes`: 1, and the grid or the fixed M) with one set of draws
+  per row (`verify_engine_q_grid`: one `rand(g+1)` and one uniform u; per M the lazy scan with
+  M's weights and the emission by inverting M's emission CDF at u) and returns
+  {M: (τ, y, log p(y))}. The driver then walks each prompt's rows in drafting order with the
+  count process (`decide_pools`, `NullGroup`) and takes each row's outcome at the M it gets;
+  rows after the slots fill are "unused". **Exactness is unchanged**: a row's draws are
+  independent of every other row, the M used for it is a function of earlier rows' outcomes
+  only, and only one of its outcomes is ever used, so how outcomes at different M are coupled
+  is irrelevant (the optional-sampling argument above). Tested by exact enumeration of the pooled
+  process over comonotonically coupled outcomes at all M with `decide_pools` (fixed M and d/s
+  policies, TV < 1e-9), a control that picks a row's M from its own outcomes (TV > 1e-3), a
+  chi-square of the grid sampler's marginal at each M, and the worker's grid results against the
+  reference sampler on GPU. Cost: the forward is shared; per row up to |envelopes| (≤ 13) lazy
+  scans and emissions, each scan re-using the cached rows. All rows are still forwarded (EP
+  lockstep counts are fixed up front); skipping forwards of unused rows is not built yet.
 - Driver (`speculative.py`): `draft_streaming(prompts, null_slots)` records the slots of the next
   step (the drafting order is the verification order); `verify` builds the pools and plans only
   for outputs (in drafting order); rollouts without a plan decode fresh (exact). Sticky routing

@@ -51,6 +51,7 @@ from thundersync_rl.engine_q import (
     ray_free,
 )
 from thundersync_rl.fused_train import FusedRef
+from thundersync_rl.null_bv import NullPolicy, decide_pools, envelopes, lpt_owners
 from thundersync_rl.routes import (
     RouteRefs,
     anchored_draft_length,
@@ -356,6 +357,8 @@ class SpeculativeGeneration:
         # step -> {prompt key: slots} of the drafts made for that step.
         self.null_bv = null_bv
         self.null_bv_policy = dict(null_bv_policy or {})
+        # Built once: its DP table is memoised across steps.
+        self._null_policy = NullPolicy(**self.null_bv_policy) if null_bv else None
         self._null_slots: dict[int, dict[tuple[int, ...], int]] = {}
         if null_bv and (self.verify_source != "engine" or verify_mode != "block"):
             raise ValueError(
@@ -953,14 +956,10 @@ class SpeculativeGeneration:
             flat, rows = self._flat_rows(drafts)
             self._record_siblings(flat)
             groups = [names[_key(d[0])] for _, d in flat]
-            by_row = self._verify_block(
-                flat,
-                rows,
-                null={
-                    "null_groups": groups,
-                    "null_slots": slots,
-                    "null_policy": self.null_bv_policy,
-                },
+            by_row = self._decide_null(
+                self._verify_block(flat, rows, null_envelopes=envelopes(self._null_policy)),
+                groups,
+                slots,
             )
             self._finish_verify_null(flat, by_row, groups, slots, dropped, n_empty)
             return
@@ -983,15 +982,15 @@ class SpeculativeGeneration:
             by_row = dict(x for rank_res in res for x in rank_res)
         self._finish_verify(drafts, flat, by_row, dropped)
 
-    def _verify_block(self, flat, rows, null=None) -> dict[int, dict[str, Any]]:
+    def _verify_block(
+        self, flat, rows, null_envelopes: Optional[tuple[float, ...]] = None
+    ) -> dict[int, dict[str, Any]]:
         """Block-verify ``flat`` drafts on every verifier pool; results by row.
 
-        ``null``: ⊥-BV arguments for the worker (``null_groups`` per row,
-        ``null_slots``, ``null_policy``); a prompt's pool must be decided by
-        one worker, so it needs a single verifier pool.
+        Engine-sourced verification places rows on a pool's data-parallel
+        ranks by tokens (``lpt_owners``). ``null_envelopes`` (⊥-BV): every row
+        is verified at each envelope; the driver decides (``_decide_null``).
         """
-        if null is not None and len(self.verifiers) != 1:
-            raise RuntimeError("null_bv needs a single verifier pool (verify_on=learner)")
         if True:
             # Contiguous row slices per verifier pool, verified concurrently.
             k = len(self.verifiers)
@@ -999,13 +998,13 @@ class SpeculativeGeneration:
             futs = []
             for g, a, b in zip(self.verifiers, cuts, cuts[1:]):
                 method, extra = self._verify_method(flat[a:b])
-                if null is not None:
-                    extra = {
-                        **extra,
-                        "null_groups": null["null_groups"][a:b],
-                        "null_slots": null["null_slots"],
-                        "null_policy": null["null_policy"],
-                    }
+                if method == "verify_drafts_block_engine":
+                    lengths = [r.numel() for r in rows[a:b]]
+                    owners = lpt_owners(lengths, getattr(g, "dp_size", 1))
+                    extra = {**extra, "row_ranks": owners}
+                    self._count_balance(lengths, owners, getattr(g, "dp_size", 1))
+                if null_envelopes is not None:
+                    extra = {**extra, "null_envelopes": list(null_envelopes)}
                 futs.append(
                     (
                         a,
@@ -1075,6 +1074,48 @@ class SpeculativeGeneration:
         self._age_stats(age_tok, age_kept)
         if self.verify_source == "engine":
             self.stats["spec/engine_q_dropped"] = float(dropped)
+
+    def _count_balance(self, lengths: list[int], owners: list[int], ranks: int) -> None:
+        """``spec/verify_load_max_over_mean``: busiest rank's tokens over the mean."""
+        load = [0] * ranks
+        for n, r in zip(lengths, owners):
+            load[r] += n
+        if sum(load):
+            self.stats["spec/verify_load_max_over_mean"] = max(load) * ranks / sum(load)
+
+    def _decide_null(
+        self, by_row: dict[int, dict[str, Any]], groups: list[str], slots: dict[str, int]
+    ) -> dict[int, dict[str, Any]]:
+        """Each row's ⊥-BV result at the envelope the count process gives it.
+
+        Rows come back verified at every envelope with one set of draws per
+        row (``null_grid``); each prompt's rows are then walked in drafting
+        order (``decide_pools``). Rows after the slots fill are "unused".
+        """
+        rows = sorted(by_row)
+        outcomes = [
+            {m: y >= 0 for m, (_, y, _) in by_row[r]["null_grid"].items()} for r in rows
+        ]
+        chosen = decide_pools([groups[r] for r in rows], slots, outcomes, self._null_policy)
+        out = {}
+        for r, m in zip(rows, chosen):
+            res = by_row[r]
+            base = {"hidden_bytes_fetched": res.get("hidden_bytes_fetched", 0)}
+            if m is None:
+                out[r] = {**base, "null": "unused", "accepted": 0, "next": -1, "logprobs": []}
+                continue
+            tau, y, lp_y = res["null_grid"][m]
+            logp = res["token_logprobs"][:tau] + ([] if y < 0 else [lp_y])
+            out[r] = {
+                **base,
+                "accepted": tau,
+                "next": y,
+                "logprobs": logp,
+                "draft_logq": res["draft_logq"][:tau],
+                "null": "out" if y >= 0 else "bot",
+                "null_m": m,
+            }
+        return out
 
     def _finish_verify_null(self, flat, by_row, groups, slots, dropped, n_empty):
         """Plans and ⊥-BV statistics: each prompt's outputs in drafting order.

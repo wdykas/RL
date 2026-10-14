@@ -2283,22 +2283,22 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         keys: list[str],
         batch_tokens: int = 0,
         anchors: list[Any] | None = None,
-        null_groups: list[Optional[str]] | None = None,
-        null_slots: dict[str, int] | None = None,
-        null_policy: dict[str, Any] | None = None,
+        null_envelopes: list[float] | None = None,
+        row_ranks: list[int] | None = None,
         **_: Any,
     ) -> list[tuple[int, dict[str, Any]]]:
         """Block verification with q from the engine and p from the training model.
 
-        Pooled ⊥-BV (``null_bv.py``): ``null_groups[i]`` names row i's prompt
-        group (None: plain block verification). The rows of one group are
-        owned by one data-parallel rank (hash of the group name) and decided in
-        their order in ``rows`` (the drafting order, fixed before
-        verification): each with envelope M = policy(drafts left, slots left)
-        until ``null_slots[group]`` outputs exist; later rows of the group are
-        returned as ``"null": "unused"`` (forwarded but not decided). Every
-        decided row reports ``"null_m"`` and ``"null"`` = "out" or "bot"
-        (BOT: no output). ``null_policy``: ``NullPolicy`` keyword arguments.
+        ``row_ranks[i]``: the data-parallel rank that verifies row i (the
+        driver balances tokens, ``null_bv.lpt_owners``); default: a stable
+        hash of the key.
+
+        Pooled ⊥-BV (``null_bv.py``): with ``null_envelopes`` every row is
+        verified at each of these envelopes M with one set of random draws
+        (``verify_engine_q_grid``) and reports ``"null_grid"`` = {M: (tau, y,
+        log p(y) or None)} plus ``"token_logprobs"`` (log p of the drafted
+        tokens up to the largest tau) and ``"draft_logq"`` (the same span);
+        the driver decides which M each row is taken at (``decide_pools``).
 
         ``anchors[i]`` (sticky MoE routing): the drafter's routes of row i,
         [positions, L, K] int16 (-1: self); p is then F(theta; anchors), the
@@ -2360,6 +2360,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             HiddenRows,
             hidden_num_rows,
             verify_engine_q,
+            verify_engine_q_grid,
         )
 
         from nemo_rl.models.megatron import sticky_routing
@@ -2382,34 +2383,12 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         chk_max, chk_tok, chk_exact = 0.0, 0, 0
         results = []
         n_rows = 0
-        null_state: dict[str, Any] = {}
-        if null_groups is not None:
-            from thundersync_rl.null_bv import NullGroup, NullPolicy
-
-            # A group's rows all on one rank, decided in index order.
-            own = [g if g is not None else k for g, k in zip(null_groups, keys)]
-            mine = self._my_rows(rows, own)
-            policy = NullPolicy(**(null_policy or {}))
-            longest: dict[str, int] = {}
-            count: dict[str, int] = {}
-            for i in mine:
-                grp = null_groups[i]
-                if grp is not None:
-                    longest[grp] = max(longest.get(grp, 0), rows[i].numel())
-                    count[grp] = count.get(grp, 0) + 1
-            # Groups ordered by their longest row (padding of the batched
-            # forwards), rows of a group consecutive in index order.
-            mine.sort(
-                key=lambda i: (
-                    longest.get(null_groups[i], rows[i].numel()),
-                    null_groups[i] or "",
-                    i,
-                )
+        if row_ranks is not None:
+            dp_rank = ps.get_data_parallel_rank()
+            mine = sorted(
+                (i for i in range(len(rows)) if row_ranks[i] == dp_rank),
+                key=lambda i: rows[i].numel(),
             )
-            null_state = {
-                grp: NullGroup(n, int((null_slots or {})[grp]), policy)
-                for grp, n in count.items()
-            }
         else:
             mine = self._my_rows(rows, keys)
         # Several drafts per training-shaped forward (padded as training pads a
@@ -2452,28 +2431,6 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 gen = torch.Generator(device=dev).manual_seed(
                     seed * 1_000_003 + ps.get_data_parallel_rank()
                 )
-            null_m, grp = 1.0, None if null_groups is None else null_groups[i]
-            if grp is not None:
-                m = null_state[grp].next_m()
-                if m is None:
-                    # Slots filled: never decided (the stopping rule depends on
-                    # counts only, so dropping it biases nothing).
-                    del logits
-                    results.append(
-                        (
-                            i,
-                            {
-                                "accepted": 0,
-                                "next": -1,
-                                "logprobs": [],
-                                "draft_logq": [],
-                                "hidden_bytes_fetched": 0,
-                                "null": "unused",
-                            },
-                        )
-                    )
-                    continue
-                null_m = m
             if tp == 1:
                 # Log-probs exactly as training computes them (fp32 log-softmax).
                 p_lp = torch.log_softmax(
@@ -2506,14 +2463,26 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                         out[j] = lp[k]
                 return torch.stack(out)
 
-            tau, y, logp, n_eval = verify_engine_q(
-                p_lp, draft, lq, q_rows, gen, null_m
-            )
-            null_info: dict[str, Any] = {}
-            if grp is not None:
-                null_state[grp].record(y >= 0)
-                null_info = {"null": "out" if y >= 0 else "bot", "null_m": null_m}
-            n_rows += n_eval + (tau < g)
+            if null_envelopes is not None:
+                grid, lpx, n_eval = verify_engine_q_grid(
+                    p_lp, draft, lq, q_rows, gen, tuple(null_envelopes)
+                )
+                tau = max(t for t, _, _ in grid.values())
+                res = {
+                    "null_grid": grid,
+                    "token_logprobs": lpx[:tau].tolist(),
+                    "draft_logq": lq[:tau].tolist(),
+                }
+                n_rows += n_eval
+            else:
+                tau, y, logp, n_eval = verify_engine_q(p_lp, draft, lq, q_rows, gen)
+                res = {
+                    "accepted": tau,
+                    "next": y,
+                    "logprobs": logp.tolist(),
+                    "draft_logq": lq[:tau].tolist(),
+                }
+                n_rows += n_eval + (tau < g)
             fetched = h.fetched_bytes  # what the scan needed (not the check)
             if check:
                 for a in range(0, g, 512):
@@ -2536,19 +2505,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                             f"versions_at={[version[t] for t in pos]} segs={segments[i]}",
                             flush=True,
                         )
-            results.append(
-                (
-                    i,
-                    {
-                        "accepted": tau,
-                        "next": y,
-                        "logprobs": logp.tolist(),
-                        "draft_logq": lq[:tau].tolist(),
-                        "hidden_bytes_fetched": fetched,
-                        **null_info,
-                    },
-                )
-            )
+            results.append((i, {**res, "hidden_bytes_fetched": fetched}))
             del p_lp, h
         for _ in range(n_dummy):
             # Expert parallelism: out of rows, join the other replicas' forwards.

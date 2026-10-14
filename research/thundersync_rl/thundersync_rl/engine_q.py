@@ -533,3 +533,39 @@ def verify_engine_q(
     return block_verify_stats_lazy(
         lpx, lqx, zeros, zeros[:g], p_rows, q_logprob_rows, generator, null_m
     )
+
+
+def verify_engine_q_grid(
+    p_logprobs: Union[torch.Tensor, GatheredLogprobRows],
+    draft: torch.Tensor,
+    engine_logq: torch.Tensor,
+    q_logprob_rows: Callable[[torch.Tensor], torch.Tensor],
+    generator: Optional[torch.Generator],
+    envelopes: tuple[float, ...],
+) -> tuple[dict[float, tuple[int, int, Optional[float]]], torch.Tensor, int]:
+    """``verify_engine_q`` at every ⊥-BV envelope in ``envelopes``, one set of draws.
+
+    Returns ({M: (tau, y, log p(y) or None for BOT)}, log p of the drafted
+    tokens [g], residual masses computed); see
+    ``block_verification_fused.block_verify_stats_lazy_grid``.
+    """
+    from thundersync_rl.block_verification_fused import block_verify_stats_lazy_grid
+
+    g = draft.numel()
+    if isinstance(p_logprobs, GatheredLogprobRows):
+        dev = p_logprobs.local.device
+        lpx = p_logprobs.token_logprobs(draft.to(dev))
+        p_rows = p_logprobs
+    else:
+        dev = p_logprobs.device
+        lpx = p_logprobs[torch.arange(g, device=dev), draft]
+
+        def p_rows(idx):
+            return p_logprobs[idx]
+
+    lqx = engine_logq.to(device=dev, dtype=torch.float32)
+    zeros = torch.zeros(g + 1, dtype=torch.float32, device=dev)
+    out, n_eval = block_verify_stats_lazy_grid(
+        lpx, lqx, zeros, zeros[:g], p_rows, q_logprob_rows, generator, envelopes
+    )
+    return out, lpx, n_eval

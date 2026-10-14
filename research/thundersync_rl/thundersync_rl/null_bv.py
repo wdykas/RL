@@ -40,6 +40,16 @@ probability from the Brownian model of log w (``agent_multi_draft.md``
 section 2.3, validated on real rows): log w_t under p is Brownian with drift
 +a^2/2 and variance a^2 = L v over a draft of length L. M = 1 whenever
 d <= s (never risk a fresh decode while drafts suffice).
+
+Placement (scale): verification forwards are placed on data-parallel ranks
+by tokens (``lpt_owners``), independent of prompts. Each rank verifies its
+rows for every M the policy can pick (``envelopes``) with one set of random
+draws per row, and the driver walks each prompt's drafts in index order
+(``decide_pools``), taking the outcome at the M the counts choose. Exactness
+is unchanged: a row's draws are independent of every other row, and the M
+used for it is a function of the earlier rows' outcomes only, so the outcome
+taken has its M's law given the past; how the outcomes of one row at
+different M are coupled is irrelevant (only one is ever used).
 """
 
 from __future__ import annotations
@@ -197,3 +207,50 @@ class NullGroup:
             self.outputs += 1
         else:
             self.bots += 1
+
+
+def envelopes(policy: NullPolicy) -> tuple[float, ...]:
+    """Every M ``policy.m`` can return: 1 (d <= s) and the grid or the fixed M."""
+    ms = {1.0} | ({float(policy.fixed_m)} if policy.fixed_m is not None else set(policy.grid))
+    return tuple(sorted(ms))
+
+
+def lpt_owners(lengths: list[int], ranks: int) -> list[int]:
+    """Rank of each row: longest first onto the least-loaded rank (by tokens).
+
+    Placement only: which rank forwards a row does not enter any decision.
+    """
+    load = [0] * ranks
+    owner = [0] * len(lengths)
+    for i in sorted(range(len(lengths)), key=lambda i: (-lengths[i], i)):
+        r = min(range(ranks), key=lambda r: (load[r], r))
+        owner[i] = r
+        load[r] += lengths[i]
+    return owner
+
+
+def decide_pools(
+    groups: list[str],
+    slots: dict[str, int],
+    outcomes: list[dict[float, bool]],
+    policy: NullPolicy,
+) -> list[Optional[float]]:
+    """The envelope each row is decided at, None for rows left unused.
+
+    ``groups[i]``: row i's prompt pool; rows of a pool are taken in index
+    order. ``outcomes[i][M]``: whether row i yields an output (not BOT) when
+    verified at envelope M (every M of ``envelopes(policy)``). The sequential
+    count process of ``NullGroup``: M from (drafts left, slots left), stop
+    when the slots are full.
+    """
+    count: dict[str, int] = {}
+    for g in groups:
+        count[g] = count.get(g, 0) + 1
+    state = {g: NullGroup(n, int(slots[g]), policy) for g, n in count.items()}
+    out: list[Optional[float]] = []
+    for g, oc in zip(groups, outcomes):
+        m = state[g].next_m()
+        out.append(m)
+        if m is not None:
+            state[g].record(oc[m])
+    return out

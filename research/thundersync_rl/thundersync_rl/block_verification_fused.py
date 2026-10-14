@@ -213,6 +213,66 @@ def block_verify_stats_lazy(
     return tau, y, logp, n_eval
 
 
+def sample_by_inversion(dist: torch.Tensor, u: float) -> int:
+    """Index sampled from the unnormalized ``dist`` by inverting its CDF at ``u``."""
+    c = torch.cumsum(dist.double(), 0)
+    i = int(torch.searchsorted(c, torch.tensor([u], dtype=c.dtype, device=c.device) * c[-1], right=True))
+    return min(i, dist.numel() - 1)
+
+
+def block_verify_stats_lazy_grid(
+    lpx: torch.Tensor,
+    lqx: torch.Tensor,
+    lse_p: torch.Tensor,
+    lse_q: torch.Tensor,
+    p_rows,
+    q_rows,
+    generator: torch.Generator | None,
+    envelopes: tuple[float, ...],
+) -> tuple[dict[float, tuple[int, int, float | None]], int]:
+    """``block_verify_stats_lazy`` at every envelope M of ``envelopes``, one set of draws.
+
+    One ``rand(g+1)`` (eta) and one ``rand(1)`` (u) per draft. For each M:
+    tau_M is the lazy scan's stop index with M's weights b_M and the shared
+    eta, and y_M is drawn from M's emission law by inverting its CDF at u.
+    Marginally in M this is the M sampler (eta uniform, emission from the same
+    law), so taking the outcome at an M chosen independently of this draft's
+    draws is exact (``null_bv.decide_pools``). Returns ({M: (tau, y, log p(y)
+    or None for BOT)}, rows evaluated); y = ``NULL_TOKEN``: BOT.
+    """
+    g = lpx.numel()
+    dev = lse_p.device
+    eta = torch.rand(g + 1, generator=generator, dtype=torch.float64, device=dev)
+    u = float(torch.rand(1, generator=generator, dtype=torch.float64, device=dev))
+    slack = lazy_slack(lse_p[:g])
+    rows: dict[tuple[str, int], torch.Tensor] = {}
+
+    def row(kind: str, t: int) -> torch.Tensor:
+        if (kind, t) not in rows:
+            at = torch.tensor([t], device=dev)
+            rows[(kind, t)] = (p_rows if kind == "p" else q_rows)(at)[0]
+        return rows[(kind, t)]
+
+    out: dict[float, tuple[int, int, float | None]] = {}
+    n_eval = 0
+    for M in envelopes:
+        check_null_m(M, g)
+        b = acceptance_weights(lpx - lqx, M)
+
+        def mass(idx, bi):
+            return residual_masses(p_rows(idx), q_rows(idx), lse_p[idx], lse_q[idx], bi)
+
+        tau, n = lazy_stop_index(b, eta, null_root_residual(mass, b, M), slack)
+        n_eval += n
+        p_row = row("p", tau)
+        q = None if tau == g else _probs(row("q", tau), lse_q[tau])
+        m = M if tau == 0 and tau < g else 1.0
+        dist = emit_distribution(_probs(p_row, lse_p[tau]), q, b[tau], m)
+        y = emitted_token(sample_by_inversion(dist, u), p_row.shape[-1])
+        out[M] = (tau, y, None if y < 0 else float(p_row[y].float() - lse_p[tau]))
+    return out, n_eval
+
+
 def block_verify_logits_lazy(
     p_logits: torch.Tensor,
     q_logits: torch.Tensor,
