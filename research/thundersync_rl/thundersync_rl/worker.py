@@ -391,6 +391,24 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             self.model, checksum=bool(os.environ.get("THUNDERSYNC_MISMATCH_CHECK"))
         )
 
+    def keep_refit_group(self, lane: int) -> None:
+        """Learner rank: file the live refit communicator under engine lane ``lane``.
+
+        Cohort lanes (lanes.py) give every engine lane its own refit
+        communicator (learner ranks + that lane's ranks). ``init_collective``
+        releases the previous ``model_update_group``, so the live one is moved
+        out first; the next lane's ``init_collective`` then builds a new one.
+        """
+        groups = self.__dict__.setdefault("_lane_refit_groups", {})
+        if self.model_update_group is None:
+            raise RuntimeError("keep_refit_group: no refit communicator to keep")
+        groups[lane] = self.model_update_group
+        self.model_update_group = None
+
+    def select_refit_group(self, lane: int) -> None:
+        """Learner rank: the next refit broadcast goes to engine lane ``lane`` only."""
+        self.model_update_group = self._lane_refit_groups[lane]
+
     def _log_mem(self, where: str) -> None:
         if os.environ.get("THUNDERSYNC_MEM_LOG"):
             print(

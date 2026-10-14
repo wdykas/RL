@@ -65,6 +65,7 @@ from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.logger import Logger
 from thundersync_rl.fused_train import FusedRef
+from thundersync_rl.lanes import CohortLanes, Lane, LaneStepOps, refit_lane
 from thundersync_rl.null_bv import drafts_per_prompt
 from thundersync_rl.routes import RouteRefs
 from thundersync_rl.speculative import SpeculativeGeneration, cohort_draft
@@ -277,6 +278,17 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # Megatron's distributed optimizer (Adam; with or without the
     # precision-aware optimizer).
     draft_weights: Literal["current", "momentum"] = "current"
+    # Cohort lanes (lanes.py, DESIGN.md section 14j): 2 splits the engine fleet
+    # into two engines of policy.generation.colocated.resources GPUs each
+    # (run_thundersync_grpo.py builds the second), each holding one weight
+    # version. At step k the lane of cohort k keeps its drafting weights and
+    # completes cohort k's continuation streams, while the other lane refits
+    # the drafter of cohort k+1 and drafts it from the top of the step; roles
+    # alternate. 1: one engine (single version). Requires sticky routing
+    # (the lanes carry the continuation anchors; without it the remainder is
+    # plain theta_k decoding, not built on lanes yet) and the packed
+    # collective refit (policy.generation.refit_transport null).
+    cohort_lanes: int = 1
 
 
 def resolve_min_pipeline_microbatches(ts_cfg: ThunderSyncConfig, pp: int) -> int:
@@ -382,6 +394,33 @@ def validate_config(master_config: ThunderSyncMasterConfig) -> None:
     validate_sticky_rounding(master_config)
     validate_null_bv(master_config)
     validate_draft_weights(master_config)
+    validate_cohort_lanes(master_config)
+
+
+def validate_cohort_lanes(master_config: ThunderSyncMasterConfig) -> None:
+    """Settings under which two engine lanes keep every cohort on its version."""
+    ts_cfg = master_config.thundersync
+    if ts_cfg.cohort_lanes == 1:
+        return
+    gen = master_config.policy["generation"]
+    problems = []
+    if ts_cfg.cohort_lanes != 2:
+        problems.append(f"cohort_lanes must be 1 or 2 (got {ts_cfg.cohort_lanes})")
+    if sticky_delta(ts_cfg) is None:
+        problems.append(
+            "thundersync.sticky_routing must be on (lanes complete each cohort's "
+            "continuations on its drafting weights; the non-sticky remainder path "
+            "is not built on lanes yet)"
+        )
+    if gen.get("backend") != "megatron" or gen.get("refit_transport") is not None:
+        problems.append(
+            "policy.generation.backend must be megatron with refit_transport null "
+            "(one packed-collective refit communicator per lane)"
+        )
+    if ts_cfg.draft_after_verify or ts_cfg.fused_verify_train:
+        problems.append("draft_after_verify and fused_verify_train must be off")
+    if problems:
+        raise ValueError("thundersync.cohort_lanes: " + "; ".join(problems) + ".")
 
 
 def sticky_delta(ts_cfg: ThunderSyncConfig) -> Optional[float]:
@@ -1152,6 +1191,7 @@ async def _run_one_step(
 
     learner_task = asyncio.create_task(learner_loop())
     draft_task = None
+    draft_started = None
     n_done = 0
     after_verify = (
         ts_cfg.draft_after_verify and verify_task is not None and drafter is not None
@@ -1161,7 +1201,9 @@ async def _run_one_step(
         # runs uncontended on the GPUs it shares with the drafting engine.
         def _start_drafts(_task):
             nonlocal draft_task
+            nonlocal draft_started
             if draft_task is None:
+                draft_started = time.perf_counter()
                 draft_task = asyncio.create_task(drafter())
 
         verify_task.add_done_callback(_start_drafts)
@@ -1175,6 +1217,7 @@ async def _run_one_step(
                 and not after_verify
                 and n_done >= draft_start_frac * n
             ):
+                draft_started = time.perf_counter()
                 draft_task = asyncio.create_task(drafter())
             if learner_task.done():
                 # Surface learner failures now instead of after the last rollout.
@@ -1276,6 +1319,10 @@ async def _run_one_step(
         "timeline/dispatches": dispatches,
         "timeline/step_end": t_end - t_start,
         "time/draft_wait": draft_wait,
+        # When this step's drafter started, from the start of the rollouts.
+        "time/draft_start": (
+            draft_started - t_start if draft_started is not None else float("nan")
+        ),
         "time/draft_score": draft_score,
         "_drafts": drafts,
         **mismatch,
@@ -1291,6 +1338,70 @@ async def _run_one_step(
     return out
 
 
+def next_draft_prompts(
+    next_batch: BatchedDataDict, ts_cfg: ThunderSyncConfig, G: int
+) -> tuple[list[torch.Tensor], Optional[dict[tuple[int, ...], int]]]:
+    """Prompts of the next step's drafts and, with ⊥-BV, its slots per prompt."""
+    null_slots = None
+    if ts_cfg.null_bv:
+        # K G drafts per group, in a fixed (drafting) order; the next step
+        # requests G rollouts per batch entry.
+        n_drafts = drafts_per_prompt(ts_cfg.null_bv_drafts_per_output, G)
+        nxt = next_batch.repeat_interleave(n_drafts)
+        counts = collections.Counter()
+        for i in range(next_batch.size):
+            p = torch.cat([m["token_ids"] for m in next_batch["message_log"][i]])
+            counts[tuple(int(t) for t in p.tolist())] += G
+        null_slots = dict(counts)
+    else:
+        nxt = next_batch.repeat_interleave(G)
+    prompts = [
+        torch.cat([m["token_ids"] for m in nxt["message_log"][i]])
+        for i in range(nxt.size)
+    ]
+    return prompts, null_slots
+
+
+def make_speculative_generation(
+    generation: GenerationInterface,
+    policy: Policy,
+    tokenizer,
+    master_config: ThunderSyncMasterConfig,
+) -> SpeculativeGeneration:
+    """The speculative wrapper of one engine (one per lane with cohort lanes)."""
+    ts_cfg = master_config.thundersync
+    return SpeculativeGeneration(
+        generation,
+        policy,
+        vocab_limit=len(tokenizer),
+        head_k=ts_cfg.spec_head_k,
+        draft_budget=ts_cfg.draft_budget,
+        max_new_tokens=master_config.policy["generation"]["max_new_tokens"],
+        pad_token_id=tokenizer.pad_token_id,
+        draft_variants=ts_cfg.draft_variants,
+        variant_eps=ts_cfg.variant_eps,
+        verify_mode=ts_cfg.verify_mode,
+        verify_precision=ts_cfg.verify_precision,
+        verify_lazy=ts_cfg.verify_lazy,
+        verify_batch_tokens=ts_cfg.verify_batch_tokens,
+        tail_lookup=ts_cfg.tail_lookup,
+        tail_lookup_max_refs=ts_cfg.tail_lookup_max_refs,
+        longest_first=ts_cfg.verify_longest_first,
+        verify_on=ts_cfg.verify_on,
+        pool_weights=ts_cfg.verify_pool_weights,
+        fused_verify_train=ts_cfg.fused_verify_train,
+        fused_max_retained_tokens=ts_cfg.fused_max_retained_tokens,
+        verify_source=ts_cfg.verify_source,
+        hidden_transport=ts_cfg.hidden_transport,
+        sticky_delta=sticky_delta(ts_cfg),
+        null_bv=ts_cfg.null_bv,
+        null_bv_policy=null_bv_policy(master_config) if ts_cfg.null_bv else None,
+        sticky_chunk_tokens=ts_cfg.sticky_continuation_chunk_tokens,
+        draft_weights=ts_cfg.draft_weights,
+        max_seq_len=master_config.policy["max_total_sequence_length"],
+    )
+
+
 def thundersync_grpo_train(
     policy: Policy,
     policy_generation: GenerationInterface,
@@ -1300,11 +1411,24 @@ def thundersync_grpo_train(
     task_to_env: dict[str, EnvironmentInterface],
     master_config: ThunderSyncMasterConfig,
     logger: Optional[Logger] = None,
+    lanes: Optional[list[Lane]] = None,
 ) -> list[dict[str, Any]]:
+    """``lanes``: the engine lanes (``lanes.build_engine_lanes``) when
+    ``thundersync.cohort_lanes`` is 2; ``policy_generation`` is then lane 0."""
     validate_config(master_config)
     ts_cfg = master_config.thundersync
     adv_fn = make_group_advantage_fn(master_config)
     learner = StreamingLearner(policy)
+    if (ts_cfg.cohort_lanes > 1) != (lanes is not None):
+        raise ValueError(
+            f"thundersync.cohort_lanes={ts_cfg.cohort_lanes} but "
+            f"{'no' if lanes is None else len(lanes)} engine lanes were built"
+        )
+    if lanes is not None:
+        return _train_on_lanes(
+            policy, lanes, learner, adv_fn, dataloader, tokenizer, loss_fn,
+            task_to_env, master_config, logger,
+        )
     max_steps = master_config.grpo.max_num_steps
     history = []
     stale = False  # setup() already performed the initial refit
@@ -1312,35 +1436,8 @@ def thundersync_grpo_train(
     spec = None
     if ts_cfg.speculate:
         policy_generation.prepare_for_generation()
-        spec = SpeculativeGeneration(
-            policy_generation,
-            policy,
-            vocab_limit=len(tokenizer),
-            head_k=ts_cfg.spec_head_k,
-            draft_budget=ts_cfg.draft_budget,
-            max_new_tokens=master_config.policy["generation"]["max_new_tokens"],
-            pad_token_id=tokenizer.pad_token_id,
-            draft_variants=ts_cfg.draft_variants,
-            variant_eps=ts_cfg.variant_eps,
-            verify_mode=ts_cfg.verify_mode,
-            verify_precision=ts_cfg.verify_precision,
-            verify_lazy=ts_cfg.verify_lazy,
-            verify_batch_tokens=ts_cfg.verify_batch_tokens,
-            tail_lookup=ts_cfg.tail_lookup,
-            tail_lookup_max_refs=ts_cfg.tail_lookup_max_refs,
-            longest_first=ts_cfg.verify_longest_first,
-            verify_on=ts_cfg.verify_on,
-            pool_weights=ts_cfg.verify_pool_weights,
-            fused_verify_train=ts_cfg.fused_verify_train,
-            fused_max_retained_tokens=ts_cfg.fused_max_retained_tokens,
-            verify_source=ts_cfg.verify_source,
-            hidden_transport=ts_cfg.hidden_transport,
-            sticky_delta=sticky_delta(ts_cfg),
-            null_bv=ts_cfg.null_bv,
-            null_bv_policy=null_bv_policy(master_config) if ts_cfg.null_bv else None,
-            sticky_chunk_tokens=ts_cfg.sticky_continuation_chunk_tokens,
-            draft_weights=ts_cfg.draft_weights,
-            max_seq_len=master_config.policy["max_total_sequence_length"],
+        spec = make_speculative_generation(
+            policy_generation, policy, tokenizer, master_config
         )
     sticky = spec is not None and spec.sticky_delta is not None
     G = master_config.grpo.num_generations_per_prompt
@@ -1452,23 +1549,7 @@ def thundersync_grpo_train(
             new = {t: _prompts(ahead[t - step - 1]) for t in targets}
             drafter = lambda new=new, step=step: spec.draft_cohorts(step, new)  # noqa: E731
         elif spec is not None and next_batch is not None and step + 1 < max_steps:
-            null_slots = None
-            if ts_cfg.null_bv:
-                # K G drafts per group, in a fixed (drafting) order; the next
-                # step requests G rollouts per batch entry.
-                n_drafts = drafts_per_prompt(ts_cfg.null_bv_drafts_per_output, G)
-                nxt = next_batch.repeat_interleave(n_drafts)
-                null_slots = collections.Counter()
-                for i in range(next_batch.size):
-                    p = torch.cat([m["token_ids"] for m in next_batch["message_log"][i]])
-                    null_slots[tuple(int(t) for t in p.tolist())] += G
-                null_slots = dict(null_slots)
-            else:
-                nxt = next_batch.repeat_interleave(G)
-            next_prompts = [
-                torch.cat([m["token_ids"] for m in nxt["message_log"][i]])
-                for i in range(nxt.size)
-            ]
+            next_prompts, null_slots = next_draft_prompts(next_batch, ts_cfg, G)
             drafter = (  # noqa: E731
                 (
                     lambda prompts=next_prompts, slots=null_slots: spec.draft_streaming(
@@ -1528,5 +1609,142 @@ def thundersync_grpo_train(
         )
         if logger is not None:
             logger.log_metrics(scalars, step + 1, prefix="thundersync")
+        step += 1
+    return history
+
+
+def _log_step(step: int, metrics: dict[str, Any], logger: Optional[Logger]) -> None:
+    scalars = {k: v for k, v in metrics.items() if isinstance(v, (int, float))}
+    print(
+        f"[thundersync step {step}] "
+        + " ".join(
+            f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}"
+            for k, v in scalars.items()
+        ),
+        flush=True,
+    )
+    if logger is not None:
+        logger.log_metrics(scalars, step + 1, prefix="thundersync")
+
+
+def _train_on_lanes(
+    policy: Policy,
+    lanes: list[Lane],
+    learner: StreamingLearner,
+    adv_fn,
+    dataloader,
+    tokenizer,
+    loss_fn: LossFunction,
+    task_to_env: dict[str, EnvironmentInterface],
+    master_config: ThunderSyncMasterConfig,
+    logger: Optional[Logger],
+) -> list[dict[str, Any]]:
+    """Training loop on cohort lanes (lanes.py, DESIGN.md section 14j).
+
+    Same algorithm as ``thundersync_grpo_train`` with sticky routing and
+    lookahead 1; only where and when the engine work runs differs: cohort
+    step+1 is drafted on the other lane from the top of step ``step``
+    (``CohortLanes.step``), not after cohort ``step``'s continuations.
+    """
+    ts_cfg = master_config.thundersync
+    G = master_config.grpo.num_generations_per_prompt
+    max_steps = master_config.grpo.max_num_steps
+    momentum = ts_cfg.draft_weights != "current"
+    for lane in lanes:
+        lane.generation.prepare_for_generation()
+        lane.spec = make_speculative_generation(
+            lane.generation, policy, tokenizer, master_config
+        )
+    sched = CohortLanes(lanes)
+    batches = iter(dataloader)
+    batch, next_batch = next(batches, None), next(batches, None)
+    drafts = None
+    history = []
+    step = 0
+    while batch is not None and step < max_steps:
+        t0 = time.perf_counter()
+        x, y = sched.cohort_lane(step), sched.drafting_lane(step)
+        for lane in lanes:
+            lane.spec.current_step = step
+        times = collections.Counter()
+
+        def timed(key, fn):
+            t = time.perf_counter()
+            try:
+                return fn()
+            finally:
+                times[key] += time.perf_counter() - t
+
+        def put_drafter(lane, target, refit):
+            if momentum:
+                # theta_hat_{step+1} from (theta_step, m, v): learner load,
+                # refit of this lane alone, learner restore; no host stage.
+                lane.spec.stage_draft_weights(refit, stage_on_engine=False)
+            else:
+                refit()
+
+        def start_drafts(lane, target, nb=next_batch):
+            prompts, slots = next_draft_prompts(nb, ts_cfg, G)
+            return asyncio.run(lane.spec.draft_streaming(prompts, null_slots=slots))
+
+        def complete_cohort(lane, cohort_drafts):
+            lane.generation.prepare_for_generation()
+            timed("time/verify", lambda: asyncio.run(lane.spec.verify_sticky(cohort_drafts)))
+
+        def run_step(lane, collector, b=batch, y=y):
+            async def drafter():
+                return collector
+
+            policy.prepare_for_training()
+            return asyncio.run(
+                _run_one_step(
+                    step=step,
+                    batch=b,
+                    learner=learner,
+                    policy_generation=lane.spec,
+                    tokenizer=tokenizer,
+                    task_to_env=task_to_env,
+                    loss_fn=loss_fn,
+                    master_config=master_config,
+                    ts_cfg=ts_cfg,
+                    adv_fn=adv_fn,
+                    drafter=drafter if collector is not None else None,
+                    before_finish=y.spec.score_prev,
+                    claim_anchors=lane.spec.claim_anchors,
+                    draft_start_frac=0.0,
+                )
+            )
+
+        def needs_current(lane, b=batch):
+            # Rollouts without a complete plan decode at theta_step on the lane.
+            prompts = [
+                torch.cat([m["token_ids"] for m in r])
+                for r in b.repeat_interleave(G)["message_log"]
+            ]
+            return not lane.spec.plans_cover(prompts)
+
+        ops = LaneStepOps(
+            drafter_version=lambda t: ("theta_hat", t) if momentum else ("theta", t - 1),
+            put_drafter=put_drafter,
+            refit_lane=lambda lane: timed("time/refit", lambda: refit_lane(policy, lane)),
+            start_drafts=start_drafts,
+            complete_cohort=complete_cohort,
+            needs_current=needs_current,
+            run_step=run_step,
+        )
+        draft_next = next_batch is not None and step + 1 < max_steps
+        metrics, drafts = sched.step(step, drafts, draft_next, ops)
+        # This step's training has replayed every anchor targeted at it.
+        x.spec.release_routes(step)
+        metrics["time/verify"] = times["time/verify"]
+        metrics["time/refit"] = times["time/refit"]
+        for lane in (x, y):
+            metrics.update(lane.spec.stats)
+            lane.spec.stats = {}
+        metrics["lanes/refits"] = float(sum(lane.refits for lane in lanes))
+        metrics["time/iteration"] = time.perf_counter() - t0
+        history.append(metrics)
+        _log_step(step, metrics, logger)
+        batch, next_batch = next_batch, next(batches, None)
         step += 1
     return history

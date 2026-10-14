@@ -24,6 +24,7 @@ from thundersync_rl.grpo_loop import (
     configure_sticky_policy,
     thundersync_grpo_train,
 )
+from thundersync_rl.lanes import build_engine_lanes
 from thundersync_rl.worker import WORKER_FQN
 
 from nemo_rl.algorithms.grpo import setup
@@ -75,7 +76,7 @@ def main() -> None:
         policy,
         policy_generation,
         _nemo_gym,
-        _clusters,
+        clusters,
         dataloader,
         _val_dataloader,
         loss_fn,
@@ -87,6 +88,21 @@ def main() -> None:
         _aliases,
     ) = setup(config, tokenizer, dataset, val_dataset)
 
+    lanes = None
+    if master_config.thundersync.cohort_lanes > 1:
+        # Cohort lanes (DESIGN.md section 14j): setup built lane 0 on
+        # policy.generation.colocated.resources; one more engine of that shape.
+        train_cluster, inference_cluster = clusters
+        lanes = build_engine_lanes(
+            policy,
+            policy_generation,
+            train_cluster,
+            inference_cluster,
+            master_config.policy,
+            tokenizer,
+            num_lanes=master_config.thundersync.cohort_lanes,
+        )
+
     try:
         history = thundersync_grpo_train(
             policy=policy,
@@ -97,6 +113,7 @@ def main() -> None:
             task_to_env=task_to_env,
             master_config=master_config,
             logger=logger,
+            lanes=lanes,
         )
     finally:
         shutdown_environments(task_to_env)

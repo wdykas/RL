@@ -23,32 +23,50 @@
 # with the momentum-predicted weights; additionally every step that drafted must report
 # a draft-weights refit, and from step 1 on draft/changed_frac > 0 (the draft differs from theta_k).
 #
+# LANES=2 (thundersync.cohort_lanes, DESIGN.md section 14j): the 2 generation GPUs become two
+# one-GPU engine lanes (needs TP=PP=EP=1 here; multi-node lanes take whole replicas per lane).
+# Cohort k+1 is drafted on the other lane from the top of step k; additionally every step after
+# the first must overlap that drafting with cohort k's continuation streams (lanes/overlap_s > 0)
+# and complete cohort k on lane k % 2. LANES=1 on the same layout (one engine, DP=2 over the same
+# 2 GPUs) is the single-version reference for step time.
+#
 # Env: MODEL, EP (2), TP (1), PP (1), STEPS (4), PROMPTS (16), MAXLEN (1024), DELTA (0.03),
 # STICKY (1), NOISE (expert-grad noise, 1), SCHED (engine scheduling: async | legacy; async),
-# DRAFT_WEIGHTS (current), ARGS (extra overrides).
+# DRAFT_WEIGHTS (current), LANES (1), ARGS (extra overrides).
 W=/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/wdykas/code/on-olicy-rl/thundersync_work
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 export MODEL=${MODEL:-$W/models/tiny-qwen3-moe-d2048}
 export EP=${EP:-2} TP=${TP:-1} PP=${PP:-1} MAXLEN=${MAXLEN:-1024} STEPS=${STEPS:-4}
 STICKY=${STICKY:-1} DELTA=${DELTA:-0.03} NOISE=${NOISE:-1} DRAFT_WEIGHTS=${DRAFT_WEIGHTS:-current}
+LANES=${LANES:-1}
+if [ "$LANES" != 1 ] && [ "$(( TP * PP * EP ))" != 1 ]; then
+  echo "LANES=$LANES on one node needs TP=PP=EP=1 (two one-GPU lanes); got TP=$TP PP=$PP EP=$EP" >&2
+  exit 2
+fi
 if [ "$NOISE" != 0 ]; then export THUNDERSYNC_DEBUG_EXPERT_GRAD_NOISE=$NOISE; fi
 export RUNS=${RUNS:-runs_sticky_moe}
 SCHED=${SCHED:-async}
-export TAG=${TAG:-sticky$STICKY-d$DELTA-ep$EP-tp$TP-pp$PP-$SCHED-dw$DRAFT_WEIGHTS-$(basename "$MODEL")}
+export TAG=${TAG:-sticky$STICKY-d$DELTA-ep$EP-tp$TP-pp$PP-$SCHED-dw$DRAFT_WEIGHTS$([ "$LANES" != 1 ] && echo -lanes$LANES)-$(basename "$MODEL")}
 STICKY_ARGS="++thundersync.draft_lookahead=1 ++policy.generation.mcore_generation_config.async_sched_mode=$SCHED"
 STICKY_ARGS+=" ++thundersync.draft_weights=$DRAFT_WEIGHTS"
 if [ "$STICKY" = 1 ]; then
   STICKY_ARGS+=" ++thundersync.sticky_routing=true ++thundersync.sticky_routing_delta=$DELTA"
+fi
+if [ "$LANES" != 1 ]; then
+  # Lane 0 = the setup's engine (1 GPU); the driver builds lane 1 on the node's 4th GPU.
+  STICKY_ARGS+=" ++thundersync.cohort_lanes=$LANES cluster.gpus_per_node=3"
+  STICKY_ARGS+=" policy.generation.colocated.resources.gpus_per_node=1"
 fi
 # fp32 router on both sides (inference_optimized requires it; training must match).
 export ARGS="policy.megatron_cfg.moe_router_dtype=fp32 policy.generation.mcore_generation_config.enable_prefix_caching=false $STICKY_ARGS ${ARGS:-}"
 bash "$HERE/engine_q_tp.sh"
 rc=$?
 OUT=$W/$RUNS/$TAG
-python - "$OUT/history.json" "$OUT/run.log" "$STICKY" "$DRAFT_WEIGHTS" <<'EOF'
+python - "$OUT/history.json" "$OUT/run.log" "$STICKY" "$DRAFT_WEIGHTS" "$LANES" <<'EOF'
 import json, re, sys
 path, log, sticky = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
 momentum = sys.argv[4] == "momentum"
+lanes = int(sys.argv[5]) > 1
 try:
     hist = json.load(open(path))
 except (OSError, ValueError) as exc:
@@ -60,7 +78,10 @@ for i, h in enumerate(hist):
             "spec/sticky_cont_retries", "spec/route_truncated_drafts", "spec/engine_q_dropped",
             "spec/route_check_tokens", "spec/route_check_exact", "mismatch/param_checksum",
             "draft/changed_frac", "draft/total_s", "draft/peak_extra_gb",
-            "time/verify", "time/iteration")
+            "time/verify", "time/refit", "time/draft_start", "time/iteration",
+            "lanes/cohort_lane", "lanes/draft_start_s", "lanes/tail_end_s", "lanes/overlap_s",
+            "lanes/cohort_lane_idle_s", "lanes/drafting_lane_idle_s", "lanes/idle_frac",
+            "lanes/fresh_refit", "lanes/refits")
     print(f"[sticky] step {i}: " + " ".join(f"{k.split('/')[-1]}={h.get(k)}" for k in keys))
     if sticky and h.get("spec/draft_tokens") and h.get("spec/sticky_rounds") is None:
         why.append(f"step {i}: no sticky stats")
@@ -74,6 +95,12 @@ for i, h in enumerate(hist):
         # Step 0 has no momentum yet (theta_hat = theta_0 - lr wd theta_0, below a bf16 ulp).
         elif i >= 1 and not h.get("draft/changed_frac", 0) > 0:
             why.append(f"step {i}: momentum draft weights equal theta_k")
+    if lanes:
+        if h.get("lanes/cohort_lane") != i % 2:
+            why.append(f"step {i}: cohort on lane {h.get('lanes/cohort_lane')}, not {i % 2}")
+        # Drafting of cohort i+1 must overlap cohort i's continuation streams.
+        if 1 <= i < len(hist) - 1 and not (h.get("lanes/overlap_s") or 0) > 0:
+            why.append(f"step {i}: no lane overlap ({h.get('lanes/overlap_s')})")
     tok, exact = h.get("spec/route_check_tokens"), h.get("spec/route_check_exact")
     if sticky and i >= 1 and not (tok and exact == tok):
         why.append(f"step {i}: route check {exact}/{tok}")
