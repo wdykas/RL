@@ -370,3 +370,25 @@ def test_grpo_config_rejects(ts, megatron, match):
 
     with pytest.raises(ValueError, match=match):
         validate_sticky_rounding(_master(megatron, **ts))
+
+
+def test_theta_store_holds_expert_gemm_weights_as_fp16():
+    class Experts(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear_fc1 = torch.nn.Module()
+            self.linear_fc1.weight0 = torch.nn.Parameter(torch.randn(3, 4).to(torch.bfloat16))
+            self.norm = torch.nn.Parameter(torch.full((4,), 1e-6, dtype=torch.bfloat16))
+
+    layer = torch.nn.Module()
+    layer.mlp = torch.nn.Module()
+    layer.mlp.experts = Experts()
+    store = sr.ThetaStore([layer])
+    store.snapshot()
+    got = store.fetch(0, torch.device("cpu"))[0]
+    w = layer.mlp.experts.linear_fc1.weight0
+    assert got["mlp.experts.linear_fc1.weight0"].dtype == torch.float16
+    assert torch.equal(got["mlp.experts.linear_fc1.weight0"], w.detach().to(torch.float16))
+    # anything else keeps its dtype (1e-6 is not exact in fp16)
+    assert got["mlp.experts.norm"].dtype == torch.bfloat16
+    assert torch.equal(got["mlp.experts.norm"], layer.mlp.experts.norm.detach())

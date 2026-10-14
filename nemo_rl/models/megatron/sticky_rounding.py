@@ -53,6 +53,7 @@ anchored policy, see §14g):
 from __future__ import annotations
 
 import contextlib
+import re
 from typing import Any, Iterator, Optional
 
 import torch
@@ -149,22 +150,43 @@ def pop_stats() -> dict[str, float]:
 # ---------------------------------------------------------------------------
 
 
+_EXPERT_WEIGHT = re.compile(r"(^|\.)experts\.linear_fc[12]\.weight\d+$")
+_ALIGN = 256  # bytes, per tensor inside a unit's flat buffer
+
+
+def _host_dtype(name: str, dtype: torch.dtype) -> torch.dtype:
+    """Expert GEMM weights are held as fp16: the expert GEMM converts them to fp16
+    before use in every path (``fp16_moe``), so storing that conversion is bitwise
+    the same operand and saves a per-expert conversion in the anchor pass."""
+    if dtype == torch.bfloat16 and _EXPERT_WEIGHT.search(name):
+        return torch.float16
+    return dtype
+
+
 class ThetaStore:
     """theta_n per lockstep unit (embedding, each transformer layer) in pinned host memory.
 
     Holds exactly this rank's local parameters of each unit (its shard under
-    TP / PP / EP, in the model's own dtype): host bytes per rank = the rank's
-    16-bit model shard. ``snapshot`` runs before the optimizer step overwrites
-    the parameters; ``fetch`` streams one unit to the GPU on a side stream.
+    TP / PP / EP; 16-bit, expert GEMM weights as fp16): host bytes per rank =
+    the rank's 16-bit model shard. Each unit is one flat pinned buffer, so a
+    unit streams to the GPU in a single copy. ``snapshot`` runs before the
+    optimizer step overwrites the parameters; ``fetch`` streams one unit on a
+    side stream.
     """
 
     def __init__(self, units: list[torch.nn.Module]):
         self.units = units
         self._index = {id(u): i for i, u in enumerate(units)}
-        self._names = [
-            [n for n, _ in u.named_parameters(remove_duplicate=False)] for u in units
-        ]
-        self._host: Optional[list[dict[str, torch.Tensor]]] = None
+        # per unit: [(name, shape, host dtype, byte offset)], buffer bytes
+        self._layout: list[tuple[list[tuple[str, torch.Size, torch.dtype, int]], int]] = []
+        for u in units:
+            entries, off = [], 0
+            for n, p in u.named_parameters(remove_duplicate=False):
+                dt = _host_dtype(n, p.dtype)
+                entries.append((n, p.shape, dt, off))
+                off += -(-p.numel() * dt.itemsize // _ALIGN) * _ALIGN
+            self._layout.append((entries, off))
+        self._host: Optional[list[torch.Tensor]] = None
         self.ready = False
         self._copy_stream: Optional[torch.cuda.Stream] = None
 
@@ -172,52 +194,58 @@ class ThetaStore:
         return self._index[id(unit)]
 
     def host_bytes(self) -> int:
+        """Bytes of parameters held (excluding alignment padding)."""
         if self._host is None:
             return 0
-        return sum(t.numel() * t.element_size() for d in self._host for t in d.values())
+        return sum(
+            sh.numel() * dt.itemsize for entries, _ in self._layout for _, sh, dt, _ in entries
+        )
 
     def _stream(self) -> torch.cuda.Stream:
         if self._copy_stream is None:
             self._copy_stream = torch.cuda.Stream()
         return self._copy_stream
 
+    @staticmethod
+    def _views(buf: torch.Tensor, entries) -> dict[str, torch.Tensor]:
+        return {
+            n: buf[off : off + sh.numel() * dt.itemsize].view(dt).view(sh)
+            for n, sh, dt, off in entries
+        }
+
     def snapshot(self) -> None:
         """Copy every unit's current parameters to host (returns when the copy is done)."""
+        cuda = any(p.is_cuda for u in self.units for p in u.parameters())
         if self._host is None:
             self._host = [
-                {
-                    n: torch.empty(
-                        p.shape, dtype=p.dtype, device="cpu", pin_memory=p.is_cuda
-                    )
-                    for n, p in u.named_parameters(remove_duplicate=False)
-                }
-                for u in self.units
+                torch.empty(nbytes, dtype=torch.uint8, device="cpu", pin_memory=cuda)
+                for _, nbytes in self._layout
             ]
-        params = [dict(u.named_parameters(remove_duplicate=False)) for u in self.units]
-        cuda = any(p.is_cuda for d in params for p in d.values())
         ctx = torch.cuda.stream(self._stream()) if cuda else contextlib.nullcontext()
         if cuda:
             self._stream().wait_stream(torch.cuda.current_stream())
         with torch.no_grad(), ctx:
-            for host, live in zip(self._host, params):
-                for n, h in host.items():
-                    h.copy_(live[n].detach(), non_blocking=True)
+            for u, buf, (entries, _) in zip(self.units, self._host, self._layout):
+                live = dict(u.named_parameters(remove_duplicate=False))
+                for n, h in self._views(buf, entries).items():
+                    h.copy_(live[n].detach().to(h.dtype), non_blocking=True)
         if cuda:
             self._stream().synchronize()
         self.ready = True
 
     def fetch(self, i: int, device: torch.device) -> tuple[dict[str, torch.Tensor], Any]:
-        """Start the H2D copy of unit i; returns (tensors, event to wait on)."""
+        """Start the H2D copy of unit i (one copy); returns (tensors, event to wait on)."""
         if not self.ready:
             return {}, None
+        entries = self._layout[i][0]
         if device.type != "cuda":
-            return {n: t.to(device) for n, t in self._host[i].items()}, None
+            return self._views(self._host[i].to(device), entries), None
         s = self._stream()
         with torch.cuda.stream(s):
-            out = {n: t.to(device, non_blocking=True) for n, t in self._host[i].items()}
+            buf = self._host[i].to(device, non_blocking=True)
             ev = torch.cuda.Event()
             ev.record(s)
-        return out, ev
+        return self._views(buf, entries), ev
 
 
 # ---------------------------------------------------------------------------
@@ -261,8 +289,8 @@ class AnchorStream:
         if ev is not None:
             cur = torch.cuda.current_stream()
             cur.wait_event(ev)
-            for t in tensors.values():
-                t.record_stream(cur)
+            if tensors:  # one flat buffer per unit: its views share the storage
+                next(iter(tensors.values())).record_stream(cur)
         return tensors
 
     def done(self, unit: torch.nn.Module, device: torch.device) -> None:

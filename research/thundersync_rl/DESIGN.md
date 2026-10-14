@@ -1714,7 +1714,7 @@ step).** [derived unless marked]
   inference working set (freed before the policy pass of the layer). Measured on real Qwen3-30B-A3B layers (L4,
   1 GPU, T = 4096 / 8192 tokens, U_max = 1.19 GB): peak allocated +32 / +64 MB (0.03 / 0.05 U_max) for a no-grad
   verification forward and +0 for forward+backward, because the peaks (LM-head logits, backward) are elsewhere [M].
-- H2D traffic: P_r per policy-forward micro-batch (every micro-batch walks all layers), i.e. n_mb·P_r per step;
+- H2D traffic: P_r per policy-forward micro-batch, one copy per unit (every micro-batch walks all layers), i.e. n_mb·P_r per step;
   hidden behind compute when t_fwd(T) ≥ U_max / B_H2D per layer, B_H2D ≈ 400 GB/s per direction on NVLink-C2C
   [hypothesis: to measure]. This scales with n_mb: the levers are (a) larger policy micro-batches (one stream per
   micro-batch), (b) a sparse θ_k − θ_{k−1} delta held on GPU and applied per layer (bytes ∝ fraction of 16-bit
@@ -1722,9 +1722,10 @@ step).** [derived unless marked]
   (needs schedule support). Until measured at scale this is the main cost risk, not a blocker.
 - Compute: one extra forward over the policy-forward tokens: +100% on forward-only verification passes, ≈ +33% of
   fwd+bwd on training passes (activation-free: inference-mode) [derived]. Measured (L4, 1 GPU, B = 4 × 1024):
-  fwd+bwd 0.44 → 0.64 s (+46%), no-grad forward 0.12 → 0.34 s (+177%); H2D on this node 125 GB/s pinned (10 ms
-  per 1.19 GB layer, ~45 ms per forward here) [M]. The excess over the derived cost (rule arithmetic, key
-  dispatch, H2D overlap) is not profiled yet.
+  GPU time on the compute stream of a no-grad (verification) forward 27.5 → 54.7 ms (2.0x, as derived); the θ_{k−1}
+  stream is 5 H2D copies (one flat pinned buffer per unit, expert weights held as fp16) = 44.6 ms on the copy
+  stream (≈120 GB/s, overlapped); wall time in this 4-layer harness is CPU-launch bound (plain 0.12 s wall for
+  27 ms of GPU work): fwd+bwd 0.42 → 0.60 s, no-grad forward 0.12 → 0.30 s [M].
 - Communication: the anchor pass repeats the layer's TP collectives and EP all-to-alls (forward only), and each
   MoE layer adds two key dispatches per pass of 16 B per routed row (≈ 4/d of a hidden dispatch) with the same
   tokens-per-expert synchronization MCore's dispatch already performs. No global synchronization is added;
