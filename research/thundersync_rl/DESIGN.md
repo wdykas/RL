@@ -1923,16 +1923,24 @@ transient 72.6 GB (none) -> 47 GB (selective) -> 26 GB (full) for Qwen3; 48.7 ->
   sequence), selective ~106 GB at T = 16k -> full at PP>1. Every term is per micro-batch tokens and per rank shard;
   none grows with the global batch, and EP enters only through ρ of one recomputed layer.
 
-**Open (not built): the learner's batch-invariant unpermute.** The NVLS expert path (`NVLSAllGatherVDispatcher`,
-AllGather-V + ordered ReduceScatter-V) is the engine's only: it is built for `transformer_impl=inference_optimized`
-and selected under `InferenceMode`; it has no backward and its symmetric buffers are EP x tokens per rank (EP=64,
-16k tokens, hidden 8k: ~51 GB), so it is not a learner option. The learner (training and its no-grad forwards) runs
-Megatron's `moe/batch_invariant.unpermute` after the AlltoAll combine: EP x top-k Python iterations of full [T, H]
-index_select / fp64 casts forward and EP x k dense [T·k, H] gradient buffers backward. Fine at Qwen3 EP=8
-(64 iterations, ~10 ms fwd + ~25 ms bwd per layer at 16k tokens [D]); at EP=64 x top-22 [H] ~0.85 s fwd + ~2 s bwd
-per layer and 24-35 GB of live gradient buffers [D]. The scalable form is a fused token-owned kernel doing the same
-fp64-within-rank / fp32-rank-order sums (bitwise, O(T·k·H), EP-independent; backward a gather), like
-`fp16_moe._unpermute_fp64_kernel` on the engine side.
+**Learner batch-invariant unpermute: fused (`policy.megatron_cfg.fused_bi_unpermute`, default on).** The NVLS expert
+path (`NVLSAllGatherVDispatcher`, AllGather-V + ordered ReduceScatter-V) is the engine's only: built for
+`transformer_impl=inference_optimized`, selected under `InferenceMode`, no backward, symmetric buffers of EP x tokens
+per rank (EP=64, 16k tokens, hidden 8k: ~51 GB). The learner (training and its no-grad forwards) runs the AlltoAll
+dispatcher, whose Megatron `moe/batch_invariant.unpermute` did EP x top-k eager [T, H] index_select / fp64 passes
+forward and built EP x k dense [T·k, H] gradients backward. `nemo_rl/models/megatron/bi_unpermute.py` replaces it
+(patching `moe_utils.batch_invariant_unpermute`): per token the K slots are visited in (EP rank, slot) order, fp64
+per-rank partials are rounded to fp32 and added in rank order (fp64 + one rounding for `multimem`) in one Triton
+kernel; backward writes g + 0.0 to each slot's row. Same operations on the same values: skipped +0.0 terms never
+change a sum started at +0.0, and the eager backward is +0.0 + g per row. O(T·k·H), independent of EP.
+- Bitwise [M]: output and input gradient equal Megatron's (int32 bit patterns, signed zeros, cancellations, skewed
+  routing) at EP 1/2/4/8/64, top-k 1/2/6/8/22, hidden 2048-8192, ordered and multimem (23 GPU tests); E2E Nano L8
+  (sticky + momentum + ⊥-BV; STICKY=0) and Qwen3 L4 (sticky + momentum; ⊥-BV) EP=2: mismatch 0, engine-q exact.
+- Per MoE layer forward + backward, 16384 tokens per rank [M, one GB200, EP emulated]: Nano EP2 21.2 -> 0.72 ms,
+  Nano EP8 85.8 -> 0.68 ms, Qwen3 EP8 96.2 -> 0.69 ms; Ultra-like EP64 x top-22 x hidden 8192 at 2048 tokens
+  1774 -> 0.87 ms (linear in tokens: ~14 s -> ~7 ms at 16384). Peak extra memory 2.6 -> 1.15 GiB (Nano), 3.0 -> 1.44
+  GiB (Ultra-like, 2048 tokens): the output, its input gradient and [T, k] int32 maps. Per 16k-token micro-batch this
+  removes ~2.0 s (Nano EP8, 23 MoE layers) / ~4.6 s (Qwen3 EP8, 48 layers) of learner time, more with MoE recompute.
 
 ## 15. Open work
 

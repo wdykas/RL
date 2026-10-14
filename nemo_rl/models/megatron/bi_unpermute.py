@@ -36,7 +36,7 @@ row is the token's output gradient. The eager backward accumulates it into zeros
 refers to get 0. Cost O(T * K * H) forward and backward, independent of EP; memory:
 the output, the input gradient and [T, K] int32 maps.
 
-Enabled by ``install()`` (``policy.megatron_cfg.fused_bi_unpermute``); other cases
+Enabled by ``install()`` (``policy.megatron_cfg.fused_bi_unpermute``, default true); other cases
 (``probs`` given, a non-fp32 input, CPU) fall back to Megatron's function.
 """
 

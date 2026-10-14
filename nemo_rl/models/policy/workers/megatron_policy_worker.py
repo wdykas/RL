@@ -625,9 +625,9 @@ class MegatronPolicyWorkerImpl(
         enable_batch_invariant_mode(config)
         if config["megatron_cfg"].get("batch_invariant_mode") and config[
             "megatron_cfg"
-        ].get("fused_bi_unpermute", False):
-            # One Triton kernel for the AlltoAll batch-invariant unpermute
-            # (bitwise the same as Megatron's EP x top-k eager loop).
+        ].get("fused_bi_unpermute", True):
+            # One Triton kernel for the AlltoAll batch-invariant unpermute, bitwise
+            # Megatron's EP x top-k eager loop (fused_bi_unpermute=false keeps the loop).
             from nemo_rl.models.megatron import bi_unpermute
 
             bi_unpermute.install()
