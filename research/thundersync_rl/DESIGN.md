@@ -1590,6 +1590,32 @@ forwards of unused drafts, multi-version (cohort) pools, the scorer path, variab
 approval). Not measured yet: acceptance/step time on a real MoE with K drafts (engine capacity is
 the price: `agent_multi_draft.md` §3).
 
+### 14d.0 When to use ⊥-BV (K > 1) and prompt drop (agent_tail.md, 2026-10-14)
+
+Measured on Nano L8 (complete drafts, 5 steps per arm):
+- The rejection tail after verify0 is 8.5 s at K = 1 and 0.00 s at K = 1.5 / 2 / 3; exact at every K.
+- But verify0 grew 1.5 → 13–17 s. ⊥ and near-⊥ drafts scan back to the root, and q rows were rebuilt per envelope in
+  small batches.
+- The shared-row scan (rows built once per chunk of 512 positions, across envelopes) is the fix. Re-measure before
+  using K > 1 for speed.
+
+Use K > 1 only when **both** hold:
+1. **The step is train-bound with near-full draft coverage**, i.e. the engine's idle window covers L·τ(K·B) before
+   θ_{k+1} exists (lanes, or a learner slower than generation).
+   - With one engine under sticky routing at Nano 8k/16k, generation binds, the best coverage is ≈ 0, and K changes
+     nothing.
+2. **The draft-side costs fit**:
+   - per-token draft τ ×1.2–1.7 (K 1.5–3, B 128 on 4 GPUs; ×1.3–2.4 at EP8, B 1024);
+   - engine slots ×K (Nano 210/258 MiB per row at 8k/16k; Ultra ~1.6 GB per row at 64k binds first);
+   - learner verify forward ×(drafts per output, 1.2–1.6).
+
+Then:
+- K 1.5 at 8k, 2 at 16k (v ≈ 1.1–1.5e-6) brings the rejection tail under 5% of a generation (Brownian model,
+  B 128, G 16).
+- Prompt drop with constant M (`null_bv_fixed_m` 1.75–2, K 2–2.5, a few spares) removes the residual tails that the
+  DP's forced M = 1 leaves at pool exhaustion; one envelope also means one scan per draft.
+- Defaults stay K = 1 (null_bv off) otherwise.
+
 ### 14d.1 Opt-in tail tools (off by default; `thundersync_work/research/agent_tail.md`)
 
 The defaults are unchanged: fixed G, the DP envelopes, and the standard GRPO estimator.
