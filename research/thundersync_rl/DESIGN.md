@@ -1350,7 +1350,9 @@ outside TE): experts (2 B bf16 + 4 B fp32 main grad + 2 B fp16 expert cache) × 
 EP=8, N=8: ≈ 90 GB; EP=4, N=8: ≈ 119 GB; EP=4, N=4: ≈ 167 GB (no activation headroom); EP=2, N=2: ≈ 320 GB.
 Engine rank (same TP/EP): 58.8 GB/E experts + 4.4 GB dense; per request slot SSM state 46 MiB + BI Mamba
 replay buffers 116 MiB (not yet in MCore's state accounting) + KV 6 KiB/token. Smallest layout without optimizer
-offload: EP=8 on 8 learner + 8 engine GPUs (`thundersync_work/sbatch/submit_nano.sh`). Scaling: every term is
+offload: EP=8 on 8 learner + 8 engine GPUs (`thundersync_work/sbatch/submit_nano.sh`). Measured on one 4-GPU node
+(2026-10-14): EP=2 2+2 with the optimizer offloaded to host builds the engine (~76 GB/GPU incl. CUDA graphs) but the
+learner runs out of memory (~188 GB) in its first forward at micro batch 8 × 2048 tokens; micro batch 1 untested. Scaling: every term is
 per-rank and divides by EP (experts) or is replicated per engine replica (Mamba/attention state, ∝ slots); none
 grows with the number of nodes.
 
