@@ -371,8 +371,8 @@ class SpeculativeGeneration:
         self.verifiers = groups
         self.verifier = groups[0]
         # Weights the engine drafts with (DESIGN.md 14f): "current" = theta_k;
-        # "momentum" = theta_hat_{k+1}, loaded by refit_draft_weights before the
-        # drafts start. Only q changes; engine-sourced q keeps verification exact.
+        # "momentum" = theta_hat_{k+1}, staged by stage_draft_weights and loaded
+        # by load_staged_draft_weights before the drafts start. Only q changes; engine-sourced q keeps verification exact.
         if draft_weights not in ("current", "momentum"):
             raise ValueError(f"unknown draft_weights {draft_weights!r}")
         if draft_weights != "current" and (
@@ -1004,7 +1004,7 @@ class SpeculativeGeneration:
         q of every token drafted at theta_k is recomputed from this stash at
         verification. Only versions that pending drafts were drafted with are kept.
         With momentum draft weights the drafting head was stashed by
-        ``refit_draft_weights`` (theta_k is not what drafted).
+        ``stage_draft_weights`` (theta_k is not what drafted).
         """
         if self.verify_mode != "block" or drafts is None:
             return
@@ -1012,9 +1012,15 @@ class SpeculativeGeneration:
             return
         self._stash_drafting_version()
 
-    def _stash_drafting_version(self) -> None:
-        """Stash the verifiers' live weights as version ``current_step``."""
+    def _stash_drafting_version(self, keep_previous: bool = False) -> None:
+        """Stash the verifiers' live weights as version ``current_step``.
+
+        ``keep_previous``: also keep version ``current_step - 1`` (its drafts
+        are not verified yet).
+        """
         keep = {self.current_step}
+        if keep_previous:
+            keep.add(self.current_step - 1)
         for cohort in self.cohorts.values():
             for d in cohort:
                 keep.update(v for v, _, _ in d["segments"])
@@ -1034,34 +1040,48 @@ class SpeculativeGeneration:
             ]
         )
 
-    def refit_draft_weights(self, refit: Callable[[], Any]) -> None:
-        """Refit the engine to the draft weights of the next step's drafts.
+    def stage_draft_weights(self, refit: Callable[[], Any]) -> None:
+        """Stage the draft weights of this step's drafts on the engine.
 
-        ``draft_weights=momentum``: the learner writes theta_hat_{k+1} (its
-        optimizer state's AdamW step with gradient 0) into its parameters, the
-        LM head of those weights is stashed as drafting version ``current_step``
-        (q rows at verification come from it and the engine's hidden states),
-        ``refit`` streams the parameters to the engine through the normal refit
-        path, and the learner restores theta_k bitwise. The caller guarantees
-        that the step's rollouts are done (the engine is idle) and that no
-        other learner call runs in between. The engine keeps these weights
-        until the next refit: drafting, the route check and the sticky
-        continuation rounds all run on them.
+        ``draft_weights=momentum``: theta_hat_{k+1} needs only the optimizer
+        state after step k-1's update (theta_k, m_k, v_k), so it is staged at
+        the top of step k, while the learner and the engine are idle between
+        the previous step's verification and this step's refit: the learner
+        writes theta_hat_{k+1} into its parameters (owned main shards, chunked),
+        the LM head of those weights is stashed as drafting version
+        ``current_step`` (q rows at verification come from it and the engine's
+        hidden states), ``refit`` streams the parameters to the engine through
+        the normal refit path, every engine rank copies its live weights into
+        its host staging buffer while the learner restores theta_k bitwise.
+        The caller then refits theta_k for this step's rollouts;
+        ``load_staged_draft_weights`` puts the staged weights back once those
+        rollouts are done, without the learner. The engine keeps them until the
+        next refit: drafting, the route check and the sticky continuation
+        rounds all run on them.
         """
         group = self.learner_policy.worker_group
+        engine = self.base._policy.worker_group
         t0 = time.perf_counter()
         loads = ray.get(
             group.run_all_workers_single_data("load_draft_weights", kind=self.draft_weights)
         )
+        stage_refs = None
         try:
             t1 = time.perf_counter()
-            self._stash_drafting_version()
+            # Drafts of version k-1 are still verified during this step's
+            # rollouts (chunked verification): keep their head.
+            self._stash_drafting_version(keep_previous=True)
             t2 = time.perf_counter()
             refit()
             t3 = time.perf_counter()
+            stage_refs = engine.run_all_workers_single_data("stage_engine_weights")
         finally:
+            # The learner's restore overlaps the engine's device -> host copy.
             restores = ray.get(group.run_all_workers_single_data("restore_training_weights"))
+            stages = ray.get(stage_refs) if stage_refs is not None else []
         t4 = time.perf_counter()
+        self._staged_version = self.current_step
+        self._staged_checksums = [x.get("checksum") for x in stages]
         changed = sum(x["draft/changed_elems"] for x in loads)
         total = sum(x["draft/shard_elems"] for x in loads)
         stats = {
@@ -1070,7 +1090,9 @@ class SpeculativeGeneration:
             "draft/load_gather_s": max(x["draft/gather_s"] for x in loads),
             "draft/stash_s": t2 - t1,
             "draft/refit_s": t3 - t2,
-            "draft/restore_s": t4 - t3,
+            "draft/stage_restore_s": t4 - t3,
+            "draft/engine_stage_s": max(x["stage_s"] for x in stages),
+            "draft/engine_stage_gb": max(x["stage_bytes"] for x in stages) / 2**30,
             "draft/restore_worker_s": max(x["draft/restore_s"] for x in restores),
             "draft/total_s": t4 - t0,
             "draft/peak_extra_gb": max(x["draft/peak_extra_bytes"] for x in loads) / 2**30,
@@ -1078,11 +1100,40 @@ class SpeculativeGeneration:
         }
         self.stats.update(stats)
         print(
-            f"[draft weights] {self.draft_weights} step={self.current_step} "
+            f"[draft weights] staged {self.draft_weights} step={self.current_step} "
             f"changed={int(changed)}/{int(total)} "
             + " ".join(f"{k}={v:.4g}" for k, v in stats.items()),
             flush=True,
         )
+
+    def load_staged_draft_weights(self) -> None:
+        """Engine: replace the live weights by the staged draft weights.
+
+        Called once this step's rollouts (sampled at theta_k) are done; each
+        engine rank copies its own host staging buffer into its parameters
+        (no learner, no collective). With ``THUNDERSYNC_MISMATCH_CHECK`` the
+        loaded weights' checksum must equal the staged one.
+        """
+        if getattr(self, "_staged_version", None) != self.current_step:
+            raise RuntimeError(
+                f"no draft weights staged for step {self.current_step} "
+                f"(staged: {getattr(self, '_staged_version', None)})"
+            )
+        t0 = time.perf_counter()
+        loads = ray.get(
+            self.base._policy.worker_group.run_all_workers_single_data(
+                "load_engine_weights"
+            )
+        )
+        sums = [x.get("checksum") for x in loads]
+        if sums != self._staged_checksums:
+            raise RuntimeError(
+                f"draft weights: engine checksums after load {sums} != staged "
+                f"{self._staged_checksums}"
+            )
+        self._staged_version = None
+        self.stats["draft/engine_load_s"] = time.perf_counter() - t0
+        self.stats["draft/engine_load_worker_s"] = max(x["load_s"] for x in loads)
 
     def _engine_q_filter(self, drafts):
         """Engine-sourced q: drop drafts the engine did not fully log (counted)."""

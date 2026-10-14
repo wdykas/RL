@@ -235,3 +235,73 @@ def restore_training(swap: DraftSwap) -> dict[str, float]:
     swap.optimizer.quantize_and_sync_model_params_from_main_params()
     torch.cuda.synchronize()
     return {"draft/restore_s": time.perf_counter() - t0}
+
+
+class EngineStage:
+    """Host staging copy of an engine rank's weights (the next drafting weights).
+
+    The draft weights are refit into the engine at the top of a step, copied
+    here, and replaced by the step's rollout weights; once the rollouts are
+    done ``load`` copies them back into the same parameter storage (CUDA graphs
+    keep pointing at it). Local to the rank: no collective, no learner. Costs
+    one pinned host copy of the rank's parameters (allocated once) and one
+    device -> host and one host -> device copy of them per step.
+    """
+
+    def __init__(self) -> None:
+        self._host: list[torch.Tensor] = []
+
+    @staticmethod
+    def _params(model) -> list[torch.Tensor]:
+        chunks = model if isinstance(model, (list, tuple)) else [model]
+        seen, out = set(), []
+        for chunk in chunks:
+            for p in chunk.parameters():
+                key = (p.data_ptr(), p.numel(), p.dtype)
+                if key not in seen:
+                    seen.add(key)
+                    out.append(p.data)
+        return out
+
+    @staticmethod
+    def _checksum(tensors: list[torch.Tensor]) -> float:
+        return float(sum(t.double().sum() for t in tensors))
+
+    @torch.no_grad()
+    def stage(self, model, checksum: bool = False) -> dict[str, float]:
+        """Copy the live parameters of ``model`` into the host staging buffers."""
+        t0 = time.perf_counter()
+        params = self._params(model)
+        if [(h.shape, h.dtype) for h in self._host] != [(p.shape, p.dtype) for p in params]:
+            pin = torch.cuda.is_available()
+            self._host = [
+                torch.empty(p.shape, dtype=p.dtype, device="cpu", pin_memory=pin)
+                for p in params
+            ]
+        for h, p in zip(self._host, params):
+            h.copy_(p, non_blocking=True)
+        if torch.cuda.is_available():
+            torch.cuda.current_stream().synchronize()
+        out = {
+            "stage_s": time.perf_counter() - t0,
+            "stage_bytes": float(sum(h.numel() * h.element_size() for h in self._host)),
+        }
+        if checksum:
+            out["checksum"] = self._checksum(params)
+        return out
+
+    @torch.no_grad()
+    def load(self, model, checksum: bool = False) -> dict[str, float]:
+        """Copy the staged weights back into the parameters of ``model``, in place."""
+        params = self._params(model)
+        if [(h.shape, h.dtype) for h in self._host] != [(p.shape, p.dtype) for p in params]:
+            raise RuntimeError("engine weights were not staged for this model")
+        t0 = time.perf_counter()
+        for h, p in zip(self._host, params):
+            p.copy_(h, non_blocking=True)
+        if torch.cuda.is_available():
+            torch.cuda.current_stream().synchronize()
+        out = {"load_s": time.perf_counter() - t0}
+        if checksum:
+            out["checksum"] = self._checksum(params)
+        return out

@@ -264,11 +264,14 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # the AdamW step of the optimizer state (theta_k, m_k, v_k) with gradient 0,
     # rounded to the parameter dtype: a closer proposal q (per-token Var log p/q
     # ~10-15x lower offline, ACCEPTANCE_LEDGER section T), verified exactly as
-    # before (q is the engine's logged law). The learner writes it into its
-    # parameters shard by shard, the engine refits once the step's rollouts are
-    # done (drafting starts then, not at draft_start_frac), and theta_k is
-    # restored bitwise; the engine keeps theta_hat until the next refit (sticky
-    # anchors and continuation rounds use it). Requires speculate,
+    # before (q is the engine's logged law). Staged at the top of step k (the
+    # state exists right after step k-1's update): the learner writes it into
+    # its parameters shard by shard, the engine receives it through the normal
+    # refit and keeps a host copy, theta_k is restored bitwise and refit for
+    # the rollouts; once the step's rollouts are done every engine rank copies
+    # the staged weights back (drafting starts then, not at draft_start_frac,
+    # and does not wait for the learner). The engine keeps theta_hat until the
+    # next refit (sticky anchors and continuation rounds use it). Requires speculate,
     # verify_mode=block, verify_source=engine, verify_on=learner,
     # draft_lookahead=1, no draft_after_verify, no fused_verify_train,
     # Megatron's distributed optimizer without the precision-aware optimizer.
@@ -1000,7 +1003,7 @@ async def _run_one_step(
     claim_anchors: Optional[
         Callable[[torch.Tensor, torch.Tensor], Optional[RouteRefs]]
     ] = None,
-    draft_refit: Optional[Callable[[], None]] = None,
+    draft_swap: Optional[Callable[[], None]] = None,
 ) -> dict[str, Any]:
     G = master_config.grpo.num_generations_per_prompt
     repeated = batch.repeat_interleave(G)
@@ -1066,9 +1069,6 @@ async def _run_one_step(
     # Fused verification + training: trajectories handed a retained forward,
     # and what the learner did with them.
     fused_counts = collections.Counter()
-    # Held by every learner dispatch and by the draft-weights refit, which
-    # swaps the learner's parameters and must not interleave with training.
-    learner_lock = asyncio.Lock()
 
     async def rollout(i: int):
         state, metrics = await run_sample_multi_turn_rollout(
@@ -1113,12 +1113,9 @@ async def _run_one_step(
                     ]
                     for chunks in d.per_rank
                 ]
-                async with learner_lock:
-                    t0 = time.perf_counter()
-                    rank_results = await asyncio.gather(
-                        *learner.submit(per_rank, d.closes)
-                    )
-                    t1 = time.perf_counter()
+                t0 = time.perf_counter()
+                rank_results = await asyncio.gather(*learner.submit(per_rank, d.closes))
+                t1 = time.perf_counter()
                 pipeline_calls += max(
                     (r.get("num_calls", 0) for r in rank_results), default=0
                 )
@@ -1144,18 +1141,15 @@ async def _run_one_step(
         asyncio.create_task(pre_rollout()) if pre_rollout is not None else None
     )
     draft_start_frac = ts_cfg.draft_start_frac
-    if draft_refit is not None and drafter is not None:
-        # Draft weights other than theta_k: the engine refits once every
-        # rollout of this step (sampled at theta_k) is done, between learner
-        # dispatches (the learner's parameters are swapped meanwhile).
+    if draft_swap is not None and drafter is not None:
+        # Draft weights other than theta_k (staged on the engine at the top of
+        # the step): the engine loads them once every rollout of this step
+        # (sampled at theta_k) is done; engine-local, the learner keeps training.
         draft_start_frac = 1.0
         draft_after = drafter
 
         async def drafter():
-            if verify_task is not None:
-                await verify_task
-            async with learner_lock:
-                await asyncio.to_thread(draft_refit)
+            await asyncio.to_thread(draft_swap)
             return await draft_after()
 
     learner_task = asyncio.create_task(learner_loop())
@@ -1393,8 +1387,20 @@ def thundersync_grpo_train(
             policy_generation.finish_generation()
             t_verify = time.perf_counter() - t1
             drafts = None
+        staged = (
+            spec is not None
+            and spec.draft_weights != "current"
+            and next_batch is not None
+            and step + 1 < max_steps
+        )
+        if staged:
+            # theta_hat_{step+1} needs only the state after the last update:
+            # stage it on the engine now, while learner and engine are idle.
+            spec.stage_draft_weights(
+                lambda: refit_policy_generation(policy, policy_generation, False)
+            )
         t_r = time.perf_counter()
-        if stale:
+        if stale or staged:
             refit_policy_generation(policy, policy_generation, False)
         else:
             policy_generation.prepare_for_generation()
@@ -1487,17 +1493,7 @@ def thundersync_grpo_train(
                 if spec is not None and ts_cfg.fused_verify_train
                 else None,
                 claim_anchors=spec.claim_anchors if sticky else None,
-                draft_refit=(
-                    (
-                        lambda: spec.refit_draft_weights(
-                            lambda: refit_policy_generation(
-                                policy, policy_generation, False
-                            )
-                        )
-                    )
-                    if spec is not None and spec.draft_weights != "current"
-                    else None
-                ),
+                draft_swap=spec.load_staged_draft_weights if staged else None,
             )
         )
         drafts = metrics.pop("_drafts")

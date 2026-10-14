@@ -43,7 +43,12 @@ from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.megatron_policy_worker import (
     MegatronPolicyWorkerImpl,
 )
-from thundersync_rl.draft_weights import DraftSwap, load_draft, restore_training
+from thundersync_rl.draft_weights import (
+    DraftSwap,
+    EngineStage,
+    load_draft,
+    restore_training,
+)
 from thundersync_rl.fused_train import (
     FusedGraph,
     FusedGraphStore,
@@ -363,6 +368,28 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         if swap is None:
             raise RuntimeError("no draft weights loaded")
         return restore_training(swap)
+
+    def stage_engine_weights(self) -> dict[str, float]:
+        """Engine rank: keep the live (draft) weights in host staging (``EngineStage``).
+
+        Called right after the draft weights were refit into this engine, before
+        the refit of the step's rollout weights; ``load_engine_weights`` puts
+        them back once the rollouts are done.
+        """
+        if getattr(self, "_engine_stage", None) is None:
+            self._engine_stage = EngineStage()
+        return self._engine_stage.stage(
+            self.model, checksum=bool(os.environ.get("THUNDERSYNC_MISMATCH_CHECK"))
+        )
+
+    def load_engine_weights(self) -> dict[str, float]:
+        """Engine rank: replace the live weights by the staged draft weights."""
+        stage = getattr(self, "_engine_stage", None)
+        if stage is None:
+            raise RuntimeError("load_engine_weights before stage_engine_weights")
+        return stage.load(
+            self.model, checksum=bool(os.environ.get("THUNDERSYNC_MISMATCH_CHECK"))
+        )
 
     def _log_mem(self, where: str) -> None:
         if os.environ.get("THUNDERSYNC_MEM_LOG"):

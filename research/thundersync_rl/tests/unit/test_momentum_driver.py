@@ -35,7 +35,7 @@ def _no_ray(monkeypatch):
     monkeypatch.setattr(spec_mod.ray, "get", lambda x: x)
 
 
-def _momentum_spec(order):
+def _momentum_spec(order, stage_sum=7.0, load_sum=7.0):
     return _spec(
         {
             "load_draft_weights": lambda kind: order.append(("load", kind)) or LOAD,
@@ -43,28 +43,66 @@ def _momentum_spec(order):
             "restore_training_weights": lambda: order.append(("restore",))
             or {"draft/restore_s": 0.05},
         },
-        base_handlers=ENGINE,
+        base_handlers={
+            **ENGINE,
+            "stage_engine_weights": lambda: order.append(("stage",))
+            or {"stage_s": 0.01, "stage_bytes": 2.0**31, "checksum": stage_sum},
+            "load_engine_weights": lambda: order.append(("engine load",))
+            or {"load_s": 0.02, "checksum": load_sum},
+        },
         verify_source="engine",
         draft_weights="momentum",
     )
 
 
-def test_refit_loads_stashes_refits_restores_in_order():
+def test_stage_loads_stashes_refits_stages_restores_in_order():
     order = []
     s = _momentum_spec(order)
     s.current_step = 5
-    s.refit_draft_weights(lambda: order.append(("refit",)))
-    # The drafting LM head is stashed while the draft weights are loaded, and the
-    # engine refit reads them; theta_k comes back last.
+    s.stage_draft_weights(lambda: order.append(("refit",)))
+    # The drafting LM head is stashed while the draft weights are loaded (the
+    # previous version stays: its drafts are verified during this step), the
+    # engine refit reads them and the engine keeps a host copy; theta_k is back
+    # before the caller refits it for the rollouts.
     assert order == [
         ("load", "momentum"),
-        ("stash", 5, [5]),
+        ("stash", 5, [4, 5]),
         ("refit",),
+        ("stage",),
         ("restore",),
     ]
     assert s.stats["draft/changed_frac"] == 0.75
     assert s.stats["draft/peak_extra_gb"] == 1.0
+    assert s.stats["draft/engine_stage_gb"] == 2.0
     assert s.stats["draft/restore_worker_s"] == 0.05
+    # After the rollouts: engine-local load, no learner call.
+    order.clear()
+    s.load_staged_draft_weights()
+    assert order == [("engine load",)]
+    assert s.stats["draft/engine_load_worker_s"] == 0.02
+
+
+def test_staged_weights_belong_to_this_step_and_load_once():
+    order = []
+    s = _momentum_spec(order)
+    with pytest.raises(RuntimeError, match="no draft weights staged"):
+        s.load_staged_draft_weights()
+    s.current_step = 2
+    s.stage_draft_weights(lambda: None)
+    s.current_step = 3
+    with pytest.raises(RuntimeError, match="no draft weights staged for step 3"):
+        s.load_staged_draft_weights()
+    s.current_step = 2
+    s.load_staged_draft_weights()
+    with pytest.raises(RuntimeError, match="no draft weights staged"):
+        s.load_staged_draft_weights()
+
+
+def test_engine_checksum_mismatch_fails():
+    s = _momentum_spec([], stage_sum=7.0, load_sum=8.0)
+    s.stage_draft_weights(lambda: None)
+    with pytest.raises(RuntimeError, match="checksums after load"):
+        s.load_staged_draft_weights()
 
 
 def test_refit_failure_still_restores_training_weights():
@@ -75,8 +113,9 @@ def test_refit_failure_still_restores_training_weights():
         raise RuntimeError("refit failed")
 
     with pytest.raises(RuntimeError, match="refit failed"):
-        s.refit_draft_weights(refit)
+        s.stage_draft_weights(refit)
     assert order[-1] == ("restore",)
+    assert ("stage",) not in order
 
 
 def test_score_prev_keeps_the_momentum_stash():

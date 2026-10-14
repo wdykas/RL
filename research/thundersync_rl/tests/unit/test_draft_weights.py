@@ -212,3 +212,25 @@ def test_distopt_draft_sharded_two_ranks(tp, ep):
         capture_output=True, text=True, timeout=600,
     )
     assert out.returncode == 0 and "MULTIRANK OK" in out.stdout, out.stdout[-3000:] + out.stderr[-3000:]
+
+
+def test_engine_stage_round_trip_keeps_parameter_storage():
+    from thundersync_rl.draft_weights import EngineStage
+
+    model = torch.nn.Sequential(torch.nn.Linear(4, 3), torch.nn.Linear(3, 2))
+    shared = torch.nn.ModuleList([model, model])  # chunks sharing parameters
+    draft = [p.detach().clone() for p in model.parameters()]
+    ptrs = [p.data_ptr() for p in model.parameters()]
+    stage = EngineStage()
+    st = stage.stage(shared, checksum=True)
+    assert st["stage_bytes"] == sum(p.numel() * 4 for p in model.parameters())
+    with torch.no_grad():
+        for p in model.parameters():
+            p.add_(1.0)  # the rollout weights replace the draft weights
+    ld = stage.load(shared, checksum=True)
+    assert ld["checksum"] == st["checksum"]
+    assert [p.data_ptr() for p in model.parameters()] == ptrs
+    for p, d in zip(model.parameters(), draft):
+        assert torch.equal(p, d)
+    with pytest.raises(RuntimeError, match="not staged"):
+        EngineStage().load(model)
