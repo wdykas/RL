@@ -1,8 +1,11 @@
-# Arm "sync": synchronous GRPO, speculation off. Every rollout of step k is generated at theta_k, then
-# the learner trains on the whole batch (thundersync.granularity=batch: the batch-synchronous loop of
-# run_thundersync_grpo.py, same learner/engine/metrics as the ThunderSync arms). Exact on-policy.
+# Arm "sync": NeMo-RL's standard synchronous GRPO (nemo_rl.algorithms.grpo.grpo_train via
+# run_ab_baseline.py) with the learner and the Megatron engine COLOCATED on the same GPUs: every
+# rollout of step k is generated at theta_k, then the same GPUs train on the whole batch. Exact
+# on-policy; no GPU idles while the other phase runs. Same exact-numerics recipe, data, caps and G
+# as every other arm (ab_base.yaml); the job is sized to one side's layout (submit_ab.sh).
 defaults: ab_base.yaml
 
-thundersync:
-  granularity: batch
-  speculate: false
+policy:
+  generation:
+    colocated:
+      enabled: true

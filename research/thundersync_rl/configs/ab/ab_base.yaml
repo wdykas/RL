@@ -28,7 +28,7 @@ policy:
     name: ${policy.model_name}
     chat_template_kwargs:
       enable_thinking: true
-  max_total_sequence_length: 16384
+  max_total_sequence_length: 8192  # first A/B pass; 16384 / 32768 via submit_ab.sh MAXLEN
   train_micro_batch_size: 1
   logprob_batch_size: 1
   make_sequence_length_divisible_by: 128
@@ -63,6 +63,10 @@ policy:
       enable_prefix_caching: false  # sticky routing forbids it; off on every arm for parity
       materialize_only_last_token_logits: true
       async_sched_mode: async
+      # Progress line every 60 s on engine rank 0 (requests, tokens, tok/s) and a stall watchdog:
+      # a busy engine rank without progress for 10 min dumps all stacks and exits non-zero.
+      progress_log_interval_s: 60
+      stall_timeout_s: 600
 
 data:
   max_input_seq_length: 2048
