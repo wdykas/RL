@@ -28,6 +28,7 @@ import asyncio
 import functools
 import os
 import time
+import zlib
 from contextlib import nullcontext
 from typing import Any, Optional
 
@@ -447,8 +448,16 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             return getattr(self, method)(**kwargs)
         finally:
             self._ordered_next += 1
+            # What this rank ran, in order (``ordered_digest``).
+            self._ordered_crc = zlib.crc32(
+                f"{seq}:{method};".encode(), getattr(self, "_ordered_crc", 0)
+            )
             async with cv:
                 cv.notify_all()
+
+    def ordered_digest(self) -> tuple[int, int]:
+        """(ordered calls run, crc32 of their (number, method) sequence) on this rank."""
+        return getattr(self, "_ordered_next", 0), getattr(self, "_ordered_crc", 0)
 
     def engine_step_stats(self) -> dict[str, float]:
         """Engine rank (debug, ``THUNDERSYNC_ENGINE_PROF``): step timing since the last call."""

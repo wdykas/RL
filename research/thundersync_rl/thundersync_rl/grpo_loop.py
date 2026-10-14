@@ -1720,6 +1720,14 @@ def thundersync_grpo_train(
             ))
         )
         t_refit = refit_s[0]
+        if tails is not None:
+            # Every learner rank ran the same ordered calls in the same order.
+            digests = ray.get(
+                policy.worker_group.run_all_workers_single_data("ordered_digest")
+            )
+            if len(set(map(tuple, digests))) != 1:
+                raise RuntimeError(f"learner ranks ran different call sequences: {digests}")
+            metrics["learner/ordered_calls"] = float(digests[0][0])
         if tails_s:
             # Continuation rounds, overlapped with this step's training.
             metrics["time/tails"] = tails_s[0]
