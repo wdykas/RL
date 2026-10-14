@@ -307,3 +307,68 @@ def test_rows_without_a_plan_take_the_plain_path_and_unfinished_plans_fail_loud(
     s._row_plans[0] = Plan(-1, [4], [-0.1], row=0)
     with pytest.raises(RuntimeError, match="unfinished"):
         s.replay_row(0)
+
+
+@pytest.mark.parametrize("env_max_seq_len", [64, 20])
+def test_turn_ending_at_the_cap_and_rollout_ends_at_max_turns_or_truncation(
+    env_max_seq_len,
+):
+    """A turn that ends at the per-turn cap (no EOS) goes to the environment;
+    the rollout ends after max_turns turns, or right away when the
+    observation reaches the total-length cap (truncated)."""
+    turn1 = list(range(10, 26))  # 16 tokens = the per-turn cap, no EOS
+    engine = _Engine(
+        [
+            [(turn1, True, [-0.1] * 16, 2 + 15)],
+            [([6, EOD], True, [-0.2] * 2, 20 + 1)],  # turn 2 from prompt + turn 1 + obs
+        ]
+    )
+    results = [(16, 99), (2, 99)]
+
+    def verify(rows, prompt_lens, engine_logq, anchors, **_):
+        a, y = results.pop(0)
+        return [
+            (
+                0,
+                {
+                    "accepted": a,
+                    "next": y,
+                    "logprobs": [-1.0] * (a + 1),
+                    "draft_logq": engine_logq[0][:a],
+                },
+            )
+        ]
+
+    s = make_spec(
+        {"verify_drafts_block_engine": verify},
+        base_handlers=engine.handlers(),
+        verify_source="engine",
+        hidden_transport="driver",
+        sticky_delta=0.03,
+    )
+    env = _Env()
+    s.turn_env = TurnEnvironment(
+        _Tokenizer(), {"toy": env}, max_seq_len=env_max_seq_len, max_turns=2
+    )
+    prompt = torch.tensor([1, 2])
+    drafts = asyncio.run(s.draft_streaming([prompt]))()
+    s.current_step = 1
+    s.bind_rows(_rows(prompt))
+    asyncio.run(s.verify_sticky(drafts))
+    plan = s._row_plans[0]
+    state, metrics, _ = s.replay_row(0)
+    if env_max_seq_len == 20:
+        # 2 + 16 + 2 observation tokens reach the cap: truncated, no turn 2.
+        assert len(env.calls) == 1 and len(engine.started) == 1
+        assert (
+            plan.prefix == turn1 and metrics["truncated"] and metrics["turn_count"] == 1
+        )
+        assert not metrics["max_turns_reached"]
+    else:
+        assert len(env.calls) == 2 and [p for p, _, _ in engine.started[1:]] == [
+            [[1, 2, *turn1, 50, 51]]
+        ]
+        assert plan.prefix == [*turn1, 50, 51, 6, EOD]
+        assert metrics["turn_count"] == 2 and metrics["max_turns_reached"]
+        assert not metrics["terminated"] and not metrics["truncated"]
+        assert plan.anchors.length == 2 + 20

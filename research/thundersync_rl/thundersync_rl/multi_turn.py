@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import time
 from dataclasses import dataclass
 from typing import Any, Union
 
@@ -86,6 +87,8 @@ class TurnEnvironment:
         self.max_turns = int(max_turns)
         self.rows: list[dict[str, Any]] = []
         self.steps = 0
+        # Wall time inside environment steps (summed over concurrent steps).
+        self.env_s = 0.0
 
     def bind(self, rows: list[dict[str, Any]]) -> None:
         for i, row in enumerate(rows):
@@ -159,7 +162,9 @@ class TurnEnvironment:
             }
         )
         # calculate_rewards blocks on the environment actors.
+        t0 = time.perf_counter()
         out = await asyncio.to_thread(calculate_rewards, batch, self.task_to_env)
+        self.env_s += time.perf_counter() - t0
         self.steps += 1
         if isinstance(out.rewards, dict):
             record.reward = {k: float(r[0].item()) for k, r in out.rewards.items()}
