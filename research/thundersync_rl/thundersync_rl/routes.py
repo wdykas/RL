@@ -30,169 +30,397 @@ drafted tokens and position P+g-1 only for a bonus token after the draft.
 
 Dense anchor tensors are [positions, num_moe_layers, topk] int16 with -1 for
 "no anchor" (self). That is also the layout of NeMo RL's ``routed_experts``
-training field per row (``router_replay.py``).
+training field per row (``router_replay.py``), restricted to a pipeline
+stage's layers on the learner.
+
+Transport: the engine rank that logged a draft puts its dense routes in the
+object store in position blocks (``put_routes``); the driver holds only block
+handles and the logged-prefix length (``RouteRefs``); each learner rank
+fetches the blocks of its own pipeline stage's layers (``fetch_anchors``).
 """
 
 from __future__ import annotations
 
 import threading
-from typing import Any, Optional, Sequence
+from collections import deque
+from dataclasses import dataclass, field, replace
+from typing import Any, Callable, Optional, Sequence
 
+import numpy as np
 import torch
 
 NO_ANCHOR = -1
 ROUTE_DTYPE = torch.int16
+# Positions per object-store block of a draft's routes. The learner fetches
+# whole blocks, so this bounds what it pulls beyond a truncated draft's kept
+# positions; 4096 positions are 7 MB at 40 MoE layers x top-22 (int16).
+ROUTE_BLOCK_POSITIONS = 4096
+
+
+class _KeyRoutes:
+    """Dense host routes of one draft key: rows [cap, L, K] and a logged mask."""
+
+    def __init__(self, shape: tuple[int, int]):
+        self.rows = np.full((0, *shape), NO_ANCHOR, dtype=np.int16)
+        self.logged = np.zeros(0, dtype=bool)
+
+    def write(self, pos: np.ndarray, rows: np.ndarray) -> None:
+        need = int(pos.max()) + 1
+        if need > self.logged.shape[0]:
+            cap = max(need, 2 * self.logged.shape[0], 256)
+            grown = np.full((cap, *self.rows.shape[1:]), NO_ANCHOR, dtype=np.int16)
+            grown[: self.rows.shape[0]] = self.rows
+            mask = np.zeros(cap, dtype=bool)
+            mask[: self.logged.shape[0]] = self.logged
+            self.rows, self.logged = grown, mask
+        # Duplicate positions in one write (an eviction recomputed them) carry
+        # bitwise-equal routes under batch invariance: any of them may win.
+        self.rows[pos] = rows
+        self.logged[pos] = True
+
+    def complete(self) -> int:
+        """Number of leading positions logged (positions 0..complete-1)."""
+        missing = np.flatnonzero(~self.logged)
+        return int(missing[0]) if missing.size else int(self.logged.shape[0])
+
+    def extent(self) -> int:
+        """One past the last logged position."""
+        hit = np.flatnonzero(self.logged)
+        return int(hit[-1]) + 1 if hit.size else 0
 
 
 class RouteLog:
     """Engine side: routes of tagged requests by (key, absolute position).
 
-    ``record(entries, rows)``: ``rows`` [n, L_local, K] is this forward's
-    route buffer (GPU, its first n local token rows); each entry
-    ``(row, key, pos)`` stores ``rows[row]`` as position ``pos`` of ``key``.
-    The copy to pinned host memory is asynchronous (one copy per forward,
-    ordered on the current stream before the next forward overwrites the
-    buffer). ``pop(key)`` returns (positions [m] int64, routes [m, L_local, K])
-    sorted by position, waiting for the copies it needs; the key is then
-    closed (later rows are dropped). A position recorded twice (an engine
-    eviction recomputes it) keeps the latest row: under batch invariance it
-    is bitwise the same route.
+    ``record(rows, sel, kid, pos)`` runs once per engine forward: ``rows``
+    [n, L_local, K] is the forward's route buffer (device), ``sel`` the rows of
+    tagged tokens, ``kid`` / ``pos`` their key ids (``key_id``) and absolute
+    positions (numpy arrays). It gathers the tagged rows on the device (the
+    index reaches the device from pinned memory without blocking), enqueues
+    one asynchronous copy into a pinned staging ring and records an event: no
+    host-device synchronization and no Python per token, so it neither stalls
+    the forward it follows nor breaks asynchronous scheduling. Staged rows move
+    into each key's dense host buffer (one vectorized scatter per key per
+    forward) once their copy has completed: at later records when the event
+    has fired, and at ``pop``. ``pop(key)`` returns (complete, routes
+    [extent, L_local, K] int16, -1 where unlogged), where positions
+    0..complete-1 are all logged; the key is then closed (later rows are
+    dropped). A position recorded twice (an engine eviction recomputes it)
+    keeps one of its rows: under batch invariance they are bitwise equal.
     """
 
-    def __init__(self, chunk_rows: int = 65536):
-        self.chunk_rows = chunk_rows
+    def __init__(self, ring_rows: int = 65536, drain_every: int = 64):
+        self.ring_rows = ring_rows
+        self.drain_every = drain_every
         self._lock = threading.Lock()
-        self._rows: dict[str, dict[int, tuple[list, int]]] = {}
-        self._closed: set[str] = set()
-        self._cur: Optional[list] = None  # [buffer, used, live, event]
+        self._ids: dict[str, int] = {}
+        self._closed: set[int] = set()
+        self._keys: dict[int, _KeyRoutes] = {}
+        self._ring: Optional[torch.Tensor] = None
+        self._head = 0
+        self._pending: deque = deque()  # (start, m, kid, pos, event)
         self.recorded = 0
 
-    def _alloc(self, k: int, like: torch.Tensor) -> tuple[list, int]:
-        cur = self._cur
-        if cur is None or cur[1] + k > cur[0].shape[0] or cur[0].shape[1:] != like.shape[1:]:
-            n = max(self.chunk_rows, k)
-            buf = torch.empty(
-                (n, *like.shape[1:]), dtype=ROUTE_DTYPE, pin_memory=like.is_cuda
+    def key_id(self, key: str) -> int:
+        with self._lock:
+            kid = self._ids.get(key)
+            if kid is None:
+                kid = self._ids[key] = len(self._ids)
+            return kid
+
+    def is_closed(self, kid: int) -> bool:
+        return kid in self._closed
+
+    def _stage(self, m: int, like: torch.Tensor) -> int:
+        """Start row of m free staging rows (drains what the reuse overwrites)."""
+        shape = tuple(like.shape[1:])
+        if self._ring is None or tuple(self._ring.shape[1:]) != shape or m > self._ring.shape[0]:
+            self._drain(force=True)
+            self._ring = torch.empty(
+                (max(self.ring_rows, m), *shape), dtype=ROUTE_DTYPE, pin_memory=like.is_cuda
             )
-            cur = self._cur = [buf, 0, 0, None]
-        off = cur[1]
-        cur[1] += k
-        return cur, off
+            self._head = 0
+        if self._head + m > self._ring.shape[0]:
+            self._head = 0
+        lo, hi = self._head, self._head + m
+        # Rows still staged in [lo, hi) must reach their keys first. Their
+        # forwards ran a whole ring ago, so the wait is normally zero.
+        while self._pending and any(
+            s < hi and lo < s + n for s, n, *_ in self._pending
+        ):
+            self._move(self._pending.popleft(), wait=True)
+        self._head = hi
+        return lo
 
-    def record(self, entries: list[tuple[int, str, int]], rows: torch.Tensor) -> None:
+    def record(
+        self, rows: torch.Tensor, sel: np.ndarray, kid: np.ndarray, pos: np.ndarray
+    ) -> None:
+        m = int(sel.shape[0])
+        if m == 0:
+            return
         with self._lock:
-            entries = [e for e in entries if e[1] not in self._closed]
-            if not entries:
+            start = self._stage(m, rows)
+            idx = torch.from_numpy(np.ascontiguousarray(sel, dtype=np.int64))
+            if rows.is_cuda:
+                idx = idx.pin_memory().to(rows.device, non_blocking=True)
+            picked = rows.index_select(0, idx).to(ROUTE_DTYPE)
+            self._ring[start : start + m].copy_(picked, non_blocking=rows.is_cuda)
+            event = None
+            if rows.is_cuda:
+                event = torch.cuda.Event()
+                event.record()
+            self._pending.append((start, m, np.asarray(kid), np.asarray(pos), event))
+            self.recorded += m
+            if len(self._pending) >= self.drain_every:
+                self._drain(force=False)
+
+    def _drain(self, force: bool) -> None:
+        while self._pending:
+            ev = self._pending[0][4]
+            if not force and ev is not None and not ev.query():
                 return
-            idx = torch.tensor([r for r, _, _ in entries], device=rows.device)
-            sel = rows.index_select(0, idx).to(ROUTE_DTYPE)
-            chunk, off = self._alloc(len(entries), sel)
-            chunk[0][off : off + len(entries)].copy_(sel, non_blocking=sel.is_cuda)
-            if sel.is_cuda:
-                ev = torch.cuda.Event()
-                ev.record()
-                chunk[3] = ev
-            for j, (_, key, pos) in enumerate(entries):
-                slots = self._rows.setdefault(key, {})
-                old = slots.get(pos)
-                if old is not None:
-                    old[0][2] -= 1
-                slots[pos] = (chunk, off + j)
-                chunk[2] += 1
-            self.recorded += len(entries)
+            self._move(self._pending.popleft(), wait=True)
 
-    def pop(self, key: str) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+    def _move(self, item, wait: bool) -> None:
+        start, m, kid, pos, event = item
+        if event is not None and wait:
+            event.synchronize()
+        rows = self._ring[start : start + m].numpy()
+        order = np.argsort(kid, kind="stable")
+        kid_sorted = kid[order]
+        bounds = np.flatnonzero(np.diff(kid_sorted)) + 1
+        for grp in np.split(order, bounds):
+            k = int(kid[grp[0]])
+            if k in self._closed:
+                continue
+            dst = self._keys.get(k)
+            if dst is None:
+                dst = self._keys[k] = _KeyRoutes(rows.shape[1:])
+            dst.write(pos[grp], rows[grp])
+
+    def pop(self, key: str) -> Optional[tuple[int, torch.Tensor]]:
         with self._lock:
-            self._closed.add(key)
-            slots = self._rows.pop(key, {})
-            if not slots:
+            kid = self._ids.get(key)
+            if kid is None:
+                kid = self._ids[key] = len(self._ids)
+            self._drain(force=True)
+            self._closed.add(kid)
+            dense = self._keys.pop(kid, None)
+            if dense is None:
                 return None
-            for chunk, _ in slots.values():
-                chunk[2] -= 1
-            for ev in {id(c[0]): c[0][3] for c in slots.values()}.values():
-                if ev is not None:
-                    ev.synchronize()
-            pos = sorted(slots)
-            rows = torch.stack([slots[p][0][0][slots[p][1]] for p in pos])
-            return torch.tensor(pos, dtype=torch.long), rows.clone()
+            n = dense.extent()
+            return dense.complete(), torch.from_numpy(dense.rows[:n].copy())
 
-    def live_rows(self) -> int:
+    def live_keys(self) -> int:
         with self._lock:
-            return sum(len(s) for s in self._rows.values())
+            return len(self._keys)
 
 
-def step_route_entries(
-    token_request_idx: Sequence[int],
-    token_pos: Sequence[int],
-    request_key: dict[int, str],
-    local_start: int,
-    local_count: int,
-) -> list[tuple[int, str, int]]:
-    """(local row, key, absolute position) of the tagged tokens of one forward.
+class SlotTags:
+    """Key id of each engine context slot's request (-1: untagged).
 
-    ``token_request_idx[j]`` / ``token_pos[j]``: context slot and absolute
-    position of the step's token j (unpadded tokens only);
-    ``request_key[slot]``: draft key of tagged slots. This rank's router saw
-    tokens ``local_start .. local_start + local_count - 1`` (sequence
-    parallelism shards the padded token axis contiguously across TP ranks;
-    without it, all tokens).
+    ``refresh(request_ids, fresh)`` is called once per forward with the
+    context's per-slot request ids and a mask of slots whose request may be
+    new (in prefill); it looks up only slots whose request id changed or
+    that are fresh, so its Python work is per new request, not per token.
+    ``lookup(rid)`` returns the draft key of a request, or None.
+    """
+
+    def __init__(self, lookup: Callable[[int], Optional[str]], key_id: Callable[[str], int]):
+        self.lookup = lookup
+        self.key_id = key_id
+        self.rid = np.full(0, -1, dtype=np.int64)
+        self.kid = np.full(0, -1, dtype=np.int64)
+
+    def refresh(self, request_ids: np.ndarray, fresh: np.ndarray) -> np.ndarray:
+        n = int(request_ids.shape[0])
+        if n > self.rid.shape[0]:
+            grow = n - self.rid.shape[0]
+            self.rid = np.concatenate([self.rid, np.full(grow, -1, dtype=np.int64)])
+            self.kid = np.concatenate([self.kid, np.full(grow, -1, dtype=np.int64)])
+        rid = request_ids.astype(np.int64)
+        for slot in np.flatnonzero((rid != self.rid[:n]) | fresh):
+            key = self.lookup(int(rid[slot])) if rid[slot] >= 0 else None
+            self.kid[slot] = -1 if key is None else self.key_id(key)
+        self.rid[:n] = rid
+        return self.kid[:n]
+
+
+def step_route_selection(
+    token_slots: np.ndarray, token_pos: np.ndarray, slot_kid: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(rows, key ids, positions) of the tagged tokens of one forward.
+
+    ``token_slots[j]`` / ``token_pos[j]``: context slot and absolute position
+    of the step's token j (unpadded tokens); ``slot_kid[slot]``: key id of
+    tagged slots, -1 otherwise. Vectorized (no Python per token).
+    """
+    kid = slot_kid[token_slots]
+    sel = np.flatnonzero(kid >= 0)
+    return sel, kid[sel], token_pos[sel]
+
+
+# ---- Transport: route blocks in the object store, handles on the driver ----
+
+
+@dataclass
+class RouteBlock:
+    """Object-store handle of one engine rank's routes of a draft.
+
+    ``ref``: ObjectRef of an int16 tensor [rows, len(layers), K] holding the
+    routes of positions lo, lo+1, ... (-1 where unlogged); only positions
+    below ``hi`` belong to the draft (a truncated draft keeps the block with a
+    smaller ``hi``). ``layers``: the global MoE layer numbers of its columns
+    (one pipeline stage's layers).
+    """
+
+    ref: Any
+    layers: tuple[int, ...]
+    lo: int
+    hi: int
+    nbytes: int
+
+
+@dataclass
+class RouteRefs:
+    """A draft's anchors as object-store block handles (sticky routing).
+
+    Draft tuple index 8 and ``Plan.anchors``. Positions 0..length-1 are the
+    row's anchored positions (later ones: self); positions 0..complete-1 are
+    logged at every MoE layer. The driver only holds these handles and two
+    integers; each learner rank fetches the blocks of its own layers
+    (``fetch_anchors``). Blocks later in the list take precedence where they
+    are logged (a continuation round's log over an earlier one: equal where
+    both are set, see ``splice_refs``).
+    """
+
+    blocks: list[RouteBlock] = field(default_factory=list)
+    length: int = 0
+    complete: int = 0
+
+    @property
+    def nbytes(self) -> int:
+        return sum(b.nbytes for b in self.blocks)
+
+    def truncate(self, n: int) -> "RouteRefs":
+        """The anchors of the first n positions (block handles shared)."""
+        n = min(n, self.length)
+        return RouteRefs(
+            [replace(b, hi=min(b.hi, n)) for b in self.blocks if b.lo < n],
+            n,
+            min(self.complete, n),
+        )
+
+
+def put_routes(
+    rows: torch.Tensor,
+    put: Callable[[Any], Any],
+    block_positions: int = ROUTE_BLOCK_POSITIONS,
+) -> list[tuple[Any, int, int, int]]:
+    """Engine side: one draft's dense routes [n, L, K] into the object store.
+
+    One object per ``block_positions`` positions. Returns [(ref, lo, hi,
+    bytes)] per block, the only thing sent to the driver.
     """
     out = []
-    hi = min(len(token_request_idx), local_start + local_count)
-    for j in range(max(local_start, 0), hi):
-        key = request_key.get(int(token_request_idx[j]))
-        if key is not None:
-            out.append((j - local_start, key, int(token_pos[j])))
+    for lo in range(0, int(rows.shape[0]), block_positions):
+        b = rows[lo : lo + block_positions].contiguous()
+        out.append((put(b), lo, lo + int(b.shape[0]), b.numel() * b.element_size()))
     return out
 
 
-def merge_route_parts(
-    parts: Sequence[tuple[Sequence[int], torch.Tensor, torch.Tensor]],
-    num_positions: int,
-    layer_numbers: Optional[Sequence[int]] = None,
-) -> tuple[torch.Tensor, list[int]]:
-    """Dense anchors [num_positions, L, K] from per-rank route logs of one draft.
+def merge_route_refs(
+    parts: Sequence[tuple[Sequence[int], int, Sequence[tuple]]],
+    length: int,
+    all_layers: Sequence[int],
+) -> RouteRefs:
+    """A draft's ``RouteRefs`` from the parts every engine rank returned.
 
-    ``parts``: (layer numbers, positions [m], routes [m, len(layers), K]) per
-    engine rank that logged this draft (pipeline stages hold different
-    layers; sequence-parallel TP ranks hold different positions). Columns are
-    the union of layer numbers in ascending order (``layer_numbers`` fixes
-    them). Missing entries are ``NO_ANCHOR``. Returns (anchors, layers).
+    ``parts``: (layer numbers, logged prefix, [(ref, lo, hi, bytes)]) per
+    engine rank that logged the draft (pipeline stages hold different
+    layers). Positions are complete where every layer of ``all_layers`` is
+    logged: the minimum logged prefix over the stages, 0 if a stage is
+    missing.
     """
-    if layer_numbers is None:
-        layer_numbers = sorted({int(x) for p in parts for x in p[0]})
-    col = {ln: j for j, ln in enumerate(layer_numbers)}
-    k = next((int(p[2].shape[-1]) for p in parts if p[2].numel()), 1)
-    out = torch.full(
-        (num_positions, len(layer_numbers), k), NO_ANCHOR, dtype=ROUTE_DTYPE
+    blocks, prefix = [], {}
+    for layers, complete, blks in parts:
+        layers = tuple(int(x) for x in layers)
+        for ln in layers:
+            prefix[ln] = max(prefix.get(ln, 0), int(complete))
+        blocks += [
+            RouteBlock(ref, layers, int(lo), min(int(hi), length), int(nb))
+            for ref, lo, hi, nb in blks
+            if lo < length
+        ]
+    complete = min((prefix.get(int(ln), 0) for ln in all_layers), default=0)
+    return RouteRefs(blocks, length, min(complete, length))
+
+
+def splice_refs(prior: Optional[RouteRefs], new: RouteRefs) -> RouteRefs:
+    """Anchors of a longer row: ``new`` where logged, else ``prior``.
+
+    Both are plain-theta_n routes of the same prefix wherever both are set
+    (bitwise equal under batch invariance), so which one wins is immaterial.
+    ``prior`` must already be cut to the shared prefix. When ``new`` covers
+    all of ``prior``, ``prior``'s blocks are dropped (nothing to fetch twice).
+    """
+    if prior is None or new.complete >= prior.length:
+        return new
+    return RouteRefs(
+        prior.blocks + new.blocks, new.length, max(new.complete, prior.complete)
     )
-    for layers, pos, routes in parts:
-        if routes.numel() == 0:
+
+
+def fetch_anchors(
+    refs: Optional[RouteRefs],
+    layers: Sequence[int],
+    topk: Optional[int],
+    width: int,
+    get: Callable[[Any], Any],
+) -> torch.Tensor:
+    """Learner side: dense anchors [width, len(layers), K] of the given layers.
+
+    Fetches only blocks that hold some of ``layers`` (this rank's pipeline
+    stage) and some position below ``min(width, refs.length)``. Unlogged
+    entries and positions past the anchored length are -1 (self). ``topk``
+    None: taken from the first fetched block (1 if none is fetched).
+    """
+    col = {int(ln): j for j, ln in enumerate(layers)}
+    n_max = 0 if refs is None else min(width, refs.length)
+    out = None if topk is None else _no_anchors(width, len(layers), topk)
+    for b in refs.blocks if refs is not None else ():
+        hi = min(b.hi, n_max)
+        src = [j for j, ln in enumerate(b.layers) if ln in col]
+        if hi <= b.lo or not src:
             continue
-        keep = pos < num_positions
-        pos, routes = pos[keep], routes[keep]
-        cols = torch.tensor([col[int(x)] for x in layers], dtype=torch.long)
-        out[pos.unsqueeze(1), cols.unsqueeze(0)] = routes.to(ROUTE_DTYPE)
-    return out, list(layer_numbers)
+        rows = get(b.ref)[: hi - b.lo][:, src].to(ROUTE_DTYPE)
+        if out is None:
+            out = _no_anchors(width, len(layers), int(rows.shape[-1]))
+        dst = torch.tensor([col[b.layers[j]] for j in src], dtype=torch.long)
+        idx = rows.ge(0).all(-1).all(-1).nonzero().flatten()
+        out[(b.lo + idx).unsqueeze(1), dst.unsqueeze(0)] = rows[idx]
+    return _no_anchors(width, len(layers), 1) if out is None else out
+
+
+def _no_anchors(n: int, layers: int, topk: int) -> torch.Tensor:
+    return torch.full((n, layers, topk), NO_ANCHOR, dtype=ROUTE_DTYPE)
+
+
+def anchored_draft_length(complete: int, prompt_len: int, g: int) -> int:
+    """Longest m <= g whose drafted tokens all have their anchors.
+
+    Token i of the draft (0-based) is sampled from the forward of position
+    P+i-1, which depends on anchors 0..P+i-1. So m tokens need positions
+    0..P+m-2 complete, i.e. P+m-1 <= complete. (The bonus after m tokens
+    would need P+m-1 too; it is never sampled from an unanchored row: see
+    ``SpeculativeGeneration``.)
+    """
+    return max(0, min(g, complete - prompt_len + 1)) if complete >= prompt_len else 0
 
 
 def position_complete(anchors: torch.Tensor) -> torch.Tensor:
     """[N] bool: positions whose anchor is set at every layer."""
     return anchors.ge(0).all(-1).all(-1)
-
-
-def anchored_draft_length(anchors: torch.Tensor, prompt_len: int, g: int) -> int:
-    """Longest m <= g whose drafted tokens all have their anchors.
-
-    Token i of the draft (0-based) is sampled from the forward of position
-    P+i-1, which depends on anchors 0..P+i-1. So m tokens need positions
-    0..P+m-2 complete. (The bonus after m tokens would need P+m-1 too; it is
-    never sampled from an unanchored row: see ``SpeculativeGeneration``.)
-    """
-    ok = position_complete(anchors)
-    n_ok = int(ok.numel()) if bool(ok.all()) else int((~ok).nonzero()[0, 0])
-    # positions 0..n_ok-1 complete: m tokens need P+m-1 <= n_ok.
-    return max(0, min(g, n_ok - prompt_len + 1)) if n_ok >= prompt_len else 0
 
 
 def compare_anchors(anchors: torch.Tensor, ref: torch.Tensor) -> tuple[int, int]:
@@ -211,28 +439,3 @@ def compare_anchors(anchors: torch.Tensor, ref: torch.Tensor) -> tuple[int, int]
     r = torch.full_like(a, NO_ANCHOR)
     r[inside] = ref[pos[inside]].to(a.dtype).sort(-1).values
     return int(pos.numel()), int((a == r).all(-1).all(-1).sum())
-
-
-def splice(anchors: torch.Tensor, new: torch.Tensor) -> torch.Tensor:
-    """Anchors of a longer row: ``new`` where set, else the earlier ``anchors``.
-
-    Both are plain-theta_n routes of the same prefix wherever both are set
-    (bitwise equal under batch invariance), so which one wins is immaterial.
-    """
-    n = max(anchors.shape[0], new.shape[0])
-    out = torch.full((n, *new.shape[1:]), NO_ANCHOR, dtype=ROUTE_DTYPE)
-    out[: anchors.shape[0]] = anchors
-    seg = new.ge(0).all(-1).all(-1)
-    idx = seg.nonzero().flatten()
-    out[idx] = new[idx]
-    return out
-
-
-def no_anchor_rows(n: int, layers: int, topk: int) -> torch.Tensor:
-    return torch.full((n, layers, topk), NO_ANCHOR, dtype=ROUTE_DTYPE)
-
-
-def route_bytes(anchors: Optional[Any]) -> int:
-    if anchors is None:
-        return 0
-    return anchors.numel() * anchors.element_size()

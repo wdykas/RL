@@ -19,88 +19,182 @@ import itertools
 import math
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from thundersync_rl.block_verification import output_distribution_given_draft
 from thundersync_rl.routes import (
     RouteLog,
+    RouteRefs,
+    SlotTags,
     anchored_draft_length,
     compare_anchors,
-    merge_route_parts,
-    splice,
-    step_route_entries,
+    fetch_anchors,
+    merge_route_refs,
+    put_routes,
+    splice_refs,
+    step_route_selection,
 )
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
 
+def _sel(rows, keys, pos, log):
+    """record() arguments for (row, key, position) entries."""
+    return (
+        np.array(rows, dtype=np.int64),
+        np.array([log.key_id(k) for k in keys], dtype=np.int64),
+        np.array(pos, dtype=np.int64),
+    )
+
+
 @pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=cuda)])
 def test_route_log_keys_by_absolute_position(device):
-    log = RouteLog(chunk_rows=4)
+    log = RouteLog(ring_rows=4, drain_every=2)
     L, K = 3, 2
     # step 1: prefill of draft a (positions 0..2) and an untagged request
     rows = torch.arange(5 * L * K, device=device).view(5, L, K)
-    log.record([(0, "a", 0), (1, "a", 1), (2, "a", 2)], rows)
-    # step 2: decode of a (position 3) at row 1; b at row 0
+    log.record(rows, *_sel([0, 1, 2], "aaa", [0, 1, 2], log))
+    # step 2: decode of a (position 3) at row 1; b at row 0 (ring wraps)
     rows2 = 100 + torch.arange(2 * L * K, device=device).view(2, L, K)
-    log.record([(1, "a", 3), (0, "b", 7)], rows2)
+    log.record(rows2, *_sel([1, 0], "ab", [3, 7], log))
     # an eviction recomputes position 1: overwrite
     rows3 = 200 + torch.arange(L * K, device=device).view(1, L, K)
-    log.record([(0, "a", 1)], rows3)
-    pos, r = log.pop("a")
-    assert pos.tolist() == [0, 1, 2, 3]
+    log.record(rows3, *_sel([0], "a", [1], log))
+    complete, r = log.pop("a")
+    assert complete == 4 and r.shape == (4, L, K) and r.dtype == torch.int16
     assert torch.equal(r[0], rows[0].cpu().to(r.dtype))
     assert torch.equal(r[1], rows3[0].cpu().to(r.dtype))
     assert torch.equal(r[3], rows2[1].cpu().to(r.dtype))
-    log.record([(0, "a", 9)], rows)  # closed: dropped
+    log.record(rows, *_sel([0], "a", [9], log))  # closed: dropped
     assert log.pop("a") is None
-    assert log.pop("b")[0].tolist() == [7]
-    assert log.live_rows() == 0
+    complete, r = log.pop("b")
+    assert complete == 0 and r.shape[0] == 8 and bool((r[:7] == -1).all())
+    assert torch.equal(r[7], rows2[0].cpu().to(r.dtype))
+    assert log.live_keys() == 0
 
 
-def test_step_entries_under_sequence_parallelism():
-    slots = [4, 4, 4, 9, 2, 2]
-    pos = [0, 1, 2, 30, 5, 6]
-    keys = {4: "a", 2: "b"}
-    full = step_route_entries(slots, pos, keys, 0, 6)
-    assert full == [(0, "a", 0), (1, "a", 1), (2, "a", 2), (4, "b", 5), (5, "b", 6)]
-    # padded token count 8 at TP=2: rank 0 routes tokens 0-3, rank 1 tokens 4-7
-    r0 = step_route_entries(slots, pos, keys, 0, 4)
-    r1 = step_route_entries(slots, pos, keys, 4, 4)
-    assert r0 == full[:3] and r1 == [(0, "b", 5), (1, "b", 6)]
+def test_route_log_record_has_no_python_per_token(monkeypatch):
+    """One record of many tagged tokens touches each key once (vectorized)."""
+    log = RouteLog(ring_rows=1 << 14)
+    n, L, K = 4096, 4, 2
+    rows = torch.arange(n * L * K, dtype=torch.int32).view(n, L, K) % 128
+    keys = [f"k{j % 8}" for j in range(n)]
+    pos = [j // 8 for j in range(n)]
+    calls = []
+    import thundersync_rl.routes as routes_mod
+
+    real = routes_mod._KeyRoutes.write
+
+    def counting(self, p, r):
+        calls.append(len(p))
+        return real(self, p, r)
+
+    monkeypatch.setattr(routes_mod._KeyRoutes, "write", counting)
+    log.record(rows, *_sel(range(n), keys, pos, log))
+    out = {k: log.pop(k) for k in sorted(set(keys))}
+    assert sorted(calls) == [n // 8] * 8
+    c, r = out["k3"]
+    assert c == n // 8 and torch.equal(r, rows[3::8].to(torch.int16))
 
 
-def test_merge_parts_from_pipeline_stages_and_sp_ranks():
+def test_slot_tags_look_up_only_new_requests():
+    looked = []
+
+    def lookup(rid):
+        looked.append(rid)
+        return {11: "a", 13: "b"}.get(rid)
+
+    ids = {}
+    tags = SlotTags(lookup, lambda k: ids.setdefault(k, len(ids)))
+    kid = tags.refresh(np.array([11, 12, 13]), np.array([True, True, True]))
+    assert kid.tolist() == [0, -1, 1] and looked == [11, 12, 13]
+    # decode steps: nothing new, nothing looked up
+    tags.refresh(np.array([11, 12, 13]), np.zeros(3, bool))
+    assert looked == [11, 12, 13]
+    # slot 1 gets a new request (fresh), slot 2 compacted onto slot 0
+    kid = tags.refresh(np.array([13, 11]), np.array([False, True]))
+    assert kid.tolist() == [1, 0] and looked[3:] == [13, 11]
+    # a reused request id in prefill is looked up again
+    kid = tags.refresh(np.array([13, 11]), np.array([False, True]))
+    assert looked[-1] == 11
+
+
+def test_step_selection():
+    slots = np.array([4, 4, 4, 9, 2, 2])
+    pos = np.array([0, 1, 2, 30, 5, 6])
+    slot_kid = np.full(10, -1)
+    slot_kid[4], slot_kid[2] = 0, 1
+    sel, kid, p = step_route_selection(slots, pos, slot_kid)
+    assert sel.tolist() == [0, 1, 2, 4, 5]
+    assert kid.tolist() == [0, 0, 0, 1, 1] and p.tolist() == [0, 1, 2, 5, 6]
+
+
+def _parts(dense_by_stage, block):
+    """pop_draft_routes parts: (layers, logged prefix, blocks) per stage."""
+    out = []
+    for layers, dense, complete in dense_by_stage:
+        out.append((layers, complete, put_routes(dense, lambda t: t, block)))
+    return out
+
+
+def test_route_refs_from_pipeline_stages_fetch_per_stage():
     K = 2
-    a = torch.tensor([[[1, 2]], [[3, 4]]], dtype=torch.int16)  # layer 1, positions 0,1
-    b = torch.tensor([[[5, 6], [7, 0]]], dtype=torch.int16)  # layers 3, 4, position 0
-    c = torch.tensor([[[8, 9], [1, 3]]], dtype=torch.int16)  # layers 3, 4, position 1
-    parts = [
-        ([1], torch.tensor([0, 1]), a),
-        ([3, 4], torch.tensor([0]), b),
-        ([3, 4], torch.tensor([1]), c),
+    a = torch.arange(10 * 1 * K, dtype=torch.int16).view(10, 1, K)  # layer 1
+    b = 100 + torch.arange(10 * 2 * K, dtype=torch.int16).view(10, 2, K)  # 3, 4
+    b[8:] = -1  # stage 2 logged positions 0..7 only
+    refs = merge_route_refs(
+        _parts([([1], a, 10), ([3, 4], b, 8)], block=4), 9, [1, 3, 4]
+    )
+    assert refs.length == 9 and refs.complete == 8
+    assert [(x.layers, x.lo, x.hi) for x in refs.blocks] == [
+        ((1,), 0, 4), ((1,), 4, 8), ((1,), 8, 9),
+        ((3, 4), 0, 4), ((3, 4), 4, 8), ((3, 4), 8, 9),
     ]
-    out, layers = merge_route_parts(parts, 3)
-    assert layers == [1, 3, 4] and out.shape == (3, 3, K)
-    assert out[0].tolist() == [[1, 2], [5, 6], [7, 0]]
-    assert out[1].tolist() == [[3, 4], [8, 9], [1, 3]]
-    assert (out[2] == -1).all()
+    fetched = []
+
+    def get(t):
+        fetched.append(t)
+        return t
+
+    # stage 2 of the learner: layers 3, 4 only; only its blocks are fetched
+    out = fetch_anchors(refs, [3, 4], K, 12, get)
+    assert out.shape == (12, 2, K)
+    assert torch.equal(out[:8], b[:8]) and bool((out[8:] == -1).all())
+    assert len(fetched) == 3 and all(t.shape[1] == 2 for t in fetched)
+    # all layers (driver check) and a narrower width
+    full = fetch_anchors(refs, [1, 3, 4], None, 6, lambda t: t)
+    assert torch.equal(full[:, 0], a[:6, 0]) and torch.equal(full[:, 1:], b[:6])
+    # a missing stage: nothing is complete
+    assert merge_route_refs(_parts([([1], a, 10)], 4), 9, [1, 3, 4]).complete == 0
 
 
-def test_anchored_length_and_splice():
-    A = torch.full((7, 2, 1), -1, dtype=torch.int16)
-    A[:5] = 1  # positions 0..4 logged
-    # prompt 3, draft 4: tokens need positions up to P+m-2 -> m <= 5-3+1 = 3
-    assert anchored_draft_length(A, 3, 4) == 3
-    assert anchored_draft_length(A, 3, 2) == 2
-    assert anchored_draft_length(A, 6, 4) == 0  # prompt not fully logged
-    A[2, 1] = -1  # one layer missing at position 2
-    assert anchored_draft_length(A, 2, 4) == 1
-    B = torch.full((9, 2, 1), -1, dtype=torch.int16)
-    B[4:8] = 3
-    S = splice(A[:5], B)
-    assert S.shape[0] == 9 and S[0, 0, 0] == 1 and S[4, 0, 0] == 3 and S[8, 0, 0] == -1
-    assert S[2, 1, 0] == -1 and S[2, 0, 0] == 1
+def test_truncate_and_splice_refs():
+    K = 1
+    old = torch.full((7, 1, K), 1, dtype=torch.int16)  # positions 0..6 (6: rejected)
+    prior = merge_route_refs(_parts([([1], old, 7)], 4), 7, [1]).truncate(5)
+    assert prior.length == 5 and prior.complete == 5
+    assert [(x.lo, x.hi) for x in prior.blocks] == [(0, 4), (4, 5)]
+    # the new round re-logs everything: prior's blocks are not kept
+    new = torch.full((9, 1, K), 2, dtype=torch.int16)
+    full_new = merge_route_refs(_parts([([1], new, 9)], 4), 9, [1])
+    assert splice_refs(prior, full_new) is full_new
+    # a gap in the new log at 0..2: prior fills it, rejected position 6 never leaks
+    gap = new.clone()
+    gap[:3] = -1
+    s = splice_refs(prior, merge_route_refs(_parts([([1], gap, 0)], 4), 9, [1]))
+    assert s.length == 9 and s.complete == 5
+    out = fetch_anchors(s, [1], K, 9, lambda t: t)
+    assert out[:, 0, 0].tolist() == [1, 1, 1, 2, 2, 2, 2, 2, 2]
+    assert anchored_draft_length(s.complete, 3, 4) == 3
+
+
+def test_anchored_length():
+    # positions 0..4 logged; prompt 3, draft 4: m <= 5 - 3 + 1 = 3
+    assert anchored_draft_length(5, 3, 4) == 3
+    assert anchored_draft_length(5, 3, 2) == 2
+    assert anchored_draft_length(5, 6, 4) == 0  # prompt not fully logged
+    assert anchored_draft_length(2, 2, 4) == 1
 
 
 def test_compare_anchors_against_a_reference_forward():

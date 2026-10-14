@@ -48,14 +48,16 @@ from thundersync_rl.engine_q import (
     free_hidden,
     hidden_nbytes,
     hidden_num_rows,
+    ray_free,
 )
 from thundersync_rl.fused_train import FusedRef
 from thundersync_rl.routes import (
+    RouteRefs,
     anchored_draft_length,
     compare_anchors,
-    merge_route_parts,
-    route_bytes,
-    splice,
+    fetch_anchors,
+    merge_route_refs,
+    splice_refs,
 )
 
 
@@ -74,9 +76,9 @@ class Plan:
     # reference for exact lookup speculative decoding of the continuation.
     dead_suffix: list[int] = field(default_factory=list)
     # Sticky MoE routing: the drafter's routes for prompt + prefix positions
-    # ([positions, L, K] int16, -1 = self); the training forward of this
+    # (object-store handles, ``RouteRefs``); the training forward of this
     # rollout replays them (routes.py).
-    anchors: Optional[torch.Tensor] = field(default=None, compare=False)
+    anchors: Optional[RouteRefs] = field(default=None, compare=False)
 
 
 @dataclass
@@ -316,8 +318,12 @@ class SpeculativeGeneration:
         # by the same (previous) weights and verified (``verify_sticky``).
         self.sticky_delta = sticky_delta
         self._anchor_claims: dict[
-            tuple[int, ...], list[tuple[tuple[int, ...], torch.Tensor]]
+            tuple[int, ...], list[tuple[tuple[int, ...], RouteRefs]]
         ] = defaultdict(list)
+        # Route blocks by the step whose training replays them (freed by
+        # ``release_routes`` once that step has trained).
+        self._route_blocks: dict[int, list] = defaultdict(list)
+        self._route_layers: list[int] = []
         if sticky_delta is not None:
             if self.verify_source != "engine" or verify_mode != "block":
                 raise ValueError(
@@ -328,7 +334,12 @@ class SpeculativeGeneration:
             ok = ray.get(
                 workers.run_all_workers_single_data("install_draft_route_log")
             )
-            if not any(x is True for x in ok) or any(x is False for x in ok):
+            # Logging ranks return their MoE layer numbers (pipeline stages:
+            # their own layers); the union is every MoE layer of the model.
+            self._route_layers = sorted(
+                {int(ln) for x in ok if isinstance(x, list) for ln in x}
+            )
+            if not self._route_layers or any(x is False for x in ok):
                 raise RuntimeError(
                     "sticky routing: the engine cannot log the drafter's routes "
                     f"({ok}); is policy.megatron_cfg.sticky_routing_delta set on "
@@ -468,7 +479,7 @@ class SpeculativeGeneration:
         def collect():
             res = [_drafted(x) for x in self._collect_drafts(rank0)]
             res, hid, anchors = self._pop_logs(
-                hkeys, [p.numel() for p in prompts], res
+                hkeys, [p.numel() for p in prompts], res, target=step + 1
             )
             return [
                 [
@@ -570,14 +581,20 @@ class SpeculativeGeneration:
         return out
 
     def _pop_routes(
-        self, hkeys: list[str] | None, prompt_lens: list[int], lengths: list[int]
-    ) -> list[Optional[torch.Tensor]]:
-        """Each draft's dense anchors [P + g, L, K] (sticky routing), None if unlogged.
+        self,
+        hkeys: list[str] | None,
+        prompt_lens: list[int],
+        lengths: list[int],
+        target: int,
+    ) -> list[Optional[RouteRefs]]:
+        """Each draft's anchors over [P + g] positions (sticky routing), None if unlogged.
 
         Every engine rank that routed the draft's tokens contributes its part
-        (pipeline stages: their layers; sequence-parallel TP ranks: their
-        positions); missing entries stay -1 and truncate the draft
-        (``_truncate_to_anchors``).
+        (pipeline stages: their layers) as object-store blocks; the driver
+        keeps only the handles (``RouteRefs``). Positions past the logged
+        prefix truncate the draft (``_truncate_to_anchors``). ``target``: the
+        step whose training replays these anchors (``release_routes`` frees
+        them after it).
         """
         n = len(lengths)
         if self.sticky_delta is None or hkeys is None:
@@ -590,18 +607,30 @@ class SpeculativeGeneration:
         ):
             for k, v in r.items():
                 parts[k].append(v)
-        out: list[Optional[torch.Tensor]] = []
+                self._route_blocks[target] += [b[0] for b in v[2]]
+        out: list[Optional[RouteRefs]] = []
         for k, plen, g in zip(hkeys, prompt_lens, lengths):
             if k not in parts:
                 out.append(None)
                 continue
-            out.append(merge_route_parts(parts[k], plen + g)[0])
+            out.append(merge_route_refs(parts[k], plen + g, self._route_layers))
         self.stats["spec/route_bytes_logged"] = self.stats.get(
             "spec/route_bytes_logged", 0.0
-        ) + float(sum(map(route_bytes, out)))
+        ) + float(sum(a.nbytes for a in out if a is not None))
         return out
 
-    def _pop_logs(self, hkeys, prompt_lens: list[int], res: list, prior=None):
+    def release_routes(self, step: int) -> None:
+        """Free the route blocks of every step <= ``step`` (trained by now)."""
+        refs = []
+        for s in [s for s in self._route_blocks if s <= step]:
+            refs += self._route_blocks.pop(s)
+        self._anchor_claims.clear()
+        if refs:
+            (self._free_refs or ray_free)(refs)
+
+    def _pop_logs(
+        self, hkeys, prompt_lens: list[int], res: list, target: int, prior=None
+    ):
         """A drafting round's engine logs: (drafts, hidden states, anchors).
 
         Routes first: each draft is cut to its anchored length
@@ -611,10 +640,12 @@ class SpeculativeGeneration:
         (``_truncate``), so its hidden rows always match its token count, as
         verification requires.
         """
-        anchors = self._pop_routes(hkeys, prompt_lens, [len(x[0]) for x in res])
+        anchors = self._pop_routes(
+            hkeys, prompt_lens, [len(x[0]) for x in res], target
+        )
         if prior is not None:
             anchors = [
-                a if a is None else splice(b, a) for a, b in zip(anchors, prior)
+                a if a is None else splice_refs(b, a) for a, b in zip(anchors, prior)
             ]
         res = [
             self._truncate_to_anchors(x, a, plen)
@@ -633,7 +664,7 @@ class SpeculativeGeneration:
         if self.sticky_delta is None or anchors is None:
             return drafted
         toks, done, lps = drafted
-        m = anchored_draft_length(anchors, prompt_len, len(toks))
+        m = anchored_draft_length(anchors.complete, prompt_len, len(toks))
         if m >= len(toks):
             return drafted
         for name, v in (
@@ -1124,7 +1155,7 @@ class SpeculativeGeneration:
         if self.sticky_delta is not None:
             # Training replays the anchors of prompt + kept tokens only: entries
             # past the kept prefix are routes of rejected draft tokens.
-            anchors = d[8][: prompt.numel() + n_acc]
+            anchors = d[8].truncate(prompt.numel() + n_acc)
             if n_acc == len(draft) and not complete:
                 # The bonus row's anchor (the last drafted token's route) was
                 # not logged: keep the whole draft, and the next token comes
@@ -1437,13 +1468,19 @@ class SpeculativeGeneration:
         while not all(ray.get(rank0.drafts_done.remote())):
             await asyncio.sleep(0.02)
         self._collect_drafts(rank0)
-        refs = self._pop_routes(hkeys, [r.numel() for r in rows], [0] * len(rows))
+        check = -1  # route blocks of this check only: freed below
+        refs = self._pop_routes(
+            hkeys, [r.numel() for r in rows], [0] * len(rows), target=check
+        )
         self._pop_hidden(hkeys, [0] * len(rows))
         tok = exact = 0
         for d, ref in zip(ds, refs):
             n = d[0].numel() + len(d[2])
-            t, e = compare_anchors(d[8][:n], d[8][:0] if ref is None else ref)
+            mine = fetch_anchors(d[8], self._route_layers, None, n, ray.get)
+            other = fetch_anchors(ref, self._route_layers, mine.shape[-1], n, ray.get)
+            t, e = compare_anchors(mine, other)
             tok, exact = tok + t, exact + e
+        (self._free_refs or ray_free)(self._route_blocks.pop(check, []))
         self.stats["spec/route_check_tokens"] = float(tok)
         self.stats["spec/route_check_exact"] = float(exact)
         print(f"[route check] drafts={len(ds)} tok={tok} exact={exact}", flush=True)
@@ -1475,6 +1512,7 @@ class SpeculativeGeneration:
             hkeys,
             [p.numel() for p in prompts],
             res,
+            target=self.current_step,
             prior=[plan.anchors for _, plan in pending],
         )
         version = self.current_step - 1
@@ -1516,13 +1554,13 @@ class SpeculativeGeneration:
             if n_acc == g:
                 plan.prefix += list(toks)
                 plan.prefix_logprobs += lps[:g]
-                plan.anchors = d[8][: p.numel() + g]
+                plan.anchors = d[8].truncate(p.numel() + g)
                 plan.complete = bool(done) or len(plan.prefix) >= self.max_new_tokens
             else:
                 y = out["next"]
                 plan.prefix += list(toks[:n_acc]) + [y]
                 plan.prefix_logprobs += lps[: n_acc + 1]
-                plan.anchors = d[8][: p.numel() + n_acc]
+                plan.anchors = d[8].truncate(p.numel() + n_acc)
                 plan.complete = y == self.eod or len(plan.prefix) >= self.max_new_tokens
         return n_tok, n_kept, retry
 

@@ -66,6 +66,7 @@ from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.logger import Logger
 from thundersync_rl.fused_train import FusedRef
 from thundersync_rl.null_bv import drafts_per_prompt
+from thundersync_rl.routes import RouteRefs
 from thundersync_rl.speculative import SpeculativeGeneration, cohort_draft
 from thundersync_rl.streaming import (
     Chunk,
@@ -785,16 +786,12 @@ def build_chunk_data(
         }
     )
     anchors = [t.payload.get("anchors") for t in chunk.trajectories]
-    first = next((a for a in anchors if a is not None), None)
-    if first is not None:
-        # Sticky routing: the drafter's routes of each drafted rollout (row
-        # positions from 0); -1 (anchor = self) for undrafted rows and padding.
-        routed = torch.full((n, s, *first.shape[1:]), -1, dtype=torch.int16)
-        for b, a in enumerate(anchors):
-            if a is not None:
-                m = min(int(a.shape[0]), s)
-                routed[b, :m] = a[:m]
-        data["routed_experts"] = routed
+    if any(a is not None for a in anchors):
+        # Sticky routing: object-store handles of each drafted rollout's
+        # routes (row positions from 0), None for undrafted rows. Each learner
+        # rank fetches its pipeline stage's layers (worker ``_with_routes``);
+        # undrafted rows and padding get anchor = self there.
+        data["route_refs"] = anchors
     if chunk.padding:
         for k in ("sample_mask", "token_mask", "advantages"):
             data[k] = torch.zeros_like(data[k])
@@ -865,7 +862,7 @@ async def _run_one_step(
         Callable[[torch.Tensor, torch.Tensor], Optional[FusedRef]]
     ] = None,
     claim_anchors: Optional[
-        Callable[[torch.Tensor, torch.Tensor], Optional[torch.Tensor]]
+        Callable[[torch.Tensor, torch.Tensor], Optional[RouteRefs]]
     ] = None,
 ) -> dict[str, Any]:
     G = master_config.grpo.num_generations_per_prompt
@@ -1332,6 +1329,9 @@ def thundersync_grpo_train(
             )
         )
         drafts = metrics.pop("_drafts")
+        if sticky:
+            # This step's training has replayed every anchor targeted at it.
+            spec.release_routes(step)
         metrics["time/verify"] = t_verify
         if spec is not None:
             metrics.update(spec.stats)

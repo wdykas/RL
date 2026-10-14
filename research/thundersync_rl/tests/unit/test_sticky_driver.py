@@ -31,9 +31,21 @@ def _no_ray(monkeypatch):
 
 
 def _routes(key_prompt_len, n_pos, val=1):
-    """pop_draft_routes payload: one layer (number 1), top-1, positions 0..n_pos-1."""
-    pos = torch.arange(n_pos)
-    return ([1], pos, torch.full((n_pos, 1, 1), val, dtype=torch.int16))
+    """pop_draft_routes payload: one layer (number 1), top-1, positions
+    0..n_pos-1 logged, as blocks of 2 positions (the "refs" are the tensors:
+    ``ray.get`` is the identity here)."""
+    from thundersync_rl.routes import put_routes
+
+    dense = torch.full((n_pos, 1, 1), val, dtype=torch.int16)
+    return ([1], n_pos, put_routes(dense, lambda t: t, 2))
+
+
+def _dense(refs, width=None):
+    """A ``RouteRefs``' anchors [length, 1, 1] (layer 1, top-1)."""
+    from thundersync_rl.routes import fetch_anchors
+
+    n = refs.length if width is None else width
+    return fetch_anchors(refs, [1], 1, n, lambda t: t)
 
 
 class _Engine:
@@ -64,7 +76,7 @@ class _Engine:
     def handlers(self):
         return {
             "install_draft_hidden_log": lambda: True,
-            "install_draft_route_log": lambda: True,
+            "install_draft_route_log": lambda: [1],
             "start_drafts": self.start,
             "draft_request_ids": lambda: {},
             "collect_drafts": self.collect,
@@ -126,29 +138,30 @@ def test_sticky_drafts_verify_and_continue_to_completion():
     drafts = asyncio.run(s.draft_streaming(prompts))()
     # The draft without logged routes has no anchors: dropped before verification.
     assert drafts[2][0][8] is None
-    assert drafts[0][0][8].shape[0] == 5 and int(drafts[0][0][8][4, 0, 0]) == -1
+    assert drafts[0][0][8].length == 5 and drafts[0][0][8].complete == 4
+    assert int(_dense(drafts[0][0][8])[4, 0, 0]) == -1
     s.current_step = 1
     asyncio.run(s.verify_sticky(drafts))
     # Verification forwards got the anchors; the dropped draft never reached it.
     first, second = calls
     assert first["rows"] == [[1, 2, 4, 5, 6], [3, 7, EOD]]
-    assert [a.shape[0] for a in first["anchors"]] == [5, 3]
+    assert [a.length for a in first["anchors"]] == [5, 3]
     # Continuation round drafted from the kept prefixes with theta_{k-1}.
     prompts1, budgets1, _ = engine.started[1]
     assert prompts1 == [[1, 2, 4, 5, 6], [3, 9]] and budgets1 == [13, 15]
     assert second["rows"] == [[1, 2, 4, 5, 6, 10, EOD], [3, 9, 11, EOD]]
     assert second["plens"] == [5, 2] and second["segs"] == [[(0, 0, 2)], [(0, 0, 2)]]
     # Anchors spliced: new log over positions 0..P'+g'-2, nothing after.
-    a0, a1 = second["anchors"]
+    a0, a1 = map(_dense, second["anchors"])
     assert a0.shape[0] == 7 and bool((a0[:6] == 2).all()) and int(a0[6, 0, 0]) == -1
     assert a1.shape[0] == 4 and bool((a1[:3] == 2).all())
     plans = {k: v[0] for k, v in s.plans.items()}
     p0, p1 = plans[(1, 2)], plans[(3,)]
     assert p0.complete and p0.prefix == [4, 5, 6, 10, EOD]
     assert p0.prefix_logprobs == [-1.0, -1.1, -1.2, -1.0, -1.1]  # no bonus kept
-    assert p0.anchors.shape[0] == 7
+    assert p0.anchors.length == 7
     # [3] rejected at 0 (-> 9), then [11] kept and EOD residual.
-    assert p1.complete and p1.prefix == [9, 11, EOD] and p1.anchors.shape[0] == 3
+    assert p1.complete and p1.prefix == [9, 11, EOD] and p1.anchors.length == 3
     assert s.stats["spec/sticky_rounds"] == 1.0
     assert (8,) not in s.plans
     # The rollout returns the plan; training claims its anchors.
@@ -160,6 +173,14 @@ def test_sticky_drafts_verify_and_continue_to_completion():
     assert toks.tolist() == [1, 2, 4, 5, 6, 10, EOD]
     assert s.claim_anchors(torch.tensor([1, 2]), toks) is p0.anchors
     assert s.claim_anchors(torch.tensor([1, 2]), toks) is None
+    # Every route block of the drafts and the round is freed after step 1
+    # trained (freed by the driver: the learner fetched them by handle).
+    freed = []
+    s._free_refs = freed.extend
+    s.release_routes(0)
+    assert freed == []
+    s.release_routes(1)
+    assert len(freed) == 3 + 5 and not s._route_blocks  # drafts, round 1
 
 
 def test_sticky_round_retries_unlogged_continuations():
@@ -192,15 +213,16 @@ def test_sticky_round_retries_unlogged_continuations():
 
 
 def test_incomplete_sticky_plan_never_reaches_plain_decoding():
+    from thundersync_rl.routes import RouteRefs
     from thundersync_rl.speculative import Plan
 
     s = make_spec(
         {},
-        base_handlers={"install_draft_hidden_log": lambda: True, "install_draft_route_log": lambda: True},
+        base_handlers={"install_draft_hidden_log": lambda: True, "install_draft_route_log": lambda: [1]},
         verify_source="engine",
         sticky_delta=0.03,
     )
-    s.plans[(1,)].append(Plan(-1, [4], [-0.1], anchors=torch.zeros(2, 1, 1)))
+    s.plans[(1,)].append(Plan(-1, [4], [-0.1], anchors=RouteRefs([], 2, 2)))
     datum = BatchedDataDict({"input_ids": torch.tensor([[1]]), "input_lengths": torch.tensor([1])})
     with pytest.raises(RuntimeError, match="incomplete"):
         asyncio.run(s._one(0, datum))
@@ -226,7 +248,7 @@ def test_sticky_requires_engine_route_log():
 # --------------------------------------------------------------------------
 
 
-def test_chunk_data_carries_anchors_and_self_rows():
+def test_chunk_data_carries_route_handles():
     from thundersync_rl.grpo_loop import build_chunk_data
 
     tok = SimpleNamespace(pad_token_id=0)
@@ -244,7 +266,9 @@ def test_chunk_data_carries_anchors_and_self_rows():
             }
         )
 
-    a = torch.arange(5 * 2 * 3, dtype=torch.int16).view(5, 2, 3)
+    from thundersync_rl.routes import RouteRefs
+
+    a = RouteRefs([], 5, 5)  # handles only: no route data on the driver
     chunk = SimpleNamespace(
         trajectories=[traj([1, 2, 3, 4, 5], a), traj([1, 2, 7], None)],
         group=None,
@@ -252,13 +276,10 @@ def test_chunk_data_carries_anchors_and_self_rows():
         padding=False,
     )
     data = build_chunk_data(chunk, tok, cfg, 1)
-    r = data["routed_experts"]
-    assert r.shape == (2, data["input_ids"].shape[1], 2, 3)
-    assert torch.equal(r[0, :5], a) and bool((r[0, 5:] == -1).all())
-    assert bool((r[1] == -1).all())
+    assert data["route_refs"] == [a, None] and "routed_experts" not in data
     chunk.trajectories = [traj([1, 2, 7], None)]
     chunk.advantages = [1.0]
-    assert "routed_experts" not in build_chunk_data(chunk, tok, cfg, 1)
+    assert "route_refs" not in build_chunk_data(chunk, tok, cfg, 1)
 
 
 # --------------------------------------------------------------------------
@@ -340,28 +361,61 @@ def _worker():
     return object.__new__(ThunderSyncMegatronPolicyWorker.__ray_metadata__.modified_class)
 
 
-def test_worker_anchor_batch_and_route_fill(monkeypatch):
-    from nemo_rl.models.megatron import router_replay, sticky_routing
+def test_worker_anchor_batch_fetches_its_stage_layers(monkeypatch):
+    """The learner materializes only its pipeline stage's MoE layers (here 3
+    and 5 of 1, 3, 5) and fetches only the blocks that hold them."""
+    import thundersync_rl.worker as worker_mod
+    from thundersync_rl.routes import merge_route_refs, put_routes
 
+    from nemo_rl.models.megatron import sticky_routing
+
+    fetched = []
+    monkeypatch.setattr(worker_mod.ray, "get", lambda r: fetched.append(r) or r)
     w = _worker()
     w._router_replay_enabled = True
-    w.model = SimpleNamespace(config=SimpleNamespace())
-    monkeypatch.setattr(router_replay, "router_replay_dimensions", lambda cfg: (3, 2))
-    import megatron.core.utils as mcu
-
-    monkeypatch.setattr(mcu, "get_model_config", lambda m: m.config)
+    w._stage_layers = ([3, 5], 2)
+    s1 = torch.full((4, 1, 2), 7, dtype=torch.int16)  # stage 1: layer 1
+    s2 = torch.arange(4 * 2 * 2, dtype=torch.int16).view(4, 2, 2)  # layers 3, 5
+    refs = merge_route_refs(
+        [([1], 4, put_routes(s1, lambda t: t)), ([3, 5], 4, put_routes(s2, lambda t: t))],
+        4,
+        [1, 3, 5],
+    )
     sticky_routing.set_delta(0.03)
     try:
-        a = torch.ones(4, 3, 2, dtype=torch.int16)
-        out = w._anchor_batch([torch.zeros(5), torch.zeros(3)], [a, None], 8)
-        assert out.shape == (2, 8, 3, 2)
-        assert bool((out[0, :4] == 1).all()) and bool((out[0, 4:] == -1).all())
+        out = w._anchor_batch([refs, None], 2, 8)
+        assert out.shape == (2, 8, 2, 2)
+        assert torch.equal(out[0, :4], s2) and bool((out[0, 4:] == -1).all())
         assert bool((out[1] == -1).all())
+        assert len(fetched) == 1 and fetched[0] is not s1
+        d = BatchedDataDict(
+            {"input_ids": torch.zeros(2, 6, dtype=torch.long), "route_refs": [None, refs]}
+        )
+        r = w._with_routes(d)
+        assert "route_refs" not in r and r["routed_experts"].shape == (2, 6, 2, 2)
+        assert torch.equal(r["routed_experts"][1, :4], s2)
         d = BatchedDataDict({"input_ids": torch.zeros(2, 6, dtype=torch.long)})
-        assert w._with_routes(d)["routed_experts"].shape == (2, 6, 3, 2)
+        assert bool((w._with_routes(d)["routed_experts"] == -1).all())
     finally:
         sticky_routing.set_delta(None)
-    assert w._anchor_batch([torch.zeros(5)], None, 8) is None
+    assert w._anchor_batch(None, 1, 8) is None
+
+
+def test_stage_local_routed_experts_layout():
+    """routed_experts with one column per MoE layer of this pipeline stage."""
+    from nemo_rl.models.megatron.router_replay import _payload_indices_for_moe_layers
+
+    idx = _payload_indices_for_moe_layers(
+        global_moe_layers=[1, 2, 3, 4],
+        num_payload_layers=2,
+        total_num_layers=4,
+        local_moe_layers=[4, 3],
+    )
+    assert idx == {3: 0, 4: 1}
+    with pytest.raises(ValueError, match="stage-local"):
+        _payload_indices_for_moe_layers(
+            global_moe_layers=[1, 2, 3, 4], num_payload_layers=3, total_num_layers=4
+        )
 
 
 def test_engine_route_log_on_a_fake_engine(monkeypatch):
@@ -388,6 +442,8 @@ def test_engine_route_log_on_a_fake_engine(monkeypatch):
         token_to_request_idx=torch.zeros(16, dtype=torch.int32),
         token_to_pos_ids=torch.zeros(16, dtype=torch.long),
         request_ids=torch.tensor([11, 12, -1, -1], dtype=torch.int32),
+        request_in_prefill_status_tensor=torch.tensor([1, 1, 0, 0], dtype=torch.int32),
+        total_request_count=2,
     )
 
     def forward_logits(input_ids, position_ids):
@@ -412,7 +468,10 @@ def test_engine_route_log_on_a_fake_engine(monkeypatch):
     )
     w.inference_context = ctx
     w._route_record = {"replays": replays, "layers": [1, 3], "sequence_parallel": False}
-    assert w.install_draft_route_log() is True
+    import thundersync_rl.worker as worker_mod
+
+    monkeypatch.setattr(worker_mod.ray, "put", lambda t: t)
+    assert w.install_draft_route_log() == [1, 3]
     # eager prefill: request 11 (slot 0) 3 prompt tokens, request 12 (slot 1) 2
     ctx.active_token_count = 5
     ctx.token_to_request_idx[:5] = torch.tensor([0, 0, 0, 1, 1])
@@ -426,8 +485,10 @@ def test_engine_route_log_on_a_fake_engine(monkeypatch):
         controller._dynamic_step_forward_logits(None, None)
     out = w.pop_draft_routes(["d|0", "x"])
     assert list(out) == ["d|0"]
-    layers, pos, routes = out["d|0"]
-    assert layers == [1, 3] and pos.tolist() == [0, 1, 2, 3, 4]
+    layers, complete, blocks = out["d|0"]
+    assert layers == [1, 3] and complete == 5
+    ((routes, lo, hi, nbytes),) = blocks  # put into the object store
+    assert (lo, hi, nbytes) == (0, 5, 5 * L * K * 2)
     assert routes[:, 0, 0].tolist() == [0, 1, 2, 100, 200]
     assert routes[:, 1, 1].tolist() == [10, 11, 12, 110, 210]
 
@@ -557,6 +618,8 @@ def test_route_check_against_an_engine_prefill(monkeypatch, same_routes):
         hidden_transport="driver",
         sticky_delta=0.03,
     )
+    freed = []
+    s._free_refs = freed.extend
     prompts = [torch.tensor([1, 2]), torch.tensor([3])]
     drafts = asyncio.run(s.draft_streaming(prompts))()
     s.current_step = 1
@@ -565,3 +628,4 @@ def test_route_check_against_an_engine_prefill(monkeypatch, same_routes):
     assert prompts_chk == [[1, 2, 4, 5, 6], [3, 7]] and budgets_chk == [1, 1]
     assert s.stats["spec/route_check_tokens"] == 4.0 + 1.0
     assert s.stats["spec/route_check_exact"] == (5.0 if same_routes else 0.0)
+    assert len(freed) == 3 + 1  # the check's own route blocks, freed at once

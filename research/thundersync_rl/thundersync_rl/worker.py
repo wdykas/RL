@@ -245,18 +245,19 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
     def _with_routes(self, data: BatchedDataDict) -> BatchedDataDict:
         """Give a batch ``routed_experts`` when sticky routing is on.
 
-        Rows the driver gave anchors carry them; a batch without the field
-        (no rollout of it was drafted) gets -1 everywhere: anchor = self,
-        i.e. plain routing, which is the sticky policy of undrafted rows.
+        Rows the driver gave anchors carry ``route_refs`` (``RouteRefs`` per
+        row, None for undrafted rows); they are fetched for this pipeline
+        stage's layers only (``_anchor_batch``). Rows without anchors get -1
+        everywhere: anchor = self, i.e. plain routing, which is the sticky
+        policy of undrafted rows.
         """
-        if (
-            "routed_experts" in data
-            or self._anchor_batch([], [], 0) is None
-            or "input_ids" not in data
-        ):
+        if "input_ids" not in data:
             return data
+        refs = data.pop("route_refs", None) if "route_refs" in data else None
         b, width = data["input_ids"].shape[:2]
-        data["routed_experts"] = self._anchor_batch([None] * b, None, width)
+        routed = self._anchor_batch(refs, b, width)
+        if routed is not None:
+            data["routed_experts"] = routed
         return data
 
     def train_microbatches(self, datas, *args, **kwargs):
@@ -1650,86 +1651,116 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             "sequence_parallel": bool(getattr(cfg, "sequence_parallel", False)),
         }
 
-    def install_draft_route_log(self) -> bool | None:
+    def install_draft_route_log(self) -> list[int] | None | bool:
         """Log the routes of tagged draft requests (prompt and drafted tokens).
 
         Generation workers, sticky routing. Wraps the controller's
         ``_dynamic_step_forward_logits``, which runs in Python for every engine
-        forward (eager or CUDA-graph replay, legacy or async scheduling): before
-        the forward it snapshots the step's token layout from the context's
-        CPU bookkeeping (which at launch time describes exactly this forward:
-        slot and absolute position of every token), after it enqueues the
-        copy of this forward's route rows of tagged tokens to host memory, on
-        the forward's stream and before the next forward can overwrite the
-        buffer. Tags are the hidden-state log's draft keys
-        (``HIDDEN_KEY_ATTR``). Every rank that routes tokens logs: pipeline
-        stages their layers, sequence-parallel TP ranks their token shard
-        (TP rank 0 alone without sequence parallelism, where routes are
-        replicated). Returns True when installed, None on ranks with nothing
-        to log, False when unsupported.
+        forward (eager or CUDA-graph replay, legacy or async scheduling). Before
+        the forward it selects the step's tagged tokens from the context's CPU
+        bookkeeping, which at launch time describes exactly this forward (slot
+        and absolute position of every token): numpy over the token axis, a
+        draft-key lookup only for slots whose request is new
+        (``routes.SlotTags``). After the forward it enqueues the gather and the
+        asynchronous copy of those route rows to pinned host memory on the
+        forward's stream, before the next forward can overwrite the buffer
+        (``routes.RouteLog``): no host-device synchronization. Tags are the
+        hidden-state log's draft keys (``HIDDEN_KEY_ATTR``).
+
+        Pipeline stages log their own layers. Tensor parallelism: TP rank 0
+        logs; under sequence parallelism each TP rank routed its contiguous
+        token shard, so the shards are all-gathered over the TP group first
+        (one collective of the step's [tokens, L, K] routes, only on steps
+        with tagged tokens; every TP rank sees the same bookkeeping, so all of
+        them take part). Returns the logged MoE layer numbers when installed,
+        None on ranks with nothing to log, False when unsupported.
         """
         from megatron.core import parallel_state as ps
         from thundersync_rl.engine_q import HIDDEN_KEY_ATTR
-        from thundersync_rl.routes import RouteLog, step_route_entries
+        from thundersync_rl.routes import RouteLog, SlotTags, step_route_selection
 
         engine = getattr(self, "dynamic_inference_engine", None)
         ctx = getattr(self, "inference_context", None)
         rec = getattr(self, "_route_record", None)
         if engine is None or ctx is None or rec is None:
             return False
-        if getattr(self, "_route_log", None) is not None:
-            return True
         tp = ps.get_tensor_model_parallel_world_size()
         tp_rank = ps.get_tensor_model_parallel_rank()
+        logs = tp_rank == 0
+        if getattr(self, "_route_log_installed", False):
+            return list(rec["layers"]) if logs else None
         sp = rec["sequence_parallel"] and tp > 1
-        if tp_rank != 0 and not sp:
+        if not logs and not sp:
             return None
         log = RouteLog()
         replays = rec["replays"]
         controller = engine.controller
         orig = controller._dynamic_step_forward_logits
 
-        def snapshot():
+        def lookup(rid):
+            # Not cached by id: the engine may reuse request ids
+            # (``SlotTags`` looks up again whenever a slot's request is new).
+            entry = self.dynamic_inference_engine.requests.get(rid)
+            if entry is None:
+                return None
+            return getattr(entry.record[-1].sampling_params, HIDDEN_KEY_ATTR, None)
+
+        tags = SlotTags(lookup, log.key_id)
+
+        def select():
             n = int(ctx.active_token_count)
             if n <= 0:
-                return []
-            slots = ctx.token_to_request_idx[:n].tolist()
-            keys: dict[int, str] = {}
-            eng = self.dynamic_inference_engine
-            for slot in set(slots):
-                rid = int(ctx.request_ids[slot])
-                entry = eng.requests.get(rid)
-                if entry is None:
-                    continue
-                key = getattr(entry.record[-1].sampling_params, HIDDEN_KEY_ATTR, None)
-                if key is not None:
-                    keys[slot] = key
-            if not keys:
-                return []
-            pos = ctx.token_to_pos_ids[:n].tolist()
-            if sp:
-                chunk = int(ctx.padded_active_token_count) // tp
-                return step_route_entries(slots, pos, keys, tp_rank * chunk, chunk)
-            return step_route_entries(slots, pos, keys, 0, n)
+                return None
+            e = int(ctx.total_request_count)
+            slot_kid = tags.refresh(
+                ctx.request_ids[:e].numpy(),
+                ctx.request_in_prefill_status_tensor[:e].numpy() != 0,
+            )
+            if not (slot_kid >= 0).any():
+                return None
+            sel = step_route_selection(
+                ctx.token_to_request_idx[:n].numpy(),
+                ctx.token_to_pos_ids[:n].numpy(),
+                slot_kid,
+            )
+            return sel if sel[0].size else None
+
+        def step_rows(n_rows: int):
+            if not sp:
+                return _step_routes(replays, n_rows)
+            chunk = int(ctx.padded_active_token_count) // tp
+            local = _step_routes(replays, chunk)
+            if local is None:
+                return None
+            full = local.new_empty((chunk * tp, *local.shape[1:]))
+            torch.distributed.all_gather_into_tensor(
+                full, local.contiguous(), group=ps.get_tensor_model_parallel_group()
+            )
+            return full
 
         def forward_logits(*args, **kwargs):
-            entries = snapshot()
+            sel = select()
             out = orig(*args, **kwargs)
-            if entries:
-                rows = _step_routes(replays, max(r for r, _, _ in entries) + 1)
-                if rows is not None:
-                    log.record(entries, rows)
+            if sel is not None:
+                rows = step_rows(int(sel[0][-1]) + 1)
+                if rows is not None and logs:
+                    log.record(rows, *sel)
             return out
 
         controller._dynamic_step_forward_logits = forward_logits
-        self._route_log = log
-        return True
+        self._route_log = log if logs else None
+        self._route_log_installed = True
+        return list(rec["layers"]) if logs else None
 
     def pop_draft_routes(self, keys: list[str]) -> dict[str, tuple]:
-        """{key: (layer numbers, positions [m], routes [m, L_local, K] int16)}.
+        """{key: (layer numbers, logged prefix, [(ref, lo, hi, bytes)])}.
 
-        Drafts this rank logged; every key is closed (late rows dropped).
+        Drafts this rank logged, as object-store blocks of their dense routes
+        (``routes.put_routes``; this rank owns the objects, the driver frees
+        them). Every key is closed (late rows dropped).
         """
+        from thundersync_rl.routes import put_routes
+
         log = getattr(self, "_route_log", None)
         if log is None:
             return {}
@@ -1738,7 +1769,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         for k in keys:
             r = log.pop(k)
             if r is not None:
-                out[k] = (layers, r[0], r[1])
+                out[k] = (layers, r[0], put_routes(r[1], ray.put))
         return out
 
     def drafts_done(self) -> list[bool]:
@@ -2438,28 +2469,44 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         return self._training_forward_rows([row], anchors=[anchors])
 
     def _anchor_batch(
-        self, rows: list[torch.Tensor], anchors: list[Any] | None, width: int
+        self, anchors: list[Any] | None, batch: int, width: int
     ) -> torch.Tensor | None:
-        """``routed_experts`` [B, width, L, K] for a sticky-routing forward.
+        """``routed_experts`` [batch, width, L_stage, K] for a sticky-routing forward.
 
-        None when sticky routing is off. Rows without anchors (and padding)
-        get -1: anchor = self, i.e. plain routing for those tokens.
+        None when sticky routing is off. ``anchors[b]``: row b's ``RouteRefs``
+        (or None). Only this pipeline stage's MoE layers are materialized, and
+        only their blocks are fetched from the object store. Rows without
+        anchors (and padding) get -1: anchor = self, i.e. plain routing.
         """
         from nemo_rl.models.megatron import sticky_routing
 
         if sticky_routing.get_delta() is None or not self._router_replay_enabled:
             return None
-        from nemo_rl.models.megatron.router_replay import router_replay_dimensions
-        from megatron.core.utils import get_model_config
+        from thundersync_rl.routes import ROUTE_DTYPE, fetch_anchors
 
-        layers, k = router_replay_dimensions(get_model_config(self.model))
-        out = torch.full((len(rows), width, layers, k), -1, dtype=torch.int16)
+        layers, k = self._stage_route_layers()
+        out = torch.full((batch, width, len(layers), k), -1, dtype=ROUTE_DTYPE)
         for b, a in enumerate(anchors or []):
-            if a is None:
-                continue
-            n = min(int(a.shape[0]), width)
-            out[b, :n] = a[:n].to(torch.int16)
+            if a is not None:
+                out[b] = fetch_anchors(a, layers, k, width, ray.get)
         return out
+
+    def _stage_route_layers(self) -> tuple[list[int], int]:
+        """(MoE layer numbers of this pipeline stage, router top-k)."""
+        layers = getattr(self, "_stage_layers", None)
+        if layers is None:
+            from megatron.core.utils import get_model_config
+
+            from nemo_rl.models.megatron.router_replay import (
+                _router_replay_instances_for_model,
+            )
+
+            nums = sorted(
+                ln for _, ln in _router_replay_instances_for_model(self.model)
+            )
+            k = int(get_model_config(self.model).moe_router_topk)
+            layers = self._stage_layers = (nums, k)
+        return layers
 
     def _training_forward_rows(
         self, rows: list[torch.Tensor], anchors: list[Any] | None = None
@@ -2483,7 +2530,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         for b, row in enumerate(rows):
             ids[b, : lens[b]] = row
         data = BatchedDataDict({"input_ids": ids, "input_lengths": torch.tensor(lens)})
-        routed = self._anchor_batch(rows, anchors, ids.shape[1])
+        routed = self._anchor_batch(anchors, len(rows), ids.shape[1])
         if routed is not None:
             # Sticky routing: the forward that defines p replays the anchors
             # through the training path's RouterReplay (REPLAY_FORWARD).
