@@ -1620,7 +1620,11 @@ experts; each rank owns ≈ P/W main elements, P/(TP·PP·EP-share) model elemen
   θ_k .936/.965/.967 vs momentum .967/.954/.980 [measured]; no consistent difference on this toy (3 steps,
   different draft lengths, drafter/target gap dominated by injected random expert-gradient noise that momentum
   cannot predict). The acceptance evidence is ledger T on real layers with real Adam; a real-model paired run
-  (L4 arms queued) is next.
+  (L4 arms queued) is next. ⊥-BV paired: θ_k accepted .976 / ⊥ .326 / tail .039 vs momentum .984 / .328 / .026.
+- Drafting window [measured]: momentum arms drafted 2–3.5x fewer tokens than the θ_k arms (⊥-BV 42k vs 150k):
+  the drafter first waits for the learner lock, i.e. for the in-flight learner dispatch, before the refit.
+  Fix candidates (not built yet): finer lock granularity, or a refit that does not swap the learner's
+  parameters (stream θ̂ per bucket straight into the refit transport).
 
 **Not built yet.** Precision-aware optimizer (masters in TE FusedAdam), Megatron-FSDP,
 fp8/fp4 param gather, a two-step draft for lookahead > 1, overlapping the draft refit with the
