@@ -2045,7 +2045,10 @@ turn rules as below the horizon) and then rebuilds it with scheme A's `replay`.
 
 **Rule kernel.** The engine applies the rule in every MoE layer of every forward once the horizon is on, so it is
 one Triton kernel (`sticky_routing_fused.py`; a pure selection, bitwise equal to `sticky_select`: GPU unit test with
-exact ties and invalid anchor rows). Measured [M] (GB200, CUDA graph, `thundersync_work/research/multiturn_b/
+exact ties, invalid anchor rows, unsorted plain top-k and anchor sets equal to the plain set). The kernel follows the
+rule's output order exactly: a kept anchor set equal to the plain set is returned in the plain top-k's order, a
+different kept set in descending score order (on the hybrid branch the torch rule gained the plain-order case; the
+kernel ported from ts-integration still sorted such rows, a bitwise mismatch caught by the GPU unit test and fixed). Measured [M] (GB200, CUDA graph, `thundersync_work/research/multiturn_b/
 bench_anchor_apply.py`): torch composition +53–82 µs per layer (Qwen3-30B-A3B shapes, 48 layers: +2.6 ms per decode
 forward), fused +2–8 µs per layer at T = 64–512 tokens (+0.10–0.20 ms per forward over 48 layers) and +14 µs at
 T = 8192 (+0.69 ms); Ultra-like (E 512, K 22, 15 layers per stage): +0.12 ms per decode forward. Fill: 6 µs host

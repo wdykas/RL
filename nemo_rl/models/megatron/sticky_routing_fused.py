@@ -22,9 +22,10 @@ at decode sizes on GB200, as one kernel ~one launch.
 
 Per token row (one program): valid anchors (all ids >= 0, pairwise
 distinct), min of the anchors' scores, max of the other experts' scores,
-keep = valid and min_in >= max_out - delta; kept anchors are written in
-descending score order with ties in anchor order (the order of a stable
-descending sort), else the plain top-k.
+keep = valid and min_in >= max_out - delta; a kept anchor set that differs
+from the plain set is written in descending score order with ties in anchor
+order (the order of a stable descending sort), else (not kept, or kept and
+equal to the plain set) the plain top-k in its own order.
 """
 
 from __future__ import annotations
@@ -78,11 +79,16 @@ def _sticky_kernel(
     rank = tl.sum((gt | eq_before).to(tl.int32), axis=1)
     pv = tl.load(pvals_ptr + row * pv_stride + ks, mask=kmask, other=0.0)
     pi = tl.load(pidx_ptr + row * pi_stride + ks, mask=kmask, other=0).to(tl.int64)
-    # plain first, then the kept anchors at their ranks (a permutation of 0..K-1)
-    tl.store(out_vals_ptr + row * K + ks, pv, mask=kmask & ~keep)
-    tl.store(out_idx_ptr + row * K + ks, pi, mask=kmask & ~keep)
-    tl.store(out_vals_ptr + row * K + rank, s_in, mask=kmask & keep)
-    tl.store(out_idx_ptr + row * K + rank, a, mask=kmask & keep)
+    # anchor set == plain set (both K distinct ids when valid): every anchor is a plain id
+    hit = (a[:, None] == pi[None, :]) & kmask[:, None] & kmask[None, :]
+    in_plain = tl.sum(hit.to(tl.int32), axis=1) > 0
+    same_set = tl.sum((in_plain & kmask).to(tl.int32), axis=0) == K
+    reorder = keep & ~same_set
+    # plain, or the kept anchors at their ranks (a permutation of 0..K-1)
+    tl.store(out_vals_ptr + row * K + ks, pv, mask=kmask & ~reorder)
+    tl.store(out_idx_ptr + row * K + ks, pi, mask=kmask & ~reorder)
+    tl.store(out_vals_ptr + row * K + rank, s_in, mask=kmask & reorder)
+    tl.store(out_idx_ptr + row * K + rank, a, mask=kmask & reorder)
     tl.store(keep_ptr + row, keep.to(tl.int8))
 
 

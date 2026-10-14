@@ -383,7 +383,8 @@ def test_horizon_config_validation():
 def test_fused_rule_is_bitwise_the_reference(E, K):
     """The engine's one-kernel rule returns bitwise what the learner's torch
     rule returns: near ties (scores on a coarse grid), invalid anchor rows
-    (negative ids, repeats), anchors kept and rejected."""
+    (negative ids, repeats), anchors kept and rejected, unsorted plain top-k
+    and anchor sets equal to the plain set (returned in the plain order)."""
     from nemo_rl.models.megatron.sticky_routing_fused import sticky_select_fused
 
     g = torch.Generator().manual_seed(E * 100 + K)
@@ -394,9 +395,13 @@ def test_fused_rule_is_bitwise_the_reference(E, K):
     anchors[::7, 0] = -1  # self rows
     if K > 1:
         anchors[3::11, 1] = anchors[3::11, 0]  # repeated ids: self
-    anchors = anchors.to(torch.int16)
-    scores, anchors = scores.cuda(), anchors.cuda()
     pv, pi = torch.topk(scores, K, dim=1)
+    # unsorted plain top-k on some rows; anchor set == plain set (other order) on others
+    pv[1::5], pi[1::5] = pv[1::5].roll(1, 1), pi[1::5].roll(1, 1)
+    anchors[2::5] = pi[2::5].flip(1)
+    anchors[1::10] = pi[1::10]
+    anchors = anchors.to(torch.int16)
+    scores, anchors, pv, pi = scores.cuda(), anchors.cuda(), pv.cuda(), pi.cuda()
     for delta in (0.0, 0.03, 0.3):
         ref = sr.sticky_select(scores, anchors, pv, pi, delta)
         out = sticky_select_fused(scores, anchors, pv, pi, delta)
