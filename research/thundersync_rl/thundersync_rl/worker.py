@@ -2114,6 +2114,10 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             return key
 
         tags = SlotTags(lookup, anchors.anchor_id)
+        # Debug control for the end-to-end check: never apply (the engine then
+        # samples plain routes on anchored prefixes; the mismatch check must
+        # fail where the rule changes a route).
+        skip = os.environ.get("THUNDERSYNC_DEBUG_NO_ANCHOR_APPLY") == "1"
 
         def sweep():
             for key in [k for k, rid in active.items() if rid not in engine.requests]:
@@ -2129,7 +2133,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             return orig_init(*args, **kwargs)
 
         def forward_logits(*args, **kwargs):
-            if dummy[0]:
+            if dummy[0] or skip:
                 anchors.clear()
             else:
                 n = int(ctx.active_token_count)

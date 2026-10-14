@@ -1899,6 +1899,17 @@ class SpeculativeGeneration:
         """
         if self.anchor_horizon is None:
             return
+        # Engine anchor-apply counters so far (cumulative, per rank; summed).
+        totals: dict[str, float] = defaultdict(float)
+        for st in ray.get(
+            self.base._policy.worker_group.run_all_workers_single_data(
+                "engine_anchor_stats"
+            )
+        ):
+            for k, v in (st or {}).items():
+                totals[k] += v
+        for k, v in totals.items():
+            self.stats[f"spec/anchor_{k}"] = v
         entries = {}
         for key, queue in self.plans.items():
             for plan in queue:

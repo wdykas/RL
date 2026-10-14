@@ -331,6 +331,7 @@ def test_horizon_bounds_theta_old_work_and_hands_plans_to_the_engine():
 
     handlers = engine.handlers()
     handlers["register_engine_anchors"] = lambda entries: registered.append(entries) or len(entries)
+    handlers["engine_anchor_stats"] = lambda: {"applied_tokens": 5.0}
     s = make_spec(
         {"verify_drafts_block_engine": verify, "stash_head": lambda **kw: 1},
         base_handlers=handlers,
@@ -356,7 +357,7 @@ def test_horizon_bounds_theta_old_work_and_hands_plans_to_the_engine():
     (entries,) = registered
     assert set(entries) == {p0.engine_key, p1.engine_key}
     assert entries[p1.engine_key].length == 3
-    assert s.stats["spec/horizon_plans"] == 2.0
+    assert s.stats["spec/horizon_plans"] == 2.0 and s.stats["spec/anchor_applied_tokens"] == 5.0
     # The rollout continues on the refit engine with the anchor key; training
     # claims the anchors (self beyond c).
     datum = BatchedDataDict({"input_ids": torch.tensor([[3]]), "input_lengths": torch.tensor([1])})
