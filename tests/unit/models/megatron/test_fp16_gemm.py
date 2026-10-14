@@ -293,10 +293,10 @@ def test_down_proj_prescale_is_exact_and_widens_range():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-@pytest.mark.parametrize("m", [1, 7, 4096, 4097, 9000])
+@pytest.mark.parametrize("m", [1, 7, 2048, 2049, 9000])
 def test_fp32_gemm_chunked_is_bitwise_the_unchunked_expression(m, monkeypatch):
     """The CUDA fp32_gemm (row-chunked, in-place) equals hi@w.T + (lo@w.T)/2^11 bit for bit."""
-    monkeypatch.setattr(fg, "_FP32_GEMM_CHUNK_ROWS", 4096)
+    monkeypatch.setattr(fg, "_FP32_GEMM_CHUNK_ROWS", 2048)
     torch.manual_seed(m)
     x = torch.randn(m, 512, device="cuda") * 3
     w = (torch.randn(1000, 512, device="cuda") * 0.05).to(torch.bfloat16)
@@ -310,3 +310,72 @@ def test_fp32_gemm_chunked_is_bitwise_the_unchunked_expression(m, monkeypatch):
     # Row results do not depend on how many rows share the call.
     assert torch.equal(fg.fp32_gemm(x[: max(1, m // 3)], w), out[: max(1, m // 3)])
     assert torch.equal(fg.fp32_gemm(x.view(1, m, 512), w).view(m, -1), out)
+
+
+def _two_gemm_fp32_head(x, w):
+    """The fp32 head as two separate fp16 GEMMs (the formulation before stacking)."""
+    x32 = x.float()
+    hi = x32.to(torch.float16)
+    lo = ((x32 - hi.float()) * fg._SPLIT_SCALE).to(torch.float16)
+    return fg.fp16_gemm(hi, w) + fg.fp16_gemm(lo, w) / fg._SPLIT_SCALE
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("rows", [1, 3, 64, 257])
+def test_fp32_gemm_stacked_matches_two_gemms_bitwise(device, rows):
+    """One GEMM on stacked [hi; lo] rows == two GEMMs, bitwise (row-invariant GEMM)."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    torch.manual_seed(rows)
+    x = torch.randn(2, rows, 512, device=device) * 3
+    w = (torch.randn(1000, 512, device=device) * 0.05).to(torch.bfloat16)
+    y = fg.fp32_gemm(x, w)
+    assert y.shape == (2, rows, 1000) and y.dtype == torch.float32
+    assert torch.equal(y, _two_gemm_fp32_head(x, w))
+    assert torch.equal(y, fg.fp32_gemm(x, w.to(torch.float16)))
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_fp16_weight_storage_is_bitwise_the_per_call_cast(device):
+    """A weight held in fp16 gives the GEMM the operand the per-call cast gave, incl. subnormals."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    torch.manual_seed(0)
+    w = torch.randn(300, 256, device=device) * 0.05
+    w[0, :8] = torch.tensor([1e-7, -3e-6, 5e-5, 7e4, -1e5, 0.0, -0.0, 2.0**-24])
+    w = w.to(torch.bfloat16)
+    x = torch.randn(5, 256, device=device)
+    held = w.to(torch.float16)
+    bits = lambda t: t.view(torch.int32)  # noqa: E731  (inf/nan rows compare by bits)
+    assert torch.equal(bits(fg.fp16_gemm(x, w)), bits(fg.fp16_gemm(x, held)))
+    assert torch.equal(bits(fg.fp32_gemm(x, w)), bits(fg.fp32_gemm(x, held)))
+
+
+class _Linear(torch.nn.Module):
+    def __init__(self, n, k, dtype=torch.bfloat16):
+        super().__init__()
+        self.weight = torch.nn.Parameter(
+            torch.randn(n, k).to(dtype), requires_grad=False
+        )
+
+
+def test_hold_fp16_weights_converts_patched_linears_in_place(monkeypatch):
+    """Only patched-class weights convert; the Parameter object is kept; copy_ rounds like a cast."""
+    pytest.importorskip("megatron.core.transformer.moe.router")
+    monkeypatch.setitem(fg._STATE, "gemm_classes", (_Linear,))
+    # a patched non-GEMM class (TE RMSNorm is patched too) must not convert
+    monkeypatch.setitem(fg._STATE, "orig", {_Linear: None, torch.nn.LayerNorm: None})
+    model = torch.nn.Module()
+    model.lin = _Linear(8, 4)
+    model.other = torch.nn.Linear(4, 4).to(torch.bfloat16)  # not a patched class
+    model.norm = torch.nn.LayerNorm(4).to(torch.bfloat16)
+    param = model.lin.weight
+    assert fg.hold_fp16_weights(model) == 1
+    assert model.lin.weight is param and param.dtype == torch.float16
+    assert model.other.weight.dtype == torch.bfloat16
+    assert model.norm.weight.dtype == torch.bfloat16
+    assert fg.hold_fp16_weights([model]) == 0  # idempotent
+    new = torch.randn(8, 4).to(torch.bfloat16)
+    with torch.no_grad():
+        param.copy_(new)  # what a refit / momentum load does
+    assert torch.equal(param, new.to(torch.float16))

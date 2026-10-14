@@ -662,6 +662,7 @@ class MegatronGenerationMixin:
 
             inference_pp_cuda_graph.install()
 
+        self._prepare_engine_numerics(engine_model)
         self.inference_context = DynamicInferenceContext(
             engine_model.config, inference_config
         )
@@ -688,6 +689,35 @@ class MegatronGenerationMixin:
         self._inference_engine_initialized = True
         self._inference_engine_asleep = True
         print(f"[Rank {self.rank}] Initialized persistent inference engine")
+
+    def _prepare_engine_numerics(self, engine_model: Any) -> None:
+        """Engine-only numerics setup, before the context is sized and graphs captured.
+
+        - fp16 GEMM forward: hold the dense GEMM weights in fp16 (``hold_fp16_weights``)
+          on a dedicated inference model whose refits write through ``copy_``
+          (``refit_transport: null``). The native MCore and M-to-N refits receive raw
+          bytes into the parameters in the sender's dtype, so those keep the per-call cast.
+        - batch-invariant Mamba: decode without the z replay buffer and count the
+          replay buffers in the inference memory budget (``mamba_bi_decode``).
+        """
+        from nemo_rl.models.megatron import fp16_gemm
+
+        refit_transport = self.cfg["generation"].get("refit_transport")
+        if (
+            fp16_gemm.enabled()
+            and self.is_refit_destination
+            and refit_transport is None
+        ):
+            n = fp16_gemm.hold_fp16_weights(self._gen_model())
+            if self.rank == 0:
+                print(
+                    f"[fp16_gemm] engine holds {n} dense GEMM weights in fp16",
+                    flush=True,
+                )
+        if getattr(engine_model.config, "batch_invariant_mode", False):
+            from nemo_rl.models.megatron import mamba_bi_decode
+
+            mamba_bi_decode.install()
 
     async def _start_inference_coordinator(self):
         """Start the inference coordinator and engine loop."""

@@ -76,6 +76,8 @@ _STATE: dict[str, Any] = {
     # None: plain round-to-nearest.
     "site_cast": None,
     "moe_preprocess": None,
+    # Linear classes whose forward is the fp16 GEMM (``hold_fp16_weights``).
+    "gemm_classes": (),
 }
 
 
@@ -91,6 +93,7 @@ def _to_fp16(x: torch.Tensor, site: Any) -> torch.Tensor:
     if cast is None or site is None:
         return x.to(torch.float16)
     return cast(site, x)
+
 
 # Target |amax| of an attention-output gradient dO after scaling into fp16: 2^0.
 # FlashAttention's dV = P^T dO sums dO over every query attending a key, so an
@@ -146,7 +149,7 @@ def fp16_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """
     k = x.shape[-1]
     x2 = x.reshape(-1, k).to(torch.float16).contiguous()
-    w16 = weight.to(torch.float16)
+    w16 = weight.to(torch.float16)  # no-op for engine weights held in fp16
     out = _mm(x2, w16.t(), torch.float32)
     return out.view(*x.shape[:-1], weight.shape[0])
 
@@ -175,13 +178,20 @@ def fp32_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         x32 = x.float()
         hi = x32.to(torch.float16)
         lo = ((x32 - hi.float()) * _SPLIT_SCALE).to(torch.float16)
-        return fp16_gemm(hi, weight) + fp16_gemm(lo, weight) / _SPLIT_SCALE
+        # One GEMM on the stacked [hi; lo] rows: the fp16 GEMM is row-invariant
+        # (the batch-invariance property both sides rely on), so each half equals
+        # the separate GEMM bitwise, with one weight read instead of two.
+        m = hi.numel() // hi.shape[-1]
+        both = fp16_gemm(torch.cat([hi.reshape(m, -1), lo.reshape(m, -1)]), weight)
+        out = both[:m] + both[m:] / _SPLIT_SCALE
+        return out.view(*x.shape[:-1], weight.shape[0])
     return _fp32_gemm_chunked(x, weight)
 
 
-# Rows per step of the chunked fp32-input GEMM: bounds its temporaries (the split
-# operands and the lo-term product) to this many rows, whatever M is.
-_FP32_GEMM_CHUNK_ROWS = 4096
+# Rows of x per step of the chunked fp32-input GEMM. Each step runs one GEMM on
+# the stacked [hi; lo] chunk (2x this many rows), so its temporaries are bounded
+# by 2 x this many [N]-wide fp32 rows, whatever M is.
+_FP32_GEMM_CHUNK_ROWS = 2048
 
 
 def _fp32_gemm_chunked(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
@@ -189,23 +199,24 @@ def _fp32_gemm_chunked(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 
     The unchunked expression holds hi @ w.T, lo @ w.T, its scaled copy and the
     sum at once: 3-4 [M, N] fp32 buffers, which for the LM head are logits-sized
-    (3 x 9.3 GiB for 16384 tokens x 151936 vocab). Here each row chunk writes
-    hi @ w.T into the output, forms lo @ w.T for the chunk only, scales it in
-    place and adds it in place: the same fp32 operations on the same values, so
-    bitwise the same result (row results do not depend on M: cuBLAS without
+    (3 x 9.3 GiB for 16384 tokens x 151936 vocab). Here each row chunk runs one
+    GEMM on the stacked [hi; lo] rows (one weight read: the engine's decode
+    steps, M = rows in flight, are one chunk), scales the lo half in place and
+    writes hi + lo into the output: the same fp32 operations on the same values,
+    so bitwise the same result (row results do not depend on M: cuBLAS without
     split-K under the batch-invariant backend, see ``_mm``).
     """
     k, n = x.shape[-1], weight.shape[0]
     x2 = x.reshape(-1, k)
-    w16t = weight.to(torch.float16).t()
+    w16t = weight.to(torch.float16).t()  # no-op for engine weights held in fp16
     out = torch.empty((x2.shape[0], n), dtype=torch.float32, device=x.device)
     for start in range(0, x2.shape[0], _FP32_GEMM_CHUNK_ROWS):
         x32 = x2[start : start + _FP32_GEMM_CHUNK_ROWS].float()
+        c = x32.shape[0]
         hi = x32.to(torch.float16)
         lo = ((x32 - hi.float()) * _SPLIT_SCALE).to(torch.float16)
-        o = out[start : start + _FP32_GEMM_CHUNK_ROWS]
-        torch.mm(hi, w16t, out_dtype=torch.float32, out=o)
-        o.add_(torch.mm(lo, w16t, out_dtype=torch.float32).div_(_SPLIT_SCALE))
+        both = torch.mm(torch.cat([hi, lo]), w16t, out_dtype=torch.float32)
+        torch.add(both[:c], both[c:].div_(_SPLIT_SCALE), out=out[start : start + c])
     return out.view(*x.shape[:-1], n)
 
 
@@ -236,6 +247,39 @@ def head_matmul(h: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     if _STATE["enabled"]:
         return _GEMMS[_STATE["head"]](h, weight)
     return h.float() @ weight.float().t()
+
+
+def hold_fp16_weights(model: Any) -> int:
+    """Store the dense GEMM weights of an inference-only model in fp16 (in place).
+
+    Every recipe GEMM rounds its weight to fp16 (``fp16_gemm``); holding the weight in
+    fp16 makes that cast a no-op, so the engine does it once per weight update instead
+    of on every call (bitwise the same operands; the cast costs 4-8x the decode GEMM).
+    Like the engine's fp16 expert buffers: each parameter's ``.data`` is replaced by its
+    fp16 copy, so the parameter keeps its identity, the bf16 storage is freed (same
+    bytes), and every later write through the parameter (refit ``copy_``, momentum
+    stage / load) rounds bf16 -> fp16 exactly as the per-call cast did. Covers the
+    patched linear classes, the untied LM head and the MoE router; not embeddings, norms
+    or a tied head (the embedding lookup reads the same tensor). Call only on a model
+    that never trains, before its CUDA graphs are captured; refits must write through
+    ``copy_`` (not a dtype-strict raw receive). Returns the number of converted weights.
+    """
+    from megatron.core.transformer.moe.router import Router
+
+    classes = tuple(_STATE["gemm_classes"]) + (Router,)
+    chunks = model if isinstance(model, (list, tuple)) else [model]
+    n = 0
+    with torch.no_grad():
+        for chunk in chunks:
+            for module in chunk.modules():
+                if not isinstance(module, classes):
+                    continue
+                w = module.__dict__.get("_parameters", {}).get("weight")
+                if w is None or w.dtype != torch.bfloat16:
+                    continue
+                w.data = w.data.to(torch.float16)
+                n += 1
+    return n
 
 
 # ---------------------------------------------------------------------------
@@ -277,7 +321,9 @@ class Fp16Linear(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x, weight, comm, group, precision=FP16_GEMM, scale_log2=0, site=None):  # noqa: D102
+    def forward(
+        ctx, x, weight, comm, group, precision=FP16_GEMM, scale_log2=0, site=None
+    ):  # noqa: D102
         # Down-projection prescale (``down_proj_prescale_log2``): x * 2^-s before
         # the fp16 cast and the fp32 output * 2^s; power-of-two scaling only
         # shifts exponents, so it widens fp16's range without changing rounding
@@ -592,7 +638,7 @@ def _patch_te_rmsnorm() -> None:
 
 
 def _cast_qkv(outputs: Any, box: Optional[_GradScaleBox], site: Any = None) -> Any:
-    """q / k / v (and any other float output) to fp16; ``site``: the attention module."""
+    """Q / k / v (and any other float output) to fp16; ``site``: the attention module."""
 
     def cast(t: Any, i: int) -> Any:
         if (
@@ -963,6 +1009,17 @@ def install(
     ):
         _make_te_forward(cls, norm)
     _make_output_layer_forward(ColumnParallelLinear)
+    _STATE["gemm_classes"] = (
+        mte.TELinear,
+        mte.TEColumnParallelLinear,
+        mte.TERowParallelLinear,
+        mte.TELayerNormColumnParallelLinear,
+        il.InferenceLinear,
+        il.InferenceColumnParallelLinear,
+        il.InferenceRowParallelLinear,
+        il.InferenceLayerNormColumnParallelLinear,
+        ColumnParallelLinear,
+    )
     _patch_te_rmsnorm()
     _patch_attention()
     _patch_inference_buffers()
