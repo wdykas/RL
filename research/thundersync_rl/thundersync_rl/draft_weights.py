@@ -22,7 +22,8 @@ proposal q only: q stays the law the engine actually sampled (engine-sourced
 q), so block verification against pi_{n+1} is unchanged (DESIGN.md 14f).
 
 theta_hat is computed on the learner from the Megatron DistributedOptimizer
-state, one main-parameter shard at a time (fp32 temporaries of one shard),
+state, on the rank that owns each main-parameter shard (no gather of master or
+moments), in chunks of ``CHUNK_ELEMS`` elements (bounded fp32 temporaries),
 written into the DDP parameter buffer in place of cast(master) and all-gathered
 exactly as after an optimizer step. The existing refit path then streams the
 buffer to the engine, and the training weights are restored bitwise by the
@@ -129,34 +130,44 @@ def _shards(optimizer) -> Iterator[_Shard]:
 
 
 def _adam_state(inner, main: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """(exp_avg, exp_avg_sq) of a main shard in fp32; zeros before the first step."""
+    """Flat (exp_avg, exp_avg_sq) of a main shard; zeros before the first step."""
     if not inner.state.get(main):
-        z = torch.zeros_like(main)
+        z = main.new_zeros(()).expand(main.numel())  # flat zeros, no allocation
         return z, z
     get = getattr(inner, "get_unscaled_state", None)
     if get is not None:  # TE FusedAdam (handles fp16/bf16/fp8-stored states)
         m, v = get(main, "exp_avg"), get(main, "exp_avg_sq")
     else:
         m, v = inner.state[main]["exp_avg"], inner.state[main]["exp_avg_sq"]
-    return m.float(), v.float()
+    return m.view(-1), v.view(-1)
 
 
-def draft_master_shard(shard: _Shard) -> torch.Tensor:
-    """fp32 momentum draft of one main shard (optimizer hyper-parameters of its group)."""
+# Elements per draft computation: bounds the fp32 temporaries (about 5 x 4 B per
+# element) independently of the largest parameter shard. The formula is
+# elementwise, so chunking does not change a bit.
+CHUNK_ELEMS = 1 << 24
+
+
+def _draft_chunks(shard: _Shard, chunk: int) -> Iterator[tuple[slice, torch.Tensor]]:
+    """(slice, rounded draft) of one main shard, ``chunk`` elements at a time."""
     g = shard.group
     beta1, beta2 = g["betas"]
     m, v = _adam_state(shard.inner, shard.main)
-    return momentum_draft_master(
-        shard.main,
-        m,
-        v,
-        lr=g["lr"],
-        beta1=beta1,
-        beta2=beta2,
-        eps=g["eps"],
-        weight_decay=g["weight_decay"],
-        step=int(g.get("step", 0)) + 1,
-    )
+    w = shard.main.view(-1)
+    for start in range(0, w.numel(), chunk):
+        sl = slice(start, min(start + chunk, w.numel()))
+        draft = momentum_draft_master(
+            w[sl],
+            m[sl].float(),  # no-op for fp32 states
+            v[sl].float(),
+            lr=g["lr"],
+            beta1=beta1,
+            beta2=beta2,
+            eps=g["eps"],
+            weight_decay=g["weight_decay"],
+            step=int(g.get("step", 0)) + 1,
+        )
+        yield sl, draft.to(shard.target.dtype)
 
 
 @dataclass
@@ -175,7 +186,7 @@ def _param_sync(optimizer) -> None:
 
 
 @torch.no_grad()
-def load_draft(optimizer, kind: str) -> DraftSwap:
+def load_draft(optimizer, kind: str, chunk: int = CHUNK_ELEMS) -> DraftSwap:
     """Write draft weights ``kind`` into the model parameters (all ranks, collective).
 
     Per main shard: compute the fp32 draft, round it into the shard's slice of
@@ -193,13 +204,13 @@ def load_draft(optimizer, kind: str) -> DraftSwap:
     swap = DraftSwap(optimizer)
     changed = total = 0
     for shard in _shards(optimizer):
-        new = draft_master_shard(shard).to(shard.target.dtype)
-        changed += int((new != shard.target).sum())
-        total += new.numel()
         if shard.aliased:
             swap.saved.append((shard.target, shard.target.clone()))
-        shard.target.copy_(new)
-        del new
+        target = shard.target.view(-1)
+        for sl, new in _draft_chunks(shard, chunk):
+            changed += int((new != target[sl]).sum())
+            total += new.numel()
+            target[sl].copy_(new)
     torch.cuda.synchronize()
     t1 = time.perf_counter()
     _param_sync(optimizer)

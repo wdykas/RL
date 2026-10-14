@@ -76,7 +76,7 @@ def mcore():
     ps.destroy_model_parallel()
 
 
-def _toy(moe: bool):
+def _toy(moe: bool, tp: int = 1, ep: int = 1):
     """Tiny bf16 GPT (MoE: expert + dense DistOpts in a ChainedOptimizer) with
     Megatron DDP + DistributedOptimizer, as the learner builds it."""
     from megatron.core.distributed import (
@@ -101,6 +101,8 @@ def _toy(moe: bool):
         moe_grouped_gemm=False,
         moe_token_dispatcher_type="alltoall",
         add_bias_linear=False,
+        tensor_model_parallel_size=tp,
+        expert_model_parallel_size=ep,
     )
     model = GPTModel(
         config=cfg,
@@ -150,7 +152,8 @@ def _train_step(ddp, opt, seed, autocast):
 @cuda
 @pytest.mark.parametrize("moe", [False, True])
 @pytest.mark.parametrize("steps", [0, 3])
-def test_distopt_draft_matches_harness_and_restores(mcore, moe, steps):
+@pytest.mark.parametrize("chunk", [None, 1000])
+def test_distopt_draft_matches_harness_and_restores(mcore, moe, steps, chunk):
     ddp, opt = _toy(moe)
     for s in range(steps):
         _train_step(ddp, opt, s, autocast=not moe)
@@ -178,7 +181,7 @@ def test_distopt_draft_matches_harness_and_restores(mcore, moe, steps):
                 ref[id(mp)] = w.to(mp.dtype).view(mp.shape)
     assert len(ref) == sum(p.requires_grad for p in params.values())
 
-    swap = load_draft(opt, "momentum")
+    swap = load_draft(opt, "momentum", **({} if chunk is None else {"chunk": chunk}))
     for n, p in params.items():
         assert torch.equal(p.detach(), ref[id(p)]), n
     if steps:  # with momentum the draft differs from theta_n (at 0 only lr*wd moves it)
@@ -188,3 +191,21 @@ def test_distopt_draft_matches_harness_and_restores(mcore, moe, steps):
     restore_training(swap)
     for n, p in params.items():
         assert torch.equal(p.detach(), before[n]), n
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs")
+@pytest.mark.parametrize("tp,ep", [(2, 1), (1, 2)])
+def test_distopt_draft_sharded_two_ranks(tp, ep):
+    """TP- / EP+DP-sharded optimizer state on 2 ranks (draft_weights_multirank.py)."""
+    import subprocess
+    import sys
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    port = 29600 + os.getpid() % 300
+    out = subprocess.run(
+        [sys.executable, "-m", "torch.distributed.run", "--nproc_per_node=2",
+         f"--master_port={port}", os.path.join(here, "draft_weights_multirank.py"),
+         f"--tp={tp}", f"--ep={ep}"],
+        capture_output=True, text=True, timeout=600,
+    )
+    assert out.returncode == 0 and "MULTIRANK OK" in out.stdout, out.stdout[-3000:] + out.stderr[-3000:]
