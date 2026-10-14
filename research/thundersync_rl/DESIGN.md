@@ -1328,7 +1328,12 @@ logs disagreed in shape). Non-gated squared-ReLU experts run on the fp16 expert 
 dense TE MLPs on the fp16 GEMM path. Under the fp16 GEMM forward the engine's Mamba conv
 state defaults to fp32 (`resolve_mamba_conv_states_dtype`; in_proj emits fp32 and MCore casts
 the engine's conv input to the conv-state dtype, params_dtype by default, which rounds it).
-Engine side for hybrids untested on GPU; 4-GPU check `scripts/bi_tp/nano_hybrid_fp16.sh`.
+Hybrids use the same route record, transport and async-scheduling path as MoE models (no
+hybrid-specific scheduler requirement; per-rank route cost = that of section 14c with L = number
+of 'E' layers of the stage: Nano 23 x 6, Super 40 x 22 int16 per token). 4-GPU check
+`scripts/bi_tp/nano_hybrid_fp16.sh` (Nano L8, EP=2, SCHED=async|legacy): train == engine
+mismatch 0 on every step with sticky on and off, async and legacy (2026-10-14; status of the
+route check: thundersync_work/research/agent_hybrid_integration.md).
 
 **Anchor schedule (exogenous).** A at position t = the plain θ_{k−1} forward's top-k on the
 rollout's own prefix, for every position up to the rollout cap c = prompt + min(max_new_tokens,
