@@ -1898,7 +1898,12 @@ driver stepped the environment (`spec/sticky_env_turns`), some rollout ran > 1 t
 (`[route check mt]`, `spec/route_check_mt_exact == spec/route_check_mt_tokens > 0`) with anchored
 observation positions among them (`spec/route_check_mt_obs_positions > 0`).
 
-*GPU status:* pending (first run 2026-10-14).
+*GPU status (2026-10-14, 4 GPUs, EP=2, 4 steps, 3 turns, 128 tokens/turn):* PASS on the tiny MoE,
+real Qwen3-30B-A3B layers (L4), ⊥-BV (K=1.5) and momentum draft weights: mismatch 0 over every
+assistant token of every turn, `[route check mt]` exact (51–55k positions per step, 2.0–2.5k of them
+observation positions), 128/128 rollouts per step replayed, environment stepped once per turn.
+Turns ended at the per-turn cap almost always (truncated models rarely emit EOS): EOS turn ends are
+unit-tested only. Environment latency on the refit path not measured (instant toy environment).
 
 ## 15. Open work
 
