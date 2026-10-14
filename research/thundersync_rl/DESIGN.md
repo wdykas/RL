@@ -1338,6 +1338,17 @@ on every step, engine q exact, weights change every step, every sticky step's an
 fresh engine prefill ([route check]) and the sticky rule changes routes against plain top-k
 (thundersync_work/research/agent_hybrid_integration.md).
 
+**Full Nemotron-3-Nano (52 layers, 31.6B) per-rank layout** [derived from the HF config; TP=1, PP=1].
+Routed experts 29.4B, everything else 2.2B. Learner rank (N GPUs, EP=E, DistributedOptimizer, fp32 masters
+outside TE): experts (2 B bf16 + 4 B fp32 main grad + 2 B fp16 expert cache) × 29.4B/E + 12 B × 29.4B/N
+(master + Adam over expert DP), dense 6 B × 2.2B + 12 B × 2.2B/N; momentum drafts add ≤ 0.42 GB scratch.
+EP=8, N=8: ≈ 90 GB; EP=4, N=8: ≈ 119 GB; EP=4, N=4: ≈ 167 GB (no activation headroom); EP=2, N=2: ≈ 320 GB.
+Engine rank (same TP/EP): 58.8 GB/E experts + 4.4 GB dense; per request slot SSM state 46 MiB + BI Mamba
+replay buffers 116 MiB (not yet in MCore's state accounting) + KV 6 KiB/token. Smallest layout without optimizer
+offload: EP=8 on 8 learner + 8 engine GPUs (`thundersync_work/sbatch/submit_nano.sh`). Scaling: every term is
+per-rank and divides by EP (experts) or is replicated per engine replica (Mamba/attention state, ∝ slots); none
+grows with the number of nodes.
+
 **Anchor schedule (exogenous).** A at position t = the plain θ_{k−1} forward's top-k on the
 rollout's own prefix, for every position up to the rollout cap c = prompt + min(max_new_tokens,
 max_total_sequence_length − prompt) (the engine stops there; a plan at c is complete:
