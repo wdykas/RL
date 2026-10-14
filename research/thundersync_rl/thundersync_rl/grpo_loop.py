@@ -40,6 +40,7 @@ import contextlib
 import itertools
 import os
 import time
+import zlib
 import warnings
 from types import SimpleNamespace
 from typing import Any, Callable, Literal, Optional
@@ -1281,6 +1282,12 @@ async def _run_one_step(
                 learner_task.result()
             last_rollout_t = time.perf_counter()
             reward = float(state["total_reward"])
+            if os.environ.get("THUNDERSYNC_DEBUG_PARITY_REWARD"):
+                # Debug: a reward that is a fixed function of the rollout's tokens
+                # (crc32 parity), so truncated models with zero task reward still
+                # train on nonzero advantages (determinism checks need them).
+                toks = torch.cat([m["token_ids"] for m in state["message_log"]])
+                reward = float(zlib.crc32(toks.to(torch.int64).numpy().tobytes()) & 1)
             rewards[i] = reward
             sample_metrics[i] = metrics
             loss_mult = float(repeated["loss_multiplier"][i])
