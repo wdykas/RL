@@ -1271,8 +1271,9 @@ generation (checked by the mismatch validator).
 ## 14c. Sticky MoE routing anchored to the drafter (`thundersync.sticky_routing`)
 
 *Opt-in, off by default (`sticky_routing: false`; `sticky_routing_delta: 0.03` when on).
-Unit-tested (CPU + GPU) and checked on a real Megatron MoE on one GPU; not yet run end to
-end (launcher: `scripts/bi_tp/sticky_moe.sh`).* Design and measurements:
+Unit-tested (CPU + GPU); end to end exact (`scripts/bi_tp/sticky_moe.sh`, 4 GPUs, EP=2, 4 steps,
+2026-10-13): mismatch 0 on every step for the tiny MoE and real Qwen3-30B-A3B layers (L4), with the
+non-vacuity checks (weights change, sticky changes routes, engine routes == re-prefill routes).* Design and measurements:
 `thundersync_work/research/agent_first_principles.md` section 3, `ACCEPTANCE_LEDGER.md`
 section T; implementation notes: `thundersync_work/research/agent_sticky_impl.md`.
 
@@ -1366,8 +1367,9 @@ cap (same engine feature) are not built yet.
 
 ## 14d. Pooled null-augmented block verification (`thundersync.null_bv`)
 
-*Opt-in, off by default. Unit-tested (exact enumeration, CPU + GPU worker path); the 4-GPU
-exactness run `scripts/bi_tp/null_bv_moe.sh` is written but not run yet (end to end untested).*
+*Opt-in, off by default. Unit-tested (exact enumeration, CPU + GPU worker path); end to end
+exact (`scripts/bi_tp/null_bv_moe.sh`, tiny MoE, K=1.5, 2026-10-13): mismatch 0 on every step,
+1.48 drafts per output, ⊥ fraction 0.32, no fresh slots.*
 Scheme and measurements: `thundersync_work/research/agent_multi_draft.md`; implementation notes:
 `thundersync_work/research/agent_null_bv_impl.md`.
 
