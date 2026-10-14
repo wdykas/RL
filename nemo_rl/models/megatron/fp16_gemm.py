@@ -92,6 +92,7 @@ def _to_fp16(x: torch.Tensor, site: Any) -> torch.Tensor:
         return x.to(torch.float16)
     return cast(site, x)
 
+
 # Target |amax| of an attention-output gradient dO after scaling into fp16: 2^0.
 # FlashAttention's dV = P^T dO sums dO over every query attending a key, so an
 # attention-sink key gets up to L * amax(dO) (L = sequence length); 2^0 keeps it
@@ -146,7 +147,7 @@ def fp16_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """
     k = x.shape[-1]
     x2 = x.reshape(-1, k).to(torch.float16).contiguous()
-    w16 = weight.to(torch.float16)
+    w16 = weight.to(torch.float16)  # no-op for engine weights held in fp16
     out = _mm(x2, w16.t(), torch.float32)
     return out.view(*x.shape[:-1], weight.shape[0])
 
@@ -173,7 +174,13 @@ def fp32_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     x32 = x.float()
     hi = x32.to(torch.float16)
     lo = ((x32 - hi.float()) * _SPLIT_SCALE).to(torch.float16)
-    return fp16_gemm(hi, weight) + fp16_gemm(lo, weight) / _SPLIT_SCALE
+    # One GEMM on the stacked [hi; lo] rows: the fp16 GEMM is row-invariant (the
+    # batch-invariance property both sides rely on), so each half equals the
+    # separate GEMM bitwise, with one weight read instead of two.
+    m = hi.numel() // hi.shape[-1]
+    both = fp16_gemm(torch.cat([hi.reshape(m, -1), lo.reshape(m, -1)]), weight)
+    out = both[:m] + both[m:] / _SPLIT_SCALE
+    return out.view(*x.shape[:-1], weight.shape[0])
 
 
 _GEMMS = {FP16_GEMM: fp16_gemm, FP32_HEAD: fp32_gemm}
@@ -203,6 +210,39 @@ def head_matmul(h: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     if _STATE["enabled"]:
         return _GEMMS[_STATE["head"]](h, weight)
     return h.float() @ weight.float().t()
+
+
+def hold_fp16_weights(model: Any) -> int:
+    """Store the dense GEMM weights of an inference-only model in fp16 (in place).
+
+    Every recipe GEMM rounds its weight to fp16 (``fp16_gemm``); holding the weight in
+    fp16 makes that cast a no-op, so the engine does it once per weight update instead
+    of on every call (bitwise the same operands; the cast costs 4-8x the decode GEMM).
+    Like the engine's fp16 expert buffers: each parameter's ``.data`` is replaced by its
+    fp16 copy, so the parameter keeps its identity, the bf16 storage is freed (same
+    bytes), and every later write through the parameter (refit ``copy_``, momentum
+    stage / load) rounds bf16 -> fp16 exactly as the per-call cast did. Covers the
+    patched linear classes, the untied LM head and the MoE router; not embeddings, norms
+    or a tied head (the embedding lookup reads the same tensor). Call only on a model
+    that never trains, before its CUDA graphs are captured; refits must write through
+    ``copy_`` (not a dtype-strict raw receive). Returns the number of converted weights.
+    """
+    from megatron.core.transformer.moe.router import Router
+
+    classes = tuple(k for k in _STATE["orig"] if isinstance(k, type)) + (Router,)
+    chunks = model if isinstance(model, (list, tuple)) else [model]
+    n = 0
+    with torch.no_grad():
+        for chunk in chunks:
+            for module in chunk.modules():
+                if not isinstance(module, classes):
+                    continue
+                w = module.__dict__.get("_parameters", {}).get("weight")
+                if w is None or w.dtype != torch.bfloat16:
+                    continue
+                w.data = w.data.to(torch.float16)
+                n += 1
+    return n
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +284,9 @@ class Fp16Linear(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x, weight, comm, group, precision=FP16_GEMM, scale_log2=0, site=None):  # noqa: D102
+    def forward(
+        ctx, x, weight, comm, group, precision=FP16_GEMM, scale_log2=0, site=None
+    ):  # noqa: D102
         # Down-projection prescale (``down_proj_prescale_log2``): x * 2^-s before
         # the fp16 cast and the fp32 output * 2^s; power-of-two scaling only
         # shifts exponents, so it widens fp16's range without changing rounding
@@ -559,7 +601,7 @@ def _patch_te_rmsnorm() -> None:
 
 
 def _cast_qkv(outputs: Any, box: Optional[_GradScaleBox], site: Any = None) -> Any:
-    """q / k / v (and any other float output) to fp16; ``site``: the attention module."""
+    """Q / k / v (and any other float output) to fp16; ``site``: the attention module."""
 
     def cast(t: Any, i: int) -> Any:
         if (
