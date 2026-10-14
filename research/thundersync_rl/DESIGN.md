@@ -1706,10 +1706,14 @@ step).** [derived unless marked]
 - Host memory: P_r (pinned), = the rank's 16-bit model shard; nothing else. Ultra-scale example: 500B params over
   64 model-parallel ranks ≈ 16 GB/rank (GB200 Grace: ~480 GB LPDDR per 4 GPUs → fits next to the optimizer's
   host-resident state only if that budget is planned; the node-level host budget must include it).
-- GPU memory: ≤ 2·U_max of θ_{k−1} weights (unit in use + unit in flight) + one layer's anchors (fp16, ≈ the
+- GPU memory: θ_{k−1} weights of one unit during its anchor pass; the next unit's H2D copy is issued when the
+  anchor pass ends and overlaps the policy pass, so ≤ 1·U_max is resident outside that overlap (≤ 2·U_max at the
+  boundary) + one layer's anchors (fp16, ≈ the
   layer's fp16 site inputs for T tokens: for an MoE layer ≈ T·(d + d_qkv + d_attn_out) + T·k·(d_ffn_expert)
-  elements × 2 B, plus 16 B keys per routed row) + the anchor residual stream (T·d·4 B). Measured on the toy
-  model: +0.30 U_max peak at TP=1 / EP=2, +0.33 U_max at TP=2 [M].
+  elements × 2 B, plus 16 B keys per routed row) + the anchor residual stream (T·d·4 B) + the anchor layer's
+  inference working set (freed before the policy pass of the layer). Measured on real Qwen3-30B-A3B layers (L4,
+  1 GPU, T = 4096 / 8192 tokens, U_max = 1.19 GB): peak allocated +32 / +64 MB (0.03 / 0.05 U_max) for a no-grad
+  verification forward and +0 for forward+backward, because the peaks (LM-head logits, backward) are elsewhere [M].
 - H2D traffic: P_r per policy-forward micro-batch (every micro-batch walks all layers), i.e. n_mb·P_r per step;
   hidden behind compute when t_fwd(T) ≥ U_max / B_H2D per layer, B_H2D ≈ 400 GB/s per direction on NVLink-C2C
   [hypothesis: to measure]. This scales with n_mb: the levers are (a) larger policy micro-batches (one stream per
@@ -1717,8 +1721,10 @@ step).** [derived unless marked]
   weights changed per step; to measure at real lr), (c) processing several micro-batches per streamed layer
   (needs schedule support). Until measured at scale this is the main cost risk, not a blocker.
 - Compute: one extra forward over the policy-forward tokens: +100% on forward-only verification passes, ≈ +33% of
-  fwd+bwd on training passes (activation-free: inference-mode). Toy measurement: fwd+bwd 66 → 104 ms (TP=1),
-  62 → 117 ms (EP=2), 78 → 137 ms (TP=2) [M; toy, launch-bound, not representative].
+  fwd+bwd on training passes (activation-free: inference-mode) [derived]. Measured (L4, 1 GPU, B = 4 × 1024):
+  fwd+bwd 0.44 → 0.64 s (+46%), no-grad forward 0.12 → 0.34 s (+177%); H2D on this node 125 GB/s pinned (10 ms
+  per 1.19 GB layer, ~45 ms per forward here) [M]. The excess over the derived cost (rule arithmetic, key
+  dispatch, H2D overlap) is not profiled yet.
 - Communication: the anchor pass repeats the layer's TP collectives and EP all-to-alls (forward only), and each
   MoE layer adds two key dispatches per pass of 16 B per routed row (≈ 4/d of a hidden dispatch) with the same
   tokens-per-expert synchronization MCore's dispatch already performs. No global synchronization is added;
