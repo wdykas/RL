@@ -1978,9 +1978,19 @@ mismatch 0 and exact_token_frac 1 every step (the horizon continuations' engine 
 training forward with the same anchors), route checks exact, 41–97 plans per step handed to the refit engine,
 15821 tokens routed with applied anchors. Control `NOAPPLY=1` (engine never applies): max |Δlog p| 0.30–0.44,
 exact_token_frac 0.80–0.84, i.e. the anchors below the horizon change the policy and the apply path is what
-reproduces it. Multi-turn (branch ts-multiturn-ab, toy stochastic environment, 3 turns × 128): mismatch 0 every
-step over every turn; see `thundersync_work/research/agent_multiturn_b.md` for the runs. Not yet run: TP > 1
-with sequence parallelism and PP > 1 on the engine (code paths unit-tested only), real-model sizes.
+reproduces it. Same check with the fused rule: PASS. Multi-turn (branch ts-multiturn-ab = ts-multiturn-a +
+this branch, `_finish_turns`; toy stochastic environment, 3 turns × 128 tokens, H = 160, 4 steps): PASS, mismatch 0
+every step over every turn, route check over full rows exact incl. 1118–1382 anchored observation positions per
+step, 128 environment steps per step below the horizon (θ_{k−1}) and 234–280 turns finished on the refit engine
+beyond it; control without apply: max |Δlog p| 0.53–0.66. Runs and numbers: `thundersync_work/research/
+agent_multiturn_b.md`.
+
+**Nemotron-H (Nano/Super/Ultra) routers.** The rule acts on the scores MCore selects on (`compute_topk`'s input):
+sigmoid + expert bias for Nemotron-H, after which MCore gathers the sigmoid scores of the effective experts; engine
+apply and learner replay go through the same call (unit test with E = 128, top-6, expert bias, scaling factor:
+bitwise equal, rule active). Hybrid layer numbering: anchors exist per MoE router instance only (route layers =
+MoE layer numbers); Mamba and attention layers carry none. MCore's fused router (`moe_router_fusion`) bypasses
+RouterReplay and is not supported (as for route recording).
 
 ## 15. Open work
 
