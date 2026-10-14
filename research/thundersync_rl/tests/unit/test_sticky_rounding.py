@@ -363,6 +363,7 @@ def test_grpo_config_default_off_and_handoff():
         ({}, {"moe_token_dispatcher_type": "flex"}, "dispatcher"),
         ({}, {"moe_shared_expert_overlap": True}, "shared_expert_overlap"),
         ({"fused_verify_train": True}, {}, "fused_verify_train"),
+        ({"draft_weights": "momentum"}, {}, "draft_weights must be 'current'"),
     ],
 )
 def test_grpo_config_rejects(ts, megatron, match):

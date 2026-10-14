@@ -483,6 +483,12 @@ def validate_sticky_rounding(master_config: ThunderSyncMasterConfig) -> None:
         problems.append("moe_shared_expert_overlap must be false")
     if ts_cfg.fused_verify_train:
         problems.append("thundersync.fused_verify_train must be false (not built yet)")
+    if ts_cfg.draft_weights != "current":
+        problems.append(
+            "thundersync.draft_weights must be 'current' (the anchor store keeps "
+            "theta_{k-1}; storing the drafting weights theta_hat_k instead is not "
+            "built yet)"
+        )
     if problems:
         raise ValueError("thundersync.sticky_rounding: " + "; ".join(problems) + ".")
 
