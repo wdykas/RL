@@ -43,6 +43,7 @@ from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.megatron_policy_worker import (
     MegatronPolicyWorkerImpl,
 )
+from thundersync_rl.draft_weights import DraftSwap, load_draft, restore_training
 from thundersync_rl.fused_train import (
     FusedGraph,
     FusedGraphStore,
@@ -324,6 +325,28 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         finally:
             self.optimizer.step = step
             self._debug_noise_steps = n_done + 1
+
+    def load_draft_weights(self, kind: str) -> dict[str, float]:
+        """Replace the model parameters by draft weights ``kind`` (collective).
+
+        ``"momentum"``: theta_hat_{k+1} = AdamW step of the optimizer state with
+        gradient 0 (``draft_weights.py``). For the refit that feeds the engine
+        the next step's drafting weights; no forward may run until
+        ``restore_training_weights``. The fp16 expert-weight cache keeps
+        theta_k's casts, which are valid again after the bitwise restore.
+        """
+        if getattr(self, "_draft_swap", None) is not None:
+            raise RuntimeError("draft weights already loaded")
+        self._draft_swap: Optional[DraftSwap] = load_draft(self.optimizer, kind)
+        self._log_mem(f"load_draft_weights {kind}")
+        return dict(self._draft_swap.stats)
+
+    def restore_training_weights(self) -> dict[str, float]:
+        """Put the training weights theta_k back, bitwise (after ``load_draft_weights``)."""
+        swap, self._draft_swap = self._draft_swap, None
+        if swap is None:
+            raise RuntimeError("no draft weights loaded")
+        return restore_training(swap)
 
     def _log_mem(self, where: str) -> None:
         if os.environ.get("THUNDERSYNC_MEM_LOG"):

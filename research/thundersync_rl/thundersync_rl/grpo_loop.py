@@ -247,6 +247,20 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # tokens decoded past the verified piece (SpeculativeGeneration
     # ._continue_sticky). Fixed count: the cut is exogenous.
     sticky_continuation_chunk_tokens: int = 2048
+    # Weights the engine drafts the next step's rollouts with (draft_weights.py,
+    # DESIGN.md section 14f). "current": theta_k. "momentum": theta_hat_{k+1} =
+    # the AdamW step of the optimizer state (theta_k, m_k, v_k) with gradient 0,
+    # rounded to the parameter dtype: a closer proposal q (per-token Var log p/q
+    # ~10-15x lower offline, ACCEPTANCE_LEDGER section T), verified exactly as
+    # before (q is the engine's logged law). The learner writes it into its
+    # parameters shard by shard, the engine refits once the step's rollouts are
+    # done (drafting starts then, not at draft_start_frac), and theta_k is
+    # restored bitwise; the engine keeps theta_hat until the next refit (sticky
+    # anchors and continuation rounds use it). Requires speculate,
+    # verify_mode=block, verify_source=engine, verify_on=learner,
+    # draft_lookahead=1, no draft_after_verify, no fused_verify_train,
+    # Megatron's distributed optimizer without the precision-aware optimizer.
+    draft_weights: Literal["current", "momentum"] = "current"
 
 
 def resolve_min_pipeline_microbatches(ts_cfg: ThunderSyncConfig, pp: int) -> int:
@@ -350,6 +364,7 @@ def validate_config(master_config: ThunderSyncMasterConfig) -> None:
     validate_engine_verify_source(master_config.thundersync, master_config.policy)
     validate_sticky_routing(master_config)
     validate_null_bv(master_config)
+    validate_draft_weights(master_config)
 
 
 def sticky_delta(ts_cfg: ThunderSyncConfig) -> Optional[float]:
@@ -450,6 +465,58 @@ def validate_null_bv(master_config: ThunderSyncMasterConfig) -> None:
         problems.append("thundersync.null_bv_logratio_var must be >= 0")
     if problems:
         raise ValueError("thundersync.null_bv: " + "; ".join(problems) + ".")
+
+
+def validate_draft_weights(master_config: ThunderSyncMasterConfig) -> None:
+    """Reject settings under which momentum draft weights are not built.
+
+    q must stay the engine's logged law with the drafting LM head stashed on
+    the learner (engine-sourced q), every draft must belong to one version
+    (lookahead 1), and the engine may switch weights only once the step's own
+    rollouts (sampled at theta_k) are done.
+    """
+    ts_cfg = master_config.thundersync
+    if ts_cfg.draft_weights == "current":
+        return
+    if ts_cfg.draft_weights != "momentum":
+        raise ValueError(f"unknown thundersync.draft_weights {ts_cfg.draft_weights!r}")
+    megatron_cfg = master_config.policy["megatron_cfg"]
+    opt_cfg = megatron_cfg.get("optimizer") or {}
+    problems = []
+    if not ts_cfg.speculate:
+        problems.append("thundersync.speculate must be true")
+    if ts_cfg.verify_mode != "block" or ts_cfg.verify_source != "engine":
+        problems.append(
+            "thundersync.verify_mode='block' and verify_source='engine' are required "
+            "(the scorer path recomputes q from theta_k)"
+        )
+    if ts_cfg.verify_on != "learner":
+        problems.append("thundersync.verify_on must be 'learner'")
+    if ts_cfg.draft_lookahead != 1:
+        problems.append(
+            "thundersync.draft_lookahead must be 1 (a two-step momentum draft is not "
+            "built yet)"
+        )
+    if ts_cfg.draft_after_verify:
+        problems.append(
+            "thundersync.draft_after_verify must be false (drafting starts after the "
+            "step's rollouts)"
+        )
+    if ts_cfg.fused_verify_train:
+        problems.append("thundersync.fused_verify_train must be false (not built yet)")
+    if not opt_cfg.get("use_distributed_optimizer", False):
+        problems.append(
+            "policy.megatron_cfg.optimizer.use_distributed_optimizer must be true"
+        )
+    if opt_cfg.get("use_precision_aware_optimizer", False):
+        problems.append(
+            "policy.megatron_cfg.optimizer.use_precision_aware_optimizer must be false "
+            "(not built yet)"
+        )
+    if opt_cfg.get("optimizer", "adam") != "adam":
+        problems.append("policy.megatron_cfg.optimizer.optimizer must be 'adam'")
+    if problems:
+        raise ValueError("thundersync.draft_weights=momentum: " + "; ".join(problems) + ".")
 
 
 def null_bv_policy(master_config: Any) -> dict[str, Any]:
@@ -870,6 +937,7 @@ async def _run_one_step(
     claim_anchors: Optional[
         Callable[[torch.Tensor, torch.Tensor], Optional[RouteRefs]]
     ] = None,
+    draft_refit: Optional[Callable[[], None]] = None,
 ) -> dict[str, Any]:
     G = master_config.grpo.num_generations_per_prompt
     repeated = batch.repeat_interleave(G)
@@ -935,6 +1003,9 @@ async def _run_one_step(
     # Fused verification + training: trajectories handed a retained forward,
     # and what the learner did with them.
     fused_counts = collections.Counter()
+    # Held by every learner dispatch and by the draft-weights refit, which
+    # swaps the learner's parameters and must not interleave with training.
+    learner_lock = asyncio.Lock()
 
     async def rollout(i: int):
         state, metrics = await run_sample_multi_turn_rollout(
@@ -979,9 +1050,12 @@ async def _run_one_step(
                     ]
                     for chunks in d.per_rank
                 ]
-                t0 = time.perf_counter()
-                rank_results = await asyncio.gather(*learner.submit(per_rank, d.closes))
-                t1 = time.perf_counter()
+                async with learner_lock:
+                    t0 = time.perf_counter()
+                    rank_results = await asyncio.gather(
+                        *learner.submit(per_rank, d.closes)
+                    )
+                    t1 = time.perf_counter()
                 pipeline_calls += max(
                     (r.get("num_calls", 0) for r in rank_results), default=0
                 )
@@ -1006,6 +1080,21 @@ async def _run_one_step(
     verify_task = (
         asyncio.create_task(pre_rollout()) if pre_rollout is not None else None
     )
+    draft_start_frac = ts_cfg.draft_start_frac
+    if draft_refit is not None and drafter is not None:
+        # Draft weights other than theta_k: the engine refits once every
+        # rollout of this step (sampled at theta_k) is done, between learner
+        # dispatches (the learner's parameters are swapped meanwhile).
+        draft_start_frac = 1.0
+        draft_after = drafter
+
+        async def drafter():
+            if verify_task is not None:
+                await verify_task
+            async with learner_lock:
+                await asyncio.to_thread(draft_refit)
+            return await draft_after()
+
     learner_task = asyncio.create_task(learner_loop())
     draft_task = None
     n_done = 0
@@ -1029,7 +1118,7 @@ async def _run_one_step(
                 drafter is not None
                 and draft_task is None
                 and not after_verify
-                and n_done >= ts_cfg.draft_start_frac * n
+                and n_done >= draft_start_frac * n
             ):
                 draft_task = asyncio.create_task(drafter())
             if learner_task.done():
@@ -1195,6 +1284,7 @@ def thundersync_grpo_train(
             null_bv=ts_cfg.null_bv,
             null_bv_policy=null_bv_policy(master_config) if ts_cfg.null_bv else None,
             sticky_chunk_tokens=ts_cfg.sticky_continuation_chunk_tokens,
+            draft_weights=ts_cfg.draft_weights,
         )
     sticky = spec is not None and spec.sticky_delta is not None
     G = master_config.grpo.num_generations_per_prompt
@@ -1231,7 +1321,8 @@ def thundersync_grpo_train(
             spec.current_step = step
         if sticky and drafts is not None:
             # Sticky routing: verify and complete every drafted rollout while
-            # the engine still holds theta_{step-1}, whose plain forward
+            # the engine still holds the drafting weights (theta_{step-1}, or
+            # theta_hat_step with momentum draft weights), whose plain forward
             # supplies the anchors of continuation positions; refit after.
             t1 = time.perf_counter()
             policy_generation.prepare_for_generation()
@@ -1333,6 +1424,17 @@ def thundersync_grpo_train(
                 if spec is not None and ts_cfg.fused_verify_train
                 else None,
                 claim_anchors=spec.claim_anchors if sticky else None,
+                draft_refit=(
+                    (
+                        lambda: spec.refit_draft_weights(
+                            lambda: refit_policy_generation(
+                                policy, policy_generation, False
+                            )
+                        )
+                    )
+                    if spec is not None and spec.draft_weights != "current"
+                    else None
+                ),
             )
         )
         drafts = metrics.pop("_drafts")

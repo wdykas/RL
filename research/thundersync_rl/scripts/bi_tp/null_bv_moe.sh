@@ -18,13 +18,14 @@
 # after the first has null_drafts > 0 and null_outputs > 0 (no vacuous all-fresh pass).
 #
 # Env: K (1.5), FIXED_M (2.0 | dp), STICKY (1), plus everything sticky_moe.sh takes
-# (MODEL, EP, TP, STEPS, PROMPTS, MAXLEN, DELTA, NOISE, ARGS).
+# (MODEL, EP, TP, STEPS, PROMPTS, MAXLEN, DELTA, NOISE, DRAFT_WEIGHTS, ARGS).
 W=/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/wdykas/code/on-olicy-rl/thundersync_work
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 K=${K:-1.5} FIXED_M=${FIXED_M:-2.0}
 export STICKY=${STICKY:-1}
 export RUNS=${RUNS:-runs_null_bv}
-export TAG=${TAG:-nullbv-k$K-m$FIXED_M-sticky$STICKY-ep${EP:-2}-$(basename "${MODEL:-tiny-qwen3-moe-d2048}")}
+export DRAFT_WEIGHTS=${DRAFT_WEIGHTS:-current}
+export TAG=${TAG:-nullbv-k$K-m$FIXED_M-sticky$STICKY-ep${EP:-2}-dw$DRAFT_WEIGHTS-$(basename "${MODEL:-tiny-qwen3-moe-d2048}")}
 NULL_ARGS="++thundersync.null_bv=true ++thundersync.null_bv_drafts_per_output=$K"
 if [ "$FIXED_M" != dp ]; then NULL_ARGS+=" ++thundersync.null_bv_fixed_m=$FIXED_M"; fi
 export ARGS="$NULL_ARGS ${ARGS:-}"

@@ -36,7 +36,7 @@ import os
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field, replace
-from typing import Any, AsyncGenerator, Optional
+from typing import Any, AsyncGenerator, Callable, Optional
 
 import numpy as np
 import ray
@@ -314,6 +314,7 @@ class SpeculativeGeneration:
         null_bv: bool = False,
         null_bv_policy: Optional[dict[str, Any]] = None,
         sticky_chunk_tokens: int = 2048,
+        draft_weights: str = "current",
     ):
         self.base = base
         self.learner_policy = learner_policy
@@ -369,6 +370,20 @@ class SpeculativeGeneration:
         }[verify_on]
         self.verifiers = groups
         self.verifier = groups[0]
+        # Weights the engine drafts with (DESIGN.md 14f): "current" = theta_k;
+        # "momentum" = theta_hat_{k+1}, loaded by refit_draft_weights before the
+        # drafts start. Only q changes; engine-sourced q keeps verification exact.
+        if draft_weights not in ("current", "momentum"):
+            raise ValueError(f"unknown draft_weights {draft_weights!r}")
+        if draft_weights != "current" and (
+            verify_mode != "block" or verify_source != "engine" or verify_on != "learner"
+        ):
+            raise ValueError(
+                "draft_weights=momentum needs verify_mode=block, verify_source=engine "
+                "and verify_on=learner (q is the engine's law, its LM head stashed on "
+                "the learner while the draft weights are loaded)"
+            )
+        self.draft_weights = draft_weights
         # Chunk assignment pattern, e.g. weights (1, 2) -> [learner, inf, inf].
         w = list(pool_weights) if pool_weights else [1] * len(groups)
         self._chunk_pools = [g for g, k in zip(groups, w) for _ in range(k)]
@@ -988,9 +1003,17 @@ class SpeculativeGeneration:
 
         q of every token drafted at theta_k is recomputed from this stash at
         verification. Only versions that pending drafts were drafted with are kept.
+        With momentum draft weights the drafting head was stashed by
+        ``refit_draft_weights`` (theta_k is not what drafted).
         """
         if self.verify_mode != "block" or drafts is None:
             return
+        if self.draft_weights != "current":
+            return
+        self._stash_drafting_version()
+
+    def _stash_drafting_version(self) -> None:
+        """Stash the verifiers' live weights as version ``current_step``."""
         keep = {self.current_step}
         for cohort in self.cohorts.values():
             for d in cohort:
@@ -1009,6 +1032,57 @@ class SpeculativeGeneration:
                     method, version=self.current_step, keep=sorted(keep), **kw
                 )
             ]
+        )
+
+    def refit_draft_weights(self, refit: Callable[[], Any]) -> None:
+        """Refit the engine to the draft weights of the next step's drafts.
+
+        ``draft_weights=momentum``: the learner writes theta_hat_{k+1} (its
+        optimizer state's AdamW step with gradient 0) into its parameters, the
+        LM head of those weights is stashed as drafting version ``current_step``
+        (q rows at verification come from it and the engine's hidden states),
+        ``refit`` streams the parameters to the engine through the normal refit
+        path, and the learner restores theta_k bitwise. The caller guarantees
+        that the step's rollouts are done (the engine is idle) and that no
+        other learner call runs in between. The engine keeps these weights
+        until the next refit: drafting, the route check and the sticky
+        continuation rounds all run on them.
+        """
+        group = self.learner_policy.worker_group
+        t0 = time.perf_counter()
+        loads = ray.get(
+            group.run_all_workers_single_data("load_draft_weights", kind=self.draft_weights)
+        )
+        try:
+            t1 = time.perf_counter()
+            self._stash_drafting_version()
+            t2 = time.perf_counter()
+            refit()
+            t3 = time.perf_counter()
+        finally:
+            restores = ray.get(group.run_all_workers_single_data("restore_training_weights"))
+        t4 = time.perf_counter()
+        changed = sum(x["draft/changed_elems"] for x in loads)
+        total = sum(x["draft/shard_elems"] for x in loads)
+        self.stats.update(
+            {
+                "draft/load_s": t1 - t0,
+                "draft/load_compute_s": max(x["draft/compute_s"] for x in loads),
+                "draft/load_gather_s": max(x["draft/gather_s"] for x in loads),
+                "draft/stash_s": t2 - t1,
+                "draft/refit_s": t3 - t2,
+                "draft/restore_s": t4 - t3,
+                "draft/restore_worker_s": max(x["draft/restore_s"] for x in restores),
+                "draft/total_s": t4 - t0,
+                "draft/peak_extra_gb": max(x["draft/peak_extra_bytes"] for x in loads) / 2**30,
+                "draft/changed_frac": changed / max(total, 1),
+            }
+        )
+        print(
+            f"[draft weights] {self.draft_weights} step={self.current_step} "
+            f"changed={int(changed)}/{int(total)} "
+            + " ".join(f"{k}={v:.4g}" for k, v in self.stats.items() if k.startswith("draft/")),
+            flush=True,
         )
 
     def _engine_q_filter(self, drafts):
@@ -1634,7 +1708,9 @@ class SpeculativeGeneration:
         """Verify drafts and complete every drafted rollout (sticky MoE routing).
 
         Called at the start of iteration k with the learner at theta_k and the
-        engine still at theta_{k-1} (the refit waits until this returns). The
+        engine still at the drafting weights D = theta_{k-1} (or theta_hat_k with
+        momentum draft weights; theta_{k-1} below stands for D) until the refit
+        after this returns. The
         target is p = F(theta_k; A): anchors A = plain theta_{k-1} routes on the
         rollout's own prefix at every position up to the rollout cap (the cut
         c = prompt + max_new_tokens, content-independent), "self" for rows
