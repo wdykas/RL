@@ -150,6 +150,10 @@ class Plan:
     # (object-store handles, ``RouteRefs``); the training forward of this
     # rollout replays them (routes.py).
     anchors: Optional[RouteRefs] = field(default=None, compare=False)
+    # Sticky MoE routing: the engine stream that drafted this whole-accepted,
+    # unfinished prefix and still decodes it (``_continue_sticky`` goes on
+    # with it instead of starting a new one).
+    stream: Optional[dict[str, Any]] = field(default=None, compare=False)
 
 
 @dataclass
@@ -535,6 +539,10 @@ class SpeculativeGeneration:
         """
         rank0 = self.base._policy.worker_group.workers[0]
         budget = min(self.draft_budget, self.max_new_tokens)
+        if self.sticky_delta is not None:
+            # Drafts are not aborted at the deadline (``_collect_running``):
+            # their streams go on toward the cap as continuations.
+            budget = self.max_new_tokens
         step = self.current_step
         if null_slots is not None:
             for t in [t for t in self._null_slots if t <= step]:
@@ -551,10 +559,15 @@ class SpeculativeGeneration:
         )
 
         def collect():
-            res = [_drafted(x) for x in self._collect_drafts(rank0)]
-            res, hid, anchors = self._pop_logs(
-                hkeys, [p.numel() for p in prompts], res, target=step + 1
-            )
+            plens = [p.numel() for p in prompts]
+            streams: list[Any] = [None] * len(prompts)
+            if self.sticky_delta is not None:
+                res, hid, anchors, streams = self._collect_running(
+                    rank0, hkeys, plens, budget, target=step + 1
+                )
+            else:
+                res = [_drafted(x) for x in self._collect_drafts(rank0)]
+                res, hid, anchors = self._pop_logs(hkeys, plens, res, target=step + 1)
             return [
                 [
                     (
@@ -573,13 +586,58 @@ class SpeculativeGeneration:
                         [(step, 0, len(toks))],
                         lps,
                         hid[i],
-                        *(() if self.sticky_delta is None else (anchors[i],)),
+                        *(() if self.sticky_delta is None else (anchors[i], streams[i])),
                     )
                 ]
                 for i, (toks, done, lps) in enumerate(res)
             ]
 
         return collect
+
+    def _peek_streams(self, rank0, idx: list[int]) -> list:
+        """(tokens, finished, engine log-probs) of running drafts, left running.
+
+        Unfinished drafts read the engines' request records (as
+        ``_collect_drafts``: streamed frames skip tokens after an eviction).
+        """
+        ids = ray.get(rank0.draft_request_ids.remote(idx))
+        records: dict[int, tuple] = {}
+        if ids:
+            for r in ray.get(
+                self.base._policy.worker_group.run_all_workers_single_data(
+                    "draft_records", request_ids=sorted(ids.values())
+                )
+            ):
+                records.update(r)
+        return ray.get(rank0.peek_drafts.remote(idx, records=records))
+
+    def _collect_running(self, rank0, hkeys, prompt_lens, budget: int, target: int):
+        """Sticky routing: the deadline snapshot of the drafts, streams left running.
+
+        Each draft is cut to its logged routes and hidden rows; its stream
+        (``_continue_sticky``) keeps decoding at theta_{k-1}, which the
+        engine holds until every drafted rollout is complete, so a
+        whole-accepted draft continues without a new prefill. Returns
+        (drafts, hidden, anchors, stream handles).
+        """
+        n = len(prompt_lens)
+        res = [_drafted(x) for x in self._peek_streams(rank0, list(range(n)))]
+        routes = self._pop_routes(
+            hkeys, prompt_lens, [budget] * n, target=target, close=False
+        )
+        cut = [
+            self._truncate_to_anchors(x, a, plen)
+            for x, a, plen in zip(res, routes, prompt_lens)
+        ]
+        hid = self._take_hidden(hkeys, [0] * n, [len(x[0]) for x in cut])
+        res = [self._truncate(x, h) for x, h in zip(cut, hid)]
+        anchors, streams = [], []
+        for i, ((toks, _, _), a, plen) in enumerate(zip(res, routes, prompt_lens)):
+            anchors.append(None if a is None else a.truncate(plen + len(toks)))
+            streams.append(
+                dict(idx=i, hkey=hkeys[i], length=plen + budget, taken=len(toks), routes=a)
+            )
+        return res, hid, anchors, streams
 
     def _collect_drafts(self, rank0) -> list:
         """Snapshot and abort the drafts, content from the engines' request records.
@@ -660,7 +718,9 @@ class SpeculativeGeneration:
             merged.update(r)
         out: list[Any] = []
         for k, n in zip(hkeys, lengths):
-            if k not in merged:
+            if n == 0:
+                out.append(HiddenRefs() if refs else torch.empty(0, 0))
+            elif k not in merged:
                 out.append(None)
             elif refs:
                 out.append(HiddenRefs.from_blocks(merged[k]))
@@ -1323,7 +1383,8 @@ class SpeculativeGeneration:
                 # not logged: keep the whole draft, and the next token comes
                 # from a continuation round (``verify_sticky``), an exact
                 # sampler of p given this prefix like the bonus draw itself.
-                return Plan(seed, list(draft), lps[:n_acc], anchors=anchors)
+                stream = d[9] if len(d) > 9 else None
+                return Plan(seed, list(draft), lps[:n_acc], anchors=anchors, stream=stream)
         if complete:
             return Plan(
                 seed,
@@ -1573,6 +1634,7 @@ class SpeculativeGeneration:
         self._plan_cv = None
         if os.environ.get("THUNDERSYNC_ENGINE_Q_CHECK") == "1":
             await self._route_check(drafts)
+        streams = [d[9] for v in drafts for d in v if len(d) > 9 and d[9] is not None]
         self.verify(drafts)
         pending = [
             (key, plan)
@@ -1580,8 +1642,24 @@ class SpeculativeGeneration:
             for plan in queue
             if not plan.complete
         ]
+        # The drafts' streams still decode: whole-accepted unfinished plans go
+        # on with theirs, every other stream stops.
+        kept = {id(plan.stream) for _, plan in pending if plan.stream is not None}
+        self._stop_streams([x for x in streams if id(x) not in kept])
         if pending:
             await self._continue_sticky(pending)
+
+    def _stop_streams(self, streams) -> None:
+        """Abort engine draft streams and close their logs (rank 0 + every engine)."""
+        if not streams:
+            return
+        rank0 = self.base._policy.worker_group.workers[0]
+        ray.get(rank0.abort_drafts.remote([x["idx"] for x in streams]))
+        ray.get(
+            self.base._policy.worker_group.run_all_workers_single_data(
+                "close_draft_logs", keys=[x["hkey"] for x in streams]
+            )
+        )
 
     async def _route_check(self, drafts) -> None:
         """Debug: the drafts' logged anchors against a fresh engine prefill.
@@ -1599,15 +1677,15 @@ class SpeculativeGeneration:
         rank0 = self.base._policy.worker_group.workers[0]
         rows = [torch.cat([d[0], torch.tensor(d[2], dtype=torch.long)]) for d in ds]
         hkeys = self._hidden_keys([f"route-check:{j}" for j in range(len(ds))])
-        ray.get(
-            rank0.start_drafts.remote(
+        # Next to the drafts' streams, which keep running (``_collect_running``).
+        idx = ray.get(
+            rank0.add_drafts.remote(
                 [r.tolist() for r in rows], [1] * len(rows), self.stream_interval,
                 hidden_keys=hkeys,
             )
         )
-        while not all(ray.get(rank0.drafts_done.remote())):
+        while not all(done for _, done in ray.get(rank0.draft_lengths.remote(idx))):
             await asyncio.sleep(0.02)
-        self._collect_drafts(rank0)
         check = -1  # route blocks of this check only: freed below
         refs = self._pop_routes(
             hkeys, [r.numel() for r in rows], [0] * len(rows), target=check
@@ -1650,9 +1728,10 @@ class SpeculativeGeneration:
         stats = dict(rounds=0, streams=0, tokens=0, kept=0, retries=0)
         live: list[dict[str, Any]] = []
         retries: dict[int, int] = defaultdict(int)
-        ray.get(rank0.start_drafts.remote([], 1, self.stream_interval, hidden_keys=[]))
 
         def start(items) -> None:
+            if not items:
+                return
             prompts = [
                 torch.cat(
                     [
@@ -1687,16 +1766,16 @@ class SpeculativeGeneration:
             stats["streams"] += len(items)
 
         def stop(streams) -> None:
-            ray.get(rank0.abort_drafts.remote([s["idx"] for s in streams]))
-            ray.get(
-                self.base._policy.worker_group.run_all_workers_single_data(
-                    "close_draft_logs", keys=[s["hkey"] for s in streams]
-                )
-            )
+            self._stop_streams(streams)
             for s in streams:
                 live.remove(s)
 
-        start(pending)
+        # Plans whose draft stream still decodes go on with it (no new prefill).
+        for key, plan in pending:
+            if plan.stream is not None:
+                live.append(dict(plan.stream, key=key, plan=plan))
+                plan.stream = None
+        start([(key, plan) for key, plan in pending if not any(s["plan"] is plan for s in live)])
         while live:
             status = ray.get(rank0.draft_lengths.remote([s["idx"] for s in live]))
             cand = [

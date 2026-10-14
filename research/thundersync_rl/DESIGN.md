@@ -1355,12 +1355,15 @@ restarted stream, so no bonus is needed. A rejection appends the residual token,
 stream and starts a new one from the new prefix, so it wastes at most the tokens decoded past
 the piece (before: the whole tail to EOS), and verification overlaps decoding instead of
 alternating with it. Pieces are cut at fixed token counts (exogenous) and to their logged
-routes and hidden rows (bookkeeping). A whole-accepted deadline draft that is not finished
-emits no bonus token (the bonus row's anchor, the route of the last drafted token, was never
-computed); under sticky routing it would need a continuation anyway, because every drafted
-rollout must be completed at θ_{k−1}, so logging that route would save one token, not a
-stream. Keeping deadline drafts' streams running into verification (no restart prefill) is not
-built yet. Then the engine refits
+routes and hidden rows (bookkeeping). Deadline drafts are not aborted under sticky routing
+(`_collect_running`): their streams run toward the cap, the deadline snapshot is verified as
+the first piece, and a whole-accepted unfinished draft goes on with its own stream (no new
+prefill of prompt + draft; the engine keeps decoding it through the optimizer step, at
+θ_{k−1}, which it holds until every drafted rollout is complete); every other draft's stream
+stops after the first verification. A whole-accepted unfinished draft emits no bonus token
+(the bonus row's anchor, the route of the last drafted token, is not logged at the deadline);
+it needs a continuation anyway because every drafted rollout must be completed at θ_{k−1}, and
+that continuation is now its own running stream. Then the engine refits
 to θ_k and the iteration's rollouts start (drafted ones return their completed plans; the
 rest decode plainly at θ_k = F(θ_k; self)). Exactness of the whole scheme (drafts cut at
 exogenous times, block verification, no bonus, continuation rounds) is checked by exact
