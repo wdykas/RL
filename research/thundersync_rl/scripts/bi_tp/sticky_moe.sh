@@ -19,8 +19,9 @@
 # changed some route against plain top-k ("[sticky check]" differs_from_plain > 0).
 # Compare spec/accepted_frac and spec/full_accept against STICKY=0.
 #
-# Env: MODEL, EP (2), TP (1), STEPS (4), PROMPTS (16), MAXLEN (1024), DELTA (0.03), STICKY (1),
-# NOISE (expert-grad noise, 1), ARGS (extra overrides).
+# Env: MODEL, EP (2), TP (1), PP (1), STEPS (4), PROMPTS (16), MAXLEN (1024), DELTA (0.03),
+# STICKY (1), NOISE (expert-grad noise, 1), SCHED (engine scheduling: legacy | async; legacy),
+# ARGS (extra overrides).
 W=/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/wdykas/code/on-olicy-rl/thundersync_work
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 export MODEL=${MODEL:-$W/models/tiny-qwen3-moe-d2048}
@@ -28,9 +29,9 @@ export EP=${EP:-2} TP=${TP:-1} PP=${PP:-1} MAXLEN=${MAXLEN:-1024} STEPS=${STEPS:
 STICKY=${STICKY:-1} DELTA=${DELTA:-0.03} NOISE=${NOISE:-1}
 if [ "$NOISE" != 0 ]; then export THUNDERSYNC_DEBUG_EXPERT_GRAD_NOISE=$NOISE; fi
 export RUNS=${RUNS:-runs_sticky_moe}
-export TAG=${TAG:-sticky$STICKY-d$DELTA-ep$EP-tp$TP-$(basename "$MODEL")}
-# Legacy scheduling: MCore's dynamic engine rejects routing replay under async scheduling.
-STICKY_ARGS="++thundersync.draft_lookahead=1 ++policy.generation.mcore_generation_config.async_sched_mode=legacy"
+SCHED=${SCHED:-legacy}
+export TAG=${TAG:-sticky$STICKY-d$DELTA-ep$EP-tp$TP-pp$PP-$SCHED-$(basename "$MODEL")}
+STICKY_ARGS="++thundersync.draft_lookahead=1 ++policy.generation.mcore_generation_config.async_sched_mode=$SCHED"
 if [ "$STICKY" = 1 ]; then
   STICKY_ARGS+=" ++thundersync.sticky_routing=true ++thundersync.sticky_routing_delta=$DELTA"
 fi

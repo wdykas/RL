@@ -97,6 +97,22 @@ def _step_routes(replays, n: int) -> Optional[torch.Tensor]:
     return torch.stack(cols, 1)
 
 
+def _drop_mcore_route_bookkeeping(controller) -> None:
+    """Switch off MCore's own routing-replay bookkeeping on an engine controller.
+
+    Sticky routing turns on ``moe_enable_routing_replay`` so that the routers
+    record (``_install_route_record``); MCore then also runs, every legacy
+    step, ``_router_record_bookkeeping``: a synchronous ``.cpu()`` of the
+    step's [tokens, L, K] routes (a TP all-gather under sequence parallelism),
+    scattered into per-KV-block host storage, from which every finished
+    request's ``routing_indices`` is rebuilt and sent back in its reply. The
+    route log replaces all of it, so it returns None (nothing stored, nothing
+    rebuilt). Upstream candidate: an MCore option to record routes without
+    this bookkeeping.
+    """
+    controller._router_record_bookkeeping = lambda: None
+
+
 def _unwrap(model: torch.nn.Module) -> torch.nn.Module:
     """The innermost module under DDP / Float16Module wrappers."""
     while hasattr(model, "module"):
@@ -1535,19 +1551,52 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         from megatron.core.inference.engines import dynamic_engine as de
 
         orig = de.DynamicInferenceEngine
+        de.DynamicInferenceEngine = self._engine_class(orig)
+        try:
+            super()._initialize_inference_engine(mcore_generation_config)
+        finally:
+            de.DynamicInferenceEngine = orig
+
+    def _engine_class(self, orig: type) -> type:
+        """``orig`` (MCore's DynamicInferenceEngine) with the draft logs armed.
+
+        The hidden-state copy and the route record are installed before the
+        constructor captures its CUDA graphs. With the route record, MCore's
+        own routing-replay bookkeeping is dropped and async scheduling is
+        allowed (``_drop_mcore_route_bookkeeping``).
+        """
         worker = self
 
         class _Engine(orig):  # type: ignore[misc, valid-type]
             def __init__(self, controller, context, *args, **kwargs):
                 worker._install_hidden_copy(context)
                 worker._install_route_record(context)
+                if getattr(worker, "_route_record", None) is not None:
+                    _drop_mcore_route_bookkeeping(controller)
                 super().__init__(controller, context, *args, **kwargs)
+                if getattr(worker, "_route_log_state", None) is not None:
+                    # An engine rebuilt after the route log was installed.
+                    worker._wrap_route_log(controller, context)
 
-        de.DynamicInferenceEngine = _Engine
-        try:
-            super()._initialize_inference_engine(mcore_generation_config)
-        finally:
-            de.DynamicInferenceEngine = orig
+            def _validate_async_sched_support_for_config(self) -> None:
+                if getattr(worker, "_route_record", None) is None:
+                    return super()._validate_async_sched_support_for_config()
+                # MCore rejects routing replay under async scheduling because of
+                # its own per-step bookkeeping (a synchronous host copy and
+                # per-KV-block storage, rebuilt per request at completion),
+                # which is dropped here. Our route log reads each forward's
+                # routes right behind it on its stream, from the token layout
+                # at launch, so async scheduling's later compaction does not
+                # affect it. The remaining checks still apply.
+                cfg = self.controller.inference_wrapped_model.model.config
+                cfg.moe_enable_routing_replay = False
+                try:
+                    super()._validate_async_sched_support_for_config()
+                finally:
+                    cfg.moe_enable_routing_replay = True
+
+
+        return _Engine
 
     def _install_hidden_copy(self, context) -> None:
         """Copy each forward's LM-head input rows into a static buffer.
@@ -1626,7 +1675,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             _router_replay_instances_for_model,
         )
 
-        if sticky_routing.get_delta() is None or getattr(self, "_route_record", None):
+        if sticky_routing.get_delta() is None:
             return
         if not getattr(context, "moe_enable_routing_replay", False):
             raise RuntimeError(
@@ -1639,6 +1688,11 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         )
         if not insts:
             return
+        rec = getattr(self, "_route_record", None)
+        if rec is not None and [id(r) for r in rec["replays"]] == [id(r) for r, _ in insts]:
+            return
+        # First build, or a rebuilt model whose routers are new instances:
+        # (re-)arm them; the route log reads ``_route_record`` per forward.
         from megatron.core.utils import get_model_config
 
         cfg = get_model_config(self._gen_model())
@@ -1676,8 +1730,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         None on ranks with nothing to log, False when unsupported.
         """
         from megatron.core import parallel_state as ps
-        from thundersync_rl.engine_q import HIDDEN_KEY_ATTR
-        from thundersync_rl.routes import RouteLog, SlotTags, step_route_selection
+        from thundersync_rl.routes import RouteLog
 
         engine = getattr(self, "dynamic_inference_engine", None)
         ctx = getattr(self, "inference_context", None)
@@ -1685,16 +1738,37 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         if engine is None or ctx is None or rec is None:
             return False
         tp = ps.get_tensor_model_parallel_world_size()
-        tp_rank = ps.get_tensor_model_parallel_rank()
-        logs = tp_rank == 0
-        if getattr(self, "_route_log_installed", False):
-            return list(rec["layers"]) if logs else None
-        sp = rec["sequence_parallel"] and tp > 1
-        if not logs and not sp:
+        logs = ps.get_tensor_model_parallel_rank() == 0
+        if not logs and not (rec["sequence_parallel"] and tp > 1):
             return None
-        log = RouteLog()
-        replays = rec["replays"]
-        controller = engine.controller
+        if getattr(self, "_route_log_state", None) is None:
+            # Sequence-parallel TP ranks > 0 only take part in the all-gather;
+            # their log never records.
+            self._route_log = RouteLog()
+            self._route_log_state = {"controller": None, "records": logs}
+        self._wrap_route_log(engine.controller, ctx)
+        return list(rec["layers"]) if logs else None
+
+    def _wrap_route_log(self, controller, ctx) -> None:
+        """Wrap ``controller``'s forward with the route log (once per controller).
+
+        Called by ``install_draft_route_log`` and again for every engine built
+        later (``_engine_class``): a rebuilt engine has a new controller and
+        context, and the log (with its open keys) carries over. The routers
+        are read from ``_route_record`` at every forward, so re-armed
+        instances are picked up.
+        """
+        from megatron.core import parallel_state as ps
+        from thundersync_rl.engine_q import HIDDEN_KEY_ATTR
+        from thundersync_rl.routes import SlotTags, step_route_selection
+
+        state = self._route_log_state
+        if state["controller"] is controller:
+            return
+        state["controller"] = controller
+        log = self._route_log
+        tp = ps.get_tensor_model_parallel_world_size()
+        sp = self._route_record["sequence_parallel"] and tp > 1
         orig = controller._dynamic_step_forward_logits
 
         def lookup(rid):
@@ -1706,6 +1780,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             return getattr(entry.record[-1].sampling_params, HIDDEN_KEY_ATTR, None)
 
         tags = SlotTags(lookup, log.key_id)
+        records = state["records"]
 
         def select():
             n = int(ctx.active_token_count)
@@ -1726,6 +1801,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             return sel if sel[0].size else None
 
         def step_rows(n_rows: int):
+            replays = self._route_record["replays"]
             if not sp:
                 return _step_routes(replays, n_rows)
             chunk = int(ctx.padded_active_token_count) // tp
@@ -1743,14 +1819,11 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             out = orig(*args, **kwargs)
             if sel is not None:
                 rows = step_rows(int(sel[0][-1]) + 1)
-                if rows is not None and logs:
+                if rows is not None and records:
                     log.record(rows, *sel)
             return out
 
         controller._dynamic_step_forward_logits = forward_logits
-        self._route_log = log if logs else None
-        self._route_log_installed = True
-        return list(rec["layers"]) if logs else None
 
     def pop_draft_routes(self, keys: list[str]) -> dict[str, tuple]:
         """{key: (layer numbers, logged prefix, [(ref, lo, hi, bytes)])}.

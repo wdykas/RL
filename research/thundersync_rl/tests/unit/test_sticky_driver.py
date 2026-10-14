@@ -629,3 +629,138 @@ def test_route_check_against_an_engine_prefill(monkeypatch, same_routes):
     assert s.stats["spec/route_check_tokens"] == 4.0 + 1.0
     assert s.stats["spec/route_check_exact"] == (5.0 if same_routes else 0.0)
     assert len(freed) == 3 + 1  # the check's own route blocks, freed at once
+
+
+# --------------------------------------------------------------------------
+# Engine: async scheduling, MCore bookkeeping, rebuilt engines
+# --------------------------------------------------------------------------
+
+
+def _fake_engine_base():
+    """An engine base class with MCore's own async-scheduling validation."""
+    from megatron.core.inference.config import AsyncScheduleMode
+    from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
+
+    class Base:
+        _validate_async_sched_support_for_config = (
+            DynamicInferenceEngine._validate_async_sched_support_for_config
+        )
+
+        def __init__(self, controller, context):
+            self.controller = controller
+            self.context = context
+            self.num_speculative_tokens = 0
+            self._validate_async_sched_support_for_config()
+
+    def controller():
+        cfg = SimpleNamespace(moe_enable_routing_replay=True)
+        return SimpleNamespace(
+            inference_wrapped_model=SimpleNamespace(model=SimpleNamespace(config=cfg)),
+            num_mtp_depths=0,
+            _router_record_bookkeeping=lambda: "mcore routes",
+            _dynamic_step_forward_logits=lambda *a: None,
+        )
+
+    ctx = SimpleNamespace(config=SimpleNamespace(async_sched_mode=AsyncScheduleMode.ASYNC))
+    return Base, controller, ctx
+
+
+def test_engine_with_route_log_runs_async_without_mcore_bookkeeping():
+    """MCore rejects routing replay under async scheduling; with our route
+    record it is allowed and MCore's own per-step bookkeeping is dropped.
+    Without it, MCore's check still applies."""
+    Base, make_controller, ctx = _fake_engine_base()
+    w = _worker()
+    w._install_hidden_copy = lambda c: None
+    w._install_route_record = lambda c: None
+    with pytest.raises(ValueError, match="routing replay"):
+        w._engine_class(Base)(make_controller(), ctx)
+    w._route_record = {"replays": [], "layers": [1], "sequence_parallel": False}
+    c = make_controller()
+    eng = w._engine_class(Base)(c, ctx)
+    assert eng.controller._router_record_bookkeeping() is None
+    assert c.inference_wrapped_model.model.config.moe_enable_routing_replay is True
+
+
+def test_rebuilt_engine_keeps_logging_into_the_route_log(monkeypatch):
+    """An engine built after the route log was installed (rebuild after a
+    refit or offload) gets its forward wrapped and logs into the same log."""
+    from megatron.core import parallel_state as ps
+
+    import thundersync_rl.worker as worker_mod
+
+    monkeypatch.setattr(ps, "get_tensor_model_parallel_world_size", lambda *a, **k: 1)
+    monkeypatch.setattr(ps, "get_tensor_model_parallel_rank", lambda *a, **k: 0)
+    monkeypatch.setattr(worker_mod.ray, "put", lambda t: t)
+    Base, make_controller, ctx = _fake_engine_base()
+    replay = SimpleNamespace(static_buffer=None, recorded_topk_idx=None)
+    w = _worker()
+    w._install_hidden_copy = lambda c: None
+    w._install_route_record = lambda c: None
+    w._route_record = {"replays": [replay], "layers": [1], "sequence_parallel": False}
+    sp = SimpleNamespace(ts_hidden_key="d|0")
+    req = SimpleNamespace(record=[SimpleNamespace(sampling_params=sp)])
+
+    def engine(controller):
+        ctx2 = SimpleNamespace(
+            config=ctx.config,
+            active_token_count=1,
+            total_request_count=1,
+            request_ids=torch.tensor([5], dtype=torch.int32),
+            request_in_prefill_status_tensor=torch.tensor([1], dtype=torch.int32),
+            token_to_request_idx=torch.zeros(1, dtype=torch.int32),
+            token_to_pos_ids=torch.zeros(1, dtype=torch.long),
+        )
+        eng = w._engine_class(Base)(controller, ctx2)
+        eng.requests = {5: req}
+        w.dynamic_inference_engine, w.inference_context = eng, ctx2
+        return eng, ctx2
+
+    eng1, ctx1 = engine(make_controller())
+    assert w.install_draft_route_log() == [1]
+    replay.recorded_topk_idx = torch.tensor([[3]])
+    eng1.controller._dynamic_step_forward_logits()
+    eng2, ctx2 = engine(make_controller())  # rebuilt: new controller and context
+    ctx2.token_to_pos_ids[0] = 1
+    replay.recorded_topk_idx = torch.tensor([[4]])
+    eng2.controller._dynamic_step_forward_logits()
+    assert w.install_draft_route_log() == [1]  # idempotent
+    eng2.controller._dynamic_step_forward_logits()
+    (layers, complete, ((routes, lo, hi, _),)) = w.pop_draft_routes(["d|0"])["d|0"]
+    assert complete == 2 and routes[:, 0, 0].tolist() == [3, 4]
+
+
+def test_route_record_rearms_new_router_instances(monkeypatch):
+    """A rebuilt generation model has new RouterReplay instances: they are
+    armed (RECORD, inference-only) and the route log reads them."""
+    from megatron.core.transformer.moe.router_replay import RouterReplayAction
+
+    import nemo_rl.models.megatron.router_replay as rr
+    from nemo_rl.models.megatron import sticky_routing
+
+    class Replay:
+        def set_router_replay_action(self, a):
+            self.action = a
+
+    models = {"m1": [(Replay(), 1), (Replay(), 3)], "m2": [(Replay(), 1), (Replay(), 3)]}
+    monkeypatch.setattr(rr, "_router_replay_instances_for_model", lambda m: models[m])
+    monkeypatch.setattr(sticky_routing, "install", lambda: None)
+    import megatron.core.utils as mcu
+
+    monkeypatch.setattr(mcu, "get_model_config", lambda m: SimpleNamespace())
+    w = _worker()
+    ctx = SimpleNamespace(moe_enable_routing_replay=True)
+    sticky_routing.set_delta(0.03)
+    try:
+        w._gen_model = lambda: "m1"
+        w._install_route_record(ctx)
+        first = w._route_record
+        w._install_route_record(ctx)
+        assert w._route_record is first  # same instances: unchanged
+        w._gen_model = lambda: "m2"
+        w._install_route_record(ctx)
+    finally:
+        sticky_routing.set_delta(None)
+    assert w._route_record["replays"] == [r for r, _ in models["m2"]]
+    assert all(r.action == RouterReplayAction.RECORD for r, _ in models["m2"])
+    assert all(r._nrl_record_inference_only for r, _ in models["m2"])
