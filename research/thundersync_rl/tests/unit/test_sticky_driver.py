@@ -909,3 +909,24 @@ def test_route_record_rearms_new_router_instances(monkeypatch):
     assert w._route_record["replays"] == [r for r, _ in models["m2"]]
     assert all(r.action == RouterReplayAction.RECORD for r, _ in models["m2"])
     assert all(r._nrl_record_inference_only for r, _ in models["m2"])
+
+
+def test_prefix_claims_match_generated_prefixes():
+    """Claims by generated prefix: one pass over the trajectory, any number of
+    entries; the environment's reply after the generated tokens is ignored."""
+    from thundersync_rl.speculative import PrefixClaims
+
+    c = PrefixClaims()
+    p = torch.tensor([1, 2])
+    c.add((1, 2), [5, 6, 7], "a")
+    c.add((1, 2), [5, 6], "b")
+    c.add((1, 2), [5, 6, 8], "c")
+    c.add((3,), [5, 6, 7], "other prompt")
+    # first stored entry whose tokens are a prefix (+ the env's reply after them)
+    assert c.claim(p, torch.tensor([1, 2, 5, 6, 8, 99, 98])) == "b"
+    assert c.claim(p, torch.tensor([1, 2, 5, 6, 8, 99, 98])) == "c"
+    assert c.claim(p, torch.tensor([1, 2, 5, 6, 8])) is None
+    assert c.claim(p, torch.tensor([1, 2, 5, 6, 7])) == "a"
+    assert c.claim(torch.tensor([4]), torch.tensor([4, 5])) is None
+    c.clear()
+    assert c.claim(torch.tensor([3]), torch.tensor([3, 5, 6, 7])) is None

@@ -38,6 +38,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field, replace
 from typing import Any, AsyncGenerator, Optional
 
+import numpy as np
 import ray
 import torch
 
@@ -60,6 +61,58 @@ from thundersync_rl.routes import (
     merge_route_refs,
     splice_refs,
 )
+
+
+class PrefixClaims:
+    """Values keyed by (prompt, generated tokens), claimed by a trajectory.
+
+    A trajectory claims (and removes) the first stored value of its prompt
+    whose generated tokens are a prefix of what follows the prompt. ``claim``
+    hashes every prefix of the trajectory at once (a random-weight linear
+    hash, one vectorized pass) and checks each stored entry of the prompt
+    against its prefix hash in O(1), confirming a hit by comparing tokens,
+    instead of building a key of every entry's length (O(G) passes over up
+    to 64k tokens per claim).
+    """
+
+    def __init__(self):
+        self._by_prompt: dict[tuple[int, ...], list[tuple[int, int, np.ndarray, Any]]] = (
+            defaultdict(list)
+        )
+        self._w = np.zeros(0, dtype=np.uint64)
+
+    def _weights(self, n: int) -> np.ndarray:
+        if n > self._w.shape[0]:
+            rng = np.random.default_rng(self._w.shape[0] + 1)
+            more = rng.integers(1, 2**63, size=max(n, 2 * self._w.shape[0]) - self._w.shape[0], dtype=np.uint64)
+            self._w = np.concatenate([self._w, more])
+        return self._w[:n]
+
+    def _prefix_hashes(self, toks: np.ndarray) -> np.ndarray:
+        """h[n] = hash of toks[:n] for n = 0..len (uint64, wraps)."""
+        with np.errstate(over="ignore"):
+            terms = self._weights(toks.shape[0]) * (toks.astype(np.uint64) + np.uint64(1))
+            return np.concatenate([np.zeros(1, dtype=np.uint64), np.cumsum(terms, dtype=np.uint64)])
+
+    def add(self, prompt_key: tuple[int, ...], gen: list[int], value: Any) -> None:
+        toks = np.asarray(gen, dtype=np.int64)
+        h = int(self._prefix_hashes(toks)[-1])
+        self._by_prompt[prompt_key].append((toks.shape[0], h, toks, value))
+
+    def claim(self, prompt: torch.Tensor, token_ids: torch.Tensor) -> Optional[Any]:
+        entries = self._by_prompt.get(_key(prompt))
+        if not entries:
+            return None
+        rest = token_ids[prompt.numel() :].cpu().numpy().astype(np.int64)
+        pref = self._prefix_hashes(rest)
+        for j, (n, h, toks, value) in enumerate(entries):
+            if n <= rest.shape[0] and int(pref[n]) == h and np.array_equal(rest[:n], toks):
+                del entries[j]
+                return value
+        return None
+
+    def clear(self) -> None:
+        self._by_prompt.clear()
 
 
 @dataclass
@@ -268,10 +321,8 @@ class SpeculativeGeneration:
         self.fused_verify_train = fused_verify_train
         self.fused_max_retained_tokens = fused_max_retained_tokens
         # Complete plans with a retained forward, handed to the rollout that
-        # consumed them: prompt key -> [(generated tokens, ref)].
-        self._fused_claims: dict[
-            tuple[int, ...], list[tuple[tuple[int, ...], FusedRef]]
-        ] = defaultdict(list)
+        # consumed them (prompt, generated tokens -> ref).
+        self._fused_claims = PrefixClaims()
         # Where stash + block verification run: "learner" or "inference" (the
         # generation workers hold theta_k until the refit and theta_{k+1} after
         # it, and sit idle while rollouts wait for verification).
@@ -323,9 +374,7 @@ class SpeculativeGeneration:
         # engine keeps decoding them (``_continue_sticky``).
         self.sticky_chunk_tokens = sticky_chunk_tokens
         self._cont_ids = itertools.count()
-        self._anchor_claims: dict[
-            tuple[int, ...], list[tuple[tuple[int, ...], RouteRefs]]
-        ] = defaultdict(list)
+        self._anchor_claims = PrefixClaims()
         # Route blocks by the step whose training replays them (freed by
         # ``release_routes`` once that step has trained).
         self._route_blocks: dict[int, list] = defaultdict(list)
@@ -1790,18 +1839,7 @@ class SpeculativeGeneration:
         ``prompt``: the generation prompt; ``token_ids``: the trajectory. None
         for rollouts that were never drafted: anchor = self, plain routing.
         """
-        entries = self._anchor_claims.get(_key(prompt))
-        if not entries:
-            return None
-        p = prompt.numel()
-        for j, (gen, anchors) in enumerate(entries):
-            if (
-                token_ids.numel() >= p + len(gen)
-                and _key(token_ids[p : p + len(gen)]) == gen
-            ):
-                del entries[j]
-                return anchors
-        return None
+        return self._anchor_claims.claim(prompt, token_ids)
 
     # -- GenerationInterface used by the rollout ----------------------------------
 
@@ -1885,7 +1923,7 @@ class SpeculativeGeneration:
         gen = list(plan.prefix)
         lps = list(plan.prefix_logprobs)
         if plan.fused is not None:
-            self._fused_claims[key].append((tuple(gen), plan.fused))
+            self._fused_claims.add(key, gen, plan.fused)
         if self.sticky_delta is not None and plan.anchors is not None:
             if not plan.complete:
                 # Its continuation would be decoded plainly by the refit
@@ -1895,7 +1933,7 @@ class SpeculativeGeneration:
                     "sticky routing: a drafted rollout reached the rollout loop "
                     "incomplete (verify_sticky must complete every plan)"
                 )
-            self._anchor_claims[key].append((tuple(gen), plan.anchors))
+            self._anchor_claims.add(key, gen, plan.anchors)
         if not plan.complete:
             ids = torch.cat([prompt, torch.tensor(plan.prefix, dtype=torch.long)])
             cont = BatchedDataDict(
@@ -1969,18 +2007,7 @@ class SpeculativeGeneration:
         removes) a ref whose verified row is a prefix of the trajectory, or
         None. Equal trajectories may share a ref: their forwards are the same.
         """
-        entries = self._fused_claims.get(_key(prompt))
-        if not entries:
-            return None
-        p = prompt.numel()
-        for j, (gen, ref) in enumerate(entries):
-            if (
-                token_ids.numel() >= p + len(gen)
-                and _key(token_ids[p : p + len(gen)]) == gen
-            ):
-                del entries[j]
-                return ref
-        return None
+        return self._fused_claims.claim(prompt, token_ids)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.base, name)
