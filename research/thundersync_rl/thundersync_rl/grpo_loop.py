@@ -1629,7 +1629,8 @@ def thundersync_grpo_train(
                     # training dispatch may be in flight meanwhile.
                     t_lock = time.perf_counter()
                     async with spec.learner_lock or contextlib.nullcontext():
-                        spec.lock_wait["refit"] += time.perf_counter() - t_lock
+                        if spec.learner_lock is not None:
+                            spec.lock_wait["refit"] += time.perf_counter() - t_lock
                         refit_for_step()
                 except BaseException as exc:
                     spec.weights_ready(error=exc)

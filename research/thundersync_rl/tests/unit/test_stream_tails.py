@@ -25,6 +25,7 @@ def _spec():
     spec = SpeculativeGeneration.__new__(SpeculativeGeneration)
     spec._tail_cv = None
     spec._weights_ready = None
+    spec.stats = {}
     return spec
 
 

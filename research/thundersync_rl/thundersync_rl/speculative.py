@@ -1305,8 +1305,9 @@ class SpeculativeGeneration:
         lock = getattr(self, "learner_lock", None)
         t0 = time.perf_counter()
         async with lock if lock is not None else contextlib.nullcontext():
-            # Time this verification waited for a training dispatch (lock cost).
-            self.lock_wait["verify"] += time.perf_counter() - t0
+            if lock is not None:
+                # Time this verification waited for a training dispatch (lock cost).
+                self.lock_wait["verify"] += time.perf_counter() - t0
             futs = self._submit_verify_block(flat, rows)
             done = []
             for a, refs in futs:
