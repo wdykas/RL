@@ -470,6 +470,9 @@ policy:
       max_tokens: 16384 # Maximum number of tokens to use in a single step. Analogous to vllm's max_num_batched_tokens
       kv_cache_management_mode: "persist"  # KV cache lifecycle across suspend/resume. Options: "persist", "offload", "recompute".
       async_sched_mode: "async"  # Dynamic-batching scheduler mode. Options: "legacy", "async". "async" hides scheduler CPU time behind GPU compute.
+      progress_log_interval_s: 60  # Generation progress line (requests, tokens, tokens/s of the engine rank) every N s on rank 0; null disables.
+      progress_log_all_ranks: false  # Log the progress line on every engine rank instead of rank 0 only.
+      stall_timeout_s: null  # Exit non-zero with all thread stacks when a busy engine rank makes no progress for N s; null disables.
       materialize_only_last_token_logits: true
       num_speculative_tokens: 0
       refit_backend: null  # Native MCore copy-service backend, used only when refit_transport="mcore". Options: "gloo", "nccl", or "nccl_m2n" ("nvshmem" is currently broken, see https://github.com/NVIDIA-NeMo/RL/issues/3646).

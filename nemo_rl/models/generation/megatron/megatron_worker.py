@@ -87,6 +87,10 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.megatron.config import (
     resolve_refit_execution_batch_bytes,
 )
+from nemo_rl.models.generation.megatron.progress import (
+    GenerationProgressMonitor,
+    with_generated_token_counter,
+)
 from nemo_rl.models.generation.megatron.utils import (
     build_image_preprocessing_config,
     build_prompt_and_multimodal_data,
@@ -681,13 +685,30 @@ class MegatronGenerationMixin:
             inference_wrapped_model=self.inference_wrapped_model,
             tokenizer=self.megatron_tokenizer,
         )
-        self.dynamic_inference_engine = DynamicInferenceEngine(
-            text_generation_controller, self.inference_context
-        )
+        self.dynamic_inference_engine = with_generated_token_counter(
+            DynamicInferenceEngine
+        )(text_generation_controller, self.inference_context)
+        self._start_generation_progress_monitor(mcore_generation_config)
 
         self._inference_engine_initialized = True
         self._inference_engine_asleep = True
         print(f"[Rank {self.rank}] Initialized persistent inference engine")
+
+    def _start_generation_progress_monitor(self, mcore_generation_config: dict) -> None:
+        """Progress log + stall watchdog over this rank's engine counters (progress.py)."""
+        interval = mcore_generation_config.get("progress_log_interval_s")
+        if interval is None:
+            return
+        rank = torch.distributed.get_rank()
+        stall = mcore_generation_config.get("stall_timeout_s")
+        self._generation_progress = GenerationProgressMonitor(
+            self.dynamic_inference_engine,
+            rank,
+            interval_s=float(interval),
+            stall_timeout_s=float(stall) if stall is not None else 0.0,
+            log=rank == 0
+            or bool(mcore_generation_config.get("progress_log_all_ranks")),
+        ).start()
 
     async def _start_inference_coordinator(self):
         """Start the inference coordinator and engine loop."""
