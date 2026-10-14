@@ -66,7 +66,8 @@ def mcore():
     from megatron.core import parallel_state as ps
     from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 
-    if not dist.is_initialized():
+    owns_pg = not dist.is_initialized()
+    if owns_pg:
         os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
         os.environ.setdefault("MASTER_PORT", str(29500 + os.getpid() % 1000))
         dist.init_process_group("nccl", rank=0, world_size=1)
@@ -74,6 +75,8 @@ def mcore():
     model_parallel_cuda_manual_seed(0)
     yield
     ps.destroy_model_parallel()
+    if owns_pg:  # leave the process as found: other tests set up their own groups
+        dist.destroy_process_group()
 
 
 def _toy(moe: bool, tp: int = 1, ep: int = 1):
