@@ -76,6 +76,8 @@ _STATE: dict[str, Any] = {
     # None: plain round-to-nearest.
     "site_cast": None,
     "moe_preprocess": None,
+    # Linear classes whose forward is the fp16 GEMM (``hold_fp16_weights``).
+    "gemm_classes": (),
 }
 
 
@@ -229,7 +231,7 @@ def hold_fp16_weights(model: Any) -> int:
     """
     from megatron.core.transformer.moe.router import Router
 
-    classes = tuple(k for k in _STATE["orig"] if isinstance(k, type)) + (Router,)
+    classes = tuple(_STATE["gemm_classes"]) + (Router,)
     chunks = model if isinstance(model, (list, tuple)) else [model]
     n = 0
     with torch.no_grad():
@@ -962,6 +964,17 @@ def install(
     ):
         _make_te_forward(cls, norm)
     _make_output_layer_forward(ColumnParallelLinear)
+    _STATE["gemm_classes"] = (
+        mte.TELinear,
+        mte.TEColumnParallelLinear,
+        mte.TERowParallelLinear,
+        mte.TELayerNormColumnParallelLinear,
+        il.InferenceLinear,
+        il.InferenceColumnParallelLinear,
+        il.InferenceRowParallelLinear,
+        il.InferenceLayerNormColumnParallelLinear,
+        ColumnParallelLinear,
+    )
     _patch_te_rmsnorm()
     _patch_attention()
     _patch_inference_buffers()

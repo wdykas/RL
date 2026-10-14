@@ -342,7 +342,9 @@ class _Linear(torch.nn.Module):
 def test_hold_fp16_weights_converts_patched_linears_in_place(monkeypatch):
     """Only patched-class weights convert; the Parameter object is kept; copy_ rounds like a cast."""
     pytest.importorskip("megatron.core.transformer.moe.router")
-    monkeypatch.setitem(fg._STATE, "orig", {_Linear: None, ("x", "y"): None})
+    monkeypatch.setitem(fg._STATE, "gemm_classes", (_Linear,))
+    # a patched non-GEMM class (TE RMSNorm is patched too) must not convert
+    monkeypatch.setitem(fg._STATE, "orig", {_Linear: None, torch.nn.LayerNorm: None})
     model = torch.nn.Module()
     model.lin = _Linear(8, 4)
     model.other = torch.nn.Linear(4, 4).to(torch.bfloat16)  # not a patched class
