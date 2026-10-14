@@ -466,15 +466,21 @@ def _no_anchors(n: int, layers: int, topk: int) -> torch.Tensor:
     return torch.full((n, layers, topk), NO_ANCHOR, dtype=ROUTE_DTYPE)
 
 
-def anchored_draft_length(complete: int, prompt_len: int, g: int) -> int:
+def anchored_draft_length(
+    complete: int, prompt_len: int, g: int, horizon: Optional[int] = None
+) -> int:
     """Longest m <= g whose drafted tokens all have their anchors.
 
     Token i of the draft (0-based) is sampled from the forward of position
     P+i-1, which depends on anchors 0..P+i-1. So m tokens need positions
     0..P+m-2 complete, i.e. P+m-1 <= complete. (The bonus after m tokens
     would need P+m-1 too; it is never sampled from an unanchored row: see
-    ``SpeculativeGeneration``.)
+    ``SpeculativeGeneration``.) ``horizon`` c (anchor horizon): positions
+    >= c are self, so only positions below c need a logged route; once they
+    are all logged every drafted token is anchored.
     """
+    if horizon is not None and complete >= horizon:
+        return g
     return max(0, min(g, complete - prompt_len + 1)) if complete >= prompt_len else 0
 
 
@@ -513,3 +519,163 @@ def _compare(anchors: torch.Tensor, ref: torch.Tensor):
     r = torch.full_like(a, NO_ANCHOR)
     r[inside] = ref[pos[inside]].to(a.dtype).sort(-1).values
     return pos, (a == r).all(-1)
+
+
+# ---- Engine anchor apply (anchor horizon), engine side ----
+
+
+class EngineAnchors:
+    """Per-token anchors of an engine's forwards, from per-request anchor rows.
+
+    Anchor horizon: a rollout drafted at theta_{k-1} whose anchors are
+    complete below c continues on the engine at theta_k, whose forward must
+    route positions < c with the sticky rule against those anchors (prefill
+    of the prefix, re-prefill after an eviction, and any decode below c) and
+    every later position plainly. Rows of a request are stored once, at
+    admission, in a paged device pool (``page`` positions per page, pages
+    grown by doubling, freed when the request leaves the engine); every
+    forward then fills the static per-token buffer ``buffer`` [max_tokens,
+    L_local, K] that the routers read inside their CUDA graphs
+    (``sticky_routing.engine_step_anchors``): one host-to-device index copy
+    (pinned, non-blocking), one fill of the rows written last step with -1
+    and one gather from the pool, all enqueued on the forward's stream before
+    it launches. Per-token work is numpy over the step's tokens; Python runs
+    per request (admission, release), never per token, and nothing is
+    synchronized with the device. Steps without anchored tokens cost nothing
+    on the device once the buffer is clean.
+
+    ``fetch(key)`` returns a request's dense rows [c, L_local, K] (positions
+    0..c-1, -1 where self) or None (unknown key: plain routing).
+    """
+
+    def __init__(
+        self,
+        max_tokens: int,
+        layers: int,
+        topk: int,
+        device: Any,
+        fetch: Callable[[str], Optional[torch.Tensor]],
+        page: int = 256,
+        pages: int = 64,
+    ):
+        self.fetch = fetch
+        self.page = int(page)
+        self.device = device
+        self.buffer = torch.full(
+            (int(max_tokens), int(layers), int(topk)), NO_ANCHOR, dtype=ROUTE_DTYPE,
+            device=device,
+        )
+        self._pool = torch.full(
+            (int(pages) * self.page, int(layers), int(topk)), NO_ANCHOR,
+            dtype=ROUTE_DTYPE, device=device,
+        )
+        self._free = list(range(int(pages)))[::-1]
+        # Per anchor id (reused after release): page table row and c.
+        self._ids: dict[str, int] = {}
+        self._free_ids: list[int] = []
+        self._table = np.zeros((0, 1), dtype=np.int64)
+        self._limit = np.zeros(0, dtype=np.int64)
+        self._dirty = 0  # buffer rows [0, _dirty) may hold anchors
+        self.applied_tokens = 0
+        self.loaded_requests = 0
+
+    @property
+    def pool_bytes(self) -> int:
+        return self._pool.numel() * self._pool.element_size()
+
+    def anchor_id(self, key: str) -> int:
+        """Id of a request's anchors, loading them into the pool (-1: none)."""
+        aid = self._ids.get(key)
+        if aid is not None:
+            return aid
+        rows = self.fetch(key)
+        if rows is None or int(rows.shape[0]) == 0:
+            return -1
+        n = int(rows.shape[0])
+        need = -(-n // self.page)
+        while len(self._free) < need:
+            self._grow()
+        pages = np.array([self._free.pop() for _ in range(need)], dtype=np.int64)
+        dst = (pages[:, None] * self.page + np.arange(self.page)[None]).reshape(-1)[:n]
+        idx = torch.from_numpy(dst)
+        src = rows.to(ROUTE_DTYPE)
+        if self._pool.is_cuda:
+            idx = idx.pin_memory().to(self.device, non_blocking=True)
+            src = src.pin_memory().to(self.device, non_blocking=True)
+        self._pool.index_copy_(0, idx, src)
+        if self._free_ids:
+            aid = self._free_ids.pop()
+        else:
+            aid = int(self._limit.shape[0])
+            self._limit = np.append(self._limit, 0)
+            self._table = np.concatenate(
+                [self._table, np.zeros((1, self._table.shape[1]), dtype=np.int64)]
+            )
+        if need > self._table.shape[1]:
+            grown = np.zeros((self._table.shape[0], need), dtype=np.int64)
+            grown[:, : self._table.shape[1]] = self._table
+            self._table = grown
+        self._table[aid, :need] = pages
+        self._limit[aid] = n
+        self._ids[key] = aid
+        self.loaded_requests += 1
+        return aid
+
+    def release(self, key: str) -> None:
+        """Free a request's pages (it left the engine)."""
+        aid = self._ids.pop(key, None)
+        if aid is None:
+            return
+        n = int(self._limit[aid])
+        self._free += self._table[aid, : -(-n // self.page)].tolist()
+        self._limit[aid] = 0
+        self._free_ids.append(aid)
+
+    def keys(self) -> list[str]:
+        return list(self._ids)
+
+    def _grow(self) -> None:
+        old = self._pool
+        n = int(old.shape[0]) // self.page
+        pool = torch.full(
+            (2 * int(old.shape[0]), *old.shape[1:]), NO_ANCHOR, dtype=ROUTE_DTYPE,
+            device=self.device,
+        )
+        pool[: old.shape[0]].copy_(old)
+        self._pool = pool
+        self._free = list(range(2 * n - 1, n - 1, -1)) + self._free
+
+    def fill(self, token_aid: np.ndarray, token_pos: np.ndarray) -> int:
+        """Fill ``buffer`` for one forward; returns the anchored token count.
+
+        ``token_aid[j]`` / ``token_pos[j]``: anchor id (-1: none) and absolute
+        position of the forward's token j (unpadded tokens, context order).
+        Rows of tokens without an anchor (no id, or position >= the request's
+        c) and padding rows are -1.
+        """
+        aid = np.asarray(token_aid, dtype=np.int64)
+        pos = np.asarray(token_pos, dtype=np.int64)
+        if self._limit.size == 0:
+            aid = np.full_like(aid, -1)
+        lim = np.where(aid >= 0, self._limit[np.maximum(aid, 0)] if self._limit.size else 0, 0)
+        sel = np.flatnonzero((aid >= 0) & (pos < lim))
+        if self._dirty:
+            self.buffer[: self._dirty].fill_(NO_ANCHOR)
+            self._dirty = 0
+        if sel.size == 0:
+            return 0
+        a, p = aid[sel], pos[sel]
+        src = self._table[a, p // self.page] * self.page + p % self.page
+        both = torch.from_numpy(np.stack([sel, src]))
+        if self.buffer.is_cuda:
+            both = both.pin_memory().to(self.device, non_blocking=True)
+        self.buffer.index_copy_(0, both[0], self._pool.index_select(0, both[1]))
+        self._dirty = int(sel[-1]) + 1
+        self.applied_tokens += int(sel.size)
+        return int(sel.size)
+
+    def clear(self) -> None:
+        """Make every buffer row self (an expert-parallel dummy step)."""
+        if self._dirty:
+            self.buffer[: self._dirty].fill_(NO_ANCHOR)
+            self._dirty = 0

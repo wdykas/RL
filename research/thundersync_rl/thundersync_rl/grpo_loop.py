@@ -259,6 +259,15 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # tokens decoded past the verified piece (SpeculativeGeneration
     # ._continue_sticky). Fixed count: the cut is exogenous.
     sticky_continuation_chunk_tokens: int = 2048
+    # Sticky routing anchor horizon H (generated positions; DESIGN.md section
+    # 14i). None: anchors up to the rollout cap (every drafted rollout is
+    # completed at theta_{k-1} before the refit). Set: anchors only at
+    # positions < c = prompt + min(H, cap), self beyond; theta_{k-1} work per
+    # drafted rollout ends once its anchors below c are logged, and the refit
+    # engine samples the rest from p_k directly, re-applying the anchors with
+    # the sticky rule in its forwards (engine anchor apply). Bounds theta_{k-1}
+    # work (and the refit wait) by H tokens per rollout.
+    sticky_anchor_horizon: Optional[int] = None
     # Weights the engine drafts the next step's rollouts with (draft_weights.py,
     # DESIGN.md section 14f). "current": theta_k. "momentum": theta_hat_{k+1} =
     # the AdamW step of the optimizer state (theta_k, m_k, v_k) with gradient 0,
@@ -446,6 +455,9 @@ def validate_sticky_routing(master_config: ThunderSyncMasterConfig) -> None:
         problems.append("invalid expert_model_parallel_size")
     if (policy_cfg.get("router_replay") or {}).get("enabled"):
         problems.append("policy.router_replay.enabled (R3) must be false")
+    horizon = ts_cfg.sticky_anchor_horizon
+    if horizon is not None and int(horizon) < 0:
+        problems.append(f"thundersync.sticky_anchor_horizon must be >= 0 (got {horizon})")
     if problems:
         raise ValueError("thundersync.sticky_routing: " + "; ".join(problems) + ".")
 
@@ -599,6 +611,11 @@ def configure_sticky_policy(master_config: Any) -> None:
     master_config.policy["megatron_cfg"]["sticky_routing_delta"] = delta
     master_config.policy["megatron_cfg"]["sticky_rounding"] = bool(
         master_config.thundersync.sticky_rounding
+    )
+    # The generation workers apply anchors in their forwards (engine anchor
+    # apply) only with an anchor horizon.
+    master_config.policy["megatron_cfg"]["sticky_anchor_horizon"] = (
+        master_config.thundersync.sticky_anchor_horizon if delta is not None else None
     )
 
 
@@ -1341,6 +1358,7 @@ def thundersync_grpo_train(
             sticky_chunk_tokens=ts_cfg.sticky_continuation_chunk_tokens,
             draft_weights=ts_cfg.draft_weights,
             max_seq_len=master_config.policy["max_total_sequence_length"],
+            anchor_horizon=ts_cfg.sticky_anchor_horizon if sticky_delta(ts_cfg) is not None else None,
         )
     sticky = spec is not None and spec.sticky_delta is not None
     G = master_config.grpo.num_generations_per_prompt

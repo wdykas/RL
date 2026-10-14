@@ -180,6 +180,10 @@ class Plan:
     # unfinished prefix and still decodes it (``_continue_sticky`` goes on
     # with it instead of starting a new one).
     stream: Optional[dict[str, Any]] = field(default=None, compare=False)
+    # Anchor horizon: the key of this plan's anchors on the generation workers
+    # (``register_engine_anchors``); the refit engine continues the rollout
+    # applying them below the horizon.
+    engine_key: Optional[str] = None
 
 
 @dataclass
@@ -328,6 +332,7 @@ class SpeculativeGeneration:
         sticky_chunk_tokens: int = 2048,
         draft_weights: str = "current",
         max_seq_len: Optional[int] = None,
+        anchor_horizon: Optional[int] = None,
     ):
         self.base = base
         self.learner_policy = learner_policy
@@ -439,6 +444,12 @@ class SpeculativeGeneration:
         # Continuations are verified every this many decoded tokens while the
         # engine keeps decoding them (``_continue_sticky``).
         self.sticky_chunk_tokens = sticky_chunk_tokens
+        # Anchor horizon H (sticky routing; None: anchors up to the cap).
+        # Positions >= c = P + min(H, cap) are self: theta_{k-1} work per
+        # drafted rollout ends once its anchors below c are logged, and the
+        # refit engine continues it, applying the anchors (``_horizon``).
+        self.anchor_horizon = anchor_horizon
+        self._anchor_keys = itertools.count()
         self._cont_ids = itertools.count()
         self._anchor_claims = PrefixClaims()
         # Route blocks by the step whose training replays them (freed by
@@ -678,7 +689,9 @@ class SpeculativeGeneration:
         res = [self._truncate(x, h) for x, h in zip(cut, hid)]
         anchors, streams = [], []
         for i, ((toks, _, _), a, plen) in enumerate(zip(res, routes, prompt_lens)):
-            anchors.append(None if a is None else a.truncate(plen + len(toks)))
+            anchors.append(
+                None if a is None else self._cut(a.truncate(plen + len(toks)), plen)
+            )
             streams.append(
                 dict(idx=i, hkey=hkeys[i], length=plen + budget, taken=len(toks), routes=a)
             )
@@ -865,6 +878,7 @@ class SpeculativeGeneration:
             self._truncate_to_anchors(x, a, plen)
             for x, a, plen in zip(res, anchors, prompt_lens)
         ]
+        anchors = [self._cut(a, plen) for a, plen in zip(anchors, prompt_lens)]
         hid = self._pop_hidden(hkeys, [len(x[0]) for x in res])
         res = [self._truncate(x, h) for x, h in zip(res, hid)]
         return res, hid, anchors
@@ -878,7 +892,9 @@ class SpeculativeGeneration:
         if self.sticky_delta is None or anchors is None:
             return drafted
         toks, done, lps = drafted
-        m = anchored_draft_length(anchors.complete, prompt_len, len(toks))
+        m = anchored_draft_length(
+            anchors.complete, prompt_len, len(toks), self._horizon(prompt_len)
+        )
         if m >= len(toks):
             return drafted
         for name, v in (
@@ -1534,6 +1550,34 @@ class SpeculativeGeneration:
             return self.max_new_tokens
         return max(0, min(self.max_new_tokens, self.max_seq_len - prompt_len))
 
+    def _horizon(self, prompt_len: int) -> Optional[int]:
+        """Anchor horizon position c = P + min(H, cap) (None: no horizon).
+
+        Positions < c carry the plain theta_{k-1} routes (drafted rollouts),
+        positions >= c are self. A function of the prompt length only.
+        """
+        if self.anchor_horizon is None:
+            return None
+        return prompt_len + min(int(self.anchor_horizon), self._cap(prompt_len))
+
+    def _cut(self, anchors: Optional[RouteRefs], prompt_len: int) -> Optional[RouteRefs]:
+        """``anchors`` restricted to positions below the horizon (self beyond)."""
+        c = self._horizon(prompt_len)
+        return anchors if anchors is None or c is None else anchors.truncate(c)
+
+    def _horizon_done(self, plan: Plan, prompt_len: int) -> bool:
+        """Whether a plan's theta_{k-1} part is done: its anchors below c are logged.
+
+        The rest of the rollout is sampled from p_k directly by the refit
+        engine, which applies those anchors.
+        """
+        c = self._horizon(prompt_len)
+        return (
+            c is not None
+            and plan.anchors is not None
+            and plan.anchors.complete >= c
+        )
+
     def _stopped(self, d) -> bool:
         """Whether draft ``d``, if fully accepted, is a finished rollout."""
         # The draft terminated on its own (EOS/stop) rather than at the budget
@@ -1833,7 +1877,7 @@ class SpeculativeGeneration:
             (key, plan)
             for key, queue in self.plans.items()
             for plan in queue
-            if not plan.complete
+            if not plan.complete and not self._horizon_done(plan, len(key))
         ]
         # The drafts' streams still decode: whole-accepted unfinished plans go
         # on with theirs, every other stream stops.
@@ -1841,6 +1885,38 @@ class SpeculativeGeneration:
         self._stop_streams([x for x in streams if id(x) not in kept])
         if pending:
             await self._continue_sticky(pending)
+        self._register_horizon_plans()
+
+    def _register_horizon_plans(self) -> None:
+        """Hand the anchors of plans the refit engine continues to the engine.
+
+        Anchor horizon: every incomplete plan now has its anchors below c
+        (``_horizon_done``); ``_one`` continues it at theta_k with the request
+        tagged by ``plan.engine_key``. All generation workers get the handles
+        (the coordinator picks the rank that runs a request; the rank that
+        admits it fetches its own stage's blocks); no route data passes
+        through the driver.
+        """
+        if self.anchor_horizon is None:
+            return
+        entries = {}
+        for key, queue in self.plans.items():
+            for plan in queue:
+                if plan.complete:
+                    continue
+                if not self._horizon_done(plan, len(key)):
+                    raise RuntimeError(
+                        "sticky routing: a drafted rollout left the theta_{k-1} "
+                        "rounds without its anchors below the horizon"
+                    )
+                plan.engine_key = f"h{next(self._anchor_keys)}"
+                entries[plan.engine_key] = self._cut(plan.anchors, len(key))
+        ray.get(
+            self.base._policy.worker_group.run_all_workers_single_data(
+                "register_engine_anchors", entries=entries
+            )
+        )
+        self.stats["spec/horizon_plans"] = float(len(entries))
 
     def _stop_streams(self, streams) -> None:
         """Abort engine draft streams and close their logs (rank 0 + every engine)."""
@@ -1947,7 +2023,19 @@ class SpeculativeGeneration:
                 )
                 for key, plan in items
             ]
-            budgets = [self._cap(len(key)) - len(plan.prefix) for key, plan in items]
+            # Anchor horizon: H + 1 tokens suffice (position c - 1 is routed by
+            # the forward that samples token H); the refit engine does the rest.
+            budgets = [
+                self._cap(len(key)) - len(plan.prefix)
+                if self.anchor_horizon is None
+                # At least one token: a re-prefill logs every prefix position.
+                else max(
+                    1,
+                    min(self._cap(len(key)), int(self.anchor_horizon) + 1)
+                    - len(plan.prefix),
+                )
+                for key, plan in items
+            ]
             hkeys = self._hidden_keys([f"c{next(self._cont_ids)}" for _ in items])
             idx = ray.get(
                 rank0.add_drafts.remote(
@@ -2037,7 +2125,9 @@ class SpeculativeGeneration:
                 m = (
                     0
                     if a is None
-                    else anchored_draft_length(a.complete, plen, len(toks))
+                    else anchored_draft_length(
+                        a.complete, plen, len(toks), self._horizon(len(s["key"]))
+                    )
                 )
                 cut.append((s, toks, done, lps, plen, m))
             some = [c for c in cut if c[5] > 0]
@@ -2072,7 +2162,9 @@ class SpeculativeGeneration:
                     [(version, 0, m)],
                     None if lps is None else lps[:m],
                     h,
-                    None if s["routes"] is None else s["routes"].truncate(plen + m),
+                    None
+                    if s["routes"] is None
+                    else self._cut(s["routes"].truncate(plen + m), len(s["key"])),
                 )
                 if m > 0 and engine_q_ready(d):
                     flat.append((len(flat), d))
@@ -2117,10 +2209,13 @@ class SpeculativeGeneration:
                     plan.prefix_logprobs += lps[:g]
                     plan.anchors = d[8].truncate(p.numel() + g)
                     s["taken"] += g
-                    plan.complete = bool(done) or len(plan.prefix) >= self._cap(
-                        len(s["key"])
-                    )
-                    if plan.complete:
+                    # A stream ends at EOS or the cap, or (anchor horizon) at
+                    # its H + 1 token budget, which does not end the rollout.
+                    plan.complete = (
+                        bool(done)
+                        and (self.anchor_horizon is None or toks[-1] == self.eod)
+                    ) or len(plan.prefix) >= self._cap(len(s["key"]))
+                    if plan.complete or self._horizon_done(plan, len(s["key"])):
                         done_streams.append(s)
                 else:
                     y = out["next"]
@@ -2131,7 +2226,9 @@ class SpeculativeGeneration:
                         len(s["key"])
                     )
                     done_streams.append(s)
-                    if not plan.complete:
+                    if not plan.complete and not self._horizon_done(
+                        plan, len(s["key"])
+                    ):
                         restart.append(s)
             if done_streams:
                 stop(done_streams)
@@ -2242,7 +2339,7 @@ class SpeculativeGeneration:
         if plan.fused is not None:
             self._fused_claims.add(key, gen, plan.fused)
         if self.sticky_delta is not None and plan.anchors is not None:
-            if not plan.complete:
+            if not plan.complete and plan.engine_key is None:
                 # Its continuation would be decoded plainly by the refit
                 # engine, which is not the sticky policy the prefix was
                 # verified against.
@@ -2262,6 +2359,9 @@ class SpeculativeGeneration:
             )
             if plan.seed >= 0:
                 cont["noise_seed"] = torch.tensor([plan.seed])
+            if plan.engine_key is not None:
+                # Anchor horizon: the engine applies the plan's anchors below c.
+                cont["ts_anchor_key"] = [plan.engine_key]
             if self.tail_lookup:
                 refs = self._lookup_references(key, plan)
                 if refs:

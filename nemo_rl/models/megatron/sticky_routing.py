@@ -37,7 +37,11 @@ target indices as anchors and stores the effective selection for
 REPLAY_BACKWARD (activation recompute replays exactly the routes the forward
 used). RECORD records the plain top-k (the drafter's anchors) into the
 instance's static buffer when one is set (engine CUDA graphs), only inside
-inference forwards.
+inference forwards. With an engine anchor buffer attached (``APPLY_ATTR``,
+anchor horizon), RECORD then applies the sticky rule against the step's
+per-token anchors (rows of -1 for tokens without anchors), so one engine
+forward both logs plain routes for drafts and samples F(theta; A) for
+anchored requests.
 """
 
 from __future__ import annotations
@@ -54,7 +58,7 @@ _MISSING_ROUTE_ATTR = "_nrl_missing_route_fallback_patch"
 
 # Process-wide sticky threshold (router-score units); None: sticky off (plain
 # replay semantics unchanged).
-_STATE: dict[str, Any] = {"delta": None, "stats": None}
+_STATE: dict[str, Any] = {"delta": None, "stats": None, "horizon": None}
 
 
 def sticky_routing_delta(config: Any) -> Optional[float]:
@@ -62,6 +66,21 @@ def sticky_routing_delta(config: Any) -> Optional[float]:
     megatron_cfg = (config or {}).get("megatron_cfg") or {}
     d = megatron_cfg.get("sticky_routing_delta")
     return None if d is None else float(d)
+
+
+def sticky_anchor_horizon(config: Any) -> Optional[int]:
+    """``policy.megatron_cfg.sticky_anchor_horizon`` (None: anchors up to the cap).
+
+    Set: the engine applies per-request anchors (positions below a rollout's
+    horizon) in its forwards (ThunderSync anchor horizon).
+    """
+    megatron_cfg = (config or {}).get("megatron_cfg") or {}
+    h = megatron_cfg.get("sticky_anchor_horizon")
+    return None if h is None else int(h)
+
+
+def get_anchor_horizon() -> Optional[int]:
+    return _STATE.get("horizon")
 
 
 def sticky_routing_enabled(config: Any) -> bool:
@@ -166,6 +185,26 @@ def pop_stats() -> dict[str, float]:
     }
 
 
+# Engine anchor apply: attribute on an engine router's ``RouterReplay`` holding
+# (buffer [max_tokens, K] view of the per-token anchor buffer, row offset
+# multiplier) set by the ThunderSync generation worker before CUDA-graph
+# capture. Sequence parallelism: TP rank r routes tokens [r T, (r+1) T) of
+# the step, so the multiplier is r (0 without sequence parallelism).
+APPLY_ATTR = "_nrl_anchor_apply"
+
+
+def engine_step_anchors(apply: tuple[torch.Tensor, int], n: int) -> torch.Tensor:
+    """Rows of the per-token anchor buffer for a router call over ``n`` tokens.
+
+    A fixed slice of a static buffer (its offset depends only on ``n``, i.e.
+    on the graph's token count), so it is captured into CUDA graphs and every
+    replay reads the anchors the step filled in.
+    """
+    buf, rank = apply
+    lo = rank * n
+    return buf[lo : lo + n]
+
+
 def _inference_active() -> bool:
     try:
         from megatron.core.inference.utils import InferenceMode
@@ -213,7 +252,21 @@ def install() -> None:
                 return default_compute_topk(
                     scores, topk, num_groups=num_groups, group_topk=group_topk
                 )
-            return inner(self, scores, topk, num_groups, group_topk, default_compute_topk)
+            probs, idx = inner(
+                self, scores, topk, num_groups, group_topk, default_compute_topk
+            )
+            apply = getattr(self, APPLY_ATTR, None)
+            if apply is None or _STATE["delta"] is None:
+                return probs, idx
+            # Engine anchor apply (anchor horizon): the plain top-k is
+            # recorded above (the drafter's log); the forward uses the sticky
+            # rule against this step's per-token anchors (all -1 = self for
+            # tokens without anchors: then bitwise the plain selection).
+            anchors = engine_step_anchors(apply, int(scores.shape[0]))
+            vals, eff, _ = sticky_select(
+                scores, anchors, probs, idx, _STATE["delta"]
+            )
+            return vals, eff
         delta = _STATE["delta"]
         if (
             delta is None
@@ -243,4 +296,5 @@ def configure(config: Any) -> Optional[float]:
     if delta is not None:
         install()
     set_delta(delta)
+    _STATE["horizon"] = None if delta is None else sticky_anchor_horizon(config)
     return delta
