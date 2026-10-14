@@ -54,7 +54,7 @@ try:
 except ImportError:  # pragma: no cover
     HAVE_TRITON = False
 
-_STATE: dict[str, Any] = {"orig": None}
+_STATE: dict[str, Any] = {"orig": None, "logged": False}
 
 
 if HAVE_TRITON:
@@ -211,6 +211,14 @@ def fused_unpermute(
 
         cross_rank_fp64 = get_batch_invariant_collective() == "multimem"
     assert num_experts % ep_size == 0, "batch-invariant MoE expects contiguous EP shards"
+    if not _STATE["logged"]:
+        _STATE["logged"] = True
+        print(
+            f"[bi_unpermute] fused batch-invariant unpermute: ep={ep_size} "
+            f"tokens={int(restore_shape[0])} topk={inverse_map.shape[-1]} "
+            f"hidden={permuted_tokens.shape[1]} cross_rank_fp64={bool(cross_rank_fp64)}",
+            flush=True,
+        )
     with torch.no_grad():
         rows, ranks = slot_order(inverse_map, num_experts, ep_size)
     out = _FusedUnpermute.apply(
