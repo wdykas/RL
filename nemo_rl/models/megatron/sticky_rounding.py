@@ -281,6 +281,8 @@ class AnchorStream:
         n = 1
         for d in t.shape[:lead]:
             n *= d
+        if self.mask.device != t.device:
+            self.mask = self.mask.to(t.device)
         m = self.mask
         if n != m.numel():
             if n * self.tp_size != m.numel():
@@ -325,17 +327,23 @@ def active_stream() -> Optional[AnchorStream]:
 def site_cast(site: Any, x: torch.Tensor) -> torch.Tensor:
     """fp16 cast of a rounding site (installed into ``fp16_gemm``).
 
-    Outside a policy forward (and for fp16 inputs, where r is the identity):
-    ``x.to(fp16)``. Anchor pass: records the value. Policy pass: r(x; a).
+    Outside a policy forward: ``x.to(fp16)``. Anchor pass: records the value.
+    Policy pass: r(x; a). Both passes record / consume every site, whatever
+    the input dtype: a site's input can be fp16 in the inference-mode anchor
+    pass and fp32 holding fp16 values under autograd (the attention output),
+    and r is the identity on fp16-representable x.
     """
     x16 = x.to(torch.float16)
     s = _STATE["stream"]
-    if s is None or s.mode is None or x.dtype == torch.float16:
+    if s is None or s.mode is None:
         return x16
     if s.mode == RECORD:
         s.record(site, x, x16)
         return x16
-    out = sticky_round16(x, s.pop(site, x16.shape), x16)
+    a = s.pop(site, x16.shape)
+    if x.dtype == torch.float16:
+        return x16
+    out = sticky_round16(x, a, x16)
     _count(out, x)
     return out
 
@@ -544,6 +552,8 @@ def sticky_rounding_enabled(config: Any) -> bool:
 
 def lockstep_units(model: torch.nn.Module) -> list[torch.nn.Module]:
     """This rank's lockstep units in forward order: embedding, then each layer."""
+    while not hasattr(model, "decoder") and hasattr(model, "module"):
+        model = model.module  # DDP / Float16Module wrappers
     units: list[torch.nn.Module] = []
     if getattr(model, "embedding", None) is not None and getattr(model, "pre_process", True):
         units.append(model.embedding)
