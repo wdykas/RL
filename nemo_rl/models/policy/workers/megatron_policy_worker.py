@@ -631,6 +631,11 @@ class MegatronPolicyWorkerImpl(
             from nemo_rl.models.megatron import bi_unpermute
 
             bi_unpermute.install()
+        if (config["megatron_cfg"].get("bi_split_kv") or {}).get("enabled", False):
+            # Anchored, batch-invariant split-KV FA4 attention for learner and engine.
+            from nemo_rl.models.megatron import bi_split_kv
+
+            bi_split_kv.install(config["megatron_cfg"])
         if config["megatron_cfg"].get("fp32_residual_connection"):
             from nemo_rl.models.megatron import fp32_residual
 

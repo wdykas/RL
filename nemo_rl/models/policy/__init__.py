@@ -609,6 +609,24 @@ class MegatronConfig(TypedDict):
     # range there 2^s-fold for models whose SwiGLU outputs approach 65504. 0 = off.
     # Must match between training and generation.
     down_proj_prescale_log2: NotRequired[int | None]
+    # Batch-invariant split-KV attention (nemo_rl.models.megatron.bi_split_kv), used by the
+    # learner (TE FA4 varlen) and the engine (Megatron FA4 paged decode/prefill) alike.
+    # Under batch_invariant_mode, FA4 otherwise runs num_splits=1 (one CTA per row and KV
+    # head), which is slow for few-row long-context decode. Must match between training
+    # and generation.
+    bi_split_kv: NotRequired["BISplitKVConfig | None"]
+
+
+class BISplitKVConfig(TypedDict):
+    enabled: bool
+    # Keys per split, anchored at absolute positions: split s owns keys [s*S, (s+1)*S).
+    # Part of the numerics (training and generation must agree); multiple of 128.
+    seqlen_k_per_split: int
+    # Fixed number of splits launched by every call (>= ceil(max context / S), >= 2):
+    # fixed CUDA-graph grids; empty splits contribute an exact zero.
+    num_splits: int
+    # Pinned split capacity of the combine kernel (>= num_splits, <= 256); default num_splits.
+    combine_max_splits: NotRequired[int | None]
 
 
 class TokenizerConfig(TypedDict):
