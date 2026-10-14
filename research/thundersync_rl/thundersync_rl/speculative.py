@@ -1923,11 +1923,12 @@ class SpeculativeGeneration:
             plans = [(_key(self._row_prompts[i]), p) for i, p in self._row_plans.items()]
         else:
             plans = [(key, plan) for key, queue in self.plans.items() for plan in queue]
+        waiting = {id(plan) for _, plan in ended}  # on the environment
         pending = [
             (key, plan)
             for key, plan in plans
             if not plan.complete
-            and not any(plan is q for _, q in ended)
+            and id(plan) not in waiting
             and not self._horizon_done(plan, len(key))
         ]
         # The drafts' streams still decode: whole-accepted unfinished plans go
@@ -2248,8 +2249,9 @@ class SpeculativeGeneration:
                 if self.turn_env.rollout_ends(plan.turns):
                     plan.complete = True
                     continue
-                plan.prefix += rec.obs
-                plan.prefix_logprobs += [0.0] * len(rec.obs)
+                # New lists: a complete plan's prefix may be its draft's token list.
+                plan.prefix = plan.prefix + rec.obs
+                plan.prefix_logprobs = plan.prefix_logprobs + [0.0] * len(rec.obs)
                 plan.turn_start = len(plan.prefix)
                 nxt.append((key, plan))
             start(nxt)
@@ -2497,6 +2499,10 @@ class SpeculativeGeneration:
                 "spec/sticky_env_turns": float(stats["turns"]),
             }
         )
+        if self.turn_env is not None:
+            # Environment latency now sits before the refit (DESIGN 14h).
+            self.stats["spec/sticky_env_s"] = self.turn_env.env_s
+            self.turn_env.env_s = 0.0
 
     def claim_anchors(
         self, prompt: torch.Tensor, token_ids: torch.Tensor
