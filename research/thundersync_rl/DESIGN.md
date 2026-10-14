@@ -1521,6 +1521,87 @@ forwards of unused drafts, multi-version (cohort) pools, the scorer path, variab
 approval). Not measured yet: acceptance/step time on a real MoE with K drafts (engine capacity is
 the price: `agent_multi_draft.md` §3).
 
+## 14e. Banded importance sampling (`thundersync.banded_is_band`)
+
+*Opt-in, off by default (unset = every row is an exact sample of the current policy). Unit-tested
+on CPU (exact enumeration, sampler identity, driver/loss plumbing); the GPU worker test and any
+end-to-end run are not run yet.* Analysis, measurements and what it gives up:
+`thundersync_work/research/agent_draft_reuse.md` §1.
+
+**What changes semantically.** With the band on, rows are **exact in expectation, not in law**:
+the trainer gets (Y, w) with E[w·f(Y)] = E_p f(Y) for every f, so the policy gradient stays
+unbiased, but the rows themselves follow m = p/w, which is close to q (TV(m, p) ≈ TV(q, p) at
+sequence level, ≈ 0.4·√(L·v) ≈ 9% at v = 1.5e-6, L = 32k) [derived; enumerated]. Unweighted
+statistics of the rows (mean reward, lengths, pass rates, entropy) are statistics of m, not p;
+`reward_is` is the weighted (unbiased) mean reward.
+
+**Rule.** For a draft with prefix log-ratio S_t = Σ_{s≤t} log p(x_s)/q(x_s), let T be the first t
+with |S_t| ≥ b (T = g if none). Block verification (section 4) runs against the target p̃ = q at
+positions 1..T and p after T (rows past the draft are p); p̃ depends on the prefix only, so the
+result is exact for p̃ [derived]. Since b_i = 1 and r_i = 0 below T, every output keeps the draft
+through T (τ ≥ T) and the whole prefix inside the band is accepted with probability 1. The
+continuation after a rejection is ordinary p decoding, and the row's loss weight is w = exp(S_T)
+(exp(S_g) without exit), so |log w| < b + one token's |log p/q|. Lemma (agent_first_principles §2.1)
++ optional stopping give E[w f(Y)] = E_p f [enumerated to 1e-12]. b → 0 is plain BV; b = ∞ is
+whole-sequence IS (rejected by validation: unbounded weights).
+
+**GRPO advantages.** The weight is per row; the group's other rows are drawn from m, not p. Exact
+enumeration of E[Σ_i w_i A_i ∇log p(y_i)] against the exactly-on-policy expectation
+(`research/draft_reuse/grpo_banded_enum.log`):
+- RLOO / mean-centred advantages with a constant normaliser: identical (rel. err 1e-15). A_i =
+  R_i − b(Y_{−i}) and E[w_i ∇log p(y_i)] = 0, so the baseline term vanishes whatever law the other
+  rows follow.
+- Leave-one-out std normalisation (`grpo.normalize_rewards`, NeMo-RL's default): A_i =
+  a(Y_{−i})·R_i + c(Y_{−i}), so the per-prompt gradient is E_m[a]·∇J_x instead of E_p[a]·∇J_x:
+  **the same direction per prompt**, a prompt scale off by 0.1–0.7% at TV(q,p) 1.5–15% in the toy.
+- Token-level loss (1/N_tok over the batch): the normaliser depends on the other rows' lengths;
+  toy group of 3: rel. err 0.5–2.5%, cosine ≥ 0.99995. In a batch of ~1000 rows N_tok
+  concentrates and the effect becomes a global scale of size |E_m len − E_p len|/E_p len [derived].
+- The group's product of weights Π_j w_j reproduces the exact expectation for every estimator
+  (1e-16), at ESS^G variance (not built: ESS 0.95 → 0.44 at G = 16).
+- For scale: exact GRPO itself differs from ∇J by more (token mean: cos 0.994; std: ×1.2).
+- `force_on_policy_ratio`: required and unchanged; w multiplies the advantage (a detached per-row
+  constant), never the PPO ratio. Folding w into prev_logprobs would let the ratio clip act on
+  it: biased, up to 46% rel. err in the toy (control row of the log).
+
+**Cost.** One draft per output (no extra decode), and gradient variance × 1/ESS, ESS =
+E[w]²/E[w²] ≈ e^{−L·v} when nothing exits. Brownian model (`research/draft_reuse/banded_sim.log`,
+20k drafts per cell at the cap): v = 1.5e-6, 32k, b = 1: tail decodes 0/20000 (BV: 16%; ⊥-BV
+M = 1.5: 6.9e-3, M = 2: 1.5e-4 with 1.5–2× drafts), ESS 0.95; 64k: 2.6e-4 with ESS 0.90 (⊥-BV
+M = 2: 4e-3). b = 0.5 at 32k: 3.5e-3, ESS 0.952. Rejections, when they happen, are after T, i.e. late.
+
+**Composition with ⊥-BV.** Mathematically valid (enumerated with per-group ⊥-BV: P(output) = 1/M
+exactly, weighted law p) but wasteful: inside the band the ⊥-BV acceptance is 1/M instead of 1, so ⊥
+only protects the post-exit walk. Use one or the other: banded IS (K = 1, ESS cost) or ⊥-BV (K > 1,
+exact rows). The pooled ⊥-BV of section 14d (`null_envelopes` grid, driver-side decisions) is not
+banded, so `banded_is_band` with `null_bv: true` is rejected by validation (not built).
+
+**Composition with sticky routing, sticky rounding and momentum draft weights.** Banded IS only
+changes the target of a draft's *first* verification (`verify` → `_verify_block(band=...)`), whatever
+p is (the sticky policy F(θ_k; A), with or without sticky rounding) and whatever q is (the engine's
+logged law at θ_{k−1} or the momentum-predicted θ̂_k). Sticky continuation rounds
+(`_continue_sticky`) call `_verify_block` without a band: plain BV, exact samplers of p given the
+prefix, which is what the weight w = exp(S_T) requires. The weight is attached to the `Plan`, survives
+the in-place continuation of the plan, and is registered (`PrefixClaims`, O(1) per entry) when the
+completed plan is taken by the rollout loop; the trainer claims it by the full trajectory.
+
+**Code.** `block_verification.band_exit / banded_log_weight / banded_target / zero_mass_below`;
+`band` argument of `block_verify(_lazy)`, `output_distribution_given_draft`,
+`block_verify_stats_lazy`, `verify_engine_q`, `worker.verify_drafts_block_engine` (rows report
+`band_log_weight`, `band_exited`); `speculative.Plan.log_weight`, `claim_log_weight`; only a
+draft's first verification is banded (sticky continuation rounds are plain BV, exact samplers of p
+as the weight requires); `grpo_loop.build_chunk_data` multiplies the advantage by
+`payload["is_weight"]` (open-group buckets stay exact: the bucket is Σ w_i ∇log p_i, scaled
+later). Metrics: `spec/band_ess`, `spec/band_exit_frac`, `spec/band_w_min/max`,
+`spec/band_outputs`, `reward_is`. Validation: finite b > 0, speculate, block + engine source, no
+fused verify-train.
+
+**Tests** (`tests/unit/test_banded_is.py`, 22): weighted law = p by exact enumeration for
+b ∈ {0.15, 0.5, 1.5, ∞} × M ∈ {1, 1.7} (w a function of the output, τ ≥ T, P(⊥) = 1 − 1/M;
+unweighted law visibly ≠ p); GRPO group expectations by enumeration (RLOO exact; LOO-std same
+direction, other scale; product weights exact); eager / lazy / engine-q pathwise identical with
+the band (incl. generator state); config, loss weight, driver plans/claims/stats, continuation
+rounds unbanded; worker on GPU (skipped on CPU) [measured: CPU suite 358 passed].
 ## 14f. Momentum-predicted draft weights (`thundersync.draft_weights: momentum`)
 
 *Opt-in, default `current`. Unit-tested (formula, Megatron DistributedOptimizer on 1 and 2 ranks
