@@ -1868,9 +1868,16 @@ observation tokens; observation log-probs are placeholders, masked from the loss
 - Engine (θ_{k−1}): each later turn is a new request whose prefill re-reads prompt + earlier turns
   + observation: O(turns × S) prefill tokens per rollout without prefix caching, plus its route
   log (L_local × K int16 per position on the logging rank, e.g. Ultra-like L=60/PP, K=22: 2.6 kB
-  per position per stage, all positions re-logged per turn). Step 4 of the brief (reuse the
-  plan's anchors for cached positions so only new positions are logged, prefill O(observation)
-  per turn) is not built yet; prefix caching stays off under sticky routing.
+  per position per stage, all positions re-logged per turn). Step 4 of the brief (prefix
+  caching: prefill O(observation) per turn, only new positions logged) is not built yet; prefix
+  caching stays off under sticky routing. What it needs [C, D]: the route log records absolute
+  positions (`token_to_pos_ids`), so a cache hit would log from the first uncached position, and
+  `merge_route_refs(base=plan.anchors)` already splices such a log over the plan's anchors (same
+  θ_{k−1}, same prefix: bitwise equal under BI); the next-turn and restart streams would pass
+  `plan.anchors` as their base. Open: prefix caching is engine-global, so drafts of one GRPO group
+  would hit each other's prompt blocks and need a shared prompt-anchor base; the route checks'
+  prefills must bypass the cache (else they compare a log with itself); cache entries must never
+  cross a weight version. All untested on GPU.
 - Learner: unchanged per token: anchors for every row position (observations included) fetched
   per pipeline stage from the object store; one verification forward per piece (as single-turn
   continuations).
