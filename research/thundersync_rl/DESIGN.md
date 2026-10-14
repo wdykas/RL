@@ -1590,6 +1590,57 @@ forwards of unused drafts, multi-version (cohort) pools, the scorer path, variab
 approval). Not measured yet: acceptance/step time on a real MoE with K drafts (engine capacity is
 the price: `agent_multi_draft.md` §3).
 
+### 14d.1 Opt-in tail tools (off by default; `thundersync_work/research/agent_tail.md`)
+
+The defaults are unchanged: fixed G, the DP envelopes, and the standard GRPO estimator.
+
+- **Prompt drop** (`null_bv_prompt_drop`, `null_bv_spare_prompts`; needs `null_bv_fixed_m`).
+  - Rule: M is the constant `null_bv_fixed_m` at every count; the forced M = 1 is never used. A
+    pool that can no longer fill its G slots (drafts left < slots left) is dropped.
+  - Why the kept groups are exact: the drop depends on success counts only. Given the past, each
+    draft succeeds with probability 1/M for every prompt and every (p, q), so P(drop) is the same
+    for every prompt and the kept groups are G iid p-samples.
+  - Enumerated through `decide_pools`:
+    - kept-group TV < 1e-9;
+    - P(drop) equals the Binomial count law for two (p, q) pairs;
+    - a content-based drop (control) has TV > 1e-2 (`tests/unit/test_tail_tools.py`).
+  - Batch selection: the dataloader batch carries `null_bv_spare_prompts` extra prompts. The step
+    trains on the first (batch − spares) undropped prompts in batch order
+    (`SpeculativeGeneration._select_prompts`). Plans of the other prompts are discarded before any
+    tail decode. If too few prompts survive, dropped prompts fill the shortfall and decode fresh.
+  - This **shifts the prompt mix** through the spare order, like DAPO's dynamic-sampling filter.
+    It never shifts it through the samples' contents.
+  - Metrics: `spec/null_dropped_prompts`, `spec/null_drop_rate`.
+- **Drop-IS** (`null_bv_drop_is`). It gives an unbiased gradient, not exact samples, so it is
+  opt-in only, like banded IS.
+  - Rule: a ⊥-BV output rejected inside its draft is discarded like ⊥: it fills no slot and gets
+    no tail decode. Each kept row's advantage is multiplied by max(1, W*/M), where W* = max_t of
+    the prefix ratio p/q (the worker reports `null_log_wstar`).
+  - Why it is unbiased: q(x)·P(whole | x)·max(1, W*/M) = p(x)/M exactly, so the weighted kept
+    rows follow p up to a common constant. Enumerated per draft and for the pooled process; the
+    unweighted control has TV > 1e-3.
+  - Combined with prompt drop, no row needs a tail from a root decision at fixed G.
+  - Continuation pieces of deadline-cut drafts are still plain BV.
+  - Metrics: `spec/drop_is_ess`, `spec/drop_is_weighted_frac`, `spec/drop_is_max_weight`,
+    `spec/drop_is_tail_drops`.
+- **Tail-excluded baseline** (`tail_excluded_baseline`; needs group or batch granularity). This
+  is an estimator change.
+  - Rule: each row's baseline (and std) is computed over the group's *other* rows that needed no
+    continuation after verification, or over all other rows if there are none. A group's
+    tail-free rows can then train before its tails return (`StreamPlanner`,
+    `register_group(tails=...)`).
+  - Why it is unbiased: the baseline is a function of the other rows' (value, flag) pairs only.
+    E[A_i ∇log p(y_i)] is therefore exactly the policy gradient for the mean baseline, and a
+    positive multiple of it with the std.
+  - Pitfall: the flag depends on y (P(tail | y) is a function of W*(y)), so the rule must not
+    change with the row's own flag. GRPO's self-inclusive mean over the tail-free subset is
+    biased.
+  - Exact enumeration: that variant fails, and so does dropping the tail rows. The rule above
+    holds to 1e-12.
+- **Guard**: `NullPolicy.m` accepts only the integer counts (d, s). An envelope chosen from any
+  pool-wide content statistic, such as the mean length of all other drafts, is biased
+  (z = +208, `agent_tail_exact_schemes.md` §3.4).
+
 ## 14f. Momentum-predicted draft weights (`thundersync.draft_weights: momentum`)
 
 *Opt-in, default `current`. Unit-tested (formula, Megatron DistributedOptimizer on 1 and 2 ranks
