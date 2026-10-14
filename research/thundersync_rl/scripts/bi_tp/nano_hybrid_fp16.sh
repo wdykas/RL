@@ -17,12 +17,17 @@
 # Hybrid specifics: the engine's Mamba conv state is fp32 under the fp16 GEMM forward (default,
 # resolve_mamba_conv_states_dtype); SSM states are fp32 (batch-invariant mode); the SSD Triton dots
 # use TF32 in training and engine alike unless TF32=ieee sets TRITON_F32_DEFAULT on both.
-# Truncated checkpoints: thundersync_work/models/nemotron3-nano-L$L (research/hybrid/make_trunc_nemotron.py).
+# Truncated checkpoints: thundersync_work/models/nemotron3-nano-L$L (research/hybrid/make_trunc_nemotron.py);
+# L=full runs the HF checkpoint nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16.
 W=/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/wdykas/code/on-olicy-rl/thundersync_work
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 L=${L:-8}
-export MODEL=${MODEL:-$W/models/nemotron3-nano-L$L}
-if [ ! -f "$MODEL/model.safetensors" ]; then
+if [ "$L" = full ]; then  # the whole 52-layer model (multi-node: thundersync_work/sbatch/submit_nano.sh)
+  export MODEL=${MODEL:-nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16}
+else
+  export MODEL=${MODEL:-$W/models/nemotron3-nano-L$L}
+fi
+if [ "$L" != full ] && [ ! -f "$MODEL/model.safetensors" ]; then
   /opt/nemo_rl_venv/bin/python $W/research/hybrid/make_trunc_nemotron.py "$L" "$MODEL" || exit 2
 fi
 export EP=${EP:-2} TP=${TP:-1} PP=${PP:-1} MAXLEN=${MAXLEN:-1024} STEPS=${STEPS:-4}
