@@ -2091,7 +2091,8 @@ finished early behind an earlier-index tail group still decoding) [unit test: id
 under three arrival orders; GPU reproducibility runs queued]. Per-rank cost: none (no extra buffer;
 U/V buffers to remove the last group's training are agent_tail_exact_schemes §3.1(b), not built).
 
-**Continuation rounds (exact, faster).** `sticky_continuation_chunk_tokens` 2048 → 256 (below the
+**Continuation rounds (exact, faster).** `sticky_continuation_chunk_tokens` 2048 → 128 (256 at first; 128 per the tail agent's Nano L8
+measurement, 20.9 → 16.7 s per step; below the
 1024-token caps of the test runs; 2048 > cap meant every piece was a whole remainder, so a rejection
 was found only after the stream had decoded all of it). Rounds no longer block the driver:
 `_verify_block_async` sends a piece's verification and the loop keeps cutting other streams' pieces,
@@ -2119,7 +2120,40 @@ it shares the learner with piece verification). The drafting window shrinks to w
 tails + refit (drafts 3–10k tokens instead of 24–33k), so more of the next cohort is decoded as
 continuation: the one-engine trade under sticky's two versions. Exactness (checks on, 29acacc8):
 Nano L8 current PASS 4/4 (mismatch 0, engine q exact, route check exact, sticky rule active).
-Results of the canonical order, determinism and the in-loop decode profile: agent_one_engine.md.
+
+**Learner call order (exact by construction).** Learner workers are asynchronous Ray actors (they
+have async methods), which may start queued calls in different orders on different ranks. With
+training dispatches, piece verifications and the momentum stage queued at once, ranks paired
+collectives of different calls: Nano L8 momentum + streaming hung (rank 0 in a verification's EP
+all_gather_object, rank 1 in a MoE forward's all-gather), reproduced on the tiny MoE. While
+streaming, every training dispatch and piece verification is a numbered learner call
+(`SpeculativeGeneration.learner_seq`) and each rank runs them strictly in number order (worker
+`ordered_call`), several in flight; unordered calls (refit, momentum stage) first drain the ordered
+ones. After every streamed step the driver compares each rank's crc32 of its (number, method)
+sequence and raises on a difference. A global driver-side lock (one call batch in flight) was the
+interim fix; step time with it was the same within noise (11.8–12.0 s vs 12.1–12.2 s ordered).
+
+**In-loop decode (profiled).** At EP=2 the engine's decode step cost 11–14 ms at every row count
+(EP=1: 3.9–6.6 ms): each MoE layer ran ReLU², the probability multiply and the fp16 cast over the
+worst-case padded CUDA-graph buffer (every EP rank's tokens × top-k, ~102k rows × 1856 at Nano
+shapes), ~2.2 ms per layer per step [torch profiler]. `fp16_moe.relu2_probs_fwd` /
+`swiglu_probs_fwd` now take the permuted-row end (`offsets[-1]`, a device scalar) in the engine
+and skip padding rows (never read: the grouped GEMM stops there); bitwise the eager values (GPU
+tests incl. CUDA-graph replay). After: 5.1–5.5 ms (1–4 rows), 6.4–6.9 ms (17–64 rows). Another
+~1.7 ms/step is the LM head's per-step fp32 hi/lo copies, which engine package A's stacked head
+removes (not on this branch). Per rank: no memory change; the fix matters more with depth (full
+Nano: 23 MoE layers).
+
+**Measured after both (Nano L8, EP=2, PERF, 6 steps, `time/iteration` steps 2–5, one run each):**
+current 12.1 s, momentum 12.2 s (from 22.9 / 22.5 baseline and 17.6 / 17.1 before the decode fix).
+Steps 3–5 of the current-draft run: verify0 0.7–0.9 s; tails + refit + serving 5.6–6.7 s
+(continuation tokens 47–65k at 17–20 rounds, drafts 54–72k tokens); after the last rollout 3.5–4.5 s
+(the remaining training of the tail groups and draft collection 0.5–0.6 s); learner busy 5.8–6.1 s
+per step. The learner (training + piece verification at chunk 128) is now the longest resource on
+the step; the tail-last order leaves the tail groups' training exposed after the tails.
+Determinism: every L8 run so far had zero rewards, so all data gradients were zero and identical
+parameter checksums across arrival orders prove nothing; non-vacuous pairs
+(`THUNDERSYNC_DEBUG_PARITY_REWARD`) are queued.
 
 ## 15. Open work
 
