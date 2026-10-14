@@ -264,7 +264,8 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # (batch - spares) prompts that were not dropped, in batch order (dropped
     # prompts decode fresh only if too few survive). It shifts the prompt mix
     # through the spare order, like DAPO's dynamic-sampling filter.
-    # grpo.num_prompts_per_step counts the spares; the train batch does not.
+    # grpo.num_prompts_per_step is the trained count; the loop re-batches the
+    # data stream into batches of num_prompts_per_step + spares prompts.
     null_bv_prompt_drop: bool = False
     null_bv_spare_prompts: int = 0
     # Opt-in, NOT exact samples (unbiased gradient, like banded IS): a ⊥-BV
@@ -584,17 +585,6 @@ def validate_tail_tools(master_config: ThunderSyncMasterConfig) -> None:
     problems = []
     if (ts_cfg.null_bv_prompt_drop or ts_cfg.null_bv_drop_is) and not ts_cfg.null_bv:
         problems.append("null_bv_prompt_drop / null_bv_drop_is need thundersync.null_bv")
-    if ts_cfg.null_bv_prompt_drop:
-        n = master_config.grpo.num_prompts_per_step
-        train = n - ts_cfg.null_bv_spare_prompts
-        G = master_config.grpo.num_generations_per_prompt
-        if train < 1:
-            problems.append("grpo.num_prompts_per_step must exceed null_bv_spare_prompts")
-        elif master_config.policy["train_global_batch_size"] != train * G:
-            problems.append(
-                "policy.train_global_batch_size must be (num_prompts_per_step - "
-                f"null_bv_spare_prompts) x G = {train * G}"
-            )
     if ts_cfg.tail_excluded_baseline:
         if not ts_cfg.speculate:
             problems.append("tail_excluded_baseline needs thundersync.speculate")
@@ -952,6 +942,19 @@ def make_group_advantage_fn(master_config: MasterConfig):
         return adv[:, 0].tolist()
 
     return fn
+
+
+def rebatch(batches, size: int):
+    """Re-chunk a stream of prompt batches into batches of ``size`` prompts (in order)."""
+    buf, n = [], 0
+    for b in batches:
+        buf.append(b)
+        n += b.size
+        while n >= size:
+            whole = BatchedDataDict.from_batches(buf)
+            yield whole.slice(0, size)
+            rest = whole.slice(size, n) if n > size else None
+            buf, n = ([rest] if rest is not None else []), n - size
 
 
 def select_null_prompts(batch: BatchedDataDict, spec, spares: int) -> BatchedDataDict:
@@ -1488,6 +1491,12 @@ def thundersync_grpo_train(
         print("[spec selftest]", asyncio.run(spec.self_test(prompts)), flush=True)
         spec.draft_budget = budget
     batches = iter(dataloader)
+    if ts_cfg.null_bv_prompt_drop and ts_cfg.null_bv_spare_prompts:
+        # Prompt drop: every step's batch carries the spares (the trained
+        # prompts stay grpo.num_prompts_per_step).
+        batches = rebatch(
+            batches, master_config.grpo.num_prompts_per_step + ts_cfg.null_bv_spare_prompts
+        )
     upcoming = collections.deque(
         b for b in itertools.islice(batches, max(1, ts_cfg.draft_lookahead) + 1)
     )

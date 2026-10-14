@@ -300,3 +300,75 @@ def test_prompt_selection_keeps_first_undropped_and_discards_spare_plans():
     s.plans = {(3,): ["c"], (4,): ["d"]}
     s._select_prompts()
     assert s.null_selected_keys == [(3,), (4,), (1,)]
+
+
+def test_rebatch_carries_spares_in_stream_order():
+    from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+    from thundersync_rl.grpo_loop import rebatch
+
+    def mk(a, n):
+        return BatchedDataDict({"idx": list(range(a, a + n)), "length": torch.arange(a, a + n)})
+
+    out = list(rebatch(iter([mk(0, 4), mk(4, 4), mk(8, 4), mk(12, 4)]), 5))
+    assert [o["idx"] for o in out] == [[0, 1, 2, 3, 4], [5, 6, 7, 8, 9], [10, 11, 12, 13, 14]]
+
+
+# --------------------------------------------------------------------------
+# ⊥-BV grid verification with rows shared across envelopes (batched rebuild)
+# --------------------------------------------------------------------------
+
+
+def _grid_reference(lpx, lqx, lse_p, lse_q, p_rows, q_rows, gen, envelopes):
+    """The per-envelope lazy scan (one ``lazy_stop_index`` per M, rows fetched per call)."""
+    from thundersync_rl.block_verification import (
+        acceptance_weights, emit_distribution, emitted_token, lazy_slack, lazy_stop_index,
+        null_root_residual,
+    )
+    from thundersync_rl.block_verification_fused import _probs, residual_masses, sample_by_inversion
+
+    g = lpx.numel()
+    eta = torch.rand(g + 1, generator=gen, dtype=torch.float64)
+    u = float(torch.rand(1, generator=gen, dtype=torch.float64))
+    out = {}
+    for M in envelopes:
+        b = acceptance_weights(lpx - lqx, M)
+
+        def mass(idx, bi):
+            return residual_masses(p_rows(idx), q_rows(idx), lse_p[idx], lse_q[idx], bi)
+
+        tau, _ = lazy_stop_index(b, eta, null_root_residual(mass, b, M), lazy_slack(lse_p[:g]))
+        p_row = p_rows(torch.tensor([tau]))[0]
+        q = None if tau == g else _probs(q_rows(torch.tensor([tau]))[0], lse_q[tau])
+        dist = emit_distribution(_probs(p_row, lse_p[tau]), q, b[tau], M if tau == 0 else 1.0)
+        y = emitted_token(sample_by_inversion(dist, u), p_row.shape[-1])
+        out[M] = (tau, y, None if y < 0 else float(p_row[y].float() - lse_p[tau]))
+    return out
+
+
+@pytest.mark.parametrize("seed", range(6))
+@pytest.mark.parametrize("chunk", [1, 3, 512])
+def test_shared_row_grid_scan_is_bitwise_the_per_envelope_scan(seed, chunk):
+    from thundersync_rl.block_verification_fused import block_verify_stats_lazy_grid
+
+    g, V = 40, 7
+    rng = torch.Generator().manual_seed(seed)
+    p = torch.log_softmax(torch.randn(g + 1, V, generator=rng), -1)
+    q = torch.log_softmax(p[:g] + 0.6 * torch.randn(g, V, generator=rng), -1)
+    draft = torch.multinomial(q.exp(), 1, generator=rng)[:, 0]
+    ar = torch.arange(g)
+    lpx, lqx = p[ar, draft], q[ar, draft]
+    z = torch.zeros(g + 1)
+    calls = []
+
+    def q_rows(idx):
+        calls.append(idx.numel())
+        return q[idx]
+
+    envs = (1.0, 1.25, 1.5, 2.0, 3.0)
+    got, n_eval = block_verify_stats_lazy_grid(
+        lpx, lqx, z, z[:g], lambda i: p[i], q_rows, torch.Generator().manual_seed(100 + seed), envs, chunk=chunk
+    )
+    want = _grid_reference(lpx, lqx, z, z[:g], lambda i: p[i], lambda i: q[i],
+                           torch.Generator().manual_seed(100 + seed), envs)
+    assert got == want
+    assert n_eval <= g  # each position's rows built at most once across envelopes

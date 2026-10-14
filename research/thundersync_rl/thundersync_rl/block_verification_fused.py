@@ -41,6 +41,7 @@ from thundersync_rl.block_verification import (
     lazy_stop_index,
     null_root_residual,
     stop_probabilities,
+    stop_probability,
 )
 
 
@@ -229,6 +230,7 @@ def block_verify_stats_lazy_grid(
     q_rows,
     generator: torch.Generator | None,
     envelopes: tuple[float, ...],
+    chunk: int = 512,
 ) -> tuple[dict[float, tuple[int, int, float | None]], int]:
     """``block_verify_stats_lazy`` at every envelope M of ``envelopes``, one set of draws.
 
@@ -239,13 +241,72 @@ def block_verify_stats_lazy_grid(
     law), so taking the outcome at an M chosen independently of this draft's
     draws is exact (``null_bv.decide_pools``). Returns ({M: (tau, y, log p(y)
     or None for BOT)}, rows evaluated); y = ``NULL_TOKEN``: BOT.
+
+    Rows are shared across envelopes and fetched in batches: positions are
+    scanned from the top in chunks of ``chunk`` candidate positions (the union
+    over the envelopes still scanning); each chunk's p and q rows are built
+    once (one batched head GEMM per chunk) and every envelope's residual masses
+    at its own candidates come from them. tau_M = the highest candidate with
+    eta <= h, as in ``lazy_stop_index``; evaluating r at more candidates than
+    the lazy scan would does not change it (r is a function of the position
+    and b), and q rows / residual masses are row-count invariant (batch-invariant
+    head GEMM, one Triton program per row), so outcomes are bitwise those of
+    the per-envelope scan.
     """
     g = lpx.numel()
     dev = lse_p.device
     eta = torch.rand(g + 1, generator=generator, dtype=torch.float64, device=dev)
     u = float(torch.rand(1, generator=generator, dtype=torch.float64, device=dev))
     slack = lazy_slack(lse_p[:g])
+    slack_h = slack.cpu() if isinstance(slack, torch.Tensor) else slack
+    eta_h = eta.cpu()
+    weights: dict[float, torch.Tensor] = {}
+    tau: dict[float, int] = {}
+    cand: dict[float, torch.Tensor] = {}  # descending candidate positions per M
+    for M in envelopes:
+        check_null_m(M, g)
+        weights[M] = b = acceptance_weights(lpx - lqx, M)
+        b_h = b.cpu()
+        if bool(eta_h[g] <= b_h[g]):
+            tau[M] = g
+        else:
+            cand[M] = torch.nonzero(eta_h[:g] <= b_h[:g] * (1 + slack_h)).flatten().flip(0)
     rows: dict[tuple[str, int], torch.Tensor] = {}
+    n_eval = 0
+    done = {M: 0 for M in cand}
+    while any(M not in tau for M in cand):
+        live = [M for M in cand if M not in tau]
+        for M in live:
+            if done[M] >= cand[M].numel():
+                raise RuntimeError("block verification: no stop position (eta > h everywhere)")
+        # The next ``chunk`` positions (descending) of the union of the live candidates.
+        pending = torch.unique(torch.cat([cand[M][done[M]:] for M in live]))
+        idx = pending.flip(0)[:chunk]
+        lo = int(idx[-1])
+        idx_d = idx.to(dev)
+        P, Q = p_rows(idx_d), q_rows(idx_d)
+        n_eval += idx.numel()
+        where = {int(t): k for k, t in enumerate(idx.tolist())}
+        for M in live:
+            c = cand[M][done[M]:]
+            c = c[c >= lo]
+            done[M] += c.numel()
+            if not c.numel():
+                continue
+            sel = torch.tensor([where[int(t)] for t in c.tolist()], device=dev)
+            c_d = c.to(dev)
+            b = weights[M]
+
+            def mass(i, bi, sel=sel):
+                return residual_masses(P[sel], Q[sel], lse_p[i], lse_q[i], bi)
+
+            h = stop_probability(null_root_residual(mass, b, M)(c_d), b[c_d])
+            hit = torch.nonzero((eta[c_d] <= h).cpu()).flatten()
+            if hit.numel():
+                tau[M] = int(c[hit[0]])
+        for k, t in enumerate(idx.tolist()):  # keep the stop rows for the emissions
+            if any(tau.get(M) == t for M in live):
+                rows[("p", t)], rows[("q", t)] = P[k], Q[k]
 
     def row(kind: str, t: int) -> torch.Tensor:
         if (kind, t) not in rows:
@@ -254,22 +315,14 @@ def block_verify_stats_lazy_grid(
         return rows[(kind, t)]
 
     out: dict[float, tuple[int, int, float | None]] = {}
-    n_eval = 0
     for M in envelopes:
-        check_null_m(M, g)
-        b = acceptance_weights(lpx - lqx, M)
-
-        def mass(idx, bi):
-            return residual_masses(p_rows(idx), q_rows(idx), lse_p[idx], lse_q[idx], bi)
-
-        tau, n = lazy_stop_index(b, eta, null_root_residual(mass, b, M), slack)
-        n_eval += n
-        p_row = row("p", tau)
-        q = None if tau == g else _probs(row("q", tau), lse_q[tau])
-        m = M if tau == 0 and tau < g else 1.0
-        dist = emit_distribution(_probs(p_row, lse_p[tau]), q, b[tau], m)
+        t, b = tau[M], weights[M]
+        p_row = row("p", t)
+        q = None if t == g else _probs(row("q", t), lse_q[t])
+        m = M if t == 0 and t < g else 1.0
+        dist = emit_distribution(_probs(p_row, lse_p[t]), q, b[t], m)
         y = emitted_token(sample_by_inversion(dist, u), p_row.shape[-1])
-        out[M] = (tau, y, None if y < 0 else float(p_row[y].float() - lse_p[tau]))
+        out[M] = (t, y, None if y < 0 else float(p_row[y].float() - lse_p[t]))
     return out, n_eval
 
 
