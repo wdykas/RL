@@ -1632,6 +1632,117 @@ experts; each rank owns ≈ P/W main elements, P/(TP·PP·EP-share) model elemen
 fp8/fp4 param gather, a two-step draft for lookahead > 1, overlapping the draft refit with the
 learner's tail (e.g. a sparse delta applied on the engine without the learner-side swap).
 
+## 14g. Sticky fp16 rounding toward a θ_{k−1} anchor forward (`thundersync.sticky_rounding`)
+
+*Opt-in, off by default (`sticky_rounding: false`); not part of the safe default recipe, intended for later
+convergence runs. Requires sticky routing (14c). Unit-tested (CPU); learner lockstep checked on a real Megatron
+MoE at TP=1, TP=2 (sequence parallel) and EP=2: bitwise equal to the research emulation for logits and every
+gradient. End-to-end 4-GPU exactness run (`scripts/bi_tp/sticky_rounding_moe.sh`): queued, not run yet.*
+Design note: `thundersync_work/research/STICKY_ROUNDING.md`; implementation notes and measurements:
+`thundersync_work/research/agent_sticky_rounding_impl.md`; code: `nemo_rl/models/megatron/sticky_rounding.py`.
+
+**Policy.** The fp16-GEMM recipe (14b) rounds fp32 activations to fp16 at fixed sites: every linear-layer input
+(attention QKV and output projections, dense MLP fc1/fc2, shared experts), the q/k/v casts after the q/k norms
+(the KV cache), and the expert GEMM inputs (fc1: the token's MoE input; fc2: SwiGLU output × routing prob).
+The policy of step k replaces round-to-nearest at every site by
+
+    r(x; a) = a          if prev16(a) < x < next16(a)
+            = RTN16(x)   otherwise
+
+with a = the value the anchor forward (plain θ_{k−1}, same tokens, same numerics) produced at that site. Edge
+semantics (unit-tested): r is the identity on fp16-representable x; a NaN anchor means "self" (RTN); signed zeros
+follow the rule (a = −0 holds a tiny positive x); next16(65504) = inf, so an anchor 65504 holds any finite x above
+it (as the emulation). The error stays below one fp16 ulp for x inside the fp16 range. The LM head has no fp16
+site under the default fp32 head; with `lm_head_precision: fp16` its input is rounded to nearest (anchor = self).
+
+**Anchor schedule.** Exactly sticky routing's (14c): a token is rounding-anchored iff it has a valid route anchor
+at every local MoE layer (drafted rollouts up to the cap c), else self (RTN = the plain recipe). Expert sites are
+matched by (expert, token): the fc1 anchor is per token (the anchor forward's MoE input), the fc2 anchor of
+(t, e) is the anchor forward's value if θ_{k−1} routed t to e, else self. So anchors depend only on θ_{k−1}, the
+rollout's prefix and the content-independent schedule (R1, R2); they never depend on θ_k, on the draft's future
+tokens, on τ or on verification noise.
+
+**Exactness.** (R1) p_k(·|prefix) = F(θ_k; anchors(prefix)) is a fixed function of the prefix for given θ_{k−1},
+θ_k; its gradient is backprop through F with anchors as constants and a straight-through cast (as for RTN, whose
+true derivative is also 0 a.e.). (R2) Anchored positions are fixed before any token is sampled. (R3) Every
+forward that computes p_k on anchored tokens runs on the learner and computes the same F: the verification
+forward, the training forward and the log-prob forward all run the lockstep below with the same θ_{k−1} snapshot,
+and the anchor forward is the batch-invariant training forward, so a token's anchors do not depend on the batch
+it is verified or trained in, nor on later tokens (causal). **The engine computes nothing new**: drafts are
+sampled from q = the plain θ_{k−1} engine forward (the drafter is the anchor forward); after a rejection the
+replacement token is sampled by the learner from the residual of p_k; continuations of drafted rollouts are
+θ_{k−1} drafting rounds verified by the learner (sticky routing's continuation mechanism, 14c), so the engine
+never samples an anchored position from π_k; rollouts never drafted are decoded on the refit engine at θ_k with
+self anchors = RTN = the engine's plain recipe. Hence block verification against p_k is exact, as in 14c.
+Checked bitwise on GPU (single replica): lockstep == the research emulation (call-order record/apply, all three
+site kinds) for logits and all gradients; all-self mask == plain forward (logits and gradients); in a
+half-anchored batch the self row equals the plain forward and the anchored row equals the full lockstep.
+
+**Learner implementation.**
+- θ_{k−1} store (`ThetaStore`): in `finish_train_step`, right before the optimizer step, every rank copies its own
+  local 16-bit parameters (its TP/PP/EP shard as the model holds them; with the distributed optimizer these are
+  the gathered model params of the shard, not optimizer state) into pinned host buffers (async D2H on a side
+  stream, waited before the step). No gathers, no cross-rank traffic.
+- Lockstep (`_gpt_forward`, `_embedding_forward`, `_layer_forward`): a GPT forward on the learner with armed
+  sticky-routing replay targets (exactly the policy forwards) opens an anchor stream. The embedding runs at θ_k
+  and at θ_{k−1} (the anchor residual stream); each transformer layer first runs at θ_{k−1} on the anchor stream
+  (`torch.func.functional_call` with the streamed weights, `no_grad`, recording fp16 values per site), then at
+  θ_k on the live stream applying r(x; a) per site. The θ_{k−1} weights of unit i+1 are copied H2D on a side
+  stream while unit i runs; at most two units are resident.
+- Sites: `fp16_gemm` calls a site hook at each fp16 cast (`Fp16Linear` input keyed by module, q/k/v keyed by
+  (attention, index)); MoE: the dispatched copy of the MoE input is rounded in token space before dispatch (the
+  router keeps the unrounded fp32 input), and a 4-column fp32 key (source rank, token index, anchored) is
+  dispatched with the layer's own routing map through the same dispatcher, so fc2 anchors are matched by key at
+  the expert rank under any EP layout (`moe_preprocess`, `experts_fc2_input`). Expert weight fp16 caching is
+  bypassed for the transient θ_{k−1} weights.
+- Same sticky routes: the anchor pass replays the same anchors A (F(θ_{k−1}; A) = A = the plain θ_{k−1} routes
+  under BI), so the anchor forward's expert dispatch is the drafter's; the policy pass dispatches F(θ_k; A).
+- Not built yet (rejected by `validate_sticky_rounding`): pipeline parallelism, context parallelism, activation
+  recompute, fused verify+train, flex/DeepEP dispatchers, shared-expert overlap. Hybrid (Mamba) layers.
+
+**Scaling (per rank; P_r = the rank's 16-bit parameter shard in bytes, U_max = its largest lockstep unit,
+T = tokens of a micro-batch on the rank, d = hidden size, k = top-k, n_mb = policy-forward micro-batches per
+step).** [derived unless marked]
+- Host memory: P_r (pinned), = the rank's 16-bit model shard; nothing else. Ultra-scale example: 500B params over
+  64 model-parallel ranks ≈ 16 GB/rank (GB200 Grace: ~480 GB LPDDR per 4 GPUs → fits next to the optimizer's
+  host-resident state only if that budget is planned; the node-level host budget must include it).
+- GPU memory: ≤ 2·U_max of θ_{k−1} weights (unit in use + unit in flight) + one layer's anchors (fp16, ≈ the
+  layer's fp16 site inputs for T tokens: for an MoE layer ≈ T·(d + d_qkv + d_attn_out) + T·k·(d_ffn_expert)
+  elements × 2 B, plus 16 B keys per routed row) + the anchor residual stream (T·d·4 B). Measured on the toy
+  model: +0.30 U_max peak at TP=1 / EP=2, +0.33 U_max at TP=2 [M].
+- H2D traffic: P_r per policy-forward micro-batch (every micro-batch walks all layers), i.e. n_mb·P_r per step;
+  hidden behind compute when t_fwd(T) ≥ U_max / B_H2D per layer, B_H2D ≈ 400 GB/s per direction on NVLink-C2C
+  [hypothesis: to measure]. This scales with n_mb: the levers are (a) larger policy micro-batches (one stream per
+  micro-batch), (b) a sparse θ_k − θ_{k−1} delta held on GPU and applied per layer (bytes ∝ fraction of 16-bit
+  weights changed per step; to measure at real lr), (c) processing several micro-batches per streamed layer
+  (needs schedule support). Until measured at scale this is the main cost risk, not a blocker.
+- Compute: one extra forward over the policy-forward tokens: +100% on forward-only verification passes, ≈ +33% of
+  fwd+bwd on training passes (activation-free: inference-mode). Toy measurement: fwd+bwd 66 → 104 ms (TP=1),
+  62 → 117 ms (EP=2), 78 → 137 ms (TP=2) [M; toy, launch-bound, not representative].
+- Communication: the anchor pass repeats the layer's TP collectives and EP all-to-alls (forward only), and each
+  MoE layer adds two key dispatches per pass of 16 B per routed row (≈ 4/d of a hidden dispatch) with the same
+  tokens-per-expert synchronization MCore's dispatch already performs. No global synchronization is added;
+  all collectives are within the groups the layer already uses, in the same order on every rank (EP lockstep
+  dummies run the anchor pass too).
+- PP (design, not built yet): the anchor residual stream travels with the stage activation (the stage output
+  becomes the pair (h, h̄); h̄ carries no gradient), i.e. 2x forward p2p bytes and the same schedule; interleaved
+  virtual stages index the store per model chunk. No extra synchronization.
+- Hybrid (Mamba-2) layers (design, not built yet): their linear sites (in_proj / out_proj inputs) are Fp16Linear
+  sites already; the layer wrapper applies to Mamba layers unchanged (the training forward scans the whole
+  sequence, no state cache); the SSD scan and conv have no fp16 cast in the recipe, so no extra sites
+  (agent_nemotron_hybrid.md for the scan's TF32 numerics).
+
+**Interaction.** Sticky routing: the anchor pass already computes the plain θ_{k−1} routes on the learner layer by
+layer, so it can also supply sticky-routing anchors without route transport (the policy pass of layer l needs only
+layer l's anchor routes, available right before it) — a candidate replacement for driver/object-store route
+transport; requires the drafter's routes to equal the learner's plain θ_{k−1} routes bitwise, which BI and the
+route check already assert. ⊥-BV: none (target π_k per draft). Momentum draft weights (separate branch): the
+anchor forward stays the plain θ_{k−1} forward (the policy definition), independent of the drafter's weights.
+
+**Measured value (emulation, ledger T).** Qwen3-30B-A3B 16 layers, steady-state AdamW: sticky rounding on top of
+sticky routing lowers Var_q(log p/q) 1.3x for θ_{k−1} drafts and 3–10x for momentum / oracle drafts (all three
+site kinds needed); ~20% of activation elements are rounded toward the anchor at steady state.
+
 ## 15. Open work
 
 - **Stragglers.** About one rejected draft per step decodes its remainder at about 3 ms
