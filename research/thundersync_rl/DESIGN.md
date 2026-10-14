@@ -1880,7 +1880,23 @@ the rollout (later turns included) can be decoded by the refit engine with the r
 turn's prefill re-applies the anchors below c by position. Driver integration of the two (rollout loop continuing
 a recorded multi-turn state on the engine) is not built yet.
 
-**Status.**
+**Rule kernel.** The engine applies the rule in every MoE layer of every forward once the horizon is on, so it is
+one Triton kernel (`sticky_routing_fused.py`; a pure selection, bitwise equal to `sticky_select`: GPU unit test with
+exact ties and invalid anchor rows). Measured [M] (GB200, CUDA graph, `thundersync_work/research/multiturn_b/
+bench_anchor_apply.py`): torch composition +53–82 µs per layer (Qwen3-30B-A3B shapes, 48 layers: +2.6 ms per decode
+forward), fused +2–8 µs per layer at T = 64–512 tokens (+0.10–0.20 ms per forward over 48 layers) and +14 µs at
+T = 8192 (+0.69 ms); Ultra-like (E 512, K 22, 15 layers per stage): +0.12 ms per decode forward. Fill: 6 µs host
+and device per forward without anchored tokens, 0.30 ms host + 0.30 ms device for an 8192-token fully anchored
+prefill; loading one request (P + H = 5120 positions) 0.5–1.7 ms.
+
+**Status.** [M] 4 GPUs, tiny MoE EP=2, async scheduling, 4 steps (`scripts/bi_tp/sticky_horizon_moe.sh`, H = 64):
+mismatch 0 and exact_token_frac 1 every step (the horizon continuations' engine log-probs equal the learner's
+training forward with the same anchors), route checks exact, 41–97 plans per step handed to the refit engine,
+15821 tokens routed with applied anchors. Control `NOAPPLY=1` (engine never applies): max |Δlog p| 0.30–0.44,
+exact_token_frac 0.80–0.84, i.e. the anchors below the horizon change the policy and the apply path is what
+reproduces it. Multi-turn (branch ts-multiturn-ab, toy stochastic environment, 3 turns × 128): mismatch 0 every
+step over every turn; see `thundersync_work/research/agent_multiturn_b.md` for the runs. Not yet run: TP > 1
+with sequence parallelism and PP > 1 on the engine (code paths unit-tested only), real-model sizes.
 
 ## 15. Open work
 
