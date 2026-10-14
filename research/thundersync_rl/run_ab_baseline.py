@@ -13,10 +13,14 @@ import os
 import runpy
 import sys
 
-from nemo_rl.utils import logger as nrl_logger
-
 
 def _install_history(path: str) -> None:
+    # Import order as examples/run_grpo.py (algorithms first): importing the logger
+    # module first loads the importlib_metadata backport before transformers, which
+    # then trips over a dangling dist-info in the container venv.
+    import nemo_rl.algorithms.grpo  # noqa: F401
+    from nemo_rl.utils import logger as nrl_logger
+
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     steps: dict[int, dict] = {}
     inner = nrl_logger.Logger.log_metrics
