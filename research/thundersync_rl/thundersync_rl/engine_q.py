@@ -163,6 +163,31 @@ class HiddenLog:
                     ev.synchronize()
             return torch.stack([slots[t][0][0][slots[t][1]] for t in range(m)])
 
+    def take(self, key: str, lo: int, n: int) -> Optional[torch.Tensor]:
+        """Rows lo..lo+m-1 of a running draft [m, d] (the longest logged run, m <= n).
+
+        The rows leave the log; the key stays open (later rows keep being
+        logged), so a draft can be taken in pieces while it is decoded.
+        """
+        with self._lock:
+            slots = self._rows.get(key, {})
+            m = 0
+            while m < n and lo + m in slots:
+                m += 1
+            if m == 0:
+                return None if n else torch.empty(0, 0)
+            taken = [slots.pop(t) for t in range(lo, lo + m)]
+            for chunk, _ in taken:
+                chunk[2] -= 1
+            for ev in {id(c[0]): c[3] for c, _ in taken}.values():
+                if ev is not None:
+                    ev.synchronize()
+            return torch.stack([c[0][i] for c, i in taken])
+
+    def close(self, key: str) -> None:
+        """Drop a draft's rows and the rows the engine logs for it later."""
+        self.pop(key, 0)
+
     def live_rows(self) -> int:
         with self._lock:
             return sum(len(s) for s in self._rows.values())

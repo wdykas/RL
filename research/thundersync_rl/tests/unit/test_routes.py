@@ -15,9 +15,7 @@
 rollout scheme (block verification + theta_n continuation rounds) by exact
 enumeration on a toy routed language model."""
 
-import itertools
 import math
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -25,7 +23,6 @@ import torch
 from thundersync_rl.block_verification import output_distribution_given_draft
 from thundersync_rl.routes import (
     RouteLog,
-    RouteRefs,
     SlotTags,
     anchored_draft_length,
     compare_anchors,
@@ -61,16 +58,16 @@ def test_route_log_keys_by_absolute_position(device):
     # an eviction recomputes position 1: overwrite
     rows3 = 200 + torch.arange(L * K, device=device).view(1, L, K)
     log.record(rows3, *_sel([0], "a", [1], log))
-    complete, r = log.pop(["a", "c"])["a"]
-    assert complete == 4 and r.shape == (4, L, K) and r.dtype == torch.int16
+    lo, complete, r = log.pop(["a", "c"])["a"]
+    assert (lo, complete) == (0, 4) and r.shape == (4, L, K) and r.dtype == torch.int16
     assert torch.equal(r[0], rows[0].cpu().to(r.dtype))
     assert r[1].tolist() in (rows[1].cpu().tolist(), rows3[0].cpu().tolist())
     assert torch.equal(r[3], rows2[1].cpu().to(r.dtype))
     log.record(rows, *_sel([0], "a", [9], log))  # closed: dropped
     assert log.pop(["a"]) == {}
-    complete, r = log.pop(["b"])["b"]
-    assert complete == 0 and r.shape[0] == 8 and bool((r[:7] == -1).all())
-    assert torch.equal(r[7], rows2[0].cpu().to(r.dtype))
+    lo, complete, r = log.pop(["b"])["b"]
+    assert (lo, complete) == (7, 8) and r.shape[0] == 1
+    assert torch.equal(r[0], rows2[0].cpu().to(r.dtype))
     assert log.stored_rows() == 0  # compacted once every key closed
 
 
@@ -84,10 +81,42 @@ def test_route_log_many_keys_one_pop():
         log.record(rows, *_sel(range(n), keys, [s] * n, log))
     out = log.pop(keys[::2])
     assert sorted(out) == sorted(keys[::2])
-    c, r = out["k6"]
-    assert c == steps and r.shape == (steps, L, K)
+    lo, c, r = out["k6"]
+    assert (lo, c) == (0, steps) and r.shape == (steps, L, K)
     assert r[:, 0, 0].tolist() == [(6 * L * K + s) % 128 for s in range(steps)]
     assert len(log.pop(keys[1::2])) == n // 2 and log.stored_rows() == 0
+
+
+def test_route_log_takes_a_running_draft_in_pieces():
+    """close=False: rows logged since the last take, key left open; the
+    pieces extend one RouteRefs (merge_route_refs with a base)."""
+    log = RouteLog(ring_rows=64)
+    L, K = 2, 1
+    rows = torch.arange(10 * L * K, dtype=torch.int32).view(10, L, K)
+    log.record(rows, *_sel(range(4), "aaaa", range(4), log))
+    lo, end, r = log.pop(["a"], close=False)["a"]
+    assert (lo, end) == (0, 4) and torch.equal(r, rows[:4].to(torch.int16))
+    log.record(rows, *_sel([4, 5, 7], "aaa", [4, 5, 7], log))  # position 6 not logged
+    lo, end, r = log.pop(["a"], close=False)["a"]
+    assert (lo, end) == (4, 6) and r.shape[0] == 4 and bool((r[2] == -1).all())
+    first = merge_route_refs(
+        [([1, 2], 0, 4, put_routes(rows[:4].to(torch.int16), lambda t: t))], 20, [1, 2]
+    )
+    both = merge_route_refs(
+        [([1, 2], lo, end, put_routes(r, lambda t: t, start=lo))],
+        20,
+        [1, 2],
+        base=first,
+    )
+    assert both.complete == 6 and [(b.lo, b.hi) for b in both.blocks] == [
+        (0, 4),
+        (4, 8),
+    ]
+    out = fetch_anchors(both, [1, 2], K, 8, lambda t: t)
+    assert torch.equal(out[:6], rows[:6].to(torch.int16)) and bool((out[6] == -1).all())
+    log.pop(["a"])  # close
+    log.record(rows, *_sel([6], "a", [6], log))
+    assert log.pop(["a"], close=False) == {} and log.stored_rows() == 0
 
 
 def test_slot_tags_look_up_only_new_requests():
@@ -126,7 +155,7 @@ def _parts(dense_by_stage, block):
     """pop_draft_routes parts: (layers, logged prefix, blocks) per stage."""
     out = []
     for layers, dense, complete in dense_by_stage:
-        out.append((layers, complete, put_routes(dense, lambda t: t, block)))
+        out.append((layers, 0, complete, put_routes(dense, lambda t: t, block)))
     return out
 
 
@@ -140,8 +169,12 @@ def test_route_refs_from_pipeline_stages_fetch_per_stage():
     )
     assert refs.length == 9 and refs.complete == 8
     assert [(x.layers, x.lo, x.hi) for x in refs.blocks] == [
-        ((1,), 0, 4), ((1,), 4, 8), ((1,), 8, 9),
-        ((3, 4), 0, 4), ((3, 4), 4, 8), ((3, 4), 8, 9),
+        ((1,), 0, 4),
+        ((1,), 4, 8),
+        ((1,), 8, 9),
+        ((3, 4), 0, 4),
+        ((3, 4), 4, 8),
+        ((3, 4), 8, 9),
     ]
     fetched = []
 
@@ -238,7 +271,9 @@ class _Toy:
         return self.scores[k]
 
     def plain_routes(self, ver, seq):
-        return tuple(int(self._score(ver, tuple(seq[: j + 1])).argmax()) for j in range(len(seq)))
+        return tuple(
+            int(self._score(ver, tuple(seq[: j + 1])).argmax()) for j in range(len(seq))
+        )
 
     def sticky_routes(self, ver, seq, anchors):
         out = []
@@ -351,7 +386,9 @@ def test_sticky_rollout_scheme_is_exact(seed, delta, cap):
     cut_law = [(1, 0.3), (2, 0.3), (cap, 0.4)]
     law = _rollout_law(toy, prompt, cut_law, toy.p)
     target = _target_law(toy, prompt, toy.p)
-    tv = 0.5 * sum(abs(law.get(s, 0) - target.get(s, 0)) for s in set(law) | set(target))
+    tv = 0.5 * sum(
+        abs(law.get(s, 0) - target.get(s, 0)) for s in set(law) | set(target)
+    )
     assert tv < 1e-12
     # the sticky target really differs from plain theta_{n+1}
     plain = _target_law(toy, prompt, lambda s: toy._lp(1, s, toy.plain_routes(1, s)))
@@ -391,5 +428,7 @@ def test_anchor_schedule_depending_on_tau_is_biased():
                 else:
                     tail(new, w)
     target = _target_law(toy, prompt, toy.p)
-    tv = 0.5 * sum(abs(out.get(s, 0) - target.get(s, 0)) for s in set(out) | set(target))
+    tv = 0.5 * sum(
+        abs(out.get(s, 0) - target.get(s, 0)) for s in set(out) | set(target)
+    )
     assert tv > 1e-3

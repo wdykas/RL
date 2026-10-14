@@ -612,6 +612,7 @@ policy.make_sequence_length_divisible_by=128
 | `merge_pipeline_calls` | One pipeline schedule call per dispatch and gradient destination (default `true`; section 2) |
 | `sticky_routing` / `sticky_routing_delta` | MoE: sticky routing anchored to the drafter (section 14c); off by default, δ 0.03 router-logit units |
 | `null_bv` / `null_bv_drafts_per_output` / `null_bv_logratio_var` / `null_bv_fixed_m` | Pooled null-augmented block verification (section 14d): K·G drafts per group, first G non-⊥ outputs in drafting order; off by default, K 1.5, DP envelope at v 8e-7 unless a fixed M is given |
+| `sticky_continuation_chunk_tokens` | Sticky routing: continuations are verified every this many decoded tokens while they decode (2048) |
 | `min_pipeline_microbatches` | Hold closed-group rows until this many micro-batches per learner rank are queued; flushed when rollouts end (`null`: 2·PP if PP > 1, else 0) |
 
 Debug switches: `THUNDERSYNC_SPEC_PROF` (verification timing), `THUNDERSYNC_SPEC_CHECK`
@@ -640,7 +641,7 @@ hidden states and print how many drafted tokens' log q match the engine bitwise)
 | `thundersync_rl/block_verification.py` | Reference block verification, shared acceptance helpers, exact output law |
 | `thundersync_rl/block_verification_fused.py` | Block verification from raw logits with a Triton residual-mass kernel; lazy variant from per-position statistics |
 | `thundersync_rl/null_bv.py` | Pooled ⊥-BV: envelope policy (DP over drafts/slots left, Brownian tail-decode model), per-prompt slot state (section 14d) |
-| `thundersync_rl/routes.py` | Sticky routing: engine route log, per-rank route merge, anchors (section 14c); rule in `nemo_rl/models/megatron/sticky_routing.py` |
+| `thundersync_rl/routes.py` | Sticky routing: engine route log, object-store route blocks (`RouteRefs`), per-stage fetch (section 14c); rule in `nemo_rl/models/megatron/sticky_routing.py` |
 | `thundersync_rl/engine_q.py` | Engine-sourced q under BI: engine hidden-state log, per-step row mapping, verification from engine log q + rows on demand |
 | `thundersync_rl/logit_free.py` | `ChunkedHead`: LM-head statistics from hidden states in fixed row chunks, rows recomputed on demand |
 | `thundersync_rl/scorer_kernels.py` | SDPA core attention, Triton SwiGLU, selective LM head |
@@ -1299,27 +1300,43 @@ only in inference forwards. The model's `moe_enable_routing_replay` makes MCore'
 context bind each router's record buffer per step: its `routing_indices_buffer` on CUDA-graph
 steps (the copy is part of the captured router), none on eager steps (the top-k stays in
 `recorded_topk_idx`); the route log reads each forward's routes from that binding
-(`_step_routes`). The engine runs with legacy scheduling (MCore rejects routing replay under
-async scheduling). `install_draft_route_log` wraps the controller's
-`_dynamic_step_forward_logits` (Python on every forward, graphed or eager): it snapshots the
-step's token layout from the context's CPU bookkeeping at launch
-(slot and absolute position of each token, i.e. the forward being launched) and, after the
-launch, enqueues one asynchronous copy of the tagged tokens' route rows to pinned memory
-(`RouteLog`, keyed by draft key and absolute position, so eviction re-prefills overwrite the
-same positions). Prompt positions are logged by the draft's own prefill (prefix caching must
-be off). Pipeline stages log their layers, sequence-parallel TP ranks their token shard;
-`pop_draft_routes` returns (layer numbers, positions, rows) and the driver merges them into a
-dense [P+g, L, K] anchor tensor (`merge_route_parts`), draft tuple index 8. Drafts are cut to
-the tokens whose anchors are all logged (`anchored_draft_length`: g tokens need positions
-0..P+g−2), before their hidden states are popped, so hidden rows always match the kept tokens
-(`_pop_logs`). Cost: L·K·2 B per token (768 B at 48 layers × top-8) through the driver.
+(`_step_routes`). MCore's own routing-replay bookkeeping is dropped (`_drop_mcore_route_bookkeeping`:
+its synchronous host copy of every step's routes, per-KV-block host storage and per-request
+`routing_indices` in replies), which also lets the engine run with async scheduling: MCore
+rejects routing replay under async scheduling only for that bookkeeping, and the engine
+subclass (`_engine_class`) passes its check when the route record is installed. No MCore
+source change; an MCore option to record routes without the bookkeeping would replace the
+override. `install_draft_route_log` wraps the controller's
+`_dynamic_step_forward_logits` (Python on every forward, graphed or eager): before the launch
+it selects the step's tagged tokens from the context's CPU bookkeeping (slot and absolute
+position of each token, i.e. the forward being launched) with numpy, looking up draft keys
+only for slots whose request is new (`SlotTags`); after the launch it enqueues the gather of
+those route rows on the device (index from pinned memory, non-blocking) and one asynchronous
+copy to a pinned staging ring (`RouteLog`): no host-device sync and no Python per token
+(0.2–0.4 ms host time per forward vs 3.6–5.5 ms before, which waited for the forward;
+`thundersync_work/research/agent_scaling_fixes.md`). Staged rows are appended to a host store
+once their copy completed; rows are keyed by draft key and absolute position, so eviction
+re-prefills write the same positions. A rebuilt engine's forward is wrapped into the same log
+and new router instances are re-armed. Prompt positions are logged by the draft's own prefill
+(prefix caching must be off). Pipeline stages log their layers; under sequence parallelism the
+TP shards are all-gathered (only on steps with tagged tokens) and TP rank 0 logs.
+**Transport** (`RouteRefs`): `pop_draft_routes` puts each draft's dense routes in the Ray object
+store in blocks of 4096 positions and returns only (layers, logged range, block handles); the
+driver keeps the handles (draft tuple index 8, `Plan.anchors`) and the logged prefix length,
+and each learner rank fetches only the blocks of its own pipeline stage's layers
+(`fetch_anchors`; `routed_experts` in the stage-local layout). Nothing per token passes through
+the driver; the driver frees a step's blocks once the step has trained (`release_routes`).
+Per learner rank and step: rows(DP rank) × S × (L/PP) × K × 2 B (fetching only the
+sequence-parallel shard is not built yet). Drafts are cut to the tokens whose anchors are all
+logged (`anchored_draft_length`: g tokens need positions 0..P+g−2), before their hidden states
+are popped, so hidden rows always match the kept tokens (`_pop_logs`).
 
 **Learner side.** Every forward that defines p_k applies the rule with the same anchors:
 the verification forward (`_training_forward_rows(..., anchors=...)`, through NeMo RL's
 `set_router_replay_forward`, also under PP and in EP lockstep dummies), the training forward
-of the rollout (`routed_experts` [B, S, L, K] in the training batch, built in
-`build_chunk_data` from the plan's anchors; `_with_routes` gives all-self rows to batches
-without drafted rows), and the mismatch check's `get_logprobs`. The sticky wrapper around
+of the rollout (the training batch carries the plans' `route_refs`; the worker's
+`_with_routes` fetches them into `routed_experts` [B, S, L_stage, K] and gives all-self rows to
+rows and batches without anchors), and the mismatch check's `get_logprobs`. The sticky wrapper around
 `RouterReplay.get_replay_topk` stores the effective selection for REPLAY_BACKWARD, so
 activation recompute replays exactly the forward's routes. Top-k has zero derivative a.e., so
 the gradient is the ordinary backward with routes fixed (as R3 router replay).
@@ -1327,13 +1344,23 @@ the gradient is the ordinary backward with routes fixed (as R3 router replay).
 **Continuations at θ_{k−1}** (`SpeculativeGeneration.verify_sticky`). Positions after a
 rejection still need θ_{k−1} routes on the new prefix. With sticky routing, at the start of
 iteration k the driver verifies the drafts while the engine still holds θ_{k−1} and completes
-every drafted rollout before the refit: each incomplete plan is continued by the engine's
-plain θ_{k−1} forward from prompt + kept prefix to EOS or the cap (logging routes, hidden
-states and log-probs as for any draft), and that draft is block-verified against the same
-p_k (anchors spliced: earlier ones + the new log); repeat until every plan is complete. A
-whole-accepted draft that is not finished emits no bonus token (the bonus row's anchor, the
-route of the last drafted token, was never computed): it continues with another round, which
-is an exact sampler of p given that prefix just as the bonus draw is. Then the engine refits
+every drafted rollout before the refit (`_continue_sticky`): each incomplete plan gets an
+engine stream decoding with the plain θ_{k−1} forward from prompt + kept prefix toward EOS or
+the cap (logging routes, hidden states and log-probs as for any draft). Every
+`sticky_continuation_chunk_tokens` (2048) decoded tokens, or at the stream's end, the new
+piece is block-verified against the same p_k, together with the ready pieces of all other
+streams, while every stream keeps decoding. Whole acceptance extends the prefix and the same
+stream goes on: its later tokens are q samples given the extended prefix, the same law as a
+restarted stream, so no bonus is needed. A rejection appends the residual token, aborts the
+stream and starts a new one from the new prefix, so it wastes at most the tokens decoded past
+the piece (before: the whole tail to EOS), and verification overlaps decoding instead of
+alternating with it. Pieces are cut at fixed token counts (exogenous) and to their logged
+routes and hidden rows (bookkeeping). A whole-accepted deadline draft that is not finished
+emits no bonus token (the bonus row's anchor, the route of the last drafted token, was never
+computed); under sticky routing it would need a continuation anyway, because every drafted
+rollout must be completed at θ_{k−1}, so logging that route would save one token, not a
+stream. Keeping deadline drafts' streams running into verification (no restart prefill) is not
+built yet. Then the engine refits
 to θ_k and the iteration's rollouts start (drafted ones return their completed plans; the
 rest decode plainly at θ_k = F(θ_k; self)). Exactness of the whole scheme (drafts cut at
 exogenous times, block verification, no bonus, continuation rounds) is checked by exact
@@ -1358,7 +1385,7 @@ log mapped to the wrong slot or position); and the rule changed routes against p
 scheme rests on the enumeration tests (`test_routes.py`).
 
 **Cost and open issues.** No extra learner FLOPs beyond the verification forwards of
-continuation rounds. The engine refit waits for the continuation rounds, so rollouts no
+continuations. The engine refit waits for the continuation rounds, so rollouts no
 longer overlap verification (keeping θ_{k−1} available after the refit, e.g. as a sparse
 weight delta toggled per chunk, would restore the overlap; not built yet). Multi-version drafts
 (`draft_lookahead>1`), multi-turn rollouts (a later turn's prefill would need the anchors in

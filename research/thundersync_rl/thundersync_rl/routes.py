@@ -72,12 +72,14 @@ class RouteLog:
     forward) once their copy has completed: at later records when the event
     has fired, and at ``pop``.
 
-    ``pop(keys)`` returns, per key that has rows, (complete, routes [extent,
-    L_local, K] int16, -1 where unlogged) where positions 0..complete-1 are
-    all logged: one vectorized pass over the store plus one dense scatter per
-    key. Popped keys are closed (later rows are dropped). A position recorded
-    twice (an engine eviction recomputes it) keeps one of its rows: under
-    batch invariance they are bitwise equal.
+    ``pop(keys)`` returns, per key with rows logged since its last pop, (lo,
+    run_end, routes [n, L_local, K] int16 of positions lo..lo+n-1, -1 where
+    unlogged), where positions lo..run_end-1 are all logged: one vectorized
+    pass over the store plus one dense scatter per key. ``close=True`` closes
+    the keys (later rows are dropped); ``close=False`` keeps them open, so a
+    running draft's routes can be taken in pieces. A position recorded twice
+    (an engine eviction recomputes it) keeps one of its rows: under batch
+    invariance they are bitwise equal.
     """
 
     def __init__(self, ring_rows: int = 65536, drain_every: int = 64):
@@ -130,7 +132,9 @@ class RouteLog:
         lo, hi = self._head, self._head + m
         # Rows still staged in [lo, hi) must be drained first. Their forwards
         # ran a whole ring ago, so the wait is normally zero.
-        while self._pending and any(s < hi and lo < s + n for s, n, *_ in self._pending):
+        while self._pending and any(
+            s < hi and lo < s + n for s, n, *_ in self._pending
+        ):
             self._move(self._pending.popleft())
         self._head = hi
         return lo
@@ -153,7 +157,13 @@ class RouteLog:
                 event = torch.cuda.Event()
                 event.record()
             self._pending.append(
-                (start, m, np.asarray(kid, dtype=np.int64), np.asarray(pos, dtype=np.int64), event)
+                (
+                    start,
+                    m,
+                    np.asarray(kid, dtype=np.int64),
+                    np.asarray(pos, dtype=np.int64),
+                    event,
+                )
             )
             self.recorded += m
             if len(self._pending) >= self.drain_every:
@@ -178,47 +188,65 @@ class RouteLog:
         if k == 0:
             return
         if self._rows is None or self._used + k > self._rows.shape[0]:
-            cap = max(self._used + k, 2 * (0 if self._rows is None else self._rows.shape[0]), 4096)
+            cap = max(
+                self._used + k,
+                2 * (0 if self._rows is None else self._rows.shape[0]),
+                4096,
+            )
             grown = np.empty((cap, *rows.shape[1:]), dtype=np.int16)
             kg, pg = np.empty(cap, dtype=np.int64), np.empty(cap, dtype=np.int64)
             if self._rows is not None:
                 grown[: self._used] = self._rows[: self._used]
-                kg[: self._used], pg[: self._used] = self._kid[: self._used], self._pos[: self._used]
+                kg[: self._used], pg[: self._used] = (
+                    self._kid[: self._used],
+                    self._pos[: self._used],
+                )
             self._rows, self._kid, self._pos = grown, kg, pg
         u = self._used
         self._rows[u : u + k] = rows
         self._kid[u : u + k], self._pos[u : u + k] = kid, pos
         self._used = u + k
 
-    def pop(self, keys: Sequence[str]) -> dict[str, tuple[int, torch.Tensor]]:
+    def pop(
+        self, keys: Sequence[str], close: bool = True
+    ) -> dict[str, tuple[int, int, torch.Tensor]]:
         with self._lock:
             ids = np.array([self._key_id(k) for k in keys], dtype=np.int64)
             self._drain(force=True)
-            self._closed[ids] = True
+            if close:
+                self._closed[ids] = True
             if self._used == 0 or ids.size == 0:
                 return {}
             u = self._used
-            want = np.zeros(self._closed.shape[0], dtype=bool)
+            want = np.zeros(self._closed.shape[0] + 1, dtype=bool)
             want[ids] = True
-            sel = np.flatnonzero(want[self._kid[:u]])
-            out: dict[str, tuple[int, torch.Tensor]] = {}
+            sel = np.flatnonzero(want[self._kid[:u]])  # taken rows have kid -1
+            out: dict[str, tuple[int, int, torch.Tensor]] = {}
             if sel.size:
                 order = sel[np.argsort(self._kid[sel], kind="stable")]
                 kid_sorted = self._kid[order]
                 name = {int(i): k for k, i in zip(keys, ids)}
                 for grp in np.split(order, np.flatnonzero(np.diff(kid_sorted)) + 1):
                     pos = self._pos[grp]
-                    n = int(pos.max()) + 1
-                    dense = np.full((n, *self._rows.shape[1:]), NO_ANCHOR, dtype=np.int16)
-                    logged = np.zeros(n, dtype=bool)
+                    lo, n = int(pos.min()), int(pos.max()) + 1
+                    dense = np.full(
+                        (n - lo, *self._rows.shape[1:]), NO_ANCHOR, dtype=np.int16
+                    )
+                    logged = np.zeros(n - lo, dtype=bool)
                     # Duplicate positions carry bitwise-equal routes: any wins.
-                    dense[pos] = self._rows[grp]
-                    logged[pos] = True
+                    dense[pos - lo] = self._rows[grp]
+                    logged[pos - lo] = True
                     missing = np.flatnonzero(~logged)
-                    complete = int(missing[0]) if missing.size else n
-                    out[name[int(self._kid[grp[0]])]] = (complete, torch.from_numpy(dense))
-            # Compact once closed keys hold at least half of the store.
-            live = ~self._closed[self._kid[:u]]
+                    run_end = lo + (int(missing[0]) if missing.size else n - lo)
+                    out[name[int(self._kid[grp[0]])]] = (
+                        lo,
+                        run_end,
+                        torch.from_numpy(dense),
+                    )
+                self._kid[sel] = -1  # taken
+            # Compact once taken rows and closed keys hold half of the store.
+            kid = self._kid[:u]
+            live = (kid >= 0) & ~self._closed[np.maximum(kid, 0)]
             if 2 * int(live.sum()) <= u:
                 keep = np.flatnonzero(live)
                 k = int(keep.size)
@@ -242,7 +270,9 @@ class SlotTags:
     ``lookup(rid)`` returns the draft key of a request, or None.
     """
 
-    def __init__(self, lookup: Callable[[int], Optional[str]], key_id: Callable[[str], int]):
+    def __init__(
+        self, lookup: Callable[[int], Optional[str]], key_id: Callable[[str], int]
+    ):
         self.lookup = lookup
         self.key_id = key_id
         self.rid = np.full(0, -1, dtype=np.int64)
@@ -313,6 +343,8 @@ class RouteRefs:
     blocks: list[RouteBlock] = field(default_factory=list)
     length: int = 0
     complete: int = 0
+    # Logged prefix per MoE layer number (``merge_route_refs``).
+    prefix: dict[int, int] = field(default_factory=dict)
 
     @property
     def nbytes(self) -> int:
@@ -325,6 +357,7 @@ class RouteRefs:
             [replace(b, hi=min(b.hi, n)) for b in self.blocks if b.lo < n],
             n,
             min(self.complete, n),
+            {ln: min(p, n) for ln, p in self.prefix.items()},
         )
 
 
@@ -332,44 +365,51 @@ def put_routes(
     rows: torch.Tensor,
     put: Callable[[Any], Any],
     block_positions: int = ROUTE_BLOCK_POSITIONS,
+    start: int = 0,
 ) -> list[tuple[Any, int, int, int]]:
     """Engine side: one draft's dense routes [n, L, K] into the object store.
 
-    One object per ``block_positions`` positions. Returns [(ref, lo, hi,
-    bytes)] per block, the only thing sent to the driver.
+    ``rows[j]`` is position ``start + j``. One object per ``block_positions``
+    positions. Returns [(ref, lo, hi, bytes)] per block (absolute positions),
+    the only thing sent to the driver.
     """
     out = []
-    for lo in range(0, int(rows.shape[0]), block_positions):
-        b = rows[lo : lo + block_positions].contiguous()
+    for a in range(0, int(rows.shape[0]), block_positions):
+        b = rows[a : a + block_positions].contiguous()
+        lo = start + a
         out.append((put(b), lo, lo + int(b.shape[0]), b.numel() * b.element_size()))
     return out
 
 
 def merge_route_refs(
-    parts: Sequence[tuple[Sequence[int], int, Sequence[tuple]]],
+    parts: Sequence[tuple[Sequence[int], int, int, Sequence[tuple]]],
     length: int,
     all_layers: Sequence[int],
+    base: Optional["RouteRefs"] = None,
 ) -> RouteRefs:
     """A draft's ``RouteRefs`` from the parts every engine rank returned.
 
-    ``parts``: (layer numbers, logged prefix, [(ref, lo, hi, bytes)]) per
+    ``parts``: (layer numbers, lo, run_end, [(ref, lo, hi, bytes)]) per
     engine rank that logged the draft (pipeline stages hold different
-    layers). Positions are complete where every layer of ``all_layers`` is
-    logged: the minimum logged prefix over the stages, 0 if a stage is
-    missing.
+    layers), where positions lo..run_end-1 are logged. ``base``: routes of
+    the same draft taken earlier (a running draft taken in pieces); the new
+    blocks extend it. Positions are complete where every layer of
+    ``all_layers`` is logged: the minimum over stages of the logged prefix.
     """
-    blocks, prefix = [], {}
-    for layers, complete, blks in parts:
+    prefix = dict(base.prefix) if base is not None else {}
+    blocks = list(base.blocks) if base is not None else []
+    for layers, lo, run_end, blks in parts:
         layers = tuple(int(x) for x in layers)
         for ln in layers:
-            prefix[ln] = max(prefix.get(ln, 0), int(complete))
+            if lo <= prefix.get(ln, 0):
+                prefix[ln] = max(prefix.get(ln, 0), int(run_end))
         blocks += [
-            RouteBlock(ref, layers, int(lo), min(int(hi), length), int(nb))
-            for ref, lo, hi, nb in blks
-            if lo < length
+            RouteBlock(ref, layers, int(a), min(int(b), length), int(nb))
+            for ref, a, b, nb in blks
+            if a < length
         ]
     complete = min((prefix.get(int(ln), 0) for ln in all_layers), default=0)
-    return RouteRefs(blocks, length, min(complete, length))
+    return RouteRefs(blocks, length, min(complete, length), prefix)
 
 
 def splice_refs(prior: Optional[RouteRefs], new: RouteRefs) -> RouteRefs:
@@ -382,8 +422,12 @@ def splice_refs(prior: Optional[RouteRefs], new: RouteRefs) -> RouteRefs:
     """
     if prior is None or new.complete >= prior.length:
         return new
+    prefix = {ln: max(p, prior.prefix.get(ln, 0)) for ln, p in new.prefix.items()}
     return RouteRefs(
-        prior.blocks + new.blocks, new.length, max(new.complete, prior.complete)
+        prior.blocks + new.blocks,
+        new.length,
+        max(new.complete, prior.complete),
+        prefix,
     )
 
 

@@ -37,7 +37,7 @@ def _routes(key_prompt_len, n_pos, val=1):
     from thundersync_rl.routes import put_routes
 
     dense = torch.full((n_pos, 1, 1), val, dtype=torch.int16)
-    return ([1], n_pos, put_routes(dense, lambda t: t, 2))
+    return ([1], 0, n_pos, put_routes(dense, lambda t: t, 2))
 
 
 def _dense(refs, width=None):
@@ -49,28 +49,63 @@ def _dense(refs, width=None):
 
 
 class _Engine:
-    """Fake generation rank 0 + route/hidden logs for two drafting rounds."""
+    """Fake generation rank 0 + route/hidden logs.
+
+    Every ``start_drafts`` with prompts and every ``add_drafts`` call takes
+    the next entry of ``rounds``: [(tokens, finished, logq, n_route_pos)] per
+    draft. ``finished``: the draft ended (EOS or budget) when collected at a
+    deadline; a continuation stream has always stopped decoding when it is
+    peeked (its tokens are all there is). Routes cover positions
+    0..n_route_pos-1 and every token has a hidden row.
+    """
 
     def __init__(self, rounds):
-        self.rounds = rounds  # list of [(tokens, finished, logq, n_route_pos)]
+        self.rounds = rounds
         self.started = []
-        self.cur = None
+        self.streams = []
+        self.aborted = []
+        self.closed = []
+
+    def _add(self, prompts, budget, hidden_keys):
+        self.started.append((prompts, budget, hidden_keys))
+        base = len(self.streams)
+        for (t, f, lq, n_pos), k in zip(self.rounds.pop(0), hidden_keys or [None] * len(prompts)):
+            self.streams.append(dict(tokens=t, done=f, logq=lq, n_pos=n_pos, key=k, sent=False))
+        return list(range(base, len(self.streams)))
 
     def start(self, prompts, budget, interval, hidden_keys=None):
-        self.started.append((prompts, budget, hidden_keys))
-        self.cur = (self.rounds.pop(0), hidden_keys)
+        self.streams = []
+        if prompts:
+            self._add(prompts, budget, hidden_keys)
+
+    def add(self, prompts, budget, interval, hidden_keys=None):
+        return self._add(prompts, budget, hidden_keys)
+
+    def _by_key(self, k):
+        return next(s for s in self.streams if s["key"] == k)
 
     def collect(self, records=None):
-        return [(t, f, lq) for t, f, lq, _ in self.cur[0]]
+        return [(s["tokens"], s["done"], s["logq"]) for s in self.streams]
+
+    def lengths(self, indices):
+        return [(len(self.streams[i]["tokens"]), True) for i in indices]
+
+    def peek(self, indices, records=None):
+        return [(self.streams[i]["tokens"], True, self.streams[i]["logq"]) for i in indices]
 
     def pop_hidden(self, keys, lengths):
         return {k: torch.ones(n, 4) for k, n in zip(keys, lengths) if n}
 
-    def pop_routes(self, keys):
+    def take_hidden(self, keys, starts, lengths):
+        return {k: torch.ones(n, 4) for k, n in zip(keys, lengths) if n}
+
+    def pop_routes(self, keys, close=True):
         out = {}
-        for k, (_, _, _, n_pos) in zip(keys, self.cur[0]):
-            if n_pos:
-                out[k] = _routes(None, n_pos, val=len(self.started))
+        for k in keys:
+            s = self._by_key(k)
+            if s["n_pos"] and not s["sent"]:
+                s["sent"] = True
+                out[k] = _routes(None, s["n_pos"], val=len(self.started))
         return out
 
     def handlers(self):
@@ -78,11 +113,17 @@ class _Engine:
             "install_draft_hidden_log": lambda: True,
             "install_draft_route_log": lambda: [1],
             "start_drafts": self.start,
-            "draft_request_ids": lambda: {},
+            "add_drafts": self.add,
+            "draft_request_ids": lambda indices=None: {},
+            "draft_lengths": self.lengths,
+            "peek_drafts": self.peek,
+            "abort_drafts": self.aborted.extend,
+            "close_draft_logs": lambda keys: self.closed.extend(keys),
             "collect_drafts": self.collect,
             "pop_draft_hidden": self.pop_hidden,
+            "take_draft_hidden": self.take_hidden,
             "pop_draft_routes": self.pop_routes,
-            "drafts_done": lambda: [True] * len(self.cur[0]),
+            "drafts_done": lambda: [True] * len(self.streams),
         }
 
 
@@ -183,6 +224,106 @@ def test_sticky_drafts_verify_and_continue_to_completion():
     assert len(freed) == 3 + 5 and not s._route_blocks  # drafts, round 1
 
 
+class _DecodingEngine(_Engine):
+    """Continuation streams that decode one token per status poll."""
+
+    def __init__(self, rounds):
+        super().__init__(rounds)
+        self.visible = {}
+
+    def add(self, prompts, budget, interval, hidden_keys=None):
+        idx = super().add(prompts, budget, interval, hidden_keys)
+        for i, p in zip(idx, prompts):
+            self.streams[i].update(prompt_len=len(p), routed=0)
+        return idx
+
+    def lengths(self, indices):
+        out = []
+        for i in indices:
+            s = self.streams[i]
+            if i not in self.aborted:
+                self.visible[i] = min(self.visible.get(i, 0) + 1, len(s["tokens"]))
+            out.append((self.visible.get(i, 0), self.visible.get(i, 0) == len(s["tokens"])))
+        return out
+
+    def peek(self, indices, records=None):
+        return [
+            (
+                self.streams[i]["tokens"][: self.visible.get(i, 0)],
+                self.visible.get(i, 0) == len(self.streams[i]["tokens"]),
+                self.streams[i]["logq"][: self.visible.get(i, 0)],
+            )
+            for i in indices
+        ]
+
+    def pop_routes(self, keys, close=True):
+        from thundersync_rl.routes import put_routes
+
+        out = {}
+        for k in keys:
+            i, s = next((j, x) for j, x in enumerate(self.streams) if x["key"] == k)
+            if "prompt_len" not in s:  # a deadline draft: all at once
+                if s["n_pos"] and not s["sent"]:
+                    s["sent"] = True
+                    out[k] = _routes(None, s["n_pos"])
+                continue
+            v = self.visible.get(i, 0)
+            # the last token's route is logged once it is fed back
+            end = s["prompt_len"] + v - (0 if v == len(s["tokens"]) else 1)
+            if end > s["routed"]:
+                dense = torch.full((end - s["routed"], 1, 1), 1, dtype=torch.int16)
+                out[k] = ([1], s["routed"], end, put_routes(dense, lambda t: t, 2, start=s["routed"]))
+                s["routed"] = end
+        return out
+
+
+def test_continuations_are_verified_in_pieces_while_decoding():
+    """Pieces of sticky_chunk_tokens (2) tokens are verified while the stream
+    decodes; whole acceptance continues the same stream, a rejection aborts
+    it and starts a new one from the new prefix."""
+    engine = _DecodingEngine(
+        [
+            [([4], False, [-0.1], 2)],  # deadline draft of prompt [1]
+            [([5, 6, 7, 8, 9, EOD], True, [-0.2] * 6, 0)],  # stream from [1, 4]
+            [([EOD], True, [-0.3], 0)],  # stream from [1, 4, 5, 6, 7, 30]
+        ]
+    )
+    calls = []
+    results = [(1, 99), (2, 99), (1, 30), (1, EOD)]
+
+    def verify(rows, prompt_lens, engine_logq, anchors, **_):
+        calls.append(([r.tolist() for r in rows], prompt_lens, dict(engine.visible)))
+        a, y = results.pop(0)
+        for r, plen, anc in zip(rows, prompt_lens, anchors):
+            # every drafted token's anchors were logged
+            assert anc.complete >= r.numel() - 1 and bool((_dense(anc)[: r.numel() - 1] == 1).all())
+        return [(0, {"accepted": a, "next": y, "logprobs": [-1.0] * (a + 1), "draft_logq": engine_logq[0][:a]})]
+
+    s = make_spec(
+        {"verify_drafts_block_engine": verify},
+        base_handlers=engine.handlers(),
+        verify_source="engine",
+        hidden_transport="driver",
+        sticky_delta=0.03,
+        sticky_chunk_tokens=2,
+    )
+    drafts = asyncio.run(s.draft_streaming([torch.tensor([1])]))()
+    s.current_step = 1
+    asyncio.run(s.verify_sticky(drafts))
+    rows = [c[0][0] for c in calls]
+    assert rows == [[1, 4], [1, 4, 5, 6], [1, 4, 5, 6, 7, 8], [1, 4, 5, 6, 7, 30, EOD]]
+    # the first piece was verified while its stream was still decoding
+    assert calls[1][2][0] < 6
+    # one restart (after the rejection), the first stream aborted
+    assert [p for p, _, _ in engine.started[1:]] == [[[1, 4]], [[1, 4, 5, 6, 7, 30]]]
+    assert 0 in engine.aborted
+    (plan,) = s.plans[(1,)]
+    assert plan.complete and plan.prefix == [4, 5, 6, 7, 30, EOD]
+    assert plan.anchors.length == 1 + 6
+    assert s.stats["spec/sticky_rounds"] == 3.0 and s.stats["spec/sticky_streams"] == 2.0
+    assert s.stats["spec/sticky_cont_draft_tokens"] == 2 + 2 + 1
+
+
 def test_sticky_round_retries_unlogged_continuations():
     engine = _Engine(
         [
@@ -209,7 +350,9 @@ def test_sticky_round_retries_unlogged_continuations():
     asyncio.run(s.verify_sticky(drafts))
     (plan,) = s.plans[(1, 2)]
     assert plan.complete and plan.prefix == [4, 5, 6, EOD]
-    assert s.stats["spec/sticky_rounds"] == 2.0 and s.stats["spec/sticky_cont_retries"] == 1.0
+    # one verification of continuations; the unlogged stream was started again
+    assert s.stats["spec/sticky_rounds"] == 1.0 and s.stats["spec/sticky_cont_retries"] == 1.0
+    assert s.stats["spec/sticky_streams"] == 2.0
 
 
 def test_incomplete_sticky_plan_never_reaches_plain_decoding():
@@ -377,7 +520,10 @@ def test_worker_anchor_batch_fetches_its_stage_layers(monkeypatch):
     s1 = torch.full((4, 1, 2), 7, dtype=torch.int16)  # stage 1: layer 1
     s2 = torch.arange(4 * 2 * 2, dtype=torch.int16).view(4, 2, 2)  # layers 3, 5
     refs = merge_route_refs(
-        [([1], 4, put_routes(s1, lambda t: t)), ([3, 5], 4, put_routes(s2, lambda t: t))],
+        [
+            ([1], 0, 4, put_routes(s1, lambda t: t)),
+            ([3, 5], 0, 4, put_routes(s2, lambda t: t)),
+        ],
         4,
         [1, 3, 5],
     )
@@ -485,8 +631,8 @@ def test_engine_route_log_on_a_fake_engine(monkeypatch):
         controller._dynamic_step_forward_logits(None, None)
     out = w.pop_draft_routes(["d|0", "x"])
     assert list(out) == ["d|0"]
-    layers, complete, blocks = out["d|0"]
-    assert layers == [1, 3] and complete == 5
+    layers, lo, complete, blocks = out["d|0"]
+    assert layers == [1, 3] and (lo, complete) == (0, 5)
     ((routes, lo, hi, nbytes),) = blocks  # put into the object store
     assert (lo, hi, nbytes) == (0, 5, 5 * L * K * 2)
     assert routes[:, 0, 0].tolist() == [0, 1, 2, 100, 200]
@@ -514,6 +660,9 @@ class _LoggingEngine(_Engine):
             for k, n, m in zip(keys, lengths, logged)
             if min(n, m)
         }
+
+    def take_hidden(self, keys, starts, lengths):
+        return self.pop_hidden(keys, lengths)
 
 
 def test_route_truncated_drafts_keep_hidden_rows_matching_tokens():
@@ -592,13 +741,9 @@ def test_route_check_against_an_engine_prefill(monkeypatch, same_routes):
     monkeypatch.setenv("THUNDERSYNC_ENGINE_Q_CHECK", "1")
 
     class Engine(_Engine):
-        def pop_routes(self, keys):
+        def pop_routes(self, keys, close=True):
             val = 1 if same_routes or len(self.started) == 1 else 2
-            return {
-                k: _routes(None, n_pos, val=val)
-                for k, (_, _, _, n_pos) in zip(keys, self.cur[0])
-                if n_pos
-            }
+            return {k: _routes(None, self._by_key(k)["n_pos"], val=val) for k in keys if self._by_key(k)["n_pos"]}
 
     engine = Engine(
         [
@@ -726,8 +871,8 @@ def test_rebuilt_engine_keeps_logging_into_the_route_log(monkeypatch):
     eng2.controller._dynamic_step_forward_logits()
     assert w.install_draft_route_log() == [1]  # idempotent
     eng2.controller._dynamic_step_forward_logits()
-    (layers, complete, ((routes, lo, hi, _),)) = w.pop_draft_routes(["d|0"])["d|0"]
-    assert complete == 2 and routes[:, 0, 0].tolist() == [3, 4]
+    (layers, lo, complete, ((routes, a, b, _),)) = w.pop_draft_routes(["d|0"])["d|0"]
+    assert (lo, complete, a, b) == (0, 2, 0, 2) and routes[:, 0, 0].tolist() == [3, 4]
 
 
 def test_route_record_rearms_new_router_instances(monkeypatch):

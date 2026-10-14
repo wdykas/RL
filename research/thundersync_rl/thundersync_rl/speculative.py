@@ -35,7 +35,7 @@ import math
 import os
 import time
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, AsyncGenerator, Optional
 
 import ray
@@ -224,6 +224,7 @@ class SpeculativeGeneration:
         sticky_delta: Optional[float] = None,
         null_bv: bool = False,
         null_bv_policy: Optional[dict[str, Any]] = None,
+        sticky_chunk_tokens: int = 2048,
     ):
         self.base = base
         self.learner_policy = learner_policy
@@ -317,6 +318,10 @@ class SpeculativeGeneration:
         # training replay them; continuations up to the rollout cap are drafted
         # by the same (previous) weights and verified (``verify_sticky``).
         self.sticky_delta = sticky_delta
+        # Continuations are verified every this many decoded tokens while the
+        # engine keeps decoding them (``_continue_sticky``).
+        self.sticky_chunk_tokens = sticky_chunk_tokens
+        self._cont_ids = itertools.count()
         self._anchor_claims: dict[
             tuple[int, ...], list[tuple[tuple[int, ...], RouteRefs]]
         ] = defaultdict(list)
@@ -568,6 +573,33 @@ class SpeculativeGeneration:
         self._count_hidden("spec/hidden_bytes_logged", sum(map(hidden_nbytes, out)))
         return out
 
+    def _take_hidden(
+        self, hkeys: list[str], starts: list[int], lengths: list[int]
+    ) -> list[Any]:
+        """Hidden rows start..start+m-1 of running drafts (``_pop_hidden`` for pieces)."""
+        refs = self.hidden_transport == "object_store"
+        merged: dict[str, Any] = {}
+        for r in ray.get(
+            self.base._policy.worker_group.run_all_workers_single_data(
+                "take_draft_hidden",
+                keys=hkeys,
+                starts=starts,
+                lengths=lengths,
+                **({"as_refs": True} if refs else {}),
+            )
+        ):
+            merged.update(r)
+        out: list[Any] = []
+        for k, n in zip(hkeys, lengths):
+            if k not in merged:
+                out.append(None)
+            elif refs:
+                out.append(HiddenRefs.from_blocks(merged[k]))
+            else:
+                out.append(merged[k])
+        self._count_hidden("spec/hidden_bytes_logged", sum(map(hidden_nbytes, out)))
+        return out
+
     def _truncate(self, drafted, hidden):
         """``_truncate_to_rows``, counting truncated drafts / tokens in the stats."""
         out = _truncate_to_rows(drafted, hidden)
@@ -586,6 +618,8 @@ class SpeculativeGeneration:
         prompt_lens: list[int],
         lengths: list[int],
         target: int,
+        close: bool = True,
+        bases: Optional[list[Optional[RouteRefs]]] = None,
     ) -> list[Optional[RouteRefs]]:
         """Each draft's anchors over [P + g] positions (sticky routing), None if unlogged.
 
@@ -594,29 +628,35 @@ class SpeculativeGeneration:
         keeps only the handles (``RouteRefs``). Positions past the logged
         prefix truncate the draft (``_truncate_to_anchors``). ``target``: the
         step whose training replays these anchors (``release_routes`` frees
-        them after it).
+        them after it). ``close=False`` with ``bases``: drafts still running,
+        whose routes taken earlier (``bases[i]``) the new blocks extend.
         """
         n = len(lengths)
         if self.sticky_delta is None or hkeys is None:
             return [None] * n
+        bases = bases or [None] * n
         parts: dict[str, list] = defaultdict(list)
+        new_bytes = 0
         for r in ray.get(
             self.base._policy.worker_group.run_all_workers_single_data(
-                "pop_draft_routes", keys=hkeys
+                "pop_draft_routes", keys=hkeys, close=close
             )
         ):
             for k, v in r.items():
                 parts[k].append(v)
-                self._route_blocks[target] += [b[0] for b in v[2]]
+                self._route_blocks[target] += [b[0] for b in v[3]]
+                new_bytes += sum(b[3] for b in v[3])
         out: list[Optional[RouteRefs]] = []
-        for k, plen, g in zip(hkeys, prompt_lens, lengths):
+        for k, plen, g, base in zip(hkeys, prompt_lens, lengths, bases):
             if k not in parts:
-                out.append(None)
+                out.append(None if base is None else replace(base, length=plen + g))
                 continue
-            out.append(merge_route_refs(parts[k], plen + g, self._route_layers))
-        self.stats["spec/route_bytes_logged"] = self.stats.get(
-            "spec/route_bytes_logged", 0.0
-        ) + float(sum(a.nbytes for a in out if a is not None))
+            out.append(
+                merge_route_refs(parts[k], plen + g, self._route_layers, base=base)
+            )
+        self.stats["spec/route_bytes_logged"] = (
+            self.stats.get("spec/route_bytes_logged", 0.0) + new_bytes
+        )
         return out
 
     def release_routes(self, step: int) -> None:
@@ -1391,7 +1431,7 @@ class SpeculativeGeneration:
 
     # -- sticky routing: verification and theta_n continuations --------------------
 
-    async def verify_sticky(self, drafts, max_rounds: int = 1000) -> None:
+    async def verify_sticky(self, drafts) -> None:
         """Verify drafts and complete every drafted rollout (sticky MoE routing).
 
         Called at the start of iteration k with the learner at theta_k and the
@@ -1400,48 +1440,26 @@ class SpeculativeGeneration:
         rollout's own prefix at every position up to the rollout cap (the cut
         c = prompt + max_new_tokens, content-independent), "self" for rows
         never drafted. Positions after a rejection need theta_{k-1} routes on
-        the new prefix, so the engine keeps theta_{k-1} and continues each
-        incomplete plan in rounds: it drafts from prompt + kept prefix to the
-        end (EOS or the cap) with its plain forward, logging routes, hidden
-        states and log-probs as for any draft, and the learner block-verifies
-        that draft against the same p (anchors: the earlier ones spliced with
-        the new route log). Every round is exact block verification of a q
-        draft against the fixed target p, so the final rollout is an exact
-        sample of p. Rounds end when every plan is complete; the expected
-        number is small when acceptance is high.
+        the new prefix, so the engine keeps theta_{k-1} and continues every
+        incomplete plan (``_continue_sticky``): it decodes from prompt + kept
+        prefix toward the end (EOS or the cap) with its plain forward, logging
+        routes, hidden states and log-probs as for any draft, and the learner
+        block-verifies each continuation in pieces while it is decoded. Every
+        piece is exact block verification of a q draft against the fixed
+        target p, so the final rollout is an exact sample of p.
         """
         self._plan_cv = None
         if os.environ.get("THUNDERSYNC_ENGINE_Q_CHECK") == "1":
             await self._route_check(drafts)
         self.verify(drafts)
-        rounds = cont_tokens = cont_kept = retries = 0
-        while True:
-            pending = [
-                (key, plan)
-                for key, queue in self.plans.items()
-                for plan in queue
-                if not plan.complete
-            ]
-            if not pending:
-                break
-            if rounds >= max_rounds:
-                raise RuntimeError(
-                    f"sticky routing: {len(pending)} rollouts still incomplete after "
-                    f"{rounds} continuation rounds"
-                )
-            rounds += 1
-            n_tok, n_kept, n_retry = await self._sticky_round(pending, rounds)
-            cont_tokens += n_tok
-            cont_kept += n_kept
-            retries += n_retry
-        self.stats.update(
-            {
-                "spec/sticky_rounds": float(rounds),
-                "spec/sticky_cont_draft_tokens": float(cont_tokens),
-                "spec/sticky_cont_accepted_frac": cont_kept / max(cont_tokens, 1),
-                "spec/sticky_cont_retries": float(retries),
-            }
-        )
+        pending = [
+            (key, plan)
+            for key, queue in self.plans.items()
+            for plan in queue
+            if not plan.complete
+        ]
+        if pending:
+            await self._continue_sticky(pending)
 
     async def _route_check(self, drafts) -> None:
         """Debug: the drafts' logged anchors against a fresh engine prefill.
@@ -1485,84 +1503,243 @@ class SpeculativeGeneration:
         self.stats["spec/route_check_exact"] = float(exact)
         print(f"[route check] drafts={len(ds)} tok={tok} exact={exact}", flush=True)
 
-    async def _sticky_round(self, pending, rnd: int) -> tuple[int, int, int]:
-        """One continuation round: engine (theta_{k-1}) drafts, learner verifies."""
+    async def _continue_sticky(self, pending, max_retries: int = 100) -> None:
+        """Complete incomplete plans at theta_{k-1}, verifying while the engine decodes.
+
+        One engine stream per plan decodes from prompt + kept prefix toward
+        EOS or the cap. Whenever a stream has ``sticky_chunk_tokens`` new
+        tokens (a fixed count: the cut is exogenous; a finished stream: all
+        that is left), that piece is a q draft given the plan's current
+        prefix, and the ready pieces of all streams are block-verified
+        together while every stream keeps decoding. Whole acceptance extends
+        the prefix and the same stream goes on (its later tokens are q
+        samples given the extended prefix, a valid draft; no bonus is needed);
+        a rejection appends the residual token, aborts the stream and starts a
+        new one from the new prefix. A rejection therefore wastes at most the
+        tokens the stream decoded past the piece, and verification overlaps
+        decoding instead of alternating with it. Anchors of a piece are the
+        stream's own route log (its prefill re-routes prompt + prefix);
+        pieces are cut to their logged routes and hidden rows, which is
+        engine bookkeeping, independent of the tokens.
+        """
         rank0 = self.base._policy.worker_group.workers[0]
-        prompts = [
-            torch.cat(
-                [torch.tensor(key, dtype=torch.long), torch.tensor(plan.prefix, dtype=torch.long)]
-            )
-            for key, plan in pending
-        ]
-        budgets = [self.max_new_tokens - len(plan.prefix) for _, plan in pending]
-        hkeys = self._hidden_keys([f"c{rnd}:{j}" for j in range(len(pending))])
-        ray.get(
-            rank0.start_drafts.remote(
-                [p.tolist() for p in prompts],
-                budgets,
-                self.stream_interval,
-                hidden_keys=hkeys,
-            )
-        )
-        # Run to completion (EOS or the cap): there is no deadline here.
-        while not all(ray.get(rank0.drafts_done.remote())):
-            await asyncio.sleep(0.02)
-        res = [_drafted(x) for x in self._collect_drafts(rank0)]
-        res, hid, routes = self._pop_logs(
-            hkeys,
-            [p.numel() for p in prompts],
-            res,
-            target=self.current_step,
-            prior=[plan.anchors for _, plan in pending],
-        )
+        chunk = max(1, int(self.sticky_chunk_tokens))
         version = self.current_step - 1
-        flat, rows, owners, retry = [], [], [], 0
-        for j, ((key, plan), p, (toks, done, lps), h, a) in enumerate(
-            zip(pending, prompts, res, hid, routes)
-        ):
-            d = (
-                p,
-                -1,
-                toks,
-                done,
-                f"c{rnd}:{j}",
-                [(version, 0, len(toks))],
-                lps,
-                h,
-                a,
+        stats = dict(rounds=0, streams=0, tokens=0, kept=0, retries=0)
+        live: list[dict[str, Any]] = []
+        retries: dict[int, int] = defaultdict(int)
+        ray.get(rank0.start_drafts.remote([], 1, self.stream_interval, hidden_keys=[]))
+
+        def start(items) -> None:
+            prompts = [
+                torch.cat(
+                    [
+                        torch.tensor(key, dtype=torch.long),
+                        torch.tensor(plan.prefix, dtype=torch.long),
+                    ]
+                )
+                for key, plan in items
+            ]
+            budgets = [self.max_new_tokens - len(plan.prefix) for _, plan in items]
+            hkeys = self._hidden_keys([f"c{next(self._cont_ids)}" for _ in items])
+            idx = ray.get(
+                rank0.add_drafts.remote(
+                    [p.tolist() for p in prompts],
+                    budgets,
+                    self.stream_interval,
+                    hidden_keys=hkeys,
+                )
             )
-            if not toks or not engine_q_ready(d) or a is None:
-                # Nothing verifiable this round (logging is engine bookkeeping,
-                # independent of the tokens): retry from the same prefix.
-                self._release_hidden([d])
-                retry += 1
+            for (key, plan), i, hk, p in zip(items, idx, hkeys, prompts):
+                live.append(
+                    dict(
+                        key=key,
+                        plan=plan,
+                        idx=i,
+                        hkey=hk,
+                        length=p.numel() + self.max_new_tokens - len(plan.prefix),
+                        taken=0,
+                        routes=None,
+                    )
+                )
+            stats["streams"] += len(items)
+
+        def stop(streams) -> None:
+            ray.get(rank0.abort_drafts.remote([s["idx"] for s in streams]))
+            ray.get(
+                self.base._policy.worker_group.run_all_workers_single_data(
+                    "close_draft_logs", keys=[s["hkey"] for s in streams]
+                )
+            )
+            for s in streams:
+                live.remove(s)
+
+        start(pending)
+        while live:
+            status = ray.get(rank0.draft_lengths.remote([s["idx"] for s in live]))
+            cand = [
+                s
+                for s, (n, done) in zip(live, status)
+                if done or n - s["taken"] >= chunk
+            ]
+            if not cand:
+                await asyncio.sleep(0.02)
                 continue
-            flat.append((len(owners), d))
-            rows.append(torch.cat([p, torch.tensor(toks, dtype=torch.long)]))
-            owners.append(plan)
-        if not flat:
-            return 0, 0, retry
-        by_row = self._verify_block(flat, rows)
-        n_tok = n_kept = 0
-        for r, ((_, d), plan) in enumerate(zip(flat, owners)):
-            out = by_row[r]
-            p, toks, done = d[0], d[2], d[3]
-            g, n_acc = len(toks), out["accepted"]
-            lps = behavior_logprobs(out["logprobs"], n_acc, d[6], out.get("draft_logq"))
-            n_tok += g
-            n_kept += n_acc
-            if n_acc == g:
-                plan.prefix += list(toks)
-                plan.prefix_logprobs += lps[:g]
-                plan.anchors = d[8].truncate(p.numel() + g)
-                plan.complete = bool(done) or len(plan.prefix) >= self.max_new_tokens
-            else:
-                y = out["next"]
-                plan.prefix += list(toks[:n_acc]) + [y]
-                plan.prefix_logprobs += lps[: n_acc + 1]
-                plan.anchors = d[8].truncate(p.numel() + n_acc)
-                plan.complete = y == self.eod or len(plan.prefix) >= self.max_new_tokens
-        return n_tok, n_kept, retry
+            idx = [s["idx"] for s in cand]
+            ids = ray.get(rank0.draft_request_ids.remote(idx))
+            records: dict[int, tuple] = {}
+            if ids:
+                for r in ray.get(
+                    self.base._policy.worker_group.run_all_workers_single_data(
+                        "draft_records", request_ids=sorted(ids.values())
+                    )
+                ):
+                    records.update(r)
+            snaps = ray.get(rank0.peek_drafts.remote(idx, records=records))
+            ready = []
+            for s, (toks, done, lps) in zip(cand, snaps):
+                a = s["taken"]
+                n = len(toks) - a if done else ((len(toks) - a) // chunk) * chunk
+                if n > 0 or done:
+                    # (stream, piece, stream finished, piece log-probs)
+                    ready.append(
+                        (
+                            s,
+                            toks[a : a + n],
+                            done,
+                            None if lps is None else lps[a : a + n],
+                        )
+                    )
+            if not ready:
+                await asyncio.sleep(0.02)
+                continue
+            routes = self._pop_routes(
+                [s["hkey"] for s, *_ in ready],
+                [s["length"] for s, *_ in ready],
+                [0] * len(ready),
+                target=self.current_step,
+                close=False,
+                bases=[s["routes"] for s, *_ in ready],
+            )
+            # Pieces are cut to the anchored length, then to the logged hidden
+            # rows (engine bookkeeping, independent of the tokens).
+            cut = []
+            for (s, toks, done, lps), a in zip(ready, routes):
+                s["routes"] = a
+                plen = len(s["key"]) + len(s["plan"].prefix)
+                m = (
+                    0
+                    if a is None
+                    else anchored_draft_length(a.complete, plen, len(toks))
+                )
+                cut.append((s, toks, done, lps, plen, m))
+            some = [c for c in cut if c[5] > 0]
+            taken = dict(
+                zip(
+                    (id(c[0]) for c in some),
+                    self._take_hidden(
+                        [c[0]["hkey"] for c in some],
+                        [c[0]["taken"] for c in some],
+                        [c[5] for c in some],
+                    )
+                    if some
+                    else [],
+                )
+            )
+            hid = [taken.get(id(c[0])) for c in cut]
+            flat, rows, owners, restart, stale = [], [], [], [], []
+            for (s, toks, done, lps, plen, m), h in zip(cut, hid):
+                m = min(m, 0 if h is None else hidden_num_rows(h))
+                prompt = torch.cat(
+                    [
+                        torch.tensor(s["key"], dtype=torch.long),
+                        torch.tensor(s["plan"].prefix, dtype=torch.long),
+                    ]
+                )
+                d = (
+                    prompt,
+                    -1,
+                    toks[:m],
+                    done and m == len(toks),
+                    s["hkey"],
+                    [(version, 0, m)],
+                    None if lps is None else lps[:m],
+                    h,
+                    None if s["routes"] is None else s["routes"].truncate(plen + m),
+                )
+                if m > 0 and engine_q_ready(d):
+                    flat.append((len(flat), d))
+                    rows.append(
+                        torch.cat([prompt, torch.tensor(d[2], dtype=torch.long)])
+                    )
+                    owners.append(s)
+                    continue
+                self._release_hidden([d])
+                if done:
+                    # Finished, but its remaining tokens cannot be verified (a
+                    # logging gap); nothing more will be logged: start again
+                    # from the prefix. A running stream just waits.
+                    stale.append(s)
+            if stale:
+                for s in stale:
+                    retries[id(s["plan"])] += 1
+                    if retries[id(s["plan"])] > max_retries:
+                        raise RuntimeError(
+                            "sticky routing: a continuation was not logged "
+                            f"{max_retries} times in a row"
+                        )
+                stats["retries"] += len(stale)
+                stop(stale)
+                start([(s["key"], s["plan"]) for s in stale])
+            if not flat:
+                continue
+            stats["rounds"] += 1
+            by_row = self._verify_block(flat, rows)
+            done_streams = []
+            for r, ((_, d), s) in enumerate(zip(flat, owners)):
+                out = by_row[r]
+                plan, p, toks, done = s["plan"], d[0], d[2], d[3]
+                g, n_acc = len(toks), out["accepted"]
+                lps = behavior_logprobs(
+                    out["logprobs"], n_acc, d[6], out.get("draft_logq")
+                )
+                stats["tokens"] += g
+                stats["kept"] += n_acc
+                if n_acc == g:
+                    plan.prefix += list(toks)
+                    plan.prefix_logprobs += lps[:g]
+                    plan.anchors = d[8].truncate(p.numel() + g)
+                    s["taken"] += g
+                    plan.complete = (
+                        bool(done) or len(plan.prefix) >= self.max_new_tokens
+                    )
+                    if plan.complete:
+                        done_streams.append(s)
+                else:
+                    y = out["next"]
+                    plan.prefix += list(toks[:n_acc]) + [y]
+                    plan.prefix_logprobs += lps[: n_acc + 1]
+                    plan.anchors = d[8].truncate(p.numel() + n_acc)
+                    plan.complete = (
+                        y == self.eod or len(plan.prefix) >= self.max_new_tokens
+                    )
+                    done_streams.append(s)
+                    if not plan.complete:
+                        restart.append(s)
+            if done_streams:
+                stop(done_streams)
+            if restart:
+                start([(s["key"], s["plan"]) for s in restart])
+        self.stats.update(
+            {
+                "spec/sticky_rounds": float(stats["rounds"]),
+                "spec/sticky_streams": float(stats["streams"]),
+                "spec/sticky_cont_draft_tokens": float(stats["tokens"]),
+                "spec/sticky_cont_accepted_frac": stats["kept"]
+                / max(stats["tokens"], 1),
+                "spec/sticky_cont_retries": float(stats["retries"]),
+            }
+        )
 
     def claim_anchors(
         self, prompt: torch.Tensor, token_ids: torch.Tensor

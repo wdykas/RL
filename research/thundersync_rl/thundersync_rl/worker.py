@@ -903,56 +903,148 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         its final hidden states under that key (``install_draft_hidden_log``,
         fetched with ``pop_draft_hidden``).
         """
-        import asyncio
 
-        from thundersync_rl.engine_q import HIDDEN_KEY_ATTR
 
         if self.inference_client is None or self._inference_loop is None:
             return False
         # Fresh buffers per call, captured by the coroutines below: streams aborted
         # at an earlier deadline may still deliver late frames, which must not
         # land in this round's drafts.
-        tokens: list[list[int]] = [[] for _ in prompts]
-        logprobs: list[list[float] | None] = [[] for _ in prompts]
-        done = [False] * len(prompts)
-        streams = {}
         (
             self._draft_tokens,
             self._draft_logprobs,
             self._draft_done,
             self._draft_streams,
-        ) = (tokens, logprobs, done, streams)
+        ) = ([], [], [], {})
+        self._draft_cancelled: set[int] = set()
+        self.add_drafts(prompts, max_new_tokens, stream_interval, hidden_keys)
+        return True
 
-        async def run_one(i, prompt):
+    def add_drafts(
+        self,
+        prompts: list[list[int]],
+        max_new_tokens: int | list[int],
+        stream_interval: int,
+        hidden_keys: list[str] | None = None,
+    ) -> list[int]:
+        """Submit more draft streams next to those of the last ``start_drafts``.
+
+        Returns their indices in the draft lists (``drafts_done``,
+        ``peek_drafts``, ``abort_drafts``, ``collect_drafts``).
+        """
+        import asyncio
+
+        from thundersync_rl.engine_q import HIDDEN_KEY_ATTR
+
+        tokens, logprobs, done, streams = (
+            self._draft_tokens,
+            self._draft_logprobs,
+            self._draft_done,
+            self._draft_streams,
+        )
+        base = len(tokens)
+        tokens += [[] for _ in prompts]
+        logprobs += [[] for _ in prompts]
+        done += [False] * len(prompts)
+
+        async def run_one(i, j, prompt):
             # return_log_probs=True: the engine reports log q'(x) of each sampled
             # token (temperature 1, no top-k/top-p under speculation, so raw and
             # processed log-probs coincide).
             sp = self._build_sampling_params(greedy=False, stop_words=None)
             sp.num_tokens_to_generate = (
-                max_new_tokens[i]
+                max_new_tokens[j]
                 if isinstance(max_new_tokens, list)
                 else max_new_tokens
             )
             sp.streaming_interval = stream_interval
             if hidden_keys is not None:
                 # Travels with the serialized sampling params to the engine.
-                sp.add_attributes({HIDDEN_KEY_ATTR: hidden_keys[i]})
+                sp.add_attributes({HIDDEN_KEY_ATTR: hidden_keys[j]})
             stream = self.inference_client.add_request_streaming(prompt, sp)
             streams[i] = stream
+            if i in cancelled:  # aborted before its stream existed
+                self.inference_client.abort_request(stream.request_id)
             async for frame in stream:
                 done[i] = apply_draft_frame(frame, tokens[i], logprobs, i) or done[i]
 
-        for i, p in enumerate(prompts):
-            asyncio.run_coroutine_threadsafe(run_one(i, list(p)), self._inference_loop)
-        return True
+        cancelled = self._draft_cancelled
+        for j, p in enumerate(prompts):
+            asyncio.run_coroutine_threadsafe(
+                run_one(base + j, j, list(p)), self._inference_loop
+            )
+        return list(range(base, base + len(prompts)))
 
-    def draft_request_ids(self) -> dict[int, int]:
-        """Engine request id of each unfinished draft (rank 0 holds the streams)."""
+    def draft_lengths(self, indices: list[int]) -> list[tuple[int, bool]]:
+        """(streamed token count, finished) of the listed drafts (rank 0).
+
+        Counts from streamed frames: a readiness signal only (after an
+        eviction frames may skip tokens); contents come from ``peek_drafts``.
+        """
+        tokens, done = self._draft_tokens, self._draft_done
+        return [(len(tokens[i]), bool(done[i])) for i in indices]
+
+    def peek_drafts(
+        self, indices: list[int], records: dict[int, tuple] | None = None
+    ) -> list[tuple[list[int], bool, list[float] | None]]:
+        """(tokens, finished, engine logprobs) of the listed drafts, left running.
+
+        Unfinished drafts read ``records`` (the engines' request records,
+        ``draft_records``) when given, as ``collect_drafts`` does; finished ones
+        their final frame.
+        """
+        import asyncio
+
+        tokens, logprobs, done, streams = (
+            self._draft_tokens,
+            self._draft_logprobs,
+            self._draft_done,
+            self._draft_streams,
+        )
+
+        async def snapshot():
+            out = []
+            for i in indices:
+                rec = None
+                if not done[i] and i in streams:
+                    rec = (records or {}).get(int(streams[i].request_id))
+                if rec is None:
+                    out += snapshot_drafts([tokens[i]], [logprobs[i]], [done[i]])
+                    continue
+                toks, lps = rec
+                ok = lps is not None and len(lps) == len(toks)
+                out.append((list(toks), False, list(lps) if ok else None))
+            return out
+
+        return asyncio.run_coroutine_threadsafe(
+            snapshot(), self._inference_loop
+        ).result()
+
+    def abort_drafts(self, indices: list[int]) -> None:
+        """Abort the listed drafts that are still running (rank 0)."""
+        import asyncio
+
+        done, streams = self._draft_done, self._draft_streams
+
+        async def abort():
+            for i in indices:
+                self._draft_cancelled.add(i)
+                if not done[i] and i in streams:
+                    self.inference_client.abort_request(streams[i].request_id)
+
+        asyncio.run_coroutine_threadsafe(abort(), self._inference_loop).result()
+
+    def draft_request_ids(self, indices: list[int] | None = None) -> dict[int, int]:
+        """Engine request id of each unfinished draft (rank 0 holds the streams).
+
+        ``indices``: only these drafts (default: all).
+        """
         done = getattr(self, "_draft_done", None) or []
+        streams = getattr(self, "_draft_streams", None) or {}
         return {
             i: int(st.request_id)
-            for i, st in (getattr(self, "_draft_streams", None) or {}).items()
-            if not done[i]
+            for i, st in streams.items()
+            if not done[i] and (indices is None or i in indices)
         }
 
     def draft_records(self, request_ids: list[int]) -> dict[int, tuple]:
@@ -1595,7 +1687,6 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 finally:
                     cfg.moe_enable_routing_replay = True
 
-
         return _Engine
 
     def _install_hidden_copy(self, context) -> None:
@@ -1689,7 +1780,9 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         if not insts:
             return
         rec = getattr(self, "_route_record", None)
-        if rec is not None and [id(r) for r in rec["replays"]] == [id(r) for r, _ in insts]:
+        if rec is not None and [id(r) for r in rec["replays"]] == [
+            id(r) for r, _ in insts
+        ]:
             return
         # First build, or a rebuilt model whose routers are new instances:
         # (re-)arm them; the route log reads ``_route_record`` per forward.
@@ -1825,12 +1918,14 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
 
         controller._dynamic_step_forward_logits = forward_logits
 
-    def pop_draft_routes(self, keys: list[str]) -> dict[str, tuple]:
-        """{key: (layer numbers, logged prefix, [(ref, lo, hi, bytes)])}.
+    def pop_draft_routes(self, keys: list[str], close: bool = True) -> dict[str, tuple]:
+        """{key: (layer numbers, lo, run_end, [(ref, lo, hi, bytes)])}.
 
-        Drafts this rank logged, as object-store blocks of their dense routes
-        (``routes.put_routes``; this rank owns the objects, the driver frees
-        them). Every key is closed (late rows dropped).
+        Routes this rank logged for the drafts since their last pop, as
+        object-store blocks of dense routes (``routes.put_routes``; this rank
+        owns the objects, the driver frees them); positions lo..run_end-1 are
+        all logged. ``close``: drop rows logged for these keys later (a
+        finished or aborted draft); False for a draft still running.
         """
         from thundersync_rl.routes import put_routes
 
@@ -1839,8 +1934,8 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             return {}
         layers = self._route_record["layers"]
         return {
-            k: (layers, complete, put_routes(rows, ray.put))
-            for k, (complete, rows) in log.pop(keys).items()
+            k: (layers, lo, run_end, put_routes(rows, ray.put, start=lo))
+            for k, (lo, run_end, rows) in log.pop(keys, close=close).items()
         }
 
     def drafts_done(self) -> list[bool]:
@@ -2036,6 +2131,39 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             if h is not None and n > 0:
                 out[k] = put_hidden(h) if as_refs else h
         return out
+
+    def take_draft_hidden(
+        self,
+        keys: list[str],
+        starts: list[int],
+        lengths: list[int],
+        as_refs: bool = False,
+    ) -> dict[str, Any]:
+        """Hidden rows start..start+m-1 of running drafts (m <= length), keys left open.
+
+        As ``pop_draft_hidden`` (same transport), for drafts verified in
+        pieces while the engine keeps decoding them.
+        """
+        from thundersync_rl.engine_q import put_hidden
+
+        log = getattr(self, "_hidden_log", None)
+        if log is None:
+            return {}
+        out = {}
+        for k, a, n in zip(keys, starts, lengths):
+            h = log.take(k, a, n)
+            if h is not None and n > 0:
+                out[k] = put_hidden(h) if as_refs else h
+        return out
+
+    def close_draft_logs(self, keys: list[str]) -> None:
+        """Close the hidden-state and route logs of finished or aborted drafts."""
+        hid = getattr(self, "_hidden_log", None)
+        for k in keys if hid is not None else ():
+            hid.close(k)
+        log = getattr(self, "_route_log", None)
+        if log is not None:
+            log.pop(keys, close=True)
 
     def _lm_head(self):
         """(output layer, live head weight, logit scaling or None) of the training model.

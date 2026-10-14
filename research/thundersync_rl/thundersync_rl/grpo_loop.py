@@ -241,6 +241,12 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     null_bv_drafts_per_output: float = 1.5
     null_bv_logratio_var: float = 8e-7
     null_bv_fixed_m: Optional[float] = None
+    # Sticky routing: continuations at theta_{k-1} are block-verified every this
+    # many decoded tokens while the engine keeps decoding them; a rejection
+    # restarts the continuation from the new prefix, so it wastes at most the
+    # tokens decoded past the verified piece (SpeculativeGeneration
+    # ._continue_sticky). Fixed count: the cut is exogenous.
+    sticky_continuation_chunk_tokens: int = 2048
 
 
 def resolve_min_pipeline_microbatches(ts_cfg: ThunderSyncConfig, pp: int) -> int:
@@ -1188,6 +1194,7 @@ def thundersync_grpo_train(
             sticky_delta=sticky_delta(ts_cfg),
             null_bv=ts_cfg.null_bv,
             null_bv_policy=null_bv_policy(master_config) if ts_cfg.null_bv else None,
+            sticky_chunk_tokens=ts_cfg.sticky_continuation_chunk_tokens,
         )
     sticky = spec is not None and spec.sticky_delta is not None
     G = master_config.grpo.num_generations_per_prompt
