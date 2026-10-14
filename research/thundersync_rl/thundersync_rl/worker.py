@@ -2361,7 +2361,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         keys: list[str],
         batch_tokens: int = 0,
         anchors: list[Any] | None = None,
-        null_envelopes: list[float] | None = None,
+        null_envelopes: list[list[float]] | None = None,
         row_ranks: list[int] | None = None,
         **_: Any,
     ) -> list[tuple[int, dict[str, Any]]]:
@@ -2371,8 +2371,9 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         driver balances tokens, ``speculative.lpt_owners``); default: a stable
         hash of the key.
 
-        Pooled ⊥-BV (``null_bv.py``): with ``null_envelopes`` every row is
-        verified at each of these envelopes M with one set of random draws
+        Pooled ⊥-BV (``null_bv.py``): with ``null_envelopes`` row i is
+        verified at each envelope M of ``null_envelopes[i]`` (the ones its pool
+        index can be decided at, ``row_envelopes``) with one set of random draws
         (``verify_engine_q_grid``) and reports ``"null_grid"`` = {M: (tau, y,
         log p(y) or None)} plus ``"token_logprobs"`` (log p of the drafted
         tokens up to the largest tau) and ``"draft_logq"`` (the same span);
@@ -2555,7 +2556,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             if null_envelopes is not None:
                 with timed("grid_scan_total"):
                     grid, lpx, n_eval = verify_engine_q_grid(
-                        p_lp, draft, lq, q_rows, gen, tuple(null_envelopes)
+                        p_lp, draft, lq, q_rows, gen, tuple(null_envelopes[i])
                     )
                 tau = max(t for t, _, _ in grid.values())
                 # log W* = max_t log prod_{u<=t} p/q over the draft (drop-IS weights).

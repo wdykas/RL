@@ -28,6 +28,8 @@ backward scan visits, and is pathwise identical to ``block_verify_logits``.
 
 from __future__ import annotations
 
+import math
+
 import torch
 import triton
 import triton.language as tl
@@ -267,8 +269,19 @@ def block_verify_stats_lazy_grid(
         eta_h = eta.cpu()
         for M in envelopes:
             check_null_m(M, g)
-            weights[M] = b = acceptance_weights(lpx - lqx, M)
-            b_h = b.cpu()
+        # Every envelope's weights in one pass (bitwise ``acceptance_weights``: the
+        # same fp64 cumsum, minus log M after the root, exp(S - cummax S) per row).
+        s_cum = torch.cat(
+            [torch.zeros(1, dtype=torch.float64, device=dev), torch.cumsum((lpx - lqx).double(), 0)]
+        )
+        S = s_cum.unsqueeze(0).repeat(len(envelopes), 1)
+        for k, M in enumerate(envelopes):
+            if M != 1.0:
+                S[k, 1:] -= math.log(M)
+        B = (S - torch.cummax(S, 1).values).exp()
+        B_h = B.cpu()
+        for k, M in enumerate(envelopes):
+            weights[M], b_h = B[k], B_h[k]
             if bool(eta_h[g] <= b_h[g]):
                 tau[M] = g
             else:
@@ -291,27 +304,44 @@ def block_verify_stats_lazy_grid(
         with timed("q_rows"):
             Q = q_rows(idx_d)
         n_eval += idx.numel()
-        where = {int(t): k for k, t in enumerate(idx.tolist())}
-        for M in live:
-            c = cand[M][done[M]:]
-            c = c[c >= lo]
-            done[M] += c.numel()
-            if not c.numel():
-                continue
-            sel = torch.tensor([where[int(t)] for t in c.tolist()], device=dev)
-            c_d = c.to(dev)
-            b = weights[M]
-
-            def mass(i, bi, sel=sel):
-                return residual_masses(P[sel], Q[sel], lse_p[i], lse_q[i], bi)
-
-            with timed("residual"):
-                h = stop_probability(null_root_residual(mass, b, M)(c_d), b[c_d])
-                hit = torch.nonzero((eta[c_d] <= h).cpu()).flatten()
-            if hit.numel():
-                tau[M] = int(c[hit[0]])
-        for k, t in enumerate(idx.tolist()):  # keep the stop rows for the emissions
-            if any(tau.get(M) == t for M in live):
+        # Chunk-local row of each position: positions are descending, so a
+        # searchsorted on the ascending reversal gives it without a Python dict.
+        asc = idx.flip(0)
+        with timed("residual"):
+            # Every live envelope's candidates in this chunk, one residual launch and
+            # one host sync for all of them (the kernel is per row, so each r is
+            # bitwise its own launch's; the root adjustment as ``null_root_residual``).
+            parts = []
+            for M in live:
+                c = cand[M][done[M]:]
+                c = c[c >= lo]
+                done[M] += c.numel()
+                if c.numel():
+                    parts.append((M, c))
+            if parts:
+                cs = torch.cat([c for _, c in parts])
+                sel = (idx.numel() - 1 - torch.searchsorted(asc, cs)).to(dev)
+                c_d = cs.to(dev)
+                bi = torch.cat([weights[M][c.to(dev)] for M, c in parts])
+                root = c_d == 0
+                inv = torch.cat(
+                    [torch.full((c.numel(),), M, dtype=torch.float64, device=dev) for M, c in parts]
+                )
+                nonone = inv != 1.0
+                b_res = torch.where(root & nonone, bi / inv, bi)
+                r = residual_masses(P[sel], Q[sel], lse_p[c_d], lse_q[c_d], b_res)
+                r = torch.where(root & nonone, r + (1.0 - 1.0 / inv), r)
+                hit = (eta[c_d] <= stop_probability(r, bi)).cpu()
+                a = 0
+                for M, c in parts:
+                    hm = torch.nonzero(hit[a : a + c.numel()]).flatten()
+                    a += c.numel()
+                    if hm.numel():
+                        tau[M] = int(c[hm[0]])
+        for M in live:  # keep the stop rows for the emissions
+            t = tau.get(M)
+            if t is not None and t >= lo and ("p", t) not in rows:
+                k = idx.numel() - 1 - int(torch.searchsorted(asc, torch.tensor(t)))
                 rows[("p", t)], rows[("q", t)] = P[k], Q[k]
 
     def row(kind: str, t: int) -> torch.Tensor:

@@ -262,6 +262,22 @@ def envelopes(policy: NullPolicy) -> tuple[float, ...]:
     return tuple(sorted(ms))
 
 
+def row_envelopes(policy: NullPolicy, n_drafts: int, slots: int, j: int) -> tuple[float, ...]:
+    """Every envelope draft ``j`` (0-based, drafting order) of a pool of ``n_drafts``
+    drafts and ``slots`` slots can be decided at: ``policy.m(d, s)`` with d = n_drafts - j
+    drafts left and s from max(1, slots - j) to slots slots left. A function of the
+    counts only (exogenous), so verifying a row at just these envelopes is as exact
+    as the full ``envelopes(policy)`` grid; it saves the scans at unreachable M.
+    """
+    d = n_drafts - j
+    out = set()
+    for s in range(max(1, slots - j), slots + 1):
+        if d <= 0 or policy.drop(d, s):
+            continue
+        out.add(float(policy.m(d, s)))
+    return tuple(sorted(out)) or (float(envelopes(policy)[0]),)
+
+
 def decide_pools(
     groups: list[str],
     slots: dict[str, int],
