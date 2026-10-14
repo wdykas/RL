@@ -376,3 +376,30 @@ def test_horizon_config_validation():
 
     assert ThunderSyncConfig().sticky_anchor_horizon is None
     assert ThunderSyncConfig(sticky_anchor_horizon=128).sticky_anchor_horizon == 128
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("E,K", [(8, 1), (8, 2), (16, 3), (128, 8), (512, 22), (60, 7)])
+def test_fused_rule_is_bitwise_the_reference(E, K):
+    """The engine's one-kernel rule returns bitwise what the learner's torch
+    rule returns: near ties (scores on a coarse grid), invalid anchor rows
+    (negative ids, repeats), anchors kept and rejected."""
+    from nemo_rl.models.megatron.sticky_routing_fused import sticky_select_fused
+
+    g = torch.Generator().manual_seed(E * 100 + K)
+    T = 3000
+    scores = (torch.randn(T, E, generator=g) * 4).round() / 4  # many exact ties
+    noisy = scores + 0.3 * torch.randn(T, E, generator=g)
+    anchors = torch.topk(noisy, K).indices
+    anchors[::7, 0] = -1  # self rows
+    if K > 1:
+        anchors[3::11, 1] = anchors[3::11, 0]  # repeated ids: self
+    anchors = anchors.to(torch.int16)
+    scores, anchors = scores.cuda(), anchors.cuda()
+    pv, pi = torch.topk(scores, K, dim=1)
+    for delta in (0.0, 0.03, 0.3):
+        ref = sr.sticky_select(scores, anchors, pv, pi, delta)
+        out = sticky_select_fused(scores, anchors, pv, pi, delta)
+        assert torch.equal(out[0], ref[0]) and torch.equal(out[1], ref[1])
+        assert torch.equal(out[2], ref[2])
+    assert bool(ref[2].any()) and not bool(ref[2].all())
