@@ -81,19 +81,19 @@ def _decode(z_free: bool, steps: int, slots, prefill, graph: bool, seed=0):
     nh, hd, ng, ds, chunk = 16, 64, 2, 128, 128
     R = max(slots) + 2
     g = torch.Generator(device="cuda").manual_seed(seed)
-    alloc = (
-        mbd._allocate.__get__(bid.BatchInvariantDecodeBuffers)
-        if z_free
-        else bid.BatchInvariantDecodeBuffers.allocate
-    )
+    mbd.install()  # idempotent; the reference arm calls MCore's originals
+    cls = bid.BatchInvariantDecodeBuffers
+    if z_free:
+        alloc, seed_fn, scan = (
+            cls.allocate,
+            cls.seed,
+            bid.batch_invariant_decode_buffered_scan,
+        )
+    else:
+        alloc = mbd._ORIG["allocate"].__get__(None, cls)
+        seed_fn, scan = mbd._ORIG["seed"], mbd._ORIG["scan"]
     buf = alloc(R, chunk, nh, hd, ng, ds, torch.device("cuda"), torch.float32)
     assert (buf.z is None) == z_free
-    seed_fn = mbd._seed if z_free else bid.BatchInvariantDecodeBuffers.seed
-    scan = (
-        mbd._decode_buffered_scan
-        if z_free
-        else bid.batch_invariant_decode_buffered_scan
-    )
     A = -torch.rand(nh, device="cuda", generator=g) - 0.5
     D = torch.randn(nh, device="cuda", generator=g)
     dtb = torch.randn(nh, device="cuda", generator=g) * 0.1
