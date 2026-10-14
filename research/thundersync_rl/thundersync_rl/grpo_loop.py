@@ -268,6 +268,12 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # learner-side at theta_k; DESIGN.md section 14k). False: training starts
     # after the last tail (the refit and the rollouts follow verify_sticky).
     stream_training_over_tails: bool = True
+    # With stream_training_over_tails: train groups with no pending tail first,
+    # then the groups whose rows still decode tails, one group per dispatch in a
+    # canonical order fixed after the drafts' verification ((tail?, group
+    # index)), so the accumulated gradient is bitwise independent of arrival
+    # times (StreamPlanner.set_order). False: dispatch as rows arrive.
+    canonical_group_order: bool = True
     # Weights the engine drafts the next step's rollouts with (draft_weights.py,
     # DESIGN.md section 14f). "current": theta_k. "momentum": theta_hat_{k+1} =
     # the AdamW step of the optimizer state (theta_k, m_k, v_k) with gradient 0,
@@ -1049,12 +1055,17 @@ async def _run_one_step(
     draft_swap: Optional[Callable[[], None]] = None,
     draft_start_frac: Optional[float] = None,
     drafts_after_pre_rollout: bool = False,
+    group_order: Optional[list[int]] = None,
+    tail_groups: Optional[list[int]] = None,
 ) -> dict[str, Any]:
     """One step: rollouts, streaming training and the next step's drafts.
 
     ``drafts_after_pre_rollout``: the drafter also waits for ``pre_rollout``
     (sticky streaming over the tails: the continuation rounds and the refit
-    that puts the drafter's weights on the engine).
+    that puts the drafter's weights on the engine). ``group_order``: dispatch
+    the step's groups (prompt indices) one at a time in this order
+    (``StreamPlanner.set_order``). ``tail_groups``: groups with pending tails,
+    logged with each group's completion and dispatch times.
     """
     G = master_config.grpo.num_generations_per_prompt
     repeated = batch.repeat_interleave(G)
@@ -1091,6 +1102,8 @@ async def _run_one_step(
     )
     for p in range(n // G):
         planner.register_group((step, p), G)
+    if group_order is not None:
+        planner.set_order([(step, p) for p in group_order])
 
     learner.begin(
         loss_fn,
@@ -1115,6 +1128,8 @@ async def _run_one_step(
     # (t_start, t_end, n_trajectories, n_tokens, n_bucket_chunks) per dispatch.
     arrivals: list[tuple[float, int, int, float]] = []
     dispatches: list[tuple[float, float, int, int, int]] = []
+    # (group, dispatch start, dispatch end) for every group a dispatch trains.
+    group_dispatch: list[tuple[int, float, float]] = []
     last_rollout_t = None
     all_trajectories: list[Trajectory] = []
     # Fused verification + training: trajectories handed a retained forward,
@@ -1175,6 +1190,8 @@ async def _run_one_step(
                         fused_counts[k] += r[k]
                 learner_busy += t1 - t0
                 chunks = [c for cs in d.per_rank for c in cs if not c.padding]
+                for gid in sorted({t.group[1] for c in chunks for t in c.trajectories}):
+                    group_dispatch.append((gid, t0 - t_start, t1 - t_start))
                 dispatches.append(
                     (
                         t0 - t_start,
@@ -1342,6 +1359,8 @@ async def _run_one_step(
         "timeline/arrivals": arrivals,
         "timeline/dispatches": dispatches,
         "timeline/step_end": t_end - t_start,
+        "timeline/group_dispatch": group_dispatch,
+        "timeline/tail_groups": list(tail_groups or []),
         "time/draft_wait": draft_wait,
         # When this step's drafter started, from the start of the rollouts.
         "time/draft_start": (
@@ -1555,9 +1574,32 @@ def thundersync_grpo_train(
             refit_s.append(time.perf_counter() - t_r)
 
         tails_s = []
+        group_order = tail_groups = None
         if tails is None:
             refit_for_step()
         else:
+            # Groups whose rows still decode tails (a pending plan of their
+            # prompt), fixed by the drafts' verification, not by timing.
+            pending_keys = {key for key, _ in tails}
+            row_keys = [tuple(x.tolist()) for x in _prompts(batch)]
+            tail_groups = [
+                p for p in range(len(row_keys) // G) if row_keys[p * G] in pending_keys
+            ]
+            if ts_cfg.canonical_group_order:
+                # Ready now, then after their tails, then rows never drafted
+                # (decoded at theta_k once the tails are done and it is refit).
+                n_plans = collections.Counter()
+                for key, queue in spec.plans.items():
+                    n_plans[key] += len(queue)
+                need = collections.Counter(row_keys)
+                fresh = {
+                    p for p in range(len(row_keys) // G)
+                    if n_plans[row_keys[p * G]] < need[row_keys[p * G]]
+                }
+                late = set(tail_groups) | fresh
+                group_order = [p for p in range(len(row_keys) // G) if p not in late]
+                group_order += [p for p in tail_groups if p not in fresh]
+                group_order += sorted(fresh)
 
             async def tails_then_refit(pending=tails):
                 # Continuation rounds on the drafting weights, then theta_k:
@@ -1643,6 +1685,8 @@ def thundersync_grpo_train(
                 ),
                 draft_start_frac=0.0 if draft_now else None,
                 drafts_after_pre_rollout=tails is not None,
+                group_order=group_order,
+                tail_groups=tail_groups,
             ))
         )
         t_refit = refit_s[0]

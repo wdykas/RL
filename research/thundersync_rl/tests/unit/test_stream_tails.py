@@ -104,3 +104,62 @@ def test_failed_tails_wake_and_raise():
                 await w
 
     asyncio.run(main())
+
+
+def _planner(groups, G=2, dp=2):
+    from thundersync_rl.streaming import StreamPlanner
+
+    pl = StreamPlanner(
+        lambda rewards: [r - sum(rewards) / len(rewards) for r in rewards],
+        dp_size=dp,
+        max_chunk_trajectories=4,
+        max_open_groups=0,
+        micro_batch_size=1,
+        equal_rank_microbatches=False,
+    )
+    for g in groups:
+        pl.register_group(g, G)
+    return pl
+
+
+def _dispatch_signature(pl):
+    out = []
+    while pl.has_work():
+        d = pl.next_dispatch()
+        out.append([[tuple((t.group, t.index) for t in c.trajectories) for c in cs] for cs in d.per_rank])
+    return out
+
+
+def test_canonical_group_order_is_independent_of_arrival():
+    from thundersync_rl.streaming import Trajectory
+
+    groups = [(0, p) for p in range(3)]
+    rows = [
+        Trajectory(group=(0, p), index=2 * p + j, reward=float(j), payload=None, num_tokens=10 + p)
+        for p in range(3)
+        for j in range(2)
+    ]
+    sigs = []
+    for arrival in (rows, rows[::-1], rows[2:] + rows[:2]):
+        pl = _planner(groups)
+        pl.set_order([(0, 2), (0, 0), (0, 1)])  # e.g. group 2 ready now, 0 and 1 had tails
+        got = []
+        for t in arrival:
+            pl.add(t)
+            while pl.has_work(flush=False):
+                got.extend(_dispatch_signature(pl))
+        got.extend(_dispatch_signature(pl))
+        assert pl.all_done()
+        sigs.append(got)
+    assert sigs[0] == sigs[1] == sigs[2]
+    # One group per dispatch, in the canonical order.
+    assert [{r[0][0] for cs in d for r in cs if r} for d in sigs[0]] == [{(0, 2)}, {(0, 0)}, {(0, 1)}]
+
+
+def test_canonical_order_needs_group_granularity_and_all_groups():
+    pl = _planner([(0, 0), (0, 1)])
+    with pytest.raises(ValueError, match="every registered group"):
+        pl.set_order([(0, 0)])
+    pl.max_open_groups = 1
+    with pytest.raises(ValueError, match="group granularity"):
+        pl.set_order([(0, 0), (0, 1)])

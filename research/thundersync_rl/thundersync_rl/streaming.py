@@ -171,6 +171,25 @@ class StreamPlanner:
         self.groups: dict[GroupId, _Group] = {}
         self.ready: list[Trajectory] = []
         self.num_dispatched = 0
+        # Canonical dispatch order (``set_order``): None = as rows arrive.
+        self.order: Optional[list[GroupId]] = None
+        self._next = 0
+
+    def set_order(self, order: list[GroupId]) -> None:
+        """Dispatch whole groups one at a time, in ``order``, whatever the arrival order.
+
+        Group granularity only. Each dispatch is then one group's rows, sorted
+        by trajectory index, chunked and placed on ranks by the same rules, so
+        which rows share a micro-batch, which rank backpropagates them and the
+        order their gradients add into the accumulator are functions of the
+        data, not of timing: the accumulated gradient is bitwise reproducible.
+        A group that closes early waits for every group before it in ``order``.
+        """
+        if self.max_open_groups:
+            raise ValueError("a canonical group order needs group granularity")
+        if sorted(map(repr, order)) != sorted(map(repr, self.groups)):
+            raise ValueError("the order must list every registered group once")
+        self.order, self._next = list(order), 0
 
     def register_group(self, group: GroupId, size: int) -> None:
         self.groups[group] = _Group(size=size)
@@ -223,6 +242,13 @@ class StreamPlanner:
         )
 
     def _pick(self, flush: bool = True) -> list[Trajectory]:
+        if self.order is not None:
+            if self._next >= len(self.order):
+                return []
+            gid = self.order[self._next]
+            if self.groups[gid].advantage_by_reward is None:
+                return []  # its rows are still arriving: later groups wait
+            return sorted((t for t in self.ready if t.group == gid), key=lambda t: t.index)
         rows = self.ready
         if not flush and self.holding():
             # Rows of closed groups wait; idle time still goes to bucket work.
@@ -268,6 +294,8 @@ class StreamPlanner:
 
     def next_dispatch(self, flush: bool = True) -> Dispatch:
         picked = self._pick(flush)
+        if self.order is not None and picked:
+            self._next += 1
         taken = {id(t) for t in picked}
         self.ready = [t for t in self.ready if id(t) not in taken]
         final: list[Trajectory] = []
