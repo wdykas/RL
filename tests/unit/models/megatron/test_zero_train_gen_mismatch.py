@@ -1196,3 +1196,34 @@ def test_batch_invariant_allows_different_pipeline_parallelism():
     assert not any("pipeline_model_parallel_size" in v for v in result.violations), (
         result.violations
     )
+
+
+def test_local_vocab_logprob_matches_autograd_and_saves_only_the_logits(monkeypatch):
+    """TP=1 BI log-probs: forward bitwise the plain path, gradient equal to autograd's."""
+    import torch
+
+    from nemo_rl.distributed import model_utils
+    from nemo_rl.models.megatron import zero_train_gen_mismatch as ztgm
+
+    monkeypatch.setattr(ztgm, "_GATHERED_LOGPROB_CHUNK_TOKENS", 5)
+    torch.manual_seed(0)
+    logits = (torch.randn(2, 7, 33) * 3).requires_grad_()
+    target = torch.randint(0, 33, (2, 7))
+    g = torch.randn(2, 7)
+
+    ref = model_utils._tp_target_logprobs(
+        logits, target, vocab_start_index=0, vocab_end_index=33, tp_group=None
+    )
+    (ref_grad,) = torch.autograd.grad(ref, logits, g)
+
+    saved = []
+    with torch.autograd.graph.saved_tensors_hooks(
+        lambda t: saved.append(t.shape) or t, lambda t: t
+    ):
+        out = ztgm._BatchInvariantLogprob(None, chunked=False).apply(
+            logits, target, 0, 33, None, False
+        )
+    (grad,) = torch.autograd.grad(out, logits, g)
+    assert torch.equal(out, ref)
+    torch.testing.assert_close(grad, ref_grad, rtol=1e-6, atol=1e-6)
+    assert saved == [logits.shape, target.shape]

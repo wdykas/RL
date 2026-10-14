@@ -511,6 +511,53 @@ class _GatheredVocabLogprob(torch.autograd.Function):
         return grad_input, None, None, None, None, None, None
 
 
+class _LocalVocabLogprob(torch.autograd.Function):
+    """TP=1 log-probs that save only the logits (backward recomputes per chunk).
+
+    Forward is ``model_utils._tp_target_logprobs``'s TP=1 path chunk by chunk
+    (fp32 cast, row-wise ``log_softmax``, gather), so the log-probs are bitwise
+    the same. Autograd through that path would also keep every chunk's
+    ``log_softmax`` output: one more [B, S, V] fp32 buffer (9.3 GiB for 16384
+    tokens x 151936 vocab). Here backward forms ``g * (onehot - softmax)`` one
+    sequence chunk at a time, as ``_GatheredVocabLogprob`` does under TP>1.
+    """
+
+    @staticmethod
+    def forward(  # pyrefly: ignore[bad-override]
+        ctx: Any,
+        logits: torch.Tensor,
+        target: torch.Tensor,
+        chunk_size: int | None,
+    ) -> torch.Tensor:
+        chunk = _gathered_chunk_size(logits, chunk_size)
+
+        def chunk_of(start: int, end: int) -> torch.Tensor:
+            return logits[:, start:end]
+
+        log_probs = _gathered_target_logprobs(chunk_of, target, chunk)
+        ctx.save_for_backward(logits, target)
+        ctx.chunk = chunk
+        return log_probs
+
+    @staticmethod
+    def backward(ctx: Any, *grad_outputs: torch.Tensor) -> tuple:
+        logits, target = ctx.saved_tensors
+
+        def chunk_of(start: int, end: int) -> torch.Tensor:
+            return logits[:, start:end]
+
+        grad = _gathered_logprob_grad(
+            chunk_of,
+            target,
+            grad_outputs[0],
+            vocab_start_index=0,
+            vocab_end_index=int(logits.shape[-1]),
+            chunk_size=ctx.chunk,
+            grad_input=torch.zeros_like(logits),
+        )
+        return grad, None, None
+
+
 class _BatchInvariantLogprob:
     """Log-probs computed the way Megatron Inference computes them (bitwise).
 
@@ -534,6 +581,8 @@ class _BatchInvariantLogprob:
             logits, target, start, end, group, inference_only = args
             chunk_size = None
         if group is None or torch.distributed.get_world_size(group) == 1:
+            if not inference_only and torch.is_grad_enabled() and logits.requires_grad:
+                return _LocalVocabLogprob.apply(logits, target, chunk_size)
             return model_utils._tp_target_logprobs(
                 logits,
                 target,
