@@ -1961,8 +1961,11 @@ prompt, R anchored requests resident on an engine rank.
 **Multi-turn.** Turns below c run at θ_{k−1} exactly as in scheme A (14h, branch ts-multiturn-a: driver turn loop,
 observation anchors from the continuation's own prefill); once a row's anchors are complete below c, the rest of
 the rollout (later turns included) can be decoded by the refit engine with the request tagged, since each later
-turn's prefill re-applies the anchors below c by position. Driver integration of the two (rollout loop continuing
-a recorded multi-turn state on the engine) is not built yet.
+turn's prefill re-applies the anchors below c by position. Built on branch ts-multiturn-ab (scheme A merged with
+this branch): `_horizon` is clipped by the total-length cap for multi-turn rollouts (max_new_tokens bounds one turn
+there); a turn that ends at or past the horizon is not sent to the environment at θ_{k−1}; the rollout loop finishes
+a handed-over row with `_finish_turns` (tagged engine requests per turn, one environment step per turn end, the same
+turn rules as below the horizon) and then rebuilds it with scheme A's `replay`.
 
 **Rule kernel.** The engine applies the rule in every MoE layer of every forward once the horizon is on, so it is
 one Triton kernel (`sticky_routing_fused.py`; a pure selection, bitwise equal to `sticky_select`: GPU unit test with
