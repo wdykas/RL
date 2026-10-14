@@ -1923,6 +1923,17 @@ transient 72.6 GB (none) -> 47 GB (selective) -> 26 GB (full) for Qwen3; 48.7 ->
   sequence), selective ~106 GB at T = 16k -> full at PP>1. Every term is per micro-batch tokens and per rank shard;
   none grows with the global batch, and EP enters only through ρ of one recomputed layer.
 
+**Open (not built): the learner's batch-invariant unpermute.** The NVLS expert path (`NVLSAllGatherVDispatcher`,
+AllGather-V + ordered ReduceScatter-V) is the engine's only: it is built for `transformer_impl=inference_optimized`
+and selected under `InferenceMode`; it has no backward and its symmetric buffers are EP x tokens per rank (EP=64,
+16k tokens, hidden 8k: ~51 GB), so it is not a learner option. The learner (training and its no-grad forwards) runs
+Megatron's `moe/batch_invariant.unpermute` after the AlltoAll combine: EP x top-k Python iterations of full [T, H]
+index_select / fp64 casts forward and EP x k dense [T·k, H] gradient buffers backward. Fine at Qwen3 EP=8
+(64 iterations, ~10 ms fwd + ~25 ms bwd per layer at 16k tokens [D]); at EP=64 x top-22 [H] ~0.85 s fwd + ~2 s bwd
+per layer and 24-35 GB of live gradient buffers [D]. The scalable form is a fused token-owned kernel doing the same
+fp64-within-rank / fp32-rank-order sums (bitwise, O(T·k·H), EP-independent; backward a gather), like
+`fp16_moe._unpermute_fp64_kernel` on the engine side.
+
 ## 15. Open work
 
 - **Stragglers.** About one rejected draft per step decodes its remainder at about 3 ms
