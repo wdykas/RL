@@ -124,7 +124,11 @@ class HiddenLog:
             entries = [e for e in entries if e[1] not in self._closed]
             if not entries:
                 return
-            idx = torch.tensor([r for r, _, _ in entries], device=hidden.device)
+            idx = torch.tensor([r for r, _, _ in entries])
+            if hidden.is_cuda:
+                # Pinned and non-blocking: a pageable copy would make the host
+                # wait for the forward that produced ``hidden``.
+                idx = idx.pin_memory().to(hidden.device, non_blocking=True)
             sel = hidden.detach().index_select(0, idx)
             chunk, off = self._alloc(len(entries), sel)
             chunk[0][off : off + len(entries)].copy_(sel, non_blocking=sel.is_cuda)
