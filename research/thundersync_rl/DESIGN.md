@@ -1677,8 +1677,13 @@ experts; each rank owns ≈ P/W main elements, P/(TP·PP·EP-share) model elemen
   (L4 arms queued) is next. ⊥-BV paired: θ_k accepted .976 / ⊥ .326 / tail .039 vs momentum .984 / .328 / .026.
 - Drafting window [measured]: momentum arms drafted 2–3.5x fewer tokens than the θ_k arms (⊥-BV 42k vs 150k):
   the drafter first waits for the learner lock, i.e. for the in-flight learner dispatch, before the refit.
-  Fixed (2026-10-14): θ̂_{k+1} is staged at the top of step k and loaded engine-locally after the rollouts
-  (see Implementation); paired draft volume after the fix: see the integration runs below.
+  Fixed (2026-10-14): θ̂_{k+1} is staged at the top of step k and loaded engine-locally after the rollouts,
+  or refit directly when no rollout decodes fresh (see Implementation). Paired after the fix (ts-integration,
+  tiny MoE EP=2, sticky, async scheduling, 4 steps, both arms `draft_start_frac=1`) [measured]: both PASS
+  (engine q exact, mismatch 0, route check exact every step); draft tokens per step current 119096 / 30080 /
+  28273 vs momentum 119096 / 26932 / 33354 (equal within noise; before: 2–3.5x fewer). Momentum steps 1–2
+  took the direct path (stage .16 s: load .02 + refit .135; no θ_k refit); step 0 the staged path (engine
+  device → host stage .11 s for 1.39 GB per rank).
 
 **Not built yet.** Megatron-FSDP, fp8/fp4 param gather, a two-step draft for lookahead > 1, the
 stage off the critical path (host-staging receive during the rollouts, or a sparse delta), sticky
