@@ -491,11 +491,25 @@ def compare_anchors(anchors: torch.Tensor, ref: torch.Tensor) -> tuple[int, int]
     the top-k ignored). Used to check logged anchors against an independent
     engine forward of the same row.
     """
+    pos, same = _compare(anchors, ref)
+    return int(pos.numel()), int(same.all(-1).sum())
+
+
+def anchor_mismatches(anchors: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+    """[m, 2] (position, layer column) where ``compare_anchors`` finds a difference.
+
+    Ordered by position, then layer: row 0 is the first mismatch.
+    """
+    pos, same = _compare(anchors, ref)
+    bad = (~same).nonzero()
+    return torch.stack([pos[bad[:, 0]], bad[:, 1]], 1) if bad.numel() else bad
+
+
+def _compare(anchors: torch.Tensor, ref: torch.Tensor):
+    """(checked positions [n], [n, L] bool: same expert set as ``ref``)."""
     pos = position_complete(anchors).nonzero().flatten()
-    if pos.numel() == 0:
-        return 0, 0
     inside = pos < ref.shape[0]
     a = anchors[pos].sort(-1).values
     r = torch.full_like(a, NO_ANCHOR)
     r[inside] = ref[pos[inside]].to(a.dtype).sort(-1).values
-    return int(pos.numel()), int((a == r).all(-1).all(-1).sum())
+    return pos, (a == r).all(-1)

@@ -25,6 +25,7 @@ from thundersync_rl.routes import (
     RouteLog,
     SlotTags,
     anchored_draft_length,
+    anchor_mismatches,
     compare_anchors,
     fetch_anchors,
     merge_route_refs,
@@ -230,7 +231,10 @@ def test_compare_anchors_against_a_reference_forward():
     assert compare_anchors(A, ref) == (4, 4)
     ref[2, 1] = torch.tensor([0, 3])  # one layer routed elsewhere
     assert compare_anchors(A, ref) == (4, 3)
+    assert anchor_mismatches(A, ref).tolist() == [[2, 1]]  # (position, layer)
     assert compare_anchors(A, ref[:3]) == (4, 2)  # positions missing from ref
+    assert anchor_mismatches(A, ref[:3]).tolist() == [[2, 1], [3, 0], [3, 1]]
+    assert anchor_mismatches(A[4:], ref).shape == (0, 2)
     assert compare_anchors(A, A[:0]) == (4, 0)
     assert compare_anchors(A[4:], ref) == (0, 0)  # nothing anchored
 

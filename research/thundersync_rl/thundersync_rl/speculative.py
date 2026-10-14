@@ -55,6 +55,7 @@ from thundersync_rl.fused_train import FusedRef
 from thundersync_rl.null_bv import NullGroup, NullPolicy, envelopes
 from thundersync_rl.routes import (
     RouteRefs,
+    anchor_mismatches,
     anchored_draft_length,
     compare_anchors,
     fetch_anchors,
@@ -1860,6 +1861,19 @@ class SpeculativeGeneration:
             other = fetch_anchors(ref, self._route_layers, mine.shape[-1], n, ray.get)
             t, e = compare_anchors(mine, other)
             tok, exact = tok + t, exact + e
+            if e < t:
+                # First differing (position, layer) of this draft.
+                bad = anchor_mismatches(mine, other)
+                pos, col = bad[0].tolist()
+                print(
+                    f"[route check] mismatch key={d[4]} prompt={d[0].numel()} "
+                    f"len={n} pos={pos} layer={self._route_layers[col]} "
+                    f"positions={t - e} (pos, layer column)={bad[:8].tolist()} "
+                    f"logged={mine[pos, col].tolist()} "
+                    f"prefill={other[pos, col].tolist()} segments={d[5]} "
+                    f"blocks={[(b.lo, b.hi) for b in d[8].blocks]}",
+                    flush=True,
+                )
         (self._free_refs or ray_free)(self._route_blocks.pop(check, []))
         self.stats["spec/route_check_tokens"] = float(tok)
         self.stats["spec/route_check_exact"] = float(exact)
