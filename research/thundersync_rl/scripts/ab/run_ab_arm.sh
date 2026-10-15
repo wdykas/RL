@@ -96,6 +96,16 @@ PAR=(policy.megatron_cfg.tensor_model_parallel_size=$TP
      ++policy.generation.mcore_generation_config.pipeline_model_parallel_size=$GEN_PP
      ++policy.generation.mcore_generation_config.expert_model_parallel_size=$GEN_EP)
 (( PP > 1 || GEN_PP > 1 )) && PAR+=(++policy.megatron_cfg.pipeline_dtype=float32)
+# Opt-in cuBLAS workspace shim (CUBLAS_WS_SHIM=1; not a default until model-level fingerprint checks pass):
+# LD_PRELOAD forces a 0-byte cuBLAS workspace instead of CUBLAS_WORKSPACE_CONFIG=:0:0, which PyTorch 2.11
+# re-parses with std::regex per cuBLAS call (58 -> 24 us host per mm, same bits; research/agent_callcost.md).
+# The driver env (env_sbatch.sh) reaches Ray workers started from this shell; multi-node workers get it
+# through the env_vars overrides below.
+if [ "${CUBLAS_WS_SHIM:-0}" = 1 ]; then
+  PAR+=("~policy.megatron_cfg.env_vars.CUBLAS_WORKSPACE_CONFIG"
+        "++policy.megatron_cfg.env_vars.CUBLAS_WORKSPACE_FIXED_BYTES='0'"
+        "++policy.megatron_cfg.env_vars.LD_PRELOAD=$W/research/callcost/cublas_ws_shim/libcublas_ws_shim.so")
+fi
 # Engine EP != learner EP (e.g. EP4 lanes under an EP8 learner) needs the EP-invariant MoE combine
 # (exact limb sums; DESIGN 14u): without it plainly sampled rows differ (np-v2-lanes-ep, epinv-lanes-ep-off).
 # EPINV=1 forces it on at equal EP, EPINV=0 off (the validators then refuse an EP mismatch).

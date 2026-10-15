@@ -175,7 +175,16 @@ def validate_batch_invariant_mode(config: PolicyConfig) -> ZeroTrainGenValidatio
         )
     if megatron_cfg.get("batch_invariant_backend") == "te_native":
         env_vars = megatron_cfg.get("env_vars") or {}
+        # Opt-in equivalent of CUBLAS_WORKSPACE_CONFIG=:0:0 (run_ab_arm.sh CUBLAS_WS_SHIM=1):
+        # the LD_PRELOAD shim thundersync_work/research/callcost/cublas_ws_shim gives every cuBLAS
+        # handle a 0-byte workspace (same cuBLAS state, no split-K) without the variable, which
+        # PyTorch 2.11 re-parses with a fresh std::regex on every cuBLAS call (~35 us host).
+        shim = "cublas_ws_shim" in str(env_vars.get("LD_PRELOAD") or "") and str(
+            env_vars.get("CUBLAS_WORKSPACE_FIXED_BYTES")
+        ) == "0"
         for key, value in _TE_NATIVE_ENV_VARS.items():
+            if key == "CUBLAS_WORKSPACE_CONFIG" and shim and env_vars.get(key) is None:
+                continue
             if env_vars.get(key) != value:
                 out.violations.append(
                     f"batch_invariant_backend='te_native' requires "
