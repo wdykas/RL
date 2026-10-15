@@ -1716,7 +1716,7 @@ also drifts as the policy sharpens. The calibration measures v on every verified
 Exactness: within a step v is fixed before any of the step's drafts is verified (a function of the
 past, like a hyperparameter), so M_j stays a function of the counts (d, s) alone. The optional-
 sampling argument above holds unchanged. Estimating v from the step's own rows would be forbidden
-(content-dependent M). Lanes: each lane's speculator calibrates from the steps it verified.
+(content-dependent M). Lanes share one calibration (v and the verify cost belong to the drafter and verifier, not to a lane); steps are verified one after another, so each step still sees earlier steps only.
 `null_bv_tail_weight` scales the tail cost against a fresh decode (a constant).
 Verification is not free either. Each verified draft costs `verify_cost` fresh decodes, so a BOT
 draft costs a verification too. `verify_cost` is measured the same past-only way: earlier steps'

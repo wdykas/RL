@@ -871,3 +871,18 @@ def test_verify_cost_is_measured_from_past_steps_and_lowers_the_envelope():
     assert costly.m(12, 8) < free.m(12, 8) or free.m(12, 8) == 1.0
     with pytest.raises(ValueError):
         NullPolicy(verify_cost=-1.0)
+
+
+def test_lanes_share_one_calibration():
+    from types import SimpleNamespace
+
+    from thundersync_rl.grpo_loop import share_null_calibration
+    from thundersync_rl.null_bv import LogRatioCalibration
+
+    a = SimpleNamespace(_null_calib=LogRatioCalibration(prior=8e-7))
+    b = SimpleNamespace(_null_calib=LogRatioCalibration(prior=8e-7))
+    off = SimpleNamespace(_null_calib=None)
+    share_null_calibration([a, b, off])
+    assert a._null_calib is b._null_calib and off._null_calib is None
+    a._null_calib.update([(2, 0.0, 0.02)])  # lane a verified a step
+    assert b._null_calib.estimate() == pytest.approx(0.01)  # lane b's next step sees it

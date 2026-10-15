@@ -2082,6 +2082,17 @@ def next_draft_prompts(
     return prompts, null_slots
 
 
+def share_null_calibration(specs: list[SpeculativeGeneration]) -> None:
+    """One ⊥-BV calibration for every lane: v and the verify cost are properties
+    of the drafter and the verifier, not of a lane. Still past-only: steps are
+    verified one after another, so each step's policy sees earlier steps only.
+    """
+    shared = next((s._null_calib for s in specs if s._null_calib is not None), None)
+    for s in specs:
+        if s._null_calib is not None:
+            s._null_calib = shared
+
+
 def make_speculative_generation(
     generation: GenerationInterface,
     policy: Policy,
@@ -2185,6 +2196,7 @@ def thundersync_grpo_train(
             lane.spec = make_speculative_generation(
                 lane.generation, policy, tokenizer, master_config
             )
+        share_null_calibration([lane.spec for lane in lanes])
         sched = CohortLanes(lanes)
         spec = lanes[0].spec
     elif ts_cfg.speculate:
@@ -2690,6 +2702,7 @@ def _train_on_lanes(
         lane.spec = make_speculative_generation(
             lane.generation, policy, tokenizer, master_config
         )
+    share_null_calibration([lane.spec for lane in lanes])
     sched = CohortLanes(lanes)
     check_weights = bool(os.environ.get("THUNDERSYNC_MISMATCH_CHECK"))
 
