@@ -171,7 +171,8 @@ class _Call:
             cu_seqlens_k=torch.tensor(cu_k, dtype=torch.int32, device=dev),
             max_seqlen_q=max(r.length for r in self.rows),
             max_seqlen_k=max(r.start + r.length for r in self.rows),
-            softmax_scale=mod.softmax_scale,
+            # TE keeps the scale on its FlashAttention backend module.
+            softmax_scale=mod.flash_attention.softmax_scale,
             causal=True,
             # As TE passes it for a causal training forward.
             window_size=dpa_utils.check_set_window_size("causal", mod.window_size),

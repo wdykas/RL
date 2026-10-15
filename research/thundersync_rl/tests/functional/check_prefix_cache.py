@@ -178,7 +178,7 @@ def check(model, args):
         starts = [cache.start(keys[i], r, pl) for i, r, pl in zip(live, full_rows, prompt_lens)]
         seg = [r[s:] for r, s in zip(full_rows, starts)]
         an_seg = [a[s:] for a, s in zip(an, starts)] if an else None
-        with cache.forward([keys[i] for i in live], full_rows, starts):
+        with torch.no_grad(), cache.forward([keys[i] for i in live], full_rows, starts):
             inc = forward(model, seg, an_seg, args.mult, gather)
         for b, (i, r, pl, s) in enumerate(zip(live, full_rows, prompt_lens, starts)):
             n = r.numel()
@@ -229,7 +229,7 @@ def bench(model, args):
         prefix = torch.randint(100, 30000, (plen,), generator=gen)
         # Fill the cache through a forward of the prefix row (as the previous piece did).
         cache.clear()
-        with cache.forward(["b"], [prefix], [0]):
+        with torch.no_grad(), cache.forward(["b"], [prefix], [0]):
             forward(model, [prefix], None, args.mult, gather)
         row = torch.cat([prefix, torch.randint(100, 30000, (PIECE,), generator=gen)])
         s = cache.start("b", row, plen)
@@ -242,7 +242,7 @@ def bench(model, args):
             times["full"].append(time.perf_counter() - t0)
             del full
             t0 = time.perf_counter()
-            with cache.forward(["b"], [row], [s]):
+            with torch.no_grad(), cache.forward(["b"], [row], [s]):
                 inc = forward(model, [row[s:]], None, args.mult, gather)[0, plen - 1 - s:]
             torch.cuda.synchronize()
             times["cached"].append(time.perf_counter() - t0)
