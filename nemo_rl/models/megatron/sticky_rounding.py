@@ -509,6 +509,39 @@ def _policy_pass(s: AnchorStream) -> Iterator[None]:
         s.mode = None
 
 
+@contextlib.contextmanager
+def _captured_params_swapped(unit: torch.nn.Module, params: dict[str, torch.Tensor]) -> Iterator[None]:
+    """Point helper objects that hold the unit's live parameters at ``params``.
+
+    ``functional_call`` swaps module attributes only. MCore's Mamba mixer hands
+    its conv1d / dt_bias / A_log / D parameters to a ``MambaContextParallel``
+    helper at construction and its forward reads them from there
+    (``mixer.cp.get_A_log()``), so without this the anchor pass would run those
+    parameters at theta_{n+1}. Any plain object (not a module, not a tensor)
+    stored on a submodule is scanned one level deep for attributes that are
+    one of the unit's live parameters (by identity) and rebound for the pass.
+    """
+    if not params:
+        yield
+        return
+    by_id = {id(p): n for n, p in unit.named_parameters(remove_duplicate=False)}
+    swaps: list[tuple[Any, str, Any]] = []
+    for mod in unit.modules():
+        for helper in list(vars(mod).values()):
+            if isinstance(helper, (torch.nn.Module, torch.Tensor)) or not hasattr(helper, "__dict__"):
+                continue
+            for attr, val in list(vars(helper).items()):
+                name = by_id.get(id(val)) if isinstance(val, torch.nn.Parameter) else None
+                if name is not None and name in params:
+                    swaps.append((helper, attr, val))
+                    setattr(helper, attr, params[name])
+    try:
+        yield
+    finally:
+        for helper, attr, val in reversed(swaps):
+            setattr(helper, attr, val)
+
+
 def _device(module: torch.nn.Module) -> torch.device:
     return next(module.parameters()).device
 
@@ -531,7 +564,8 @@ def _layer_forward(orig):
         dev = _device(self)
         with _anchor_pass(s):
             params = s.params(self, dev)
-            out = functional_call(self, params, a_args, a_kwargs, strict=False)
+            with _captured_params_swapped(self, params):
+                out = functional_call(self, params, a_args, a_kwargs, strict=False)
         del params
         s.done(self, dev)
         s.hidden = out[0] if isinstance(out, tuple) else out

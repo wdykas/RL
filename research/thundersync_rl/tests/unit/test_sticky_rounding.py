@@ -570,3 +570,31 @@ def test_lockstep_units_reject_layers_without_a_lockstep():
     with pytest.raises(NotImplementedError, match="no lockstep"):
         sr.lockstep_units(Model([torch.nn.Linear(2, 2)]))
     assert len(sr.lockstep_units(Model([]))) == 1
+
+
+def test_anchor_pass_rebinds_parameters_captured_by_helper_objects():
+    """MCore's Mamba mixer reads A_log / D / conv1d / dt_bias through a context-parallel
+    helper that captured the Parameter objects: the anchor pass must use theta_n there too."""
+
+    class Helper:
+        def __init__(self, w):
+            self.w_cp1 = w
+
+    class Mixer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w = torch.nn.Parameter(torch.tensor([2.0]))
+            self.cp = Helper(self.w)
+
+        def forward(self, x):
+            return x * self.cp.w_cp1
+
+    m = Mixer()
+    theta_n = {"w": torch.tensor([3.0])}
+    with sr._captured_params_swapped(m, theta_n):
+        from torch.func import functional_call
+
+        assert functional_call(m, theta_n, (torch.ones(1),)).item() == 3.0
+    assert m.cp.w_cp1 is m.w and m(torch.ones(1)).item() == 2.0
+    with sr._captured_params_swapped(m, {}):
+        assert m.cp.w_cp1 is m.w
