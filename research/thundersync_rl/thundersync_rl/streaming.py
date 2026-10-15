@@ -209,21 +209,31 @@ class StreamPlanner:
         self.order: Optional[list[GroupId]] = None
         self._next = 0
 
-    def set_order(self, order: list[GroupId]) -> None:
-        """Dispatch whole groups one at a time, in ``order``, whatever the arrival order.
+    def set_order(self, order: list[GroupId], block_sizes: Optional[list[int]] = None) -> None:
+        """Dispatch whole blocks of groups, in ``order``, whatever the arrival order.
 
-        Group granularity only. Each dispatch is then one group's rows, sorted
-        by trajectory index, chunked and placed on ranks by the same rules, so
-        which rows share a micro-batch, which rank backpropagates them and the
-        order their gradients add into the accumulator are functions of the
-        data, not of timing: the accumulated gradient is bitwise reproducible.
-        A group that closes early waits for every group before it in ``order``.
+        ``block_sizes`` partitions ``order`` into consecutive blocks (default:
+        one group per block). Group granularity only. Each dispatch is one
+        block's rows, sorted by (position of the group in ``order``, trajectory
+        index), chunked and placed on ranks by the same rules, so which rows
+        share a micro-batch, which rank backpropagates them and the order their
+        gradients add into the accumulator are functions of the data, not of
+        timing: the accumulated gradient is bitwise reproducible. A block
+        dispatches once all its groups are complete, after every block before
+        it. Fewer, larger blocks pay the learner's per-call cost fewer times.
         """
         if self.max_open_groups:
             raise ValueError("a canonical group order needs group granularity")
         if sorted(map(repr, order)) != sorted(map(repr, self.groups)):
             raise ValueError("the order must list every registered group once")
+        sizes = list(block_sizes) if block_sizes is not None else [1] * len(order)
+        if any(b <= 0 for b in sizes) or sum(sizes) != len(order):
+            raise ValueError(f"block sizes {sizes} do not partition {len(order)} groups")
         self.order, self._next = list(order), 0
+        self._blocks, at = [], 0
+        for b in sizes:
+            self._blocks.append(self.order[at : at + b])
+            at += b
 
     def register_group(self, group: GroupId, size: int, tails: int = 0) -> None:
         """``tails``: rows of the group that need a continuation (tail-excluded baseline)."""
@@ -297,16 +307,21 @@ class StreamPlanner:
 
     def _pick(self, flush: bool = True) -> list[Trajectory]:
         if self.order is not None:
-            if self._next >= len(self.order):
+            if self._next >= len(self._blocks):
                 return []
-            gid = self.order[self._next]
-            g = self.groups[gid]
-            # Its rows are still arriving: later groups wait. (The
-            # tail-excluded baseline closes a group before its tail rows
-            # arrive; a canonical dispatch is still the whole group.)
-            if g.advantage_by_reward is None or len(g.rewards) < g.size:
-                return []
-            return sorted((t for t in self.ready if t.group == gid), key=lambda t: t.index)
+            block = self._blocks[self._next]
+            for gid in block:
+                g = self.groups[gid]
+                # Its rows are still arriving: later blocks wait. (The
+                # tail-excluded baseline closes a group before its tail rows
+                # arrive; a canonical dispatch is still the whole group.)
+                if g.advantage_by_reward is None or len(g.rewards) < g.size:
+                    return []
+            pos = {repr(gid): i for i, gid in enumerate(block)}
+            return sorted(
+                (t for t in self.ready if repr(t.group) in pos),
+                key=lambda t: (pos[repr(t.group)], t.index),
+            )
         rows = self.ready
         if not flush and self.holding():
             # Rows of closed groups wait; idle time still goes to bucket work.

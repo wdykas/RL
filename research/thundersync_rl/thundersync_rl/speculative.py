@@ -235,6 +235,8 @@ def _key(ids: torch.Tensor) -> tuple[int, ...]:
 def _drafted(res) -> tuple[list[int], bool, list[float] | None]:
     """(tokens, finished, engine log-probs or None) of one ``collect_drafts`` entry."""
     toks, done, *rest = res
+    # Token ids arrive as one int array (typed transport); the plan keeps ints.
+    toks = toks.tolist() if isinstance(toks, np.ndarray) else list(toks)
     lps = rest[0] if rest else None
     return toks, done, (lps if lps is not None and len(lps) == len(toks) else None)
 
@@ -325,11 +327,14 @@ def behavior_logprobs(
         return list(logp)
     out = list(logp)
     for j in range(n_acc):
-        if engine_logq[j] == draft_logq[j]:
+        # Python floats (engine log q may arrive as a float32 array): compare
+        # and correct in double, as with the former per-token float lists.
+        eq, dq = float(engine_logq[j]), float(draft_logq[j])
+        if eq == dq:
             # q is the engine's law (engine-sourced verification): no
             # correction, and log p is reported bitwise.
             continue
-        v = logp[j] + engine_logq[j] - draft_logq[j]
+        v = logp[j] + eq - dq
         if math.isfinite(v):
             out[j] = v
     return out
@@ -743,16 +748,27 @@ class SpeculativeGeneration:
         Unfinished drafts read the engines' request records (as
         ``_collect_drafts``: streamed frames skip tokens after an eviction).
         """
+        t0 = time.perf_counter()
         ids = ray.get(rank0.draft_request_ids.remote(idx))
-        records: dict[int, tuple] = {}
-        if ids:
-            for r in ray.get(
-                self.base._policy.worker_group.run_all_workers_single_data(
-                    "draft_records", request_ids=sorted(ids.values())
-                )
-            ):
-                records.update(r)
-        return ray.get(rank0.peek_drafts.remote(idx, records=records))
+        refs, rids = self._record_refs(ids)
+        out = ray.get(rank0.peek_drafts.remote(idx, record_refs=refs, request_ids=rids))
+        # Driver seconds spent fetching draft snapshots (typed transport).
+        self.stats["driver/peek_s"] = self.stats.get("driver/peek_s", 0.0) + time.perf_counter() - t0
+        return out
+
+    def _record_refs(self, ids: dict[int, int]) -> tuple[list, list[int]]:
+        """The other engine ranks' ``draft_records`` as object refs (for rank 0).
+
+        The records go to rank 0, which reads its own directly, without passing
+        through the driver; rank 0 is not sent a ``draft_records`` call (its
+        ``peek_drafts`` waits on these refs while it runs, so a call queued
+        behind it on rank 0 would never start).
+        """
+        if not ids:
+            return [], []
+        rids = sorted(ids.values())
+        others = self.base._policy.worker_group.workers[1:]
+        return [w.draft_records.remote(request_ids=rids) for w in others], rids
 
     def _collect_running(self, rank0, hkeys, prompt_lens, budget: int, target: int):
         """Sticky routing: the deadline snapshot of the drafts, streams left running.
@@ -794,16 +810,12 @@ class SpeculativeGeneration:
         between the two calls are discarded: the cut is a time, not a function
         of the tokens, and any prefix of a draft is a valid draft.
         """
+        t0 = time.perf_counter()
         ids = ray.get(rank0.draft_request_ids.remote())
-        records: dict[int, tuple] = {}
-        if ids:
-            for r in ray.get(
-                self.base._policy.worker_group.run_all_workers_single_data(
-                    "draft_records", request_ids=sorted(ids.values())
-                )
-            ):
-                records.update(r)
-        return ray.get(rank0.collect_drafts.remote(records=records))
+        refs, rids = self._record_refs(ids)
+        out = ray.get(rank0.collect_drafts.remote(record_refs=refs, request_ids=rids))
+        self.stats["driver/collect_s"] = self.stats.get("driver/collect_s", 0.0) + time.perf_counter() - t0
+        return out
 
     def _hidden_keys(self, keys: list[str]) -> list[str] | None:
         """Engine hidden-log keys of one drafting round (None: not logging)."""
@@ -1108,7 +1120,7 @@ class SpeculativeGeneration:
                 start = len(d["tokens"])
                 d["tokens"].extend(toks)
                 if d.get("logprobs") is not None and lps is not None:
-                    d["logprobs"].extend(lps)
+                    d["logprobs"].extend(np.asarray(lps).tolist())
                 else:
                     d["logprobs"] = None
                 d["finished"] = done
@@ -2770,18 +2782,10 @@ class SpeculativeGeneration:
         def pieces(cand):
             """(flat drafts, rows, owner streams) of the ready pieces of ``cand``."""
             idx = [s["idx"] for s in cand]
-            ids = ray.get(rank0.draft_request_ids.remote(idx))
-            records: dict[int, tuple] = {}
-            if ids:
-                for r in ray.get(
-                    self.base._policy.worker_group.run_all_workers_single_data(
-                        "draft_records", request_ids=sorted(ids.values())
-                    )
-                ):
-                    records.update(r)
-            snaps = ray.get(rank0.peek_drafts.remote(idx, records=records))
+            snaps = self._peek_streams(rank0, idx)
             ready = []
             for s, (toks, done, lps) in zip(cand, snaps):
+                toks = toks.tolist() if isinstance(toks, np.ndarray) else list(toks)
                 a = s["taken"]
                 s["decoded"] = len(toks)  # stream length when its piece is taken
                 n = len(toks) - a if done else ((len(toks) - a) // chunk) * chunk

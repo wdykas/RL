@@ -4,6 +4,7 @@
 #
 #   ARM=sync|async1|ts_nonull|ts_por|ts_banded|sync_coloc|async1_nrl [MBS=8 LPBS=4] MODEL=<hf id or path> TP=1 PP=1 EP=8 \
 #     MAXLEN=8192 STEPS=6 PROMPTS=64 RUNS=runs_ab TAG=<tag> bash run_ab_arm.sh
+# MAXIN (prompt cap, data.max_input_seq_length): MAXLEN/2 for MAXLEN <= 4096, else 2048.
 #
 # GPUS_PER_SIDE (default lcm(TP, EP) * PP) GPUs per side, 4 GPUs per node. sync_coloc (stock NeMo-RL GRPO)
 # is colocated: learner and engine share GPUS_PER_SIDE GPUs. Every other arm is split: GPUS_PER_SIDE
@@ -76,6 +77,12 @@ PAR=(policy.megatron_cfg.tensor_model_parallel_size=$TP
 # Micro-batch sizes (default: ab_base.yaml, 1 / 1 for long caps; the 1k-cap single-node runs use 8 / 4).
 [ -n "${MBS:-}" ] && PAR+=(policy.train_micro_batch_size=$MBS)
 [ -n "${LPBS:-}" ] && PAR+=(policy.logprob_batch_size=$LPBS)
+# Prompts must leave room for generation under the total-length cap: NeMo-RL masks out (loss 0, 4-token stub)
+# prompts at or above data.max_input_seq_length, and a prompt above the cap overflows the engine. Same for
+# every arm: half the cap for short caps (the 1k single-node runs), else ab_base's 2048.
+MAXIN=${MAXIN:-$(( MAXLEN <= 4096 ? MAXLEN / 2 : 2048 ))}
+if (( MAXIN > MAXLEN )); then echo "MAXIN=$MAXIN must not exceed MAXLEN=$MAXLEN" >&2; exit 2; fi
+PAR+=(data.max_input_seq_length=$MAXIN)
 read -r -a USER_ARGS <<< "${ARGS:-}"
 OUT=$W/$RUNS/$TAG
 mkdir -p "$OUT"
