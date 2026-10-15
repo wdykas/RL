@@ -3167,7 +3167,7 @@ agent note.
 verification inside the continuation prefill for the rest), linear correction dropped. VIT rows are exact without
 `deterministic_training` (decisions come from the training forward itself); determinism is only for bitwise tests.
 
-**Placement.** VIT for fully-finished groups, engine-side verification (14q) for unfinished drafts (ideally inside the
+**Placement.** VIT for fully-finished groups, engine-side verification (ts-engine-verify, not merged) for unfinished drafts (ideally inside the
 continuation's own prefill). Per-rank cost of VIT: no memory beyond a training micro-batch; q (4 B/token) and the row
 seed to the row's last PP stage; one [V/TP] head row per rejected position.
 
@@ -3405,7 +3405,7 @@ costs more than ~5k decode tokens, e.g. a 128k restart prefill). Full grid (all 
 - Learner: one pinned Mamba boundary per cached row (Nano 46.8 MiB; Ultra ~25 MB per GPU [H]) so the scan forwards
   from the floor's piece; scan forwards only on rejections (modeled scan tokens ≤ wasted decode above).
 - Placement: `verify_engine_q_walk` / `verify_engine_q_scan` take the same inputs as `verify_engine_q`, so the engine
-  path (14q) calls them unchanged; the walk state and decisions travel through the driver.
+  path (ts-engine-verify, not merged) calls them unchanged; the walk state and decisions travel through the driver.
 Metrics: `spec/cw_decisions`, `_whole`, `_rejects`, `_scans`, `_scan_tokens`, `_ratio_mismatch` (must be 0: the scan's
 forward reproduces the pieces' log p bitwise), `_hidden_retained_bytes_max`.
 **Chunked verification head (all engine-sourced verification, ts-carried-walk).** A verification forward
@@ -3419,7 +3419,7 @@ rows a scan asks for. Same ops per row as the materialized path (row-invariant G
 bitwise the same values [T: test_carried_walk_gpu.py::test_deferred_logprob_rows_equal_materialized]. Per rank:
 the head input (tokens x h x 4 B) plus one [4096, V] fp32 chunk (2 GiB at V 131k) instead of tokens x V x 4 B.
 Not covered: TP > 1 (vocab-parallel `GatheredLogprobRows` still keeps [n, V/TP] logits per row), heads outside the
-fp16-GEMM recipe (logits materialized as before; `[verify head] chunked=False` in the log). Engine placement (14q)
+fp16-GEMM recipe (logits materialized as before; `[verify head] chunked=False` in the log). Engine placement (ts-engine-verify, not merged)
 already chunks p rows (`HeadLogprobRows`, 512 rows).
 
 **Debug** `THUNDERSYNC_DEBUG_CW_FORCE_REJECT=N`: the first N decisions of each plan fail their terminal test (only when
