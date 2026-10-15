@@ -372,6 +372,7 @@ class SpeculativeGeneration:
         null_bv_drop_is: bool = False,
         null_bv_spare_prompts: int = 0,
         sticky_chunk_tokens: int = 2048,
+        sticky_chunk_growth: float = 0.0,
         draft_until_complete: bool = False,
         draft_weights: str = "current",
         max_seq_len: Optional[int] = None,
@@ -491,6 +492,8 @@ class SpeculativeGeneration:
         # Continuations are verified every this many decoded tokens while the
         # engine keeps decoding them (``_continue_sticky``).
         self.sticky_chunk_tokens = sticky_chunk_tokens
+        # Piece size grows with the row's generated position (``_piece_tokens``).
+        self.sticky_chunk_growth = float(sticky_chunk_growth)
         # Measurement only: the deadline waits for every draft to finish.
         self.draft_until_complete = draft_until_complete
         self._cont_ids = itertools.count()
@@ -2636,6 +2639,19 @@ class SpeculativeGeneration:
             flush=True,
         )
 
+    def _piece_tokens(self, generated: int) -> int:
+        """Continuation piece size at generated position ``generated`` of a row.
+
+        ``max(sticky_chunk_tokens, growth * generated)``: a function of the
+        position only (never of the tokens), so the cut stays exogenous and
+        verification exact. Each piece is verified by a forward of the whole row
+        (prompt + prefix + piece), so a fixed size costs O(L^2 / chunk) learner
+        work per continued row; growing pieces need O(log L) of them
+        (growth 1.0: <= 7 pieces per 8k row at chunk 128), at the price of
+        finding a rejection up to growth * position tokens later.
+        """
+        return max(1, int(self.sticky_chunk_tokens), int(self.sticky_chunk_growth * generated))
+
     async def _continue_sticky(
         self,
         pending,
@@ -2675,9 +2691,9 @@ class SpeculativeGeneration:
         streams are cut and sent meanwhile. ``trace``: the step's TailTrace.
         """
         rank0 = self.base._policy.worker_group.workers[0]
-        chunk = max(1, int(self.sticky_chunk_tokens))
         version = self.current_step - 1
         stats = dict(rounds=0, streams=0, tokens=0, kept=0, retries=0, turns=0)
+        pieces_per_plan: dict[int, int] = defaultdict(int)
         live: list[dict[str, Any]] = []
         retries: dict[int, int] = defaultdict(int)
         turns: dict[asyncio.Task, tuple] = {}
@@ -2788,6 +2804,7 @@ class SpeculativeGeneration:
                 toks = toks.tolist() if isinstance(toks, np.ndarray) else list(toks)
                 a = s["taken"]
                 s["decoded"] = len(toks)  # stream length when its piece is taken
+                chunk = self._piece_tokens(len(s["plan"].prefix))
                 n = len(toks) - a if done else ((len(toks) - a) // chunk) * chunk
                 if n > 0 or done:
                     # (stream, piece, stream finished, piece log-probs)
@@ -2892,6 +2909,7 @@ class SpeculativeGeneration:
             for r, ((_, d), s) in enumerate(zip(flat, owners)):
                 out = by_row[r]
                 plan, p, toks, done = s["plan"], d[0], d[2], d[3]
+                pieces_per_plan[id(plan)] += 1
                 g, n_acc = len(toks), out["accepted"]
                 lps = behavior_logprobs(
                     out["logprobs"], n_acc, d[6], out.get("draft_logq")
@@ -2962,7 +2980,7 @@ class SpeculativeGeneration:
                     cand = [
                         s
                         for s, (n, done) in zip(idle, status)
-                        if done or n - s["taken"] >= chunk
+                        if done or n - s["taken"] >= self._piece_tokens(len(s["plan"].prefix))
                     ]
                     flat, rows, owners = pieces(cand) if cand else ([], [], [])
                     if flat:
@@ -2984,6 +3002,12 @@ class SpeculativeGeneration:
         self.stats.update(
             {
                 "spec/sticky_rounds": float(stats["rounds"]),
+                # Verified continuation pieces per continued row (learner forwards of
+                # the whole row each): mean and max.
+                "spec/sticky_pieces_per_row": (
+                    sum(pieces_per_plan.values()) / max(len(pieces_per_plan), 1)
+                ),
+                "spec/sticky_pieces_per_row_max": float(max(pieces_per_plan.values(), default=0)),
                 "spec/sticky_streams": float(stats["streams"]),
                 "spec/sticky_cont_draft_tokens": float(stats["tokens"]),
                 "spec/sticky_cont_accepted_frac": stats["kept"]

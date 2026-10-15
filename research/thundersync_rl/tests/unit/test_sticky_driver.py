@@ -1055,3 +1055,26 @@ def test_prefix_at_the_total_length_cap_is_a_finished_rollout():
     assert plan.complete
     spec.max_seq_len = None
     assert not spec._plan(d, r).complete
+
+
+def test_piece_size_grows_with_position_only():
+    from thundersync_rl.speculative import SpeculativeGeneration
+
+    s = SpeculativeGeneration.__new__(SpeculativeGeneration)
+    s.sticky_chunk_tokens, s.sticky_chunk_growth = 128, 1.0
+    assert [s._piece_tokens(g) for g in (0, 100, 128, 129, 1000, 5000)] == [128, 128, 128, 129, 1000, 5000]
+
+    def pieces(length, growth):
+        s.sticky_chunk_growth = growth
+        pos, n = 0, 0
+        while pos < length:
+            pos += s._piece_tokens(pos)
+            n += 1
+        return n
+
+    # Whole-accepted continuation of an 8k row: 64 fixed pieces vs <= 7 growing ones.
+    assert pieces(8192, 0.0) == 64
+    assert pieces(8192, 1.0) <= 7
+    assert pieces(32768, 1.0) <= 9
+    s.sticky_chunk_growth = 0.0
+    assert all(s._piece_tokens(g) == 128 for g in (0, 5000))  # growth 0: fixed pieces
