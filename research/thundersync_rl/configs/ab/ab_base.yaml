@@ -72,10 +72,12 @@ policy:
       # sized for exactly this many (the fixed 0.1 buffer share admitted ~8 per rank at full
       # Nemotron-3-Nano). ThunderSync's capacity guard needs max_requests x engine DP >= a
       # cohort's primary drafts (prompts x G): 64 x 8 / 8 ranks = 64 at EP8; lanes run a whole
-      # cohort (x K = 1.5) per lane: 64 x 8 x 1.5 / 4 ranks = 192 for a lane of EP4.
-      max_requests: 192
-      # Per rank: Mamba state 192 x ~125 MB (full Nano) = 24 GB + KV (6 KiB/token at full Nano,
-      # 192 x 10240 tokens = 11.5 GB at an 8k generation cap) under one buffer for every arm.
+      # cohort (x K = 1.5) per lane. Set to the primaries per rank of an EP4 lane (64 x 8 / 4 =
+      # 128): measured (lanes ord-p-l2, 5336268f) 7.77 s/step at 128 vs 8.57 s at 192 -- extras
+      # beyond the primaries compete with them for the drafting lane. One EP8 engine needs 64.
+      max_requests: 128
+      # Per rank: Mamba state 128 x ~125 MB (full Nano) = 16 GB + KV (6 KiB/token at full Nano,
+      # 128 x 10240 tokens = 7.7 GB at an 8k generation cap) under one buffer for every arm.
       buffer_size_gb: 48
       # Progress line every 60 s on engine rank 0 (requests, tokens, tok/s) and a stall watchdog:
       # a busy engine rank without progress for 10 min dumps all stacks and exits non-zero.
