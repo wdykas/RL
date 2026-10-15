@@ -90,3 +90,26 @@ def test_views_and_fallback():
     torch.testing.assert_close(d * 2, full * 2)
     with pytest.raises(RuntimeError, match="in-place"):
         d.div_(2.0)
+
+
+def test_detach_data_and_megatron_fp32_output_conversion():
+    """``.detach()`` / ``.data`` (Megatron's Float16Module output conversion reads
+    ``val.data``) stay deferred and detached; value ops on them materialize."""
+    x, w, target, _ = _inputs("cpu", s=9, b=2, h=16, v=40)
+    x.requires_grad_(True)
+    full = fg.Fp16Linear.apply(x, w, fg.COMM_NONE, None, fg.FP32_HEAD).transpose(0, 1)
+    d = dh.deferred_head_logits(x, w).transpose(0, 1)
+    for view in (d.detach(), d.data):
+        assert isinstance(view, dh.DeferredHeadLogits)
+        assert not view._x.requires_grad
+        torch.testing.assert_close(view.materialize(), full.detach(), rtol=0, atol=0)
+    # Megatron float16_to_fp32: checks val.data's type, then val.float() for 16-bit.
+    val = d
+    _ = val.data
+    assert (val.float() if val.dtype in (torch.float16, torch.bfloat16) else val) is d
+    # prof_fwd-style direct use: slicing, cast, log_softmax (materializes with autograd).
+    lp = torch.log_softmax(d[:, :-1].float(), -1).gather(-1, target[:, 1:, None]).sum()
+    ref = torch.log_softmax(full[:, :-1].float(), -1).gather(-1, target[:, 1:, None]).sum()
+    torch.testing.assert_close(lp, ref)
+    lp.backward()
+    assert x.grad is not None

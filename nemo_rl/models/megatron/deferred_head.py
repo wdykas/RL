@@ -177,6 +177,11 @@ class DeferredHeadLogits(torch.Tensor):
             self._seq if seq is None else seq,
         )
 
+    def _detached(self) -> "DeferredHeadLogits":
+        return DeferredHeadLogits(
+            self._x.detach(), self._w.detach(), self._batch_first, self._seq
+        )
+
     def _seq_dim(self) -> int:
         return 1 if self._batch_first else 0
 
@@ -208,6 +213,11 @@ class DeferredHeadLogits(torch.Tensor):
         kwargs = kwargs or {}
         fns = _view_fns()
         self = args[0] if args and isinstance(args[0], DeferredHeadLogits) else None
+        if self is not None and (
+            func == torch.Tensor.detach or func == torch.Tensor.data.__get__
+        ):
+            # A detached stand-in (same logical values, no autograd history).
+            return self._detached()
         if self is not None and getattr(func, "__name__", "") in _METADATA:
             # Shape / dtype / device queries: the wrapper's own metadata.
             with torch._C.DisableTorchFunctionSubclass():
@@ -259,7 +269,20 @@ class DeferredHeadLogits(torch.Tensor):
 
     @classmethod
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):  # noqa: D105
-        raise RuntimeError(f"DeferredHeadLogits reached dispatch for {func}")
+        # Below autograd (ops reached without __torch_function__, e.g. property
+        # getters such as ``.data``): the stand-in has requires_grad=False, so
+        # its value is computed without autograd history.
+        kwargs = kwargs or {}
+        if func is torch.ops.aten.detach.default:
+            return args[0]._detached()
+
+        def unwrap(a):
+            if isinstance(a, DeferredHeadLogits):
+                with torch.no_grad():
+                    return a._detached().materialize()
+            return a
+
+        return func(*(unwrap(a) for a in args), **{k: unwrap(v) for k, v in kwargs.items()})
 
 
 def _seq_slice(idx: Any, seq_dim: int) -> Optional[slice]:
