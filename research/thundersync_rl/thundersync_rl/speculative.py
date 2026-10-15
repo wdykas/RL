@@ -29,6 +29,7 @@ unchanged: a request for a prompt that has a verified plan returns immediately
 
 from __future__ import annotations
 
+import array
 import asyncio
 import contextlib
 import itertools
@@ -368,6 +369,8 @@ class SpeculativeGeneration:
         null_bv_spare_prompts: int = 0,
         sticky_chunk_tokens: int = 2048,
         sticky_chunk_growth: float = 0.0,
+        sticky_decision: str = "every",
+        sticky_decision_dip: float = 0.1,
         draft_until_complete: bool = False,
         draft_weights: str = "current",
         max_seq_len: Optional[int] = None,
@@ -490,6 +493,11 @@ class SpeculativeGeneration:
         self.sticky_chunk_tokens = sticky_chunk_tokens
         # Piece size grows with the row's generated position (``_piece_tokens``).
         self.sticky_chunk_growth = float(sticky_chunk_growth)
+        # Carried-walk decisions (DESIGN 14r): None keeps every piece a block.
+        from thundersync_rl.carried_walk import DecisionRule
+
+        rule = DecisionRule(sticky_decision, float(sticky_decision_dip))
+        self.cw_rule = None if rule.mode == "every" else rule
         # Learner prefix-state cache (DESIGN 14p): continuation pieces are
         # forwarded from the row's cached state on the learner rank that holds
         # it ({"gpu_gb", "max_gb"} per learner rank; None: off).
@@ -1536,7 +1544,14 @@ class SpeculativeGeneration:
         return self._verify_block_results(flat, [(a, ray.get(refs)) for a, refs in futs])
 
     async def _verify_block_async(
-        self, flat, rows, prefix_keys: Optional[list[str]] = None
+        self,
+        flat,
+        rows,
+        prefix_keys: Optional[list[str]] = None,
+        walks: Optional[list] = None,
+        walk_scans: Optional[list] = None,
+        pins: Optional[list] = None,
+        keep_hidden: bool = False,
     ) -> dict[int, dict[str, Any]]:
         """``_verify_block`` without blocking the driver's event loop.
 
@@ -1545,17 +1560,21 @@ class SpeculativeGeneration:
         may start queued calls in different orders on different ranks; the
         numbered calls run in the same order everywhere.
         """
-        futs = self._submit_verify_block(flat, rows, ordered=True, prefix_keys=prefix_keys)
+        futs = self._submit_verify_block(
+            flat, rows, ordered=True, prefix_keys=prefix_keys,
+            walks=walks, walk_scans=walk_scans, pins=pins,
+        )
         done = []
         for a, refs in futs:
             # A worker thread waits on the results; the event loop keeps going.
             done.append((a, await asyncio.to_thread(ray.get, refs)))
         if getattr(self, "learner_ordered", False):
             self._learner_inflight.difference_update(r for _, refs in futs for r in refs)
-        return self._verify_block_results(flat, done)
+        return self._verify_block_results(flat, done, keep_hidden=keep_hidden)
 
     def _submit_verify_block(
-        self, flat, rows, null_envelopes=None, ordered=False, band=None, prefix_keys=None
+        self, flat, rows, null_envelopes=None, ordered=False, band=None, prefix_keys=None,
+        walks=None, walk_scans=None, pins=None,
     ) -> list:
         """Send ``flat``'s block verification to the verifier pools: [(first row, refs)].
 
@@ -1595,6 +1614,12 @@ class SpeculativeGeneration:
                 self._count_balance(lengths, owners, ranks)
             if null_envelopes is not None:
                 extra = {**extra, "null_envelopes": [list(e) for e in null_envelopes[a:b]]}
+            if walks is not None:
+                extra = {**extra, "walks": walks[a:b]}
+            if walk_scans is not None:
+                extra = {**extra, "walk_scans": walk_scans[a:b]}
+            if pins is not None and "prefix_keys" in extra:
+                extra = {**extra, "prefix_pins": pins[a:b]}
             if band is not None:
                 extra = {**extra, "band": band}
             seq = self.learner_seq() if ordered else None
@@ -1629,7 +1654,7 @@ class SpeculativeGeneration:
                 self.learner_track(futs[-1][1])
         return futs
 
-    def _verify_block_results(self, flat, done) -> dict[int, dict[str, Any]]:
+    def _verify_block_results(self, flat, done, keep_hidden: bool = False) -> dict[int, dict[str, Any]]:
         """Results by row from [(first row, per-rank results)] of ``_submit_verify_block``."""
         by_row = dict(
             (a + j, r) for a, ranks in done for rank_res in ranks for j, r in rank_res
@@ -1637,7 +1662,13 @@ class SpeculativeGeneration:
         missing = sorted(set(range(len(flat))) - by_row.keys())
         if missing:
             raise RuntimeError(f"block verification returned no result for rows {missing}")
-        self._verified_hidden(flat, by_row)
+        if keep_hidden:
+            # Carried-walk pieces: the block's hidden rows stay until its decision.
+            self._verified_hidden(flat, {})
+            for k in HIDDEN_FETCH_KEYS:
+                self._count_hidden("spec/" + k, sum(r.get(k, 0) for r in by_row.values()))
+        else:
+            self._verified_hidden(flat, by_row)
         return by_row
 
     def _count_balance(self, lengths: list[int], owners: list[int], ranks: int) -> None:
@@ -2774,7 +2805,7 @@ class SpeculativeGeneration:
         stats = dict(rounds=0, streams=0, tokens=0, kept=0, retries=0, turns=0)
         pieces_per_plan: dict[int, int] = defaultdict(int)
         stats.update(prefix_rows=0, prefix_hits=0, prefix_skipped=0)
-        self._prefix_cache_begin()
+        self._prefix_cache_begin(len(pending))
         live: list[dict[str, Any]] = []
         retries: dict[int, int] = defaultdict(int)
         turns: dict[asyncio.Task, tuple] = {}
@@ -2885,7 +2916,7 @@ class SpeculativeGeneration:
                 toks = toks.tolist() if isinstance(toks, np.ndarray) else list(toks)
                 a = s["taken"]
                 s["decoded"] = len(toks)  # stream length when its piece is taken
-                chunk = self._piece_tokens(len(s["plan"].prefix))
+                chunk = self._piece_tokens(len(s["plan"].prefix) + self._cw_pending(s))
                 n = len(toks) - a if done else ((len(toks) - a) // chunk) * chunk
                 if n > 0 or done:
                     # (stream, piece, stream finished, piece log-probs)
@@ -2912,7 +2943,7 @@ class SpeculativeGeneration:
             cut = []
             for (s, toks, done, lps), a in zip(ready, routes):
                 s["routes"] = a
-                plen = len(s["key"]) + len(s["plan"].prefix)
+                plen = len(s["key"]) + len(s["plan"].prefix) + self._cw_pending(s)
                 m = (
                     0
                     if a is None
@@ -2942,6 +2973,7 @@ class SpeculativeGeneration:
                     [
                         torch.tensor(s["key"], dtype=torch.long),
                         torch.tensor(s["plan"].prefix, dtype=torch.long),
+                        torch.tensor(s["cw"]["toks"] if "cw" in s else [], dtype=torch.long),
                     ]
                 )
                 d = (
@@ -2979,6 +3011,10 @@ class SpeculativeGeneration:
                             f"{max_retries} times in a row"
                         )
                 stats["retries"] += len(stale)
+                for s in stale:
+                    # A logging gap (independent of the tokens): the undecided
+                    # carried block is dropped with its stream.
+                    self._cw_reset(s)
                 stop(stale)
                 start([(s["key"], s["plan"]) for s in stale])
             return flat, rows, owners
@@ -3047,6 +3083,110 @@ class SpeculativeGeneration:
             if restart:
                 start([(s["key"], s["plan"]) for s in restart])
 
+        async def apply_cw(flat, owners, by_row, t_verify, kind):
+            """Carried walk (DESIGN 14r): advance blocks; apply decisions; scans to send."""
+            done_streams, restart, scans = [], [], []
+            n_rejects = 0
+            for r, ((_, d), s) in enumerate(zip(flat, owners)):
+                out = by_row[r]
+                plan, cw = s["plan"], self._cw(s)
+                if "prefix_start" in out:
+                    stats["prefix_rows"] += 1
+                    stats["prefix_hits"] += int(out["prefix_start"] > 0)
+                    stats["prefix_skipped"] += out["prefix_start"]
+                if kind == "piece":
+                    pieces_per_plan[id(plan)] += 1
+                    toks = list(d[2])
+                    g = len(toks)
+                    cw["pieces"].append(
+                        dict(a=cw["walk"]["n"], m=g, h=d[7], lb0=cw["walk"]["log_b"])
+                    )
+                    cw["toks"] += toks
+                    cw["lps"] += list(out["token_logprobs"])
+                    cw["lq"].extend(float(x) for x in d[6])
+                    cw["lr"].extend(out["log_ratio"])
+                    cw["anchors"] = d[8]
+                    s["taken"] += g
+                    stats["tokens"] += g
+                    dec = out["decision"]
+                    cw["walk"] = {k: out["walk"][k] for k in ("log_b", "floor", "n")}
+                    if dec is None:
+                        self._cw_free_below_floor(s)
+                        continue
+                    cw_stats["decisions"] += 1
+                    if dec == "scan":
+                        cw_stats["scans"] += 1
+                        scans.append(s)
+                        continue
+                    if dec == "whole":
+                        cw_stats["whole"] += 1
+                        n_blk = len(cw["toks"])
+                        stats["kept"] += n_blk
+                        start_pos = len(plan.prefix)
+                        plan.prefix += cw["toks"]
+                        plan.prefix_logprobs += cw["lps"]
+                        plan.anchors = cw["anchors"].truncate(len(s["key"]) + len(plan.prefix))
+                        self._cw_reset(s)
+                        if trace is not None:
+                            trace.piece(plan, start_pos, n_blk, n_blk, s["decoded"])
+                        if self._horizon_done(plan, len(s["key"])):
+                            done_streams.append(s)
+                        elif (bool(d[3]) and self.anchor_horizon is None) or self._turn_ended(
+                            s["key"], plan, plan.prefix[-1]
+                        ):
+                            done_streams.append(s)
+                            end_turn(s["key"], plan)
+                        if trace is not None and plan.complete:
+                            trace.completed(plan)
+                        continue
+                    tau, y, lpy = out["tau"], out["next"], out["next_logp"]
+                else:  # the rejection scan below a deciding piece
+                    cw_stats["ratio_mismatch"] += int(out.get("walk_ratio_mismatch", 0))
+                    tau, y, lpy = out["tau"], out["next"], out["next_logp"]
+                # Rejection at block position tau: keep the block's first tau tokens + y.
+                n_rejects += 1
+                cw_stats["rejects"] += 1
+                n_blk = len(cw["toks"])
+                stats["kept"] += tau
+                start_pos = len(plan.prefix)
+                plan.prefix += cw["toks"][:tau] + [y]
+                plan.prefix_logprobs += cw["lps"][:tau] + [lpy]
+                plan.anchors = cw["anchors"].truncate(len(s["key"]) + start_pos + tau)
+                self._cw_reset(s)
+                done_streams.append(s)
+                if trace is not None:
+                    trace.piece(plan, start_pos, n_blk, tau, s["decoded"])
+                if self._horizon_done(plan, len(s["key"])):
+                    pass
+                elif self._turn_ended(s["key"], plan, y):
+                    end_turn(s["key"], plan)
+                else:
+                    restart.append(s)
+                if trace is not None and plan.complete:
+                    trace.completed(plan)
+            if trace is not None:
+                trace.round(len(live), len(flat), t_verify, n_rejects)
+            if self.prefix_cache is not None:
+                self.prefix_cache.release(
+                    s["plan"].prefix_key for s in owners if s["plan"].complete
+                )
+            if done_streams:
+                stop(done_streams)
+                await self._notify_tails()
+            if restart:
+                start([(s["key"], s["plan"]) for s in restart])
+            if not scans:
+                return None
+            sflat, srows, sscans = [], [], []
+            for s in scans:
+                d_scan, scan = self._cw_scan_request(s, version)
+                sflat.append((len(sflat), d_scan))
+                srows.append(torch.cat([d_scan[0], torch.tensor(d_scan[2], dtype=torch.long)]))
+                sscans.append(scan)
+                cw_stats["scan_tokens"] += len(d_scan[2])
+            return sflat, srows, scans, sscans
+
+        cw_stats = dict(decisions=0, whole=0, rejects=0, scans=0, scan_tokens=0, ratio_mismatch=0)
         try:
             while live or inflight or turns:
                 progressed = False
@@ -3058,11 +3198,28 @@ class SpeculativeGeneration:
                         # Rollouts that ended in the environment can be served.
                         await self._notify_tails()
                 for task in [t for t in inflight if t.done()]:
-                    flat, owners, t_sent = inflight.pop(task)
+                    flat, owners, t_sent, kind = inflight.pop(task)
                     for s in owners:
                         busy.discard(id(s))
                     # Verification latency of the round (overlaps decoding).
-                    await apply(flat, owners, task.result(), time.perf_counter() - t_sent)
+                    if self.cw_rule is None:
+                        await apply(flat, owners, task.result(), time.perf_counter() - t_sent)
+                    else:
+                        scans = await apply_cw(
+                            flat, owners, task.result(), time.perf_counter() - t_sent, kind
+                        )
+                        if scans:
+                            sflat, srows, sowners, sscans = scans
+                            stask = asyncio.create_task(
+                                self._verify_block_async(
+                                    sflat,
+                                    srows,
+                                    self._prefix_keys([s["plan"] for s in sowners]),
+                                    walk_scans=sscans,
+                                )
+                            )
+                            inflight[stask] = (sflat, sowners, time.perf_counter(), "scan")
+                            busy.update(id(s) for s in sowners)
                     progressed = True
                 idle = [s for s in live if id(s) not in busy]
                 if idle:
@@ -3070,17 +3227,38 @@ class SpeculativeGeneration:
                     cand = [
                         s
                         for s, (n, done) in zip(idle, status)
-                        if done or n - s["taken"] >= self._piece_tokens(len(s["plan"].prefix))
+                        if done
+                        or n - s["taken"]
+                        >= self._piece_tokens(len(s["plan"].prefix) + self._cw_pending(s))
                     ]
                     flat, rows, owners = pieces(cand) if cand else ([], [], [])
                     if flat:
                         stats["rounds"] += 1
-                        task = asyncio.create_task(
-                            self._verify_block_async(
-                                flat, rows, self._prefix_keys([s["plan"] for s in owners])
+                        if self.cw_rule is None:
+                            task = asyncio.create_task(
+                                self._verify_block_async(
+                                    flat, rows, self._prefix_keys([s["plan"] for s in owners])
+                                )
                             )
-                        )
-                        inflight[task] = (flat, owners, time.perf_counter())
+                        else:
+                            task = asyncio.create_task(
+                                self._verify_block_async(
+                                    flat,
+                                    rows,
+                                    self._prefix_keys([s["plan"] for s in owners]),
+                                    walks=[
+                                        {
+                                            **self._cw(s)["walk"],
+                                            "final": bool(d[3]),
+                                            "rule": self.cw_rule.as_dict(),
+                                        }
+                                        for (_, d), s in zip(flat, owners)
+                                    ],
+                                    pins=[self._cw_pin(s) for s in owners],
+                                    keep_hidden=True,
+                                )
+                            )
+                        inflight[task] = (flat, owners, time.perf_counter(), "piece")
                         busy.update(id(s) for s in owners)
                         progressed = True
                 if not progressed:
@@ -3093,6 +3271,8 @@ class SpeculativeGeneration:
         finally:
             for task in inflight:
                 task.cancel()
+            for s in live:
+                self._cw_reset(s)
             if self.prefix_cache is not None:
                 self.prefix_cache.release(plan.prefix_key for _, plan in pending)
         if stats["prefix_rows"]:
@@ -3102,6 +3282,8 @@ class SpeculativeGeneration:
                     "spec/prefix_cache_tokens_skipped": float(stats["prefix_skipped"]),
                 }
             )
+        if self.prefix_cache is not None:
+            self._prefix_cache_report(stats["prefix_hits"])
         self.stats.update(
             {
                 "spec/sticky_rounds": float(stats["rounds"]),
@@ -3119,16 +3301,108 @@ class SpeculativeGeneration:
                 "spec/sticky_env_turns": float(stats["turns"]),
             }
         )
+        if self.cw_rule is not None:
+            self.stats.update({f"spec/cw_{k}": float(v) for k, v in cw_stats.items()})
+            self.stats["spec/cw_hidden_retained_bytes_max"] = float(self._cw_retained_max)
+            self._cw_retained_max = 0
         if self.turn_env is not None:
             # Environment latency now sits before the refit (DESIGN 14m).
             self.stats["spec/sticky_env_s"] = self.turn_env.env_s
             self.turn_env.env_s = 0.0
 
-    def _prefix_cache_begin(self) -> None:
+    # ---- carried walk (DESIGN 14r) ------------------------------------------------
+    _cw_retained_max = 0
+
+    def _cw(self, s: dict) -> dict:
+        """A stream's carried block (created on first use)."""
+        if "cw" not in s:
+            s["cw"] = dict(
+                walk={"log_b": 0.0, "floor": 0, "n": 0},
+                # fp32 per-token values as 4-byte arrays (driver RAM at 128k)
+                toks=[], lps=[], lq=array.array("f"), lr=array.array("f"), pieces=[],
+                anchors=None,
+            )
+        return s["cw"]
+
+    def _cw_pending(self, s: dict) -> int:
+        """Undecided block tokens of a stream (0 without the carried walk)."""
+        return len(s["cw"]["toks"]) if "cw" in s else 0
+
+    def _cw_reset(self, s: dict) -> None:
+        """Free the block's retained hidden rows and start a new block."""
+        cw = s.pop("cw", None)
+        if cw is not None:
+            self._free_hidden([pc["h"] for pc in cw["pieces"] if pc["h"] is not None])
+
+    def _cw_floor_piece(self, cw: dict) -> int:
+        """Block position where the piece holding the floor starts."""
+        f = cw["walk"]["floor"]
+        return max((pc["a"] for pc in cw["pieces"] if pc["a"] <= f), default=0)
+
+    def _cw_free_below_floor(self, s: dict) -> None:
+        """Hidden rows below the floor's piece are never read (h = 1 at the floor)."""
+        cw = s["cw"]
+        s0 = self._cw_floor_piece(cw)
+        drop = [pc for pc in cw["pieces"] if pc["a"] < s0 and pc["h"] is not None]
+        self._free_hidden([pc["h"] for pc in drop])
+        for pc in drop:
+            pc["h"] = None
+        held = sum(hidden_nbytes(pc["h"]) for pc in cw["pieces"] if pc["h"] is not None)
+        self._cw_retained_max = max(self._cw_retained_max, held)
+
+    def _cw_pin(self, s: dict) -> Optional[int]:
+        """Row position whose cached boundary the learner keeps for a rejection scan."""
+        if "cw" not in s:
+            return None
+        cw = s["cw"]
+        return len(s["key"]) + len(s["plan"].prefix) + self._cw_floor_piece(cw) - 1
+
+    def _cw_scan_request(self, s: dict, version: int) -> tuple[tuple, dict]:
+        """Draft tuple and scan dict of a block's rejection scan below its deciding piece."""
+        cw = s["cw"]
+        f = cw["walk"]["floor"]
+        stop = cw["pieces"][-1]["a"]
+        s0 = self._cw_floor_piece(cw)
+        sub = [pc for pc in cw["pieces"] if s0 <= pc["a"] < stop]
+        hs = [pc["h"] for pc in sub]
+        if any(h is None for h in hs):
+            raise RuntimeError("carried walk: a scanned piece's hidden rows were freed")
+        if all(isinstance(h, HiddenRefs) for h in hs):
+            hcat = HiddenRefs([seg for h in hs for seg in h.segs])
+        else:
+            hcat = torch.cat(hs)
+        for pc in sub:
+            pc["h"] = None  # handed to the scan call, which frees them
+        prompt = torch.cat(
+            [
+                torch.tensor(s["key"], dtype=torch.long),
+                torch.tensor(s["plan"].prefix, dtype=torch.long),
+                torch.tensor(cw["toks"][:s0], dtype=torch.long),
+            ]
+        )
+        toks = cw["toks"][s0:stop]
+        d = (
+            prompt,
+            -1,
+            toks,
+            False,
+            s["hkey"],
+            [(version, 0, len(toks))],
+            cw["lq"][s0:stop].tolist(),
+            hcat,
+            cw["anchors"].truncate(prompt.numel() + len(toks)),
+        )
+        lb0 = next(pc["lb0"] for pc in cw["pieces"] if pc["a"] == s0)
+        # Block positions: the scan row's draft is block positions [s0, stop).
+        scan = dict(log_ratio=cw["lr"][s0:stop].tolist(), log_b0=lb0, pos0=s0, floor=f, stop=stop)
+        return d, scan
+
+    def _prefix_cache_begin(self, rows: int = 0) -> None:
         """Learner prefix-state cache: costs on first use; empty at each new step.
 
         The learner drops its cached states when its weights change (every
         optimizer step), so the directory starts empty for each step's rounds.
+        ``rows``: continued rows of this call (sizes the per-rank budget).
         """
         if self.prefix_cache is None:
             return
@@ -3140,6 +3414,32 @@ class SpeculativeGeneration:
         if self._prefix_step != self.current_step:
             self.prefix_cache.reset()
             self._prefix_step = self.current_step
+        if rows:
+            self.prefix_cache.plan_step(rows, data_parallel_size(self.verifiers[0]))
+
+    def _prefix_cache_report(self, hits: int) -> None:
+        """Hit-rate metrics of the step's rounds; loud warning / gate when it thrashes."""
+        c = self.prefix_cache.take_counts()
+        self.stats.update({f"spec/prefix_cache_{k}": v for k, v in c.items()})
+        if not c["eligible"]:
+            return
+        frac = hits / c["eligible"]
+        self.stats["spec/prefix_cache_eligible_hit_frac"] = frac
+        if frac < 0.9 or c["denied"] or c["evicted"]:
+            print(
+                f"[prefix cache] WARNING step {self.current_step}: hit fraction {frac:.2f} of "
+                f"{int(c['eligible'])} re-verified rows; denied {int(c['denied'])} rows, evicted "
+                f"{int(c['evicted'])}; need {c['need_gb_per_rank']:.1f} GB/rank at the row cap, "
+                f"budget {c['budget_gb_per_rank']:.1f} GB/rank (learner_prefix_cache_max_gb). "
+                "Uncached rows re-forward their whole prefix per piece (O(L^2/c)).",
+                flush=True,
+            )
+        gate = self.prefix_cache.min_hit_frac
+        if gate > 0 and c["eligible"] >= 8 and frac < gate:
+            raise RuntimeError(
+                f"learner prefix cache hit fraction {frac:.2f} < "
+                f"learner_prefix_cache_min_hit_frac {gate} (raise max_gb or lower rows/rank)"
+            )
 
     def _prefix_keys(self, plans) -> Optional[list[str]]:
         """Cache keys of the plans whose pieces are verified (None: cache off)."""

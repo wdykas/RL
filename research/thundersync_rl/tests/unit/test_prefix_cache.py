@@ -28,8 +28,8 @@ GIB = 2**30
 
 
 # ---- driver: placement and membership ------------------------------------------------
-def _directory(max_gb=1.0, kv=1024, state=2**20, chunk=128):
-    d = PrefixCacheDirectory(gpu_gb=0.5, max_gb=max_gb)
+def _directory(max_gb=1.0, kv=1024, state=2**20, chunk=128, **kw):
+    d = PrefixCacheDirectory(gpu_gb=0.5, max_gb=max_gb, **kw)
     d.configure(
         [
             {"kv_bytes_per_token": kv, "state_bytes_per_boundary": state, "chunk": chunk, "max_keep": 4},
@@ -70,7 +70,7 @@ def test_continued_rows_keep_their_rank():
 
 
 def test_budget_releases_least_recently_verified_rows():
-    d = _directory(max_gb=0.01)  # ~10 MiB per rank
+    d = _directory(max_gb=0.01, policy="lru")  # ~10 MiB per rank
     per_row = d.entry_bytes(2000, 1872)
     assert per_row == 2000 * 1024 + 2 * 2 * 2**20
     keys = [d.new_key() for _ in range(3)]
@@ -85,6 +85,50 @@ def test_budget_releases_least_recently_verified_rows():
     big = d.new_key()
     _, sent = d.place([big], [20000], [19872], ranks=1)
     assert sent == [None] and big not in d.owner
+
+
+def _cyclic_hits(d, rows, rounds, ranks=1, n0=1000, c=128):
+    """Continuation rounds visit every row in turn; hits = placements of a row already cached."""
+    keys = [d.new_key() for _ in range(rows)]
+    hits = 0
+    for t in range(rounds):
+        for k in keys:
+            n = n0 + t * c
+            was = k in d.owner
+            _, sent = d.place([k], [n + c], [n], ranks=ranks)
+            hits += int(was and sent[0] is not None)
+    return hits / (rows * (rounds - 1))
+
+
+def test_lru_thrashes_under_cyclic_rounds_and_pinning_does_not():
+    """The 128k failure mode (agent_carried_walk.md): working set above the budget."""
+    kw = dict(kv=1024, state=2**20, row_cap_tokens=4000)
+    lru = _directory(max_gb=0.03, policy="lru", **kw)
+    pin = _directory(max_gb=0.03, policy="pin", **kw)
+    per_row = pin.row_bytes()
+    assert per_row == pin.entry_bytes(4000, 1) + 2 * 2**20
+    fits = int(pin.max_bytes // per_row)
+    assert 0 < fits < 10
+    assert _cyclic_hits(lru, 10, 6) == 0.0  # every access misses
+    frac = _cyclic_hits(pin, 10, 6)
+    assert frac == pytest.approx(fits / 10)
+    c = pin.take_counts()
+    assert c["admitted"] == fits and c["evicted"] == 0 and c["denied"] == (10 - fits) * 6
+    assert c["eligible"] == fits * 5
+    assert lru.take_counts()["evicted"] > 0
+
+
+def test_auto_budget_is_rows_per_rank_times_row_bytes_capped():
+    d = _directory(max_gb=1.0, kv=1024, state=2**20, row_cap_tokens=4000)
+    d.plan_step(rows=10, ranks=4)  # 3 rows per rank
+    assert d.need_bytes == 3 * d.row_bytes() and d.max_bytes == d.need_bytes
+    d.plan_step(rows=10_000, ranks=4)
+    assert d.max_bytes == 1 * GIB and d.need_bytes > d.max_bytes
+    f = _directory(max_gb=1.0, size="fixed", row_cap_tokens=4000)
+    f.plan_step(rows=10, ranks=4)
+    assert f.max_bytes == 1 * GIB
+    with pytest.raises(ValueError):
+        _directory(policy="mru")
 
 
 def test_release_and_reset():
@@ -120,12 +164,14 @@ def test_keep_boundaries():
     assert c.keep(0, 64) == [0, 20, 40, 60]
 
 
-def _commit(c, key, tokens, start, kv_dim=2):
+def _commit(c, key, tokens, start, kv_dim=2, pin=None):
     """What a forward of [start, n) leaves behind (the hooks' pending tensors)."""
     from nemo_rl.models.megatron.prefix_state_cache import _Row
 
     n = tokens.numel()
-    r = _Row(key, tokens, start, c.entries.get(key) if start else None, c.keep(start, n))
+    keep = c.keep(start, n)
+    entry = c.entries.get(key) if start else None
+    r = _Row(key, tokens, start, entry, keep, c.retain(c.entries.get(key), start, keep, pin))
     if r.keep and r.new_kv_len > r.start:
         m = r.new_kv_len - start
         k = tokens[start : start + m].float().view(m, 1, 1).expand(m, 1, kv_dim).contiguous()
@@ -167,6 +213,28 @@ def test_commit_continues_from_cached_kv_and_states():
     assert e.states[8] is old_state_8  # the start boundary carries over
     assert torch.equal(e.kv[1][0][:16, 0, 0], nxt[:16].float())
     assert torch.equal(e.tokens, nxt[:16])
+
+
+def test_pin_retains_the_floor_boundary_across_pieces():
+    """Carried walk (DESIGN 14r): a pinned older boundary survives later pieces, so a
+    rejection scan can re-forward the block from its floor's piece."""
+    c = _cache(chunk=4)
+    row = torch.arange(100, 111)
+    _commit(c, "a", row, 0)  # boundaries 4, 8
+    s4 = c.entries["a"].states[4]
+    nxt = torch.cat([row, torch.arange(200, 207)])  # n = 18
+    _commit(c, "a", nxt, 8, pin=6)  # keeps 8, 12, 16 and the pinned 4
+    assert sorted(c.entries["a"].states) == [4, 8, 12, 16]
+    assert c.entries["a"].states[4] is s4
+    nxt2 = torch.cat([nxt, torch.arange(300, 306)])  # n = 24
+    _commit(c, "a", nxt2, 16, pin=6)
+    assert sorted(c.entries["a"].states) == [4, 16, 20]
+    # a scan row whose prompt ends at 7 (floor piece) starts from boundary 4
+    assert c.start("a", nxt2[:20], 7) == 4
+    # without a pin the old boundary is dropped
+    _commit(c, "a", nxt2, 16)
+    assert sorted(c.entries["a"].states) == [16, 20]
+    assert c.retain(None, 8, [8], 6) == [] and c.retain(c.entries["a"], 0, [0, 4], 6) == []
 
 
 def test_weights_version_and_release_drop_entries():

@@ -20,10 +20,16 @@ same lists and picks the same start positions without any communication among ra
 - placement: a continued row is verified on the data-parallel rank that holds its state
   (sticky owner); new rows go longest-first onto the least-loaded rank, by the tokens each
   row will actually forward (placement never enters a decision, ``lpt_owners``);
-- memory: each rank's cached rows cost at most ``max_gb`` (positions x K/V bytes + kept
-  boundaries x Mamba state bytes, the largest per-rank costs the workers report); the least
-  recently verified rows of an over-budget rank are released (they forward whole next time:
-  slower, same bits). Device residency within that is the worker's (``gpu_gb``);
+- memory: each rank's cached rows cost at most the budget (positions x K/V bytes + kept
+  boundaries x Mamba state bytes, the largest per-rank costs the workers report). ``size``
+  "auto" sets the budget to what this step's continued rows need at the row cap
+  (rows per rank x one row's bytes at ``row_cap_tokens``), at most ``max_gb``; "fixed" uses
+  ``max_gb``. ``policy`` "pin" (default) admits a row only if its reservation (its bytes at
+  the row cap) fits and never evicts: continuation rounds visit every row cyclically, and
+  least-recently-used eviction with a working set above the budget misses on *every* access
+  (measured in the MC of agent_carried_walk.md; it silently degrades to O(L^2 / c)), while
+  pinning keeps budget / need of the rows hitting. "lru" is the former policy. Rows not
+  cached forward whole (slower, same bits). Device residency is the worker's (``gpu_gb``);
 - lifetime: a row's state is released when its rollout is complete; everything is dropped
   when the learner's weights change (the worker clears itself on a new weights version, and
   the directory resets at each step).
@@ -61,11 +67,26 @@ def lpt_owners(
 class PrefixCacheDirectory:
     """Membership and placement of rows in the learner ranks' prefix-state caches."""
 
-    def __init__(self, gpu_gb: float = 8.0, max_gb: float = 32.0):
+    def __init__(
+        self,
+        gpu_gb: float = 8.0,
+        max_gb: float = 32.0,
+        size: str = "auto",
+        policy: str = "pin",
+        row_cap_tokens: Optional[int] = None,
+        min_hit_frac: float = 0.0,
+    ):
         if max_gb <= 0 or gpu_gb < 0:
             raise ValueError("learner_prefix_cache: need max_gb > 0 and gpu_gb >= 0")
+        if size not in ("auto", "fixed") or policy not in ("pin", "lru"):
+            raise ValueError(f"learner_prefix_cache: size {size!r} / policy {policy!r}")
         self.gpu_gb = float(gpu_gb)
-        self.max_bytes = int(max_gb * 2**30)
+        self.cap_bytes = int(max_gb * 2**30)
+        self.max_bytes = self.cap_bytes
+        self.size, self.policy = size, policy
+        self.row_cap_tokens = row_cap_tokens
+        self.min_hit_frac = float(min_hit_frac)
+        self.need_bytes = 0
         self.kv_bytes = self.state_bytes = 0
         self.chunk = 128
         self.max_keep = 4
@@ -90,6 +111,22 @@ class PrefixCacheDirectory:
         self.cost: dict[str, int] = {}
         self.lru: dict[int, OrderedDict] = {}
         self._release: list[str] = []
+        self.seen: set[str] = set()  # keys forwarded under the cache at least once
+        self.counts = dict(admitted=0, denied=0, evicted=0, eligible=0)
+
+    def row_bytes(self, prompt_len: int = 1) -> int:
+        """One row's bytes at the row cap (its reservation under "pin")."""
+        n = int(self.row_cap_tokens or 0)
+        return self.entry_bytes(n, prompt_len) + (self.state_bytes if self.policy == "pin" else 0)
+
+    def plan_step(self, rows: int, ranks: int) -> None:
+        """Budget for a step's continuation rounds: ``rows`` continued rows over ``ranks``."""
+        per_rank = -(-rows // max(ranks, 1))
+        self.need_bytes = per_rank * self.row_bytes() if self.row_cap_tokens else 0
+        if self.size == "auto" and self.need_bytes:
+            self.max_bytes = min(self.cap_bytes, max(self.need_bytes, 1))
+        else:
+            self.max_bytes = self.cap_bytes
 
     def new_key(self) -> str:
         return f"p{next(self._ids)}"
@@ -113,8 +150,12 @@ class PrefixCacheDirectory:
         fixed = {i: self.owner[k] for i, k in enumerate(keys) if k in self.owner}
         load = [self.forwarded(k, n, p) for k, n, p in zip(keys, lengths, prompt_lens)]
         owners = lpt_owners(load, ranks, fixed)
+        if self.policy == "pin":
+            return owners, self._place_pinned(keys, lengths, prompt_lens, owners)
         sent: list[Optional[str]] = []
         for k, n, p, r in zip(keys, lengths, prompt_lens, owners):
+            # eligible: forwarded before (an evicted row still counts: its miss is thrash)
+            self.counts["eligible"] += int(k in self.seen)
             lru = self.lru.setdefault(r, OrderedDict())
             lru.pop(k, None)
             need = self.entry_bytes(n, p)
@@ -124,6 +165,7 @@ class PrefixCacheDirectory:
                 used -= self.cost.pop(old)
                 self.owner.pop(old, None)
                 self._release.append(old)
+                self.counts["evicted"] += 1
             if need > self.max_bytes:
                 self._forget(k)
                 sent.append(None)
@@ -131,8 +173,49 @@ class PrefixCacheDirectory:
             lru[k] = True
             self.cost[k] = need
             self.owner[k] = r
+            self.seen.add(k)
             sent.append(k)
         return owners, sent
+
+    def _place_pinned(self, keys, lengths, prompt_lens, owners) -> list[Optional[str]]:
+        """Admission without eviction: a row reserves its bytes at the row cap once
+        (without a row cap: its current bytes, updated as it grows)."""
+        sent: list[Optional[str]] = []
+        for k, n, p, r in zip(keys, lengths, prompt_lens, owners):
+            if k in self.owner:
+                self.counts["eligible"] += int(k in self.seen)
+                if not self.row_cap_tokens:
+                    self.cost[k] = max(self.cost[k], self.entry_bytes(n, p) + self.state_bytes)
+                self.seen.add(k)
+                sent.append(k)
+                continue
+            lru = self.lru.setdefault(r, OrderedDict())
+            need = (
+                self.row_bytes(p)
+                if self.row_cap_tokens
+                else self.entry_bytes(n, p) + self.state_bytes
+            )
+            used = sum(self.cost[x] for x in lru)
+            if used + need > self.max_bytes:
+                self.counts["denied"] += 1
+                sent.append(None)
+                continue
+            self.counts["admitted"] += 1
+            lru[k] = True
+            self.cost[k] = need
+            self.owner[k] = r
+            self.seen.add(k)
+            sent.append(k)
+        return sent
+
+    def take_counts(self) -> dict[str, float]:
+        """This step's admission counters and budget (metrics), then zero the counters."""
+        out = {k: float(v) for k, v in self.counts.items()}
+        out["need_gb_per_rank"] = self.need_bytes / 2**30
+        out["budget_gb_per_rank"] = self.max_bytes / 2**30
+        out["max_rank_gb"] = max(self.rank_bytes().values(), default=0) / 2**30
+        self.counts = dict(admitted=0, denied=0, evicted=0, eligible=0)
+        return out
 
     def release(self, keys) -> None:
         """Rows whose rollouts are complete (released by the next call)."""

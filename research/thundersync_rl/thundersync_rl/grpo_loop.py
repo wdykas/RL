@@ -314,6 +314,14 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # pieces are O(L^2 / chunk) per continued row; growth 1.0 keeps <= 7 pieces
     # per 8k row. 0: fixed pieces.
     sticky_continuation_chunk_growth: float = 1.0
+    # Carried-walk continuation verification (DESIGN.md section 14r; carried_walk.py).
+    # "every": every piece is its own block (decided at its end; the walk restarts).
+    # "row": the pieces of a stream form one block, decided only at the stream's end
+    # (the one-block law). "dip": also decided at a piece end where the walk has
+    # dipped by -log b >= sticky_continuation_decision_dip. Forward pieces keep the
+    # chunk/growth sizes above; decisions are a separate schedule. All exact.
+    sticky_continuation_decision: str = "every"
+    sticky_continuation_decision_dip: float = 0.1
     # Learner prefix-state cache (DESIGN.md section 14p; nemo_rl/models/megatron/
     # prefix_state_cache.py). Each continuation piece is verified by a forward
     # of positions [last Mamba chunk boundary before the piece, end of piece)
@@ -322,14 +330,22 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # O(L^2 / piece). Bitwise the whole-row forward's logits (batch
     # invariance). The driver keeps a row on the learner rank that holds its
     # state. Per learner rank: device residency gpu_gb (colder rows wait in
-    # pinned host memory), total max_gb (least recently verified rows are
-    # dropped beyond it: slower, same bits). Requires sticky_routing,
+    # pinned host memory), total budget at most max_gb: size "auto" = this
+    # step's continued rows per rank x one row's bytes at the row cap; policy
+    # "pin" admits a row only if its reservation fits and never evicts (LRU
+    # thrashes under cyclic rounds: every access misses); uncached rows
+    # forward whole (slower, same bits). min_hit_frac > 0 raises when the hit
+    # fraction of re-verified rows falls below it (a warning is always
+    # printed below 0.9 / on denials). Requires sticky_routing,
     # verify_source=engine, verify_on=learner, no sticky_rounding, no context
     # parallelism, a model without RoPE (Nemotron-H; RoPE offsets not built
     # yet). Off until validated.
     learner_prefix_cache: bool = False
     learner_prefix_cache_gpu_gb: float = 8.0
     learner_prefix_cache_max_gb: float = 32.0
+    learner_prefix_cache_size: str = "auto"
+    learner_prefix_cache_policy: str = "pin"
+    learner_prefix_cache_min_hit_frac: float = 0.0
     # Sticky, one engine: serve and train every rollout whose plan is complete
     # while the continuation rounds of the other rows still run (both are
     # learner-side at theta_k; DESIGN.md section 14k). False: training starts
@@ -550,6 +566,7 @@ def validate_config(master_config: ThunderSyncMasterConfig) -> None:
     validate_null_bv(master_config)
     validate_tail_tools(master_config)
     validate_learner_prefix_cache(master_config)
+    validate_carried_walk(master_config)
     if master_config.thundersync.draft_until_complete and not (
         master_config.thundersync.sticky_routing
     ):
@@ -583,6 +600,10 @@ def validate_learner_prefix_cache(master_config: ThunderSyncMasterConfig) -> Non
         problems.append("context parallelism not built yet")
     if ts_cfg.learner_prefix_cache_max_gb <= 0 or ts_cfg.learner_prefix_cache_gpu_gb < 0:
         problems.append("needs learner_prefix_cache_max_gb > 0 and gpu_gb >= 0")
+    if getattr(ts_cfg, "learner_prefix_cache_size", "auto") not in ("auto", "fixed"):
+        problems.append("learner_prefix_cache_size must be 'auto' or 'fixed'")
+    if getattr(ts_cfg, "learner_prefix_cache_policy", "pin") not in ("pin", "lru"):
+        problems.append("learner_prefix_cache_policy must be 'pin' or 'lru'")
     if problems:
         raise ValueError("thundersync.learner_prefix_cache: " + "; ".join(problems) + ".")
 
@@ -739,6 +760,30 @@ def validate_sticky_rounding(master_config: ThunderSyncMasterConfig) -> None:
         )
     if problems:
         raise ValueError("thundersync.sticky_rounding: " + "; ".join(problems) + ".")
+
+
+def validate_carried_walk(master_config: ThunderSyncMasterConfig) -> None:
+    """Carried-walk decisions (DESIGN 14r) apply to sticky continuation rounds."""
+    from thundersync_rl.carried_walk import DecisionRule
+
+    ts_cfg = master_config.thundersync
+    rule = DecisionRule(
+        ts_cfg.sticky_continuation_decision, float(ts_cfg.sticky_continuation_decision_dip)
+    )
+    if rule.mode == "every":
+        return
+    problems = []
+    if not ts_cfg.sticky_routing:
+        problems.append("thundersync.sticky_routing must be true (continuation rounds)")
+    if ts_cfg.verify_source != "engine" or ts_cfg.verify_on != "learner":
+        problems.append(
+            "thundersync.verify_source='engine' and verify_on='learner' are required "
+            "(engine placement: same functions, wiring not built on this branch)"
+        )
+    if ts_cfg.banded_is_band is not None:
+        problems.append("thundersync.banded_is_band does not compose with carried blocks")
+    if problems:
+        raise ValueError("sticky_continuation_decision: " + "; ".join(problems))
 
 
 def validate_null_bv(master_config: ThunderSyncMasterConfig) -> None:
@@ -2070,6 +2115,8 @@ def make_speculative_generation(
         null_bv_spare_prompts=ts_cfg.null_bv_spare_prompts,
         sticky_chunk_tokens=ts_cfg.sticky_continuation_chunk_tokens,
         sticky_chunk_growth=ts_cfg.sticky_continuation_chunk_growth,
+        sticky_decision=ts_cfg.sticky_continuation_decision,
+        sticky_decision_dip=ts_cfg.sticky_continuation_decision_dip,
         draft_until_complete=ts_cfg.draft_until_complete,
         draft_weights=ts_cfg.draft_weights,
         banded_is_band=ts_cfg.banded_is_band,
@@ -2081,6 +2128,10 @@ def make_speculative_generation(
             {
                 "gpu_gb": ts_cfg.learner_prefix_cache_gpu_gb,
                 "max_gb": ts_cfg.learner_prefix_cache_max_gb,
+                "size": ts_cfg.learner_prefix_cache_size,
+                "policy": ts_cfg.learner_prefix_cache_policy,
+                "row_cap_tokens": master_config.policy["max_total_sequence_length"],
+                "min_hit_frac": ts_cfg.learner_prefix_cache_min_hit_frac,
             }
             if ts_cfg.learner_prefix_cache
             else None
