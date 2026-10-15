@@ -1717,8 +1717,15 @@ Exactness: within a step v is fixed before any of the step's drafts is verified 
 past, like a hyperparameter), so M_j stays a function of the counts (d, s) alone. The optional-
 sampling argument above holds unchanged. Estimating v from the step's own rows would be forbidden
 (content-dependent M). Lanes: each lane's speculator calibrates from the steps it verified.
-`null_bv_tail_weight` scales the tail cost against a fresh decode (a constant). Logged:
-`spec/null_v_used`, `spec/logratio_var_step`, `spec/logratio_mean_step`, `spec/null_v_next`.
+`null_bv_tail_weight` scales the tail cost against a fresh decode (a constant).
+Verification is not free either. Each verified draft costs `verify_cost` fresh decodes, so a BOT
+draft costs a verification too. `verify_cost` is measured the same past-only way: earlier steps'
+verification seconds per verified draft, divided by a full decode (earlier drafts' per-token
+latency at the cut times the cap). It therefore adapts to wherever verification runs (learner,
+engine, fused with training). This matters because fixed M = 1.3 at L8 was slower: verify0 grew
+from 1.5 to 2.1–2.3 s while a rejection still occurred [M, cut-p-l2-M13]. Logged:
+`spec/null_v_used`, `spec/null_verify_cost_used`, `spec/logratio_var_step`,
+`spec/logratio_mean_step`, `spec/null_v_next`.
 Unit-tested (past-only update, decay, counts-only M). Validation queued: order-replay exactness run
 and perf vs `cut-p-l2-M13` (fixed M = 1.3).
 

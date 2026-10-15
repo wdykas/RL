@@ -741,6 +741,13 @@ class SpeculativeGeneration:
                 t0 = time.perf_counter()
                 peeked = [_drafted(x) for x in self._peek_streams(rank0, list(range(len(prompts))))]
                 self.stats["cut/peek_s"] = time.perf_counter() - t0
+                calib = self.__dict__.get("_null_calib")
+                running = [len(toks) for toks, done, _ in peeked if not done]
+                if calib is not None and running:
+                    # Per-token decode latency of one stream, for later steps'
+                    # ⊥-BV verify cost (drafts admitted at the start run
+                    # the whole window; the longest unfinished one did).
+                    calib.update_decode(t0 - t_start, max(running))
                 handout = lambda: self._handout_running(  # noqa: E731
                     peeked, hkeys, plens, budget, target=step + 1
                 )
@@ -1736,9 +1743,14 @@ class SpeculativeGeneration:
             # This step's v: earlier steps' rows only (fixed before any of
             # this step's drafts is verified).
             v = calib.estimate()
-            if v != self._null_policy.logratio_var:
-                self._null_policy = NullPolicy(**{**self.null_bv_policy, "logratio_var": v})
+            cv = calib.verify_cost(int(self.null_bv_policy.get("ref_len", self.max_new_tokens)))
+            if (v, cv) != (self._null_policy.logratio_var, self._null_policy.verify_cost):
+                self._null_policy = NullPolicy(
+                    **{**self.null_bv_policy, "logratio_var": v, "verify_cost": cv}
+                )
             self.stats["spec/null_v_used"] = v
+            self.stats["spec/null_verify_cost_used"] = cv
+        t_verify, n_forwarded = time.perf_counter(), 0
         policy = self._null_policy
         queue: dict[str, list[int]] = defaultdict(list)
         for i, g in enumerate(groups):
@@ -1762,6 +1774,7 @@ class SpeculativeGeneration:
             if not batch:
                 break
             waves += 1
+            n_forwarded += len(batch)
             res = self._verify_block(
                 [flat[i] for i in batch],
                 [rows[i] for i in batch],
@@ -1788,6 +1801,9 @@ class SpeculativeGeneration:
         for i in skipped:
             out[i] = _null_result({}, None)
         self.stats["spec/null_waves"] = float(waves)
+        if calib is not None:
+            # This step's verification cost, for later steps' policies only.
+            calib.update_verify(time.perf_counter() - t_verify, n_forwarded)
         self.stats["spec/null_envelopes_per_row"] = sum(map(len, row_env.values())) / max(len(row_env), 1)
         self.stats["spec/null_skipped_drafts"] = float(len(skipped))
         return out

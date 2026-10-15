@@ -854,3 +854,20 @@ def test_larger_logratio_var_and_tail_weight_raise_the_envelope():
         assert weighted.m(12, 8) >= plain.m(12, 8)
     # Still counts only, and M = 1 once drafts no longer exceed slots.
     assert weighted.m(8, 8) == 1.0
+
+
+def test_verify_cost_is_measured_from_past_steps_and_lowers_the_envelope():
+    from thundersync_rl.null_bv import LogRatioCalibration, NullPolicy
+
+    cal = LogRatioCalibration(prior=1e-4, decay=0.0)
+    assert cal.verify_cost(1024) == 0.0  # nothing measured yet
+    cal.update_verify(seconds=1.6, rows=160)  # 10 ms per verified draft
+    assert cal.verify_cost(1024) == 0.0  # decode latency still unknown
+    cal.update_decode(seconds=5.12, tokens=1024)  # 5 ms per token: a full decode is 5.12 s
+    assert cal.verify_cost(1024) == pytest.approx(0.01 / 5.12)
+    free = NullPolicy(logratio_var=1e-4, ref_len=1024)
+    costly = NullPolicy(logratio_var=1e-4, ref_len=1024, verify_cost=0.2)
+    assert costly.m(12, 8) <= free.m(12, 8)
+    assert costly.m(12, 8) < free.m(12, 8) or free.m(12, 8) == 1.0
+    with pytest.raises(ValueError):
+        NullPolicy(verify_cost=-1.0)

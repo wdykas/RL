@@ -68,7 +68,12 @@ is built from it before any of the step's drafts is verified, so within the
 step v is a constant determined by the past, like a hyperparameter, and M_j
 remains a function of the counts only: the argument above holds unchanged.
 Estimating v from the step's own rows would make M_j depend on the drafts'
-contents (forbidden, section 3.4 above). ``tail_weight`` scales the tail cost
+contents (forbidden, section 3.4 above). The same holds for ``verify_cost``,
+the critical-path cost of verifying one draft (a BOT draft costs a
+verification too), measured as earlier steps' verification seconds per
+verified draft over a full decode (earlier drafts' per-token latency times
+the cap): it adapts to wherever verification runs (learner, engine, fused
+with training). ``tail_weight`` scales the tail cost
 against a fresh decode (a constant of the cost model). v drifts over training
 as the policy sharpens, so a fixed v leaves M near 1 when tails are not rare.
 
@@ -145,6 +150,9 @@ class NullPolicy:
     prompt_drop: bool = False
     # Critical-path weight of a tail decode against a fresh decode of a slot.
     tail_weight: float = 1.0
+    # Critical-path cost of verifying one draft (any outcome), in fresh
+    # decodes: a BOT outcome is not free, the next draft is verified too.
+    verify_cost: float = 0.0
     grid: tuple[float, ...] = M_GRID
     _table: dict[tuple[int, int], float] = field(default_factory=dict, repr=False)
     _value: dict[tuple[int, int], float] = field(default_factory=dict, repr=False)
@@ -155,6 +163,8 @@ class NullPolicy:
             raise ValueError(f"null_bv fixed M must be >= 1 (got {self.fixed_m})")
         if any(not m >= 1.0 for m in self.grid):
             raise ValueError(f"null_bv M grid must be >= 1 (got {self.grid})")
+        if not self.verify_cost >= 0.0:
+            raise ValueError(f"null_bv verify cost must be >= 0 (got {self.verify_cost})")
         if self.prompt_drop and self.fixed_m is None:
             raise ValueError("null_bv prompt drop needs a constant envelope (fixed_m)")
 
@@ -208,7 +218,8 @@ class NullPolicy:
                     best, bm = math.inf, 1.0
                     for M in (1.0,) if dd <= ss else self.grid:
                         val = (
-                            self.costs()[M]
+                            self.verify_cost
+                            + self.costs()[M]
                             + self.value(dd - 1, ss - 1) / M
                             + (1 - 1 / M) * self.value(dd - 1, ss)
                         )
@@ -241,9 +252,33 @@ class LogRatioCalibration:
         self.prior, self.decay = float(prior), float(decay)
         self.value: Optional[float] = None
         self.last_step: Optional[float] = None
+        # Verification seconds per verified draft and engine seconds per
+        # decoded token (one stream), both measured on earlier steps: the
+        # verify cost in fresh decodes is their ratio over the rollout cap.
+        self.verify_row_s: Optional[float] = None
+        self.token_s: Optional[float] = None
 
     def estimate(self) -> float:
         return self.prior if self.value is None else self.value
+
+    def _ema(self, old: Optional[float], new: float) -> float:
+        return new if old is None else self.decay * old + (1 - self.decay) * new
+
+    def update_verify(self, seconds: float, rows: int) -> None:
+        """One step's verification wall time over the drafts it verified."""
+        if rows > 0 and seconds > 0:
+            self.verify_row_s = self._ema(self.verify_row_s, seconds / rows)
+
+    def update_decode(self, seconds: float, tokens: int) -> None:
+        """Wall time a still-running draft took to decode ``tokens`` tokens."""
+        if tokens > 0 and seconds > 0:
+            self.token_s = self._ema(self.token_s, seconds / tokens)
+
+    def verify_cost(self, cap: int) -> float:
+        """Critical-path cost of verifying one draft, in fresh full decodes (0 until measured)."""
+        if self.verify_row_s is None or self.token_s is None or cap <= 0:
+            return 0.0
+        return self.verify_row_s / (self.token_s * cap)
 
     def update(self, moments: list[tuple[int, float, float]]) -> None:
         """Fold in one step's per-row (tokens, sum log p/q, sum (log p/q)^2)."""
@@ -254,7 +289,7 @@ class LogRatioCalibration:
         sq = sum(m[2] for m in moments)
         v = max(sq / n - (s / n) ** 2, 0.0)
         self.last_step = v
-        self.value = v if self.value is None else self.decay * self.value + (1 - self.decay) * v
+        self.value = self._ema(self.value, v)
 
 
 def drafts_per_prompt(k: float, group_size: int) -> int:
