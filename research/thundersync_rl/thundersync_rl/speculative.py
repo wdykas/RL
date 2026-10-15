@@ -3534,6 +3534,25 @@ class SpeculativeGeneration:
         if ev is not None:
             ev.set()
 
+    # False once the step's refit left the engine off theta_k (a cohort lane
+    # that took no fresh refit, or ``draft_now``): set by the driver's refit.
+    fresh_at_current: bool = True
+
+    def _check_fresh_weights(self, key) -> None:
+        """A rollout about to decode at theta_k: the engine must hold theta_k.
+
+        The driver skips the theta_k refit when it predicts that no rollout
+        decodes on the engine (lanes: ``lane_fresh``; one engine: ``draft_now``).
+        A wrong prediction used to sample such rows from the drafting weights
+        silently (v0s-xlanes, 6fc1ae9c: forced-fresh rows, max|dlogp| 1.66).
+        """
+        if not self.fresh_at_current:
+            raise RuntimeError(
+                f"a rollout of prompt {key[:8]!r}... decodes at theta_k, but this step's "
+                "refit left the engine on the drafting weights (the driver predicted "
+                "no fresh row)"
+            )
+
     async def _await_plan(self, plan: Plan) -> None:
         cv = getattr(self, "_tail_cv", None)
         if cv is None or plan.complete:
@@ -4650,6 +4669,7 @@ class SpeculativeGeneration:
                 await self._weights_ready.wait()
                 if self._tail_error is not None:
                     raise RuntimeError("sticky tails or refit failed") from self._tail_error
+                self._check_fresh_weights(key)
         gen = list(plan.prefix)
         lps = list(plan.prefix_logprobs)
         if plan.fused is not None:

@@ -169,6 +169,59 @@ def test_stream_order_segments_tails_and_fresh():
         o.decided({"x": (1, 0)})
 
 
+def test_stream_order_fresh_keys_never_ready():
+    # "b" decodes at theta_k whatever its plans (debug fresh rows): never in a
+    # decided segment, listed in ``fresh`` at close, after the tail groups.
+    keys = ["a", "b", "c"]
+    need = Counter({k: 2 for k in keys})
+    o = StreamOrder(keys, need, groups_per_block=2, fresh_keys=["b"])
+    assert o.decided({"a": (2, 0), "b": (2, 0)}) == [0]
+    assert o.decided({"c": (2, 1)}) == []
+    o.close()
+    assert o.order == [0, 2, 1]
+    assert o.tail_groups == [2] and o.fresh == [1]
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_stream_fresh_covers_every_row_decoded_at_theta_k(seed, monkeypatch):
+    """Regression (v0s-xlanes at 6fc1ae9c, max|dlogp| 1.66): with cohort lanes the
+    cohort lane takes theta_k only if ``StreamOrder.fresh`` is non-empty. Forced
+    fresh rows (THUNDERSYNC_DEBUG_FRESH_MOD) had full plans, so ``fresh`` was empty,
+    the lane kept its drafting weights and those rows were sampled from them.
+    Every group with a rollout that ``_one`` decodes at theta_k must be fresh."""
+    from thundersync_rl.grpo_loop import stream_fresh_keys
+
+    monkeypatch.setenv("THUNDERSYNC_DEBUG_FRESH_MOD", "3")
+    rng = random.Random(seed)
+    G = 4
+    keys = [tuple(rng.randrange(1, 50) for _ in range(rng.randrange(2, 6))) for _ in range(12)]
+    keys[0] = (3, 3)  # at least one forced-fresh prompt
+    need = Counter({k: G * c for k, c in Counter(keys).items()})
+    o = StreamOrder(keys, need, groups_per_block=2, fresh_keys=stream_fresh_keys(keys))
+    info = {}
+    for k in dict.fromkeys(keys):
+        # Every drafted prompt decided with enough plans, some short, some with tails.
+        n = need[k] - (1 if rng.random() < 0.2 else 0)
+        info[k] = (n, 1 if rng.random() < 0.2 else 0)
+    o.decided(info)
+    o.close()
+    decodes_fresh = {
+        p for p, k in enumerate(keys) if spec_mod._debug_forced_fresh(k) or info[k][0] < need[k]
+    }
+    assert 0 in decodes_fresh
+    assert decodes_fresh == set(o.fresh)
+    # The lanes rule (grpo_loop ``tails_then_refit``): a fresh row means a theta_k refit.
+    assert bool(o.fresh)
+
+
+def test_rollout_at_theta_k_raises_when_the_refit_was_skipped():
+    s = SpeculativeGeneration.__new__(SpeculativeGeneration)
+    s._check_fresh_weights((1, 2))  # default: the engine holds theta_k
+    s.fresh_at_current = False
+    with pytest.raises(RuntimeError, match="drafting weights"):
+        s._check_fresh_weights((1, 2))
+
+
 def test_planner_follows_a_growing_order_like_the_final_one():
     """The same final order given at once (set_order) or grown with the decisions
     (begin/extend/close) dispatches the same chunks, whatever the arrival order."""
@@ -540,12 +593,13 @@ def test_verify0_stream_config_validation():
 
     ok = _master(verify0_stream=True)
     validate_verify0_stream(ok)
+    # Lanes: allowed again (forced-fresh rows now refit the cohort lane; v0s-xlanes).
+    validate_verify0_stream(_master(verify0_stream=True, cohort_lanes=2))
     for bad, match in (
         (dict(verify0_stream=True, null_bv_prompt_drop=True), "null_bv_prompt_drop"),
         (dict(verify0_stream=True, tail_excluded_baseline=True), "tail_excluded_baseline"),
         (dict(verify0_stream=True, verify0_stream_window=0), "window"),
         (dict(verify0_stream=True, stream_training_over_tails=False), "stream_training_over_tails"),
-        (dict(verify0_stream=True, cohort_lanes=2), "cohort_lanes"),
     ):
         with pytest.raises(ValueError, match=match):
             validate_verify0_stream(_master(**bad))

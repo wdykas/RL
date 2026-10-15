@@ -82,7 +82,7 @@ from thundersync_rl.run_state import (
     save_state,
 )
 from thundersync_rl.sentinel import WeightSentinel
-from thundersync_rl.speculative import SpeculativeGeneration, cohort_draft
+from thundersync_rl.speculative import SpeculativeGeneration, _debug_forced_fresh, cohort_draft
 from thundersync_rl.verify0_stream import StreamOrder, Verify0Risk
 from thundersync_rl import vit
 from thundersync_rl.window_pace import share_window_pacer
@@ -730,6 +730,16 @@ def validate_config(master_config: ThunderSyncMasterConfig) -> None:
     validate_verify0_stream(master_config)
 
 
+def stream_fresh_keys(row_keys) -> list:
+    """Prompt keys whose rollouts decode at theta_k whatever their plans.
+
+    The rule ``SpeculativeGeneration._one`` applies (``_debug_forced_fresh``):
+    streaming verify0's ``StreamOrder`` must list these groups as fresh, or a
+    cohort lane skips its theta_k refit and they decode on the drafting weights.
+    """
+    return sorted(k for k in set(row_keys) if _debug_forced_fresh(k))
+
+
 def validate_verify0_stream(master_config: ThunderSyncMasterConfig) -> None:
     """Settings risk-first streaming verify0 is built for (DESIGN 14z)."""
     ts_cfg = master_config.thundersync
@@ -756,12 +766,6 @@ def validate_verify0_stream(master_config: ThunderSyncMasterConfig) -> None:
             problems.append(f"{name} must be off (not built with verify0_stream)")
     if ts_cfg.sticky_anchor_horizon is not None:
         problems.append("the anchor horizon is not built with verify0_stream")
-    if (getattr(ts_cfg, "cohort_lanes", 1) or 1) > 1:
-        # Measured inexact (thundersync_work/runs_1node/v0s-xlanes, 6fc1ae9c: Nano
-        # L8, learner EP2 + two EP1 lanes, max|dlogp| 1.66 / 0.76 / 0.60 on steps
-        # 1-3, while the same layout without verify0_stream is EXACT on 5f835b57,
-        # bh-xlanes). Allowed again once the lanes path is fixed and re-validated.
-        problems.append("cohort_lanes > 1 failed its exactness check (v0s-xlanes); one engine only")
     if min(
         ts_cfg.verify0_stream_first_chunk_tokens,
         ts_cfg.verify0_stream_chunk_tokens,
@@ -3402,6 +3406,10 @@ def thundersync_grpo_train(
                     sentinel.check(lane_x.generation, f"theta_{step} (lane {lane_x.index})")
                 else:
                     lane_x.generation.prepare_for_generation()
+                # Without the refit the lane keeps the drafting weights: a
+                # rollout that then decodes there raises (``_one``) instead of
+                # sampling from them (v0s-xlanes at 6fc1ae9c).
+                spec.fresh_at_current = bool(lane_fresh)
                 refit_s.append(time.perf_counter() - t_r)
                 lane_stats["lanes/fresh_refit"] = float(lane_fresh)
                 return
@@ -3419,6 +3427,9 @@ def thundersync_grpo_train(
                 sentinel.check(policy_generation, f"theta_{step}")
             else:
                 policy_generation.prepare_for_generation()
+            # draft_now: the engine took theta_hat_{step+1}; nothing may decode at theta_k.
+            if spec is not None:
+                spec.fresh_at_current = not draft_now
             refit_s.append(time.perf_counter() - t_r)
 
         tails_s = []
@@ -3449,6 +3460,10 @@ def thundersync_grpo_train(
                     ),
                 ),
                 block_tokens=ts_cfg.canonical_block_tokens,
+                # Rows that decode at theta_k whatever their plans (debug fresh
+                # rows): their groups count as fresh, so the cohort lane takes
+                # theta_k for them (lanes) and they train after the tails.
+                fresh_keys=stream_fresh_keys(row_keys),
             )
             group_order, group_blocks = v0_order.order, v0_order.blocks
             tail_groups = v0_order.tail_groups

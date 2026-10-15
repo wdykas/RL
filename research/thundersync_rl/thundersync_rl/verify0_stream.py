@@ -43,7 +43,7 @@ from __future__ import annotations
 import math
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Callable, Hashable, Optional, Sequence
+from typing import Any, Callable, Hashable, Iterable, Optional, Sequence
 
 # Draft-length bucket upper edges (tokens); the last bucket is open.
 LENGTH_EDGES: tuple[int, ...] = (256, 1024, 2048, 4096, 8192)
@@ -188,6 +188,13 @@ class StreamOrder:
     ``groups_per_block`` groups within each appended segment, or one segment
     per append with ``block_tokens`` (the planner cuts it by tokens). The
     order is a function of the schedule (counts, past) and of the decisions.
+
+    ``fresh_keys``: prompts whose rollouts decode at theta_k whatever their
+    plans (``THUNDERSYNC_DEBUG_FRESH_MOD`` rows ignore their drafts). Their
+    groups are never ready at a decision and are listed in ``fresh``: with
+    cohort lanes ``fresh`` decides whether the cohort lane takes theta_k, so
+    every group with a row decoded at theta_k must be in it (v0s-xlanes at
+    6fc1ae9c decoded these rows on the drafting weights).
     """
 
     def __init__(
@@ -196,9 +203,11 @@ class StreamOrder:
         need: Counter,
         groups_per_block: int,
         block_tokens: Optional[int] = None,
+        fresh_keys: Iterable[Hashable] = (),
     ):
         self.row_keys = list(row_keys)
         self.need = need
+        self.fresh_keys = frozenset(fresh_keys)
         self.bg = max(1, int(groups_per_block))
         self.block_tokens = block_tokens
         self.order: list[int] = []
@@ -239,7 +248,11 @@ class StreamOrder:
 
     def _ready(self, key) -> bool:
         n, tails = self.info.get(key, (0, 0))
-        return n >= self.need[key] and tails == 0
+        return n >= self.need[key] and tails == 0 and key not in self.fresh_keys
+
+    def _fresh(self, key) -> bool:
+        """A rollout of ``key`` decodes at theta_k (too few plans, or a fresh key)."""
+        return key in self.fresh_keys or self.info.get(key, (0, 0))[0] < self.need[key]
 
     def decided(self, info: dict[Hashable, tuple[int, int]]) -> list[int]:
         if self.closed:
@@ -257,9 +270,7 @@ class StreamOrder:
             return
         listed = set(self.order)
         rest = [p for p in range(len(self.row_keys)) if p not in listed]
-        self.fresh = [
-            p for p in rest if self.info.get(self.row_keys[p], (0, 0))[0] < self.need[self.row_keys[p]]
-        ]
+        self.fresh = [p for p in rest if self._fresh(self.row_keys[p])]
         fresh = set(self.fresh)
         self.tail_groups[:] = [p for p in rest if p not in fresh]
         self._extend(list(self.tail_groups))

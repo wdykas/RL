@@ -3817,6 +3817,25 @@ calibration's verify cost is the calls' service time, which includes interleaved
 8k with CHECKS=1, parity reward, forced fresh rows, zero-advantage groups; order replay. Full Nano 8k pair
 (control vs streaming, same frozen tree ../RL-v0s-scale): `bash thundersync_work/sbatch/go_v0s.sh`.
 
+**Lanes fix (branch ts-v0s-lanes-fix off ts-integ3, 2026-10-15).** v0s-xlanes (6fc1ae9c) failed with max|dlogp|
+1.66 / 0.76 / 0.60 and exact_frac .875 / .688 / .625 on steps 1-3 [M runs_1node/v0s-xlanes]. Those fractions are
+exactly 1 - forced-fresh rows / 128 (16 / 40 / 48 rows, `debug/forced_fresh_rows`), and `lanes/fresh_refit` was 0
+on every one of those steps (bh-xlanes, same layout without streaming: 1, EXACT). Cause: with lanes the cohort
+lane takes θ_k only if some row decodes fresh; the streamed path decided that from `StreamOrder.fresh` (groups
+with fewer plans than rows), while `_one` also decodes fresh every row of a `THUNDERSYNC_DEBUG_FRESH_MOD` prompt
+whatever its plans. Those prompts were drafted and fully planned, so `fresh` was empty, the lane kept θ̂_k (the
+drafting weights) and the forced-fresh rows were sampled from θ̂_k and logged with its log-probs. Drafted rows
+were exact throughout (route / engine-q checks exact). The one-engine path refits θ_k unconditionally, hence
+v0s-x passed. Fix: `StreamOrder(fresh_keys=...)` (grpo_loop `stream_fresh_keys`, the same rule `_one` applies):
+those groups are never ready at a decision and are listed in `fresh` (trained after the tail groups), so the
+cohort lane refits. Guard: the driver's refit sets `spec.fresh_at_current` (lanes: `lane_fresh`; one engine:
+`not draft_now`), and a rollout reaching the θ_k decode with it false raises instead of sampling from the drafting
+weights. Production runs (no FRESH_MOD) had an empty `fresh_keys`, so their lanes path is unchanged by the fix;
+the guard now checks the prediction on every step. The validator accepts cohort_lanes > 1 again. Cost: none per
+rank (one set lookup per prompt on the driver). Tests: test_verify0_stream.py (fresh keys never ready; every
+group `_one` decodes at θ_k is in `fresh`, seeds 0-3; guard raises). Rerun: queue_1node `v0sl-xlanes`
+(+ `v0sl-x`, one engine, whose forced-fresh groups now train last).
+
 ## 14aa. Tail speed: verification yields into training, graphed restart prefill, lookup on real tail rows
 
 *Branch ts-tail-speed (../RL-tail). Code: `thundersync_rl/verify_yield.py`, `worker.py` (`_run_train_pieces`,
@@ -3893,7 +3912,7 @@ zero-advantage skip 14x + bughunt 14y). Notes, decisions and validation: thunder
 | Mamba fp32 pre-norm input (14b) | **default on** (`mamba_fp32_prenorm_input=false` = control) | m32-x1k / m32-x8k EXACT; m32-ut failures a subset of base; L8 harness v 2.5e-6 -> 5.9e-7 |
 | learner micro-batch 2 rows, 20480-token cap (ab_base, every arm) | **default** | mbs2-full-base: 2x8192 1399 ms/row vs 1655 (1x8192), bench peak 112 GiB -> ~159 GB in-loop; 4x8192 OOM; mbs-l8x x4/xl4/xcap EXACT, grad-norm MBS1 vs 4 rel 8e-5 |
 | verify_yield, tail dump, graphed-prefill knob (14aa) | opt-in | ty-x1k / ty-xl2 EXACT; L8 perf within noise; full-Nano go_tail yield arm (tyy) not run -> tail-redesign defaults (growth 0, graphed prefill) not adopted. Prefix cache at >= 4k was already run_ab_arm's default |
-| streaming verify0 (14z) | opt-in, **one engine only** | v0s-x / v0s-x8k / v0s-xnonull EXACT, order replay same_as_real; **v0s-xlanes FAIL** (max\|dlogp\| 1.66 / 0.76 / 0.60) -> validator rejects cohort_lanes > 1; no full-Nano gain on record |
+| streaming verify0 (14z) | opt-in | v0s-x / v0s-x8k / v0s-xnonull EXACT, order replay same_as_real; v0s-xlanes FAIL (max\|dlogp\| 1.66 / 0.76 / 0.60) = forced-fresh rows decoded on the cohort lane's drafting weights (no θ_k refit); fixed on ts-v0s-lanes-fix (14z "Lanes fix"), lanes re-allowed by the validator, rerun v0sl-xlanes pending; no full-Nano gain on record |
 | window pacing (14v) | opt-in | pace-x EXACT; pace-p1 on 9.77 vs ctl 9.60 s, pace-p2 8.57 vs 8.01 s (no gain) |
 | sticky rounding on hybrid (14g) | opt-in | sre2e-sr1-cur / sr1-mom / sr0-mom EXACT (c692af97); ~1.6x learner fwd+bwd; needs activation_checkpointing off |
 | callcost kernels (`NEMO_RL_FP16_MOE_TRAIN_GEMM=auto`) | opt-in | at the chosen MBS 2: mbs2-full-cc 2835 ms vs base 2797 ms per 2x8192 micro-batch (shim 2803): not faster |
