@@ -622,9 +622,9 @@ class BISplitKVConfig(TypedDict):
     # Keys per split, anchored at absolute positions: split s owns keys [s*S, (s+1)*S).
     # Part of the numerics (training and generation must agree); multiple of 128. Default 2048.
     seqlen_k_per_split: NotRequired[int | None]
-    # Fixed number of splits launched by every call (>= ceil(max context / S), >= 2): fixed
-    # CUDA-graph grids; empty splits contribute an exact zero. Default: derived from
-    # max(max_total_sequence_length, generation max_model_len).
+    # Number of splits per call (>= ceil(max context / S), >= 2); empty splits contribute an exact
+    # zero and the bits do not depend on it. Default: per call, ceil(max_seqlen_k / S), which a CUDA
+    # graph captures as a constant.
     num_splits: NotRequired[int | None]
 
 

@@ -57,9 +57,11 @@ def _resolve(cfg: dict, max_seq_len: int | None = None) -> dict:
     s = int(cfg.get("seqlen_k_per_split") or DEFAULT_SEQLEN_K_PER_SPLIT)
     ns = cfg.get("num_splits")
     if ns is None:
-        if not max_seq_len:
-            raise ValueError("bi_split_kv.num_splits unset and no max sequence length to derive it from")
-        ns = max(2, -(-int(max_seq_len) // s))
+        # Per call: ceil(max_seqlen_k / S) (>= 2). Bits do not depend on the split count, and a CUDA
+        # graph captures the call's max_seqlen_k as a constant, so the grid stays fixed per graph.
+        if max_seq_len and max_seq_len > 256 * s:
+            raise ValueError(f"bi_split_kv: max context {max_seq_len} needs > 256 splits of {s} keys")
+        return {"seqlen_k_per_split": s, "num_splits": None}
     ns = int(ns)
     if s <= 0 or s % 128:
         raise ValueError(f"bi_split_kv.seqlen_k_per_split={s} must be a positive multiple of 128")
@@ -91,6 +93,11 @@ def wrap(fn: Callable, cfg: dict, max_seq_len: int | None = None) -> Callable:
     def anchored(*args: Any, **kwargs: Any) -> Any:
         if kwargs.get("num_splits", 1) == 1 and kwargs.get("seqlen_k_per_split") is None:
             kwargs.update(c)
+            if kwargs["num_splits"] is None:
+                max_k = kwargs.get("max_seqlen_k")
+                if max_k is None:  # dense (bshd) path: keys are k.shape[1]
+                    max_k = (args[1] if len(args) > 1 else kwargs["k"]).shape[1]
+                kwargs["num_splits"] = max(2, -(-int(max_k) // c["seqlen_k_per_split"]))
             if not seen["logged"]:  # non-vacuity evidence: the anchored path actually ran
                 seen["logged"] = True
                 print(f"[bi_split_kv] first anchored call: {name} {c}", flush=True)
