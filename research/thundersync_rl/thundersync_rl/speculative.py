@@ -695,6 +695,11 @@ class SpeculativeGeneration:
                 del self._null_slots[t]  # never verified (no drafts reached it)
             self._null_slots[step + 1] = dict(null_slots)
         hkeys = self._hidden_keys([f"{step + 1}:{i}" for i in range(len(prompts))])
+        # ⊥-BV: the primaries (one per output slot) come first and must all
+        # run at once; the extras may queue behind them.
+        self._check_draft_capacity(
+            rank0, sum(null_slots.values()) if null_slots else len(prompts)
+        )
         t_start = time.perf_counter()
         ray.get(
             rank0.start_drafts.remote(
@@ -720,6 +725,9 @@ class SpeculativeGeneration:
                     rank0, hkeys, plens, budget, target=step + 1
                 )
                 self.stats["tail/next_drafted_tokens"] = float(sum(len(x[0]) for x in res))
+                if os.environ.get("THUNDERSYNC_DEBUG_DRAFT_LENS"):
+                    # Debug: drafted length per draft, in drafting (= admission) order.
+                    print(f"[draft lens] target={step + 1} {[len(x[0]) for x in res]}", flush=True)
                 self.stats["tail/next_drafts"] = float(len(res))
             else:
                 res = [_drafted(x) for x in self._collect_drafts(rank0)]
@@ -749,6 +757,30 @@ class SpeculativeGeneration:
             ]
 
         return collect
+
+    def _check_draft_capacity(self, rank0, n: int) -> None:
+        """Fail fast when the engine cannot run a cohort's ``n`` primary drafts at once.
+
+        Drafts beyond the engine's concurrent request capacity start only when
+        earlier ones finish (a whole draft's decode time later), so they are
+        short or empty at the cut and their rows decode as long tails or
+        fresh. ⊥-BV extras are submitted after the primaries and may queue. Raise the capacity with
+        ``policy.generation.mcore_generation_config.max_requests`` (hybrid
+        models: the Mamba region is then sized for that many requests, per
+        engine rank max_requests x Mamba state bytes per request) or fewer
+        drafts per cohort.
+        """
+        cap = self.__dict__.get("_draft_capacity")
+        if cap is None:
+            query = getattr(rank0, "engine_request_capacity", None)  # absent on test stubs
+            cap = self._draft_capacity = int(ray.get(query.remote())) if query else 0
+        if cap and n > cap:
+            raise RuntimeError(
+                f"{n} primary drafts per cohort but the engine runs {cap} requests at once "
+                "(max_requests x engine DP): set "
+                "policy.generation.mcore_generation_config.max_requests >= "
+                f"{n} / engine DP, or draft fewer rows per cohort"
+            )
 
     def _peek_streams(self, rank0, idx: list[int]) -> list:
         """(tokens, finished, engine log-probs) of running drafts, left running.
@@ -788,15 +820,23 @@ class SpeculativeGeneration:
         (drafts, hidden, anchors, stream handles).
         """
         n = len(prompt_lens)
+        t0 = time.perf_counter()
         res = [_drafted(x) for x in self._peek_streams(rank0, list(range(n)))]
+        t1 = time.perf_counter()
         routes = self._pop_routes(
             hkeys, prompt_lens, [budget] * n, target=target, close=False
         )
+        t2 = time.perf_counter()
         cut = [
             self._truncate_to_anchors(x, a, plen)
             for x, a, plen in zip(res, routes, prompt_lens)
         ]
         hid = self._take_hidden(hkeys, [0] * n, [len(x[0]) for x in cut])
+        t3 = time.perf_counter()
+        # Where the deadline cut goes (driver wall seconds).
+        self.stats["cut/peek_s"] = t1 - t0
+        self.stats["cut/routes_s"] = t2 - t1
+        self.stats["cut/hidden_s"] = t3 - t2
         res = [self._truncate(x, h) for x, h in zip(cut, hid)]
         anchors, streams = [], []
         for i, ((toks, _, _), a, plen) in enumerate(zip(res, routes, prompt_lens)):

@@ -1973,6 +1973,14 @@ def next_draft_prompts(
         # requests G rollouts per batch entry.
         n_drafts = drafts_per_prompt(ts_cfg.null_bv_drafts_per_output, G)
         nxt = next_batch.repeat_interleave(n_drafts)
+        # Submission order: every group's first G drafts (the ones its slots
+        # take unless some are rejected), then the extras. The engine admits
+        # drafts in this order, so with request capacity for the primaries
+        # the extras decode only in what is left of the window. Each pool's
+        # own order (draft index within the group) is unchanged.
+        primary = [i * n_drafts + j for i in range(next_batch.size) for j in range(G)]
+        extra = [i * n_drafts + j for i in range(next_batch.size) for j in range(G, n_drafts)]
+        nxt = nxt.select_indices(primary + extra)
         counts = collections.Counter()
         for i in range(next_batch.size):
             p = torch.cat([m["token_ids"] for m in next_batch["message_log"][i]])

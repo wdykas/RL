@@ -649,8 +649,13 @@ class MegatronGenerationMixin:
             "pg_collection": pg_collection,
             "mamba_inference_state_config": mamba_inference_state_config,
             # Reserve more KV-cache space when speculative decoding is enabled.
+            # With max_requests set, MCore sizes the Mamba region for exactly that
+            # many requests and gives the rest to KV (the fixed ratio would cap
+            # the request count at ratio * buffer / state bytes instead).
             "mamba_memory_ratio": (
-                0.1 + 0.1 * num_speculative_tokens if is_hybrid_model else None
+                0.1 + 0.1 * num_speculative_tokens
+                if is_hybrid_model and max_requests is None
+                else None
             ),
             "num_speculative_tokens": num_speculative_tokens,
             "logprobs_mode": mcore_generation_config["logprobs_mode"],

@@ -1161,6 +1161,20 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
 
     # ---- Deadline-truncated streaming drafts (generation rank 0) ----
 
+    def engine_request_capacity(self) -> int:
+        """Requests the engine fleet decodes at once: this engine's ``max_requests`` x engine DP.
+
+        A draft beyond it waits for a running one to finish, so it starts only
+        after a whole draft's decode time (``SpeculativeGeneration.draft_streaming``
+        rejects that).
+        """
+        from megatron.core import parallel_state as ps
+
+        ctx = getattr(self, "inference_context", None)
+        if ctx is None:
+            return 0
+        return int(ctx.max_requests) * ps.get_data_parallel_world_size()
+
     def start_drafts(
         self,
         prompts: list[list[int]],
