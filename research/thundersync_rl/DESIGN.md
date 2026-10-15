@@ -2940,6 +2940,36 @@ with mixed starts vs the whole rows, logits compared with torch.equal).
   ~0.25 s (average 16k) ~ 60 s of learner work without the cache, ~1-2 s with it. The per-call cost is shared by all
   rows batched in one verification call and is not changed by the cache; it needs its own fix (profile first).
 
+## 14r. Verify-in-train (VIT): design B, exactness, debug check (2026-10-15; not built beyond the check)
+
+*Notes and numbers: `thundersync_work/research/agent_verify_in_train.md`. Branch ts-verify-in-train (../RL-vit).*
+
+**Idea.** For a group whose G drafts are all finished at t_{n+1}, the block-verification forward at theta_{n+1} is the
+group's canonical training forward: decisions are read from the training forward's `next_token_logprobs` (same
+function of (p, q, u) as `verify_drafts`), then the backward runs. Verification of those rows costs no forward.
+
+**Design B (chosen).** Only groups whose drafts are all finished AND whole-accepted contribute gradient from the fused
+call; for them the draft rewards are the final rewards (no provisional advantage). A micro-batch in which the forward
+finds a rejection is masked like a padding row (sample_mask = token_mask = advantages = 0; the backward still runs on
+every rank, keeping EP/PP lockstep) and its group trains later in its canonical (tail-last) position. With
+group-aligned micro-batches and deterministic kernels the accumulated gradient equals canonical training bitwise.
+**Design A (provisional advantages + linear correction over all accepted rows) is rejected**: exact only in exact
+arithmetic (fp two-term sum; the replacement row trains in another micro-batch), and it saves <= 0.03 s/step at L8.
+
+**Measured coverage (Nano L8 1k, steps 2-5).** Fully-finished groups 0.48 (ord-p-l2-m128) / 0.69 (lanes2r-l2), 0 with
+one lane; fusable drafted-token share 0.50 / 0.80; P(rejection | finished group) 0.03-0.04. Group-major admission
+(untested) would raise m128's 0.48 toward 0.89.
+
+**Debug check `THUNDERSYNC_VIT_CHECK=1`** (`vit_check.py`; first `THUNDERSYNC_VIT_CHECK_CALLS` final calls per step):
+regular call twice (control), training-forward p vs generation_logprobs (verifier/engine p) bitwise, masked-row
+content independence (exact zero), row-absent and correction fp differences (information); the regular result is
+what trains. Bitwise needs `policy.megatron_cfg.deterministic_training=true` (14n). Cluster line vit-x; result: see the
+agent note.
+
+**Placement.** VIT for fully-finished groups, engine-side verification (14q) for unfinished drafts (ideally inside the
+continuation's own prefill). Per-rank cost of VIT: no memory beyond a training micro-batch; q (4 B/token) and the row
+seed to the row's last PP stage; one [V/TP] head row per rejected position.
+
 ## 15. Open work
 
 - **Stragglers.** About one rejected draft per step decodes its remainder at about 3 ms
