@@ -2856,6 +2856,30 @@ merge commit messages):
 - ts-ep-invariant a036bb7c (14u): EP-invariant MoE combine. The engine-vs-learner EP equality rule is lifted when it
   is on (both validators); `run_ab_arm.sh` turns it on when GEN_EP != EP.
 
+*Round-2 validation [M] (Nano L8, parity reward, no expert-grad noise; runs_1node/i2-*, code bd792ea1).*
+
+| run | what | result |
+|---|---|---|
+| i2-ut | GPU unit tests, tip vs base eb351bc0 | tip 1769 passed, 3 failed + 10 errors, all also failing at base (base: 5 failed incl. 2 hidden-transport tests that run-ready fixed) |
+| i2-x1k | ts_por one engine EP2, 1k, m2n refit + crosscheck | EXACT 4/4, crosscheck 5/5 PASS, non-vacuous |
+| i2-xlanes | learner EP2, 2 lanes EP1 (EP-invariant combine), forced-fresh rows, m2n crosscheck | EXACT 4/4, crosscheck 7/7 PASS |
+| i2-x8k | ts_por EP2 at 8k, prefix cache (pin/auto), chunked verify head | EXACT 4/4, no OOM; continuation pieces verified: 511k / 504k tokens in 46 / 61 rounds (steps 2-3) |
+| i2-p | equal GPUs (4): lanes vs async1 at 1k, steps 2-5 | lanes 8.44 / 7.51 / 8.77 / 6.92 s (mean 7.91); async1 7.11 / 4.96 / 5.02 / 4.70 (mean 5.45): lanes = 0.69 of async1 |
+
+At 8k on one engine the drafting window is again the limit: steps 2-3 cut the drafts at 519 / 857 tokens and decode
+~0.5M continuation tokens (60-69 s steps). Exact resume: not shown (i2-resume / rr-resume-nano2 pending).
+
+**Frozen: ../RL-nano-perf-scale2 @ 8f99ebc9, fork branch ts-nano-perf-scale2.** 8f99ebc9 = the validated bd792ea1 plus
+the ep-invariant branch's validator wording (same rule), DESIGN and two unit tests.
+
+*After the freeze (on ts-nano-perf, not in the snapshot):* ts-learner-callcost be160af1 (TMA segment kernel, per-pass
+choice by cost; one MoE layer 32 experts x 8k fwd+bwd 23.3 -> 7.7 ms) merged opt-in, cuBLAS default on forward, dgrad
+and wgrad until cc-full-ep4-new2 confirms the 8k gain. Opt-in `CUBLAS_WS_SHIM=1` (run_ab_arm.sh / submit_ab.sh /
+env.sh): an LD_PRELOAD shim gives every cuBLAS handle a 0-byte workspace instead of CUBLAS_WORKSPACE_CONFIG=:0:0
+(PyTorch 2.11 re-parses that variable with std::regex per cuBLAS call; 58 -> 24 us host per mm, same bits;
+upstream fix pytorch#177912, backport #200066 open). The te_native env check accepts the shim as equivalent. Not a
+default until the model-level fingerprint checks pass.
+
 *A/B layout after round 2: unchanged, learner EP4 x DP2 on every arm (8 GPUs) + 8 engine GPUs* (ts_por: 2 lanes x
 EP4; sync / async1: one EP4 engine at engine DP 2), 16 GPUs = 4 nodes per arm. Engine EP = learner EP, so the
 EP-invariant combine stays off (the old combine is exact at equal EP and cheaper). Alternative considered: learner
