@@ -87,6 +87,46 @@ def test_speculative_wrapper_uses_derived_seed_streams(monkeypatch):
     assert next(t._verify_seeds) == next(s._verify_seeds)
 
 
+def _call_seed_spec(step=3):
+    from thundersync_rl.speculative import SpeculativeGeneration
+
+    sp = object.__new__(SpeculativeGeneration)
+    sp.__dict__.update(
+        current_step=step,
+        _verify_seeds=SeedStream(11, "verify/0", lambda: sp.current_step),
+    )
+    return sp
+
+
+def _d(key, toks=(1, 2)):
+    return (torch.tensor([5, 6, 7]), -1, list(toks), False, key, [], None, None)
+
+
+def test_call_seed_is_independent_of_arrival_order():
+    """Block and piece verification calls get the same seeds whichever submits first."""
+    block = [_d("1:0"), _d("1:1")]
+    piece = [_d("c:0")]
+    a = _call_seed_spec()
+    sa = (a._call_seed("block", block), a._call_seed("block", piece))
+    b = _call_seed_spec()
+    sb_piece = b._call_seed("block", piece)
+    sb_block = b._call_seed("block", block)
+    assert sa == (sb_block, sb_piece)
+
+
+def test_call_seed_is_fresh_per_row_ordinal_and_step():
+    """A row's next call (next piece) and the next step never reuse a seed."""
+    sp = _call_seed_spec(step=3)
+    first = sp._call_seed("block", [_d("c:0")])
+    second = sp._call_seed("block", [_d("c:0")])
+    assert first != second
+    sp.current_step = 4
+    assert sp._call_seed("block", [_d("c:0")]) not in (first, second)
+    # Unkeyed rows are named by their content.
+    u = _call_seed_spec()
+    assert u._call_seed("block", [_d(None, (1, 2))]) != u._call_seed("block", [_d(None, (1, 3))])
+
+
 # ---------------------------------------------------------------------------
 # Data: epochs and an exact resume position (issues 1, 3)
 # ---------------------------------------------------------------------------

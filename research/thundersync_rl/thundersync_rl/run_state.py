@@ -78,6 +78,15 @@ class SeedStream:
         self.counter += 1
         return derive_seed(self.base, self.stream, int(self.step_fn()), self.counter)
 
+    def keyed(self, *identity: Any) -> int:
+        """Seed of the call named ``identity`` in the current step.
+
+        A function of (base, stream, step, identity) only: unlike ``next``, it
+        does not depend on the order in which concurrent callers arrive. The
+        caller must make ``identity`` unique within a step (fresh randomness).
+        """
+        return derive_seed(self.base, self.stream, int(self.step_fn()), "id", *identity)
+
     def state_dict(self) -> dict[str, Any]:
         return {"base": self.base, "stream": self.stream, "counter": self.counter}
 

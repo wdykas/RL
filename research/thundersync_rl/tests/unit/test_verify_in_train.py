@@ -270,11 +270,12 @@ def test_retained_forward_reuses_output_and_restores_routes():
 def _spec_stub(G=2, slots_per_key=2):
     import itertools as it
 
+    from thundersync_rl.run_state import SeedStream
     from thundersync_rl.speculative import SpeculativeGeneration
 
     sp = object.__new__(SpeculativeGeneration)
     sp.__dict__.update(
-        base=None, vit_group_size=G, _verify_seeds=it.count(1), vit_predictor=vit.PassPredictor(),
+        base=None, vit_group_size=G, _verify_seeds=SeedStream(1, "verify/0", lambda: 0), vit_predictor=vit.PassPredictor(),
         vit_dp=1, vit_mbs=8, vit_min_pass_prob=0.5, vit_checkpoint_bytes=float("inf"),
         vit_bytes_per_token=0.0, stats={}, _vit_groups=[], _null_policy=NullPolicy(fixed_m=None),
         max_new_tokens=4, max_seq_len=None, draft_budget=4, eod=0,

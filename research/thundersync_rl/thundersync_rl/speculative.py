@@ -35,7 +35,9 @@ import contextlib
 import itertools
 import math
 import os
+import threading
 import time
+import zlib
 from collections import Counter, defaultdict
 import dataclasses
 from dataclasses import dataclass, field, replace
@@ -1764,7 +1766,7 @@ class SpeculativeGeneration:
         if names is None:
             raise RuntimeError("verify_in_train needs pooled ⊥-BV drafts")
         G = int(self.vit_group_size)
-        base = next(self._verify_seeds)
+        base = self._verify_seeds.keyed("vit")  # once per step
         pred = self.vit_predictor
         pred.end_step()  # the previous step's outcomes join the window
         spread = self.vit_spread_rows() is not None
@@ -2093,6 +2095,40 @@ class SpeculativeGeneration:
             done.append((a, await asyncio.to_thread(ray.get, [b[0] for b in boxes])))
         return self._verify_block_results(flat, done, keep_hidden=keep_hidden)
 
+    def _call_seed(self, kind: str, drafts) -> int:
+        """Verification seed of one call, by canonical identity (not arrival).
+
+        Block verification (verify0, ⊥-BV waves, streamed verify0 calls) and
+        continuation-piece verification submit calls from different tasks and
+        threads, so drawing ``next(self._verify_seeds)`` gave each call a seed
+        that depended on which caller came first. The seed is now a hash of
+        (grpo.seed, stream, step, kind, the call's rows), each row named by its
+        key and its verification ordinal in this step (0 for its first call,
+        1 for its next, ...). A row's calls are sequential (one piece in flight
+        per stream; waves one after another), so its ordinals do not depend on
+        timing, and every (row, ordinal) occurs in exactly one call: no two
+        calls of a step share a seed (fresh randomness, as before). Rows without
+        a key are named by (prompt length, crc32 of their tokens).
+        Cost: O(rows) driver work per call; nothing on the ranks.
+        """
+        step = int(self.current_step)
+        with self.__dict__.setdefault("_ord_lock", threading.Lock()):
+            ords = self.__dict__.get("_row_ords")
+            if ords is None or ords[0] != step:
+                ords = self._row_ords = (step, {})
+            table = ords[1]
+            ident = []
+            for d in drafts:
+                rid = d[4] if len(d) > 4 and d[4] is not None else (
+                    "crc",
+                    int(d[0].numel()),
+                    zlib.crc32(np.asarray(d[2], dtype=np.int64).tobytes()),
+                )
+                n = table.get(rid, 0)
+                table[rid] = n + 1
+                ident.append((rid, n))
+        return self._verify_seeds.keyed(kind, tuple(ident))
+
     def _submit_verify_block(
         self,
         flat,
@@ -2118,6 +2154,7 @@ class SpeculativeGeneration:
         futs = []
         for g, a, b in zip(self.verifiers, cuts, cuts[1:]):
             method, extra = self._verify_method(flat[a:b])
+            call_seed = self._call_seed("block", [d for _, d in flat[a:b]])
             if method == "verify_drafts_block_engine":
                 # Rows placed on the pool's data-parallel ranks by tokens.
                 lengths = [r.numel() for r in rows[a:b]]
@@ -2167,7 +2204,7 @@ class SpeculativeGeneration:
                     prompt_lens=[d[0].numel() for _, d in flat[a:b]],
                     segments=[d[5] for _, d in flat[a:b]],
                     vocab_limit=self.vocab_limit,
-                    seed=next(self._verify_seeds),
+                    seed=call_seed,
                     keys=[d[4] for _, d in flat[a:b]],
                     precision=self.verify_precision,
                     batch_tokens=self.verify_batch_tokens,
@@ -2197,13 +2234,11 @@ class SpeculativeGeneration:
                         prompt_lens=[d[0].numel() for _, d in flat[a:b]],
                         segments=[d[5] for _, d in flat[a:b]],
                         vocab_limit=self.vocab_limit,
-                        # A fresh counter value per call: verification
-                        # randomness is never reused across calls or steps
-                        # (``seed * 7 + a`` collided between consecutive
-                        # calls, e.g. (s, a=7) and (s+1, a=0), so a later
-                        # decision could reuse a stream that shaped the
-                        # update producing the policy it verifies against).
-                        seed=next(self._verify_seeds),
+                        # Fresh per call and step, by the call's canonical
+                        # identity (``_call_seed``; ``seed * 7 + a`` once
+                        # collided between consecutive calls, and a shared
+                        # counter depended on which caller arrived first).
+                        seed=call_seed,
                         keys=[d[4] for _, d in flat[a:b]],
                         precision=self.verify_precision,
                         batch_tokens=self.verify_batch_tokens,
@@ -2896,7 +2931,7 @@ class SpeculativeGeneration:
                 prompt_lens=[d[0].numel() for _, d in flat[a:b]],
                 segments=[d[5] for _, d in flat[a:b]],
                 vocab_limit=self.vocab_limit,
-                seed=next(self._verify_seeds),
+                seed=self._call_seed("chunked", [d for _, d in flat[a:b]]),
                 keys=[d[4] for _, d in flat[a:b]],
                 batch_tokens=self.verify_batch_tokens,
                 precision=self.verify_precision,
