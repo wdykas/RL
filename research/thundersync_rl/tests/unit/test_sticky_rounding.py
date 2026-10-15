@@ -363,7 +363,6 @@ def test_grpo_config_default_off_and_handoff():
         ({}, {"moe_token_dispatcher_type": "flex"}, "dispatcher"),
         ({}, {"moe_shared_expert_overlap": True}, "shared_expert_overlap"),
         ({"fused_verify_train": True}, {}, "fused_verify_train"),
-        ({"draft_weights": "momentum"}, {}, "draft_weights must be 'current'"),
     ],
 )
 def test_grpo_config_rejects(ts, megatron, match):
@@ -423,3 +422,45 @@ def test_micro_batch_padding_is_never_anchored(sticky):
         assert bool(out[1].eq(-1).all()) and bool(out[0, 3:].eq(-1).all())
     else:  # R3 keeps the dummy top-k route on padding
         assert bool(out[0, 3:].eq(torch.tensor([0, 1], dtype=torch.int16)).all())
+
+
+def test_grpo_config_accepts_momentum_draft_weights():
+    from thundersync_rl.grpo_loop import validate_sticky_rounding
+
+    validate_sticky_rounding(_master(draft_weights="momentum"))
+
+
+@pytest.mark.parametrize("kind", [None, "momentum"])
+def test_anchor_store_keeps_the_drafting_weights(monkeypatch, kind):
+    """The store holds what the next step's drafts come from: theta_k, or the staged
+    draft weights theta_hat_{k+1} (recomputed, kept, and theta_k restored)."""
+    from thundersync_rl import worker as w
+
+    unit = torch.nn.Linear(4, 4, bias=False).to(torch.bfloat16)
+    theta = unit.weight.detach().clone()
+    draft = (theta.float() + 1.0).to(torch.bfloat16)
+    calls = []
+
+    def load(optimizer, k):
+        calls.append(("load", k))
+        with torch.no_grad():
+            unit.weight.copy_(draft)
+        return "swap"
+
+    def restore(swap):
+        calls.append(("restore", swap))
+        with torch.no_grad():
+            unit.weight.copy_(theta)
+
+    monkeypatch.setattr(w, "load_draft", load)
+    monkeypatch.setattr(w, "restore_training", restore)
+    sr.configure(True)
+    try:
+        sr._STATE["store"] = sr.ThetaStore([unit])
+        w.snapshot_anchor_weights(object(), kind)
+        got = sr.store().fetch(0, torch.device("cpu"))[0]["weight"]
+    finally:
+        sr.configure(False)
+    assert torch.equal(got, theta if kind is None else draft)
+    assert torch.equal(unit.weight.detach(), theta)  # training weights back
+    assert calls == ([] if kind is None else [("load", "momentum"), ("restore", "swap")])

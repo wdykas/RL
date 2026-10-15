@@ -321,6 +321,32 @@ if engine_prof.enabled():
     engine_prof.install()
 
 
+def snapshot_anchor_weights(optimizer: Any, draft_kind: Optional[str]) -> None:
+    """Keep the next step's sticky-rounding anchor weights (no-op when it is off).
+
+    Called right before the optimizer step of step k, with theta_k, m_k, v_k
+    still in place. The anchor forward is the drafter's forward: theta_k
+    (``draft_kind`` None: the engine drafts the next step's rollouts with the
+    refit theta_k), or theta_hat_{k+1} for draft weights ``draft_kind`` staged
+    at the top of this step. theta_hat_{k+1} is a deterministic function of
+    (theta_k, m_k, v_k), which the optimizer step has not changed yet, so it is
+    recomputed here bitwise as staged (``load_draft``), kept, and theta_k is
+    restored; the store stays one copy of the rank's 16-bit shard.
+    """
+    from nemo_rl.models.megatron import sticky_rounding
+
+    if not sticky_rounding.enabled():
+        return
+    if draft_kind is None:
+        sticky_rounding.snapshot()
+        return
+    swap = load_draft(optimizer, draft_kind)
+    try:
+        sticky_rounding.snapshot()
+    finally:
+        restore_training(swap)
+
+
 @ray.remote(
     runtime_env=get_runtime_env_for_policy_worker("megatron_policy_worker")
 )  # pragma: no cover
@@ -438,10 +464,9 @@ class ThunderSyncMegatronPolicyWorker(verify_yield.YieldWorkerMixin, MegatronPol
         every reward is 0 (random tiny models). Exercises refit into the engine's expert
         weights: any stale engine weight shows up in the mismatch check.
         """
-        from nemo_rl.models.megatron import sticky_rounding
-
-        # theta_n of the next step's policy (the weights its drafts come from).
-        sticky_rounding.snapshot()
+        # Anchor weights of the next step's policy: the weights its drafts come from.
+        snapshot_anchor_weights(self.optimizer, getattr(self, "_staged_draft_kind", None))
+        self._staged_draft_kind = None
         scale = os.environ.get("THUNDERSYNC_DEBUG_EXPERT_GRAD_NOISE")
         if not scale:
             return super().finish_train_step()
@@ -490,6 +515,8 @@ class ThunderSyncMegatronPolicyWorker(verify_yield.YieldWorkerMixin, MegatronPol
         check_no_expert_bias_updates(self.model)
         self._weights_version += 1
         self._draft_swap: Optional[DraftSwap] = load_draft(self.optimizer, kind)
+        # The next step's drafts come from these weights (finish_train_step).
+        self._staged_draft_kind = kind
         self._log_mem(f"load_draft_weights {kind}")
         return dict(self._draft_swap.stats)
 
