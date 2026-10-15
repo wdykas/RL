@@ -270,6 +270,7 @@ def validate_batch_invariant_mode(config: PolicyConfig) -> ZeroTrainGenValidatio
             "lm_head_precision",
             "down_proj_prescale_log2",
             "moe_ep_invariant_combine",
+            "mamba_fp32_prenorm_input",
         )
         if megatron_cfg.get("moe_ep_invariant_combine", False) or (
             os.environ.get("THUNDERSYNC_ALLOW_EP_MISMATCH") == "1"

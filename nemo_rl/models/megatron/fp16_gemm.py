@@ -1067,6 +1067,7 @@ def install(
     lm_head_precision: Optional[str] = None,
     down_proj_prescale_log2: int = 0,
     expert_weight_cache: bool = True,
+    mamba_fp32_prenorm_input: bool = True,
 ) -> None:
     """Install the fp16 GEMM forward for this process (idempotent).
 
@@ -1077,6 +1078,11 @@ def install(
     time, stacked, and keeps the two most recent layers (fp16_moe._CACHE_LINEARS);
     False casts one expert at a time instead (no stacked buffer). Same fp16
     values either way, so bitwise the same outputs.
+    ``mamba_fp32_prenorm_input`` (``policy.megatron_cfg.mamba_fp32_prenorm_input``,
+    default True): Mamba layers feed the fp32 residual to their fused pre-norm
+    (_patch_mamba_layer_input). False keeps stock MCore's cast to params_dtype
+    (the pre-fix numerics; a control arm only). Must match between training and
+    generation.
     """
     if _STATE["enabled"]:
         return
@@ -1121,7 +1127,8 @@ def install(
     )
     _patch_te_rmsnorm()
     _patch_attention()
-    _patch_mamba_layer_input()
+    if mamba_fp32_prenorm_input:
+        _patch_mamba_layer_input()
     _patch_inference_buffers()
     _patch_inference_pp_logits()
     _patch_moe()

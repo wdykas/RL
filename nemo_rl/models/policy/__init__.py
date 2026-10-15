@@ -620,6 +620,12 @@ class MegatronConfig(TypedDict):
     # range there 2^s-fold for models whose SwiGLU outputs approach 65504. 0 = off.
     # Must match between training and generation.
     down_proj_prescale_log2: NotRequired[int | None]
+    # forward_gemm_precision="fp16" on hybrid (Mamba) models: True (default when
+    # unset) feeds the fp32 residual to the Mamba layers' fused pre-norm; False
+    # keeps stock MCore's cast of the layer input to params_dtype (bf16 noise
+    # floor in draft acceptance; control arms only). Must match between training
+    # and generation.
+    mamba_fp32_prenorm_input: NotRequired[bool]
     # MoE under forward_gemm_precision="fp16": sum each token's expert rows through
     # exact fixed-point limbs (nemo_rl/models/megatron/ep_invariant_combine.py), so
     # the MoE output has the same bits at every expert-parallel size (training and
