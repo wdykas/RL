@@ -35,7 +35,7 @@ from nemo_rl.algorithms.logits_sampling_utils import (
     need_top_k_or_top_p_filtering,
 )
 from nemo_rl.models.generation.megatron.config import merged_inference_megatron_cfg
-from nemo_rl.models.megatron import bi_mean, mamba_ssd_parity
+from nemo_rl.models.megatron import bi_mean, mamba_ssd_parity, moe_deterministic
 from nemo_rl.models.megatron.batch_invariant import batch_invariant_token_multiple
 
 if TYPE_CHECKING:
@@ -632,6 +632,8 @@ def enable_batch_invariant_kernels(config: PolicyConfig) -> None:
     )
     # Mamba: train on the engine's SSD kernels, pinned the same way in every process.
     mamba_ssd_parity.install()
+    # MoE: reproducible token-gather backward (no atomics over a token's top-k copies).
+    moe_deterministic.install()
     _use_inference_log_softmax()
     print(
         "[zero_train_gen_mismatch] batch-invariant kernels enabled: "
