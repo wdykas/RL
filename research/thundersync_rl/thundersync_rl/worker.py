@@ -2697,7 +2697,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         keys: list[str],
         batch_tokens: int = 0,
         anchors: list[Any] | None = None,
-        null_envelopes: list[float] | None = None,
+        null_envelopes: list[list[float]] | None = None,
         row_ranks: list[int] | None = None,
         band: float | None = None,
         **_: Any,
@@ -2708,8 +2708,9 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         driver balances tokens, ``speculative.lpt_owners``); default: a stable
         hash of the key.
 
-        Pooled ⊥-BV (``null_bv.py``): with ``null_envelopes`` every row is
-        verified at each of these envelopes M with one set of random draws
+        Pooled ⊥-BV (``null_bv.py``): with ``null_envelopes`` row i is
+        verified at each envelope M of ``null_envelopes[i]`` (the ones its pool
+        index can be decided at, ``row_envelopes``) with one set of random draws
         (``verify_engine_q_grid``) and reports ``"null_grid"`` = {M: (tau, y,
         log p(y) or None)} plus ``"token_logprobs"`` (log p of the drafted
         tokens up to the largest tau) and ``"draft_logq"`` (the same span);
@@ -2787,6 +2788,11 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         )
 
         from nemo_rl.models.megatron import sticky_rounding, sticky_routing
+        from thundersync_rl.prof import pop as prof_pop
+        from thundersync_rl.prof import timed
+
+        prof_pop()  # phases of this call only
+        torch_prof = self._torch_profiler(null_envelopes is not None)
 
         if not self.cfg["megatron_cfg"].get("batch_invariant_mode"):
             raise RuntimeError(
@@ -2891,9 +2897,10 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 )
             if tp == 1:
                 # Log-probs exactly as training computes them (fp32 log-softmax).
-                p_lp = torch.log_softmax(
-                    logits[0, plen - 1 : n, :vocab_limit].float(), -1
-                )
+                with timed("p_log_softmax"):
+                    p_lp = torch.log_softmax(
+                        logits[0, plen - 1 : n, :vocab_limit].float(), -1
+                    )
             else:
                 # Vocab-parallel logits: rows gathered on demand, as batch-
                 # invariant training's gathered log-softmax computes them.
@@ -2916,7 +2923,10 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 for j, t in enumerate(idx_l):
                     by_v.setdefault(version[t], []).append(j)
                 for v, js in by_v.items():
-                    lp = self._head_logprobs(h([idx_l[j] for j in js]), v, vocab_limit)
+                    with timed("q_rows/hidden_fetch"):
+                        hv = h([idx_l[j] for j in js])
+                    with timed("q_rows/head_gemm"):
+                        lp = self._head_logprobs(hv, v, vocab_limit)
                     for k, j in enumerate(js):
                         out[j] = lp[k]
                 return torch.stack(out)
@@ -2924,9 +2934,10 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             if null_envelopes is not None:
                 # Banded IS is rejected with null_bv by validation (§14e).
                 assert band is None, "banded IS does not compose with pooled null_bv"
-                grid, lpx, n_eval = verify_engine_q_grid(
-                    p_lp, draft, lq, q_rows, gen, tuple(null_envelopes)
-                )
+                with timed("grid_scan_total"):
+                    grid, lpx, n_eval = verify_engine_q_grid(
+                        p_lp, draft, lq, q_rows, gen, tuple(null_envelopes[i])
+                    )
                 tau = max(t for t, _, _ in grid.values())
                 # log W* = max_t log prod_{u<=t} p/q over the draft (drop-IS weights).
                 lr = torch.cumsum(lpx.double() - lq.to(lpx.device).double(), 0)
@@ -2993,6 +3004,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             self._dummy_training_forward()
         self._prof["ep_dummy_forwards"] = n_dummy
         self._prof["q_rows"] = n_rows
+        self._prof.update(prof_pop())
         self._log_mem("verify_drafts_block_engine")
         if check and last_stage:
             print(
@@ -3016,6 +3028,13 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                     f"changed_frac={sround['changed_frac']:.6f}",
                     flush=True,
                 )
+        if torch_prof is not None:
+            torch_prof.__exit__(None, None, None)
+            path = f"{os.environ['THUNDERSYNC_TORCH_PROF']}.rank{self.rank}.txt"
+            with open(path, "w") as f:
+                for key in ("self_cuda_time_total", "self_cpu_time_total"):
+                    f.write(torch_prof.key_averages().table(sort_by=key, row_limit=40) + "\n")
+            print(f"[spec prof] torch profile -> {path}", flush=True)
         if os.environ.get("THUNDERSYNC_SPEC_PROF"):
             ntok = sum(rows[i].numel() for i, _ in results)
             print(
@@ -3024,6 +3043,20 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 flush=True,
             )
         return results
+
+    def _torch_profiler(self, null: bool):
+        """``THUNDERSYNC_TORCH_PROF=<path prefix>``: profile this rank's second ⊥-BV
+        verification call (the first one compiles and warms caches); None otherwise."""
+        if not null or not os.environ.get("THUNDERSYNC_TORCH_PROF"):
+            return None
+        self._null_verify_calls = getattr(self, "_null_verify_calls", 0) + 1
+        if self._null_verify_calls != 2:
+            return None
+        prof = torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+        )
+        prof.__enter__()
+        return prof
 
     def _check_dropless_moe(self) -> None:
         """Raise if MoE layers drop tokens (expert capacity factor set).

@@ -55,7 +55,7 @@ from thundersync_rl.engine_q import (
 )
 from thundersync_rl.fused_train import FusedRef
 from thundersync_rl.multi_turn import TurnEnvironment, TurnRecord, pair_rows, replay
-from thundersync_rl.null_bv import NullGroup, NullPolicy, envelopes
+from thundersync_rl.null_bv import NullGroup, NullPolicy, row_envelopes
 from thundersync_rl.tail_trace import TailTrace
 from thundersync_rl.routes import (
     RouteRefs,
@@ -1449,14 +1449,15 @@ class SpeculativeGeneration:
         self,
         flat,
         rows,
-        null_envelopes: Optional[tuple[float, ...]] = None,
+        null_envelopes: Optional[list[tuple[float, ...]]] = None,
         band: Optional[float] = None,
     ) -> dict[int, dict[str, Any]]:
         """Block-verify ``flat`` drafts on every verifier pool; results by row.
 
         Engine-sourced verification places rows on a pool's data-parallel
         ranks by tokens (``lpt_owners``). ``null_envelopes`` (⊥-BV): every row
-        is verified at each envelope; the driver decides (``_decide_null``).
+        is verified at each of its envelopes (``null_envelopes[i]`` for row i);
+        the driver decides (``_decide_null``).
         ``band``: banded IS (only a draft's first verification; never with
         ``null_envelopes``).
         """
@@ -1501,7 +1502,7 @@ class SpeculativeGeneration:
                 extra = {**extra, "row_ranks": owners}
                 self._count_balance(lengths, owners, ranks)
             if null_envelopes is not None:
-                extra = {**extra, "null_envelopes": list(null_envelopes)}
+                extra = {**extra, "null_envelopes": [list(e) for e in null_envelopes[a:b]]}
             if band is not None:
                 extra = {**extra, "band": band}
             seq = self.learner_seq() if ordered else None
@@ -1605,8 +1606,10 @@ class SpeculativeGeneration:
         Each wave forwards, per prompt with slots left, its next
         ceil(s * M) rows in drafting order (s slots left, M the envelope the
         counts give now: the expected number of drafts that fill s slots).
-        Every forwarded row is verified at every envelope with one set of
-        draws (``null_grid``); the driver then walks each prompt's rows in
+        Every forwarded row is verified at every envelope it can be decided
+        at (``row_envelopes``: a function of its index in the pool and the
+        counts, not of any content) with one set of draws (``null_grid``);
+        the driver then walks each prompt's rows in
         drafting order with the count process (``NullGroup``) and takes each
         row's outcome at the M it gets. Which rows are forwarded depends on
         counts only, so the decisions are those of the one-shot process
@@ -1614,10 +1617,13 @@ class SpeculativeGeneration:
         never forwarded cost nothing (their hidden states are freed).
         """
         policy = self._null_policy
-        ms = envelopes(policy)
         queue: dict[str, list[int]] = defaultdict(list)
         for i, g in enumerate(groups):
             queue[g].append(i)
+        row_env: dict[int, tuple[float, ...]] = {}
+        for g, q in queue.items():
+            for j, i in enumerate(q):
+                row_env[i] = row_envelopes(policy, len(q), int(slots[g]), j)
         state = {g: NullGroup(len(q), int(slots[g]), policy) for g, q in queue.items()}
         out: dict[int, dict[str, Any]] = {}
         waves = 0
@@ -1634,7 +1640,9 @@ class SpeculativeGeneration:
                 break
             waves += 1
             res = self._verify_block(
-                [flat[i] for i in batch], [rows[i] for i in batch], null_envelopes=ms
+                [flat[i] for i in batch],
+                [rows[i] for i in batch],
+                null_envelopes=[row_env[i] for i in batch],
             )
             for j in sorted(range(len(batch)), key=lambda j: batch[j]):
                 i, r = batch[j], res[j]
@@ -1657,6 +1665,7 @@ class SpeculativeGeneration:
         for i in skipped:
             out[i] = _null_result({}, None)
         self.stats["spec/null_waves"] = float(waves)
+        self.stats["spec/null_envelopes_per_row"] = sum(map(len, row_env.values())) / max(len(row_env), 1)
         self.stats["spec/null_skipped_drafts"] = float(len(skipped))
         return out
 

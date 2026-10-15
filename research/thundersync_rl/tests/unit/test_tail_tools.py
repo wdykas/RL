@@ -372,3 +372,26 @@ def test_shared_row_grid_scan_is_bitwise_the_per_envelope_scan(seed, chunk):
                            torch.Generator().manual_seed(100 + seed), envs)
     assert got == want
     assert n_eval <= g  # each position's rows built at most once across envelopes
+
+
+def test_row_envelopes_cover_every_decision_and_are_small():
+    """Each row's envelope set contains the M the count process uses at it (any
+    outcomes), for the DP and prompt-drop policies."""
+    from thundersync_rl.null_bv import row_envelopes
+
+    for pol, N, G in [
+        (NullPolicy(logratio_var=1.1e-6, ref_len=8192), 24, 16),
+        (NullPolicy(logratio_var=1e-5, ref_len=1024), 12, 8),
+        (NullPolicy(fixed_m=1.75, prompt_drop=True), 16, 8),
+    ]:
+        envs = [row_envelopes(pol, N, G, j) for j in range(N)]
+        rng = np.random.default_rng(0)
+        for _ in range(300):
+            grp = NullGroup(N, G, pol)
+            for j in range(N):
+                m = grp.next_m()
+                if m is None:
+                    break
+                assert m in envs[j], (j, m, envs[j])
+                grp.record(bool(rng.random() < 0.6))
+        assert max(map(len, envs)) <= 8 and np.mean([len(e) for e in envs]) < 4

@@ -620,7 +620,7 @@ def test_driver_pools_drafts_and_fills_slots_in_order(monkeypatch):
                 {
                     "null_grid": {
                         M: (script[k][0], script[k][1], None if script[k][1] < 0 else -1.0)
-                        for M in kw["null_envelopes"]
+                        for M in kw["null_envelopes"][i]  # this row's envelopes
                     },
                     "token_logprobs": [-1.0] * script[k][0],
                     "draft_logq": engine_logq[i][: script[k][0]],
@@ -657,9 +657,11 @@ def test_driver_pools_drafts_and_fills_slots_in_order(monkeypatch):
     s.current_step = 1
     s.verify(drafts)
     (kw,) = calls
-    # Every row verified at every envelope the policy can pick (B1, empty,
-    # dropped), on the ranks the driver placed it on; the driver decided.
-    assert kw["null_envelopes"] == [1.0, 2.0] and kw["row_ranks"] == [0] * 5
+    # Every row verified at the envelopes its pool index can be decided at
+    # (row_envelopes: A0 d=3,s=2 -> 2; A1 d=2,s in 1..2 -> 2 or 1; A2 and the
+    # B rows -> 1; B1 empty, dropped), on the ranks the driver placed it on.
+    assert kw["null_envelopes"] == [[2.0], [1.0, 2.0], [1.0], [1.0], [1.0]]
+    assert kw["row_ranks"] == [0] * 5
     plans_a = s.plans[tuple(pa)]
     assert [p.prefix for p in plans_a] == [[6, EOD], [7, 9]]
     assert plans_a[0].complete and not plans_a[1].complete
@@ -714,7 +716,7 @@ def test_worker_verifies_every_row_at_every_envelope(monkeypatch):
             seed=11,
             keys=keys,
             batch_tokens=64,
-            null_envelopes=list(Ms),
+            null_envelopes=[list(Ms)] * len(rows),
             row_ranks=[0] * len(rows),
         )
     )
@@ -752,7 +754,7 @@ def test_driver_forwards_only_rows_that_can_be_used(monkeypatch):
             (
                 i,
                 {
-                    "null_grid": {M: (2, 0, -1.0) for M in kw["null_envelopes"]},
+                    "null_grid": {M: (2, 0, -1.0) for M in kw["null_envelopes"][i]},
                     "token_logprobs": [-1.0, -1.0],
                     "draft_logq": engine_logq[i][:2],
                 },
