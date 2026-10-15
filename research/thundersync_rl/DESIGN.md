@@ -2046,7 +2046,14 @@ half-anchored batch the self row equals the plain forward and the anchored row e
 - Same sticky routes: the anchor pass replays the same anchors A (F(θ_{k−1}; A) = A = the plain θ_{k−1} routes
   under BI), so the anchor forward's expert dispatch is the drafter's; the policy pass dispatches F(θ_k; A).
 - Not built yet (rejected by `validate_sticky_rounding`): pipeline parallelism, context parallelism, activation
-  recompute, fused verify+train, flex/DeepEP dispatchers, shared-expert overlap. Hybrid (Mamba) layers.
+  recompute, fused verify+train, flex/DeepEP dispatchers, shared-expert overlap, hybrid shortcut-MoE blocks and
+  hyper-connection layers (`lockstep_units` raises for any decoder layer class without a lockstep).
+- Hybrid models (Nemotron-H: `HybridModel` / `HybridStack`): `HybridModel.forward` opens the policy forward like
+  `GPTModel.forward`, and `MambaLayer.forward` runs the same two-pass lockstep as `TransformerLayer` (attention, MoE
+  and MLP layers of the hybrid stack are `TransformerLayer`s). A Mamba layer's rounding sites are its in_proj /
+  out_proj inputs (`Fp16Linear`); conv1d and the SSD scan run in fp32 under the recipe and have no fp16 site. Before
+  this, a hybrid model with `sticky_rounding: true` took θ_{k−1} snapshots but never opened a policy forward (only
+  `GPTModel` was patched): the policy was silently the plain recipe.
 
 **Scaling (per rank; P_r = the rank's 16-bit parameter shard in bytes, U_max = its largest lockstep unit,
 T = tokens of a micro-batch on the rank, d = hidden size, k = top-k, n_mb = policy-forward micro-batches per

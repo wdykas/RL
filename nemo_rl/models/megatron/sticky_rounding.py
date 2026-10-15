@@ -35,7 +35,7 @@ anchored policy, see §14g):
   copies its own local 16-bit parameters (its TP/PP/EP shard, exactly as the
   model holds them) into pinned host buffers.
 - A policy forward (verification, training, log-probs) runs the anchor
-  forward in lockstep: for every transformer layer, first the layer at
+  forward in lockstep: for every decoder layer (transformer or Mamba), first the layer at
   theta_n (weights streamed from host, the next unit prefetched on a side
   stream; inference only, no autograd state) on the anchor residual stream,
   recording its fp16 values per site; then the layer at theta_{n+1} on the
@@ -164,7 +164,7 @@ def _host_dtype(name: str, dtype: torch.dtype) -> torch.dtype:
 
 
 class ThetaStore:
-    """theta_n per lockstep unit (embedding, each transformer layer) in pinned host memory.
+    """theta_n per lockstep unit (embedding, each decoder layer) in pinned host memory.
 
     Holds exactly this rank's local parameters of each unit (its shard under
     TP / PP / EP; 16-bit, expert GEMM weights as fp16): host bytes per rank =
@@ -519,7 +519,7 @@ def _layer_forward(orig):
         if s is None or s.mode is not None:
             return orig(self, *args, **kwargs)
         if s.hidden is None:
-            raise RuntimeError("sticky rounding: transformer layer before the anchor stream starts")
+            raise RuntimeError("sticky rounding: decoder layer before the anchor stream starts")
         if "hidden_states" in kwargs:
             a_kwargs = dict(kwargs, hidden_states=s.hidden)
             a_args = args
@@ -602,21 +602,74 @@ def _gpt_forward(orig):
     return forward
 
 
+def _layer_classes() -> tuple[type, ...]:
+    """Decoder layer classes the lockstep runs (``_layer_forward`` is installed on each).
+
+    Transformer layers (attention, MoE, MLP layers of GPT and hybrid stacks) and,
+    when MCore has them, hybrid Mamba layers (Nemotron-H).
+    """
+    from megatron.core.transformer.transformer_layer import TransformerLayer
+
+    classes: list[type] = [TransformerLayer]
+    try:
+        from megatron.core.ssm.mamba_layer import MambaLayer
+    except ImportError:  # MCore without SSM support
+        pass
+    else:
+        classes.append(MambaLayer)
+    return tuple(classes)
+
+
+def _model_classes() -> tuple[type, ...]:
+    """Language-model classes whose forward opens a policy forward (GPT, hybrid)."""
+    from megatron.core.models.gpt.gpt_model import GPTModel
+
+    classes: list[type] = [GPTModel]
+    try:
+        from megatron.core.models.hybrid.hybrid_model import HybridModel
+    except ImportError:
+        try:  # MCore before the HybridModel rename
+            from megatron.core.models.mamba.mamba_model import MambaModel as HybridModel
+        except ImportError:
+            HybridModel = None
+    if HybridModel is not None:
+        classes.append(HybridModel)
+    return tuple(classes)
+
+
+def _patch_forward(cls: type, wrap) -> None:
+    """``cls.forward = wrap(cls.forward)`` unless cls's own forward is already patched.
+
+    A subclass that inherits a patched forward is covered by its base's patch.
+    """
+    own = cls.__dict__.get("forward")
+    if own is None or hasattr(own, "__wrapped__"):
+        return
+    cls.forward = wrap(own)
+
+
 def install() -> None:
-    """Patch MCore's GPT model / embedding / transformer layer and fp16_gemm's sites (idempotent)."""
+    """Patch MCore's model / embedding / decoder layer forwards and fp16_gemm's sites (idempotent).
+
+    Model forwards: ``GPTModel`` and ``HybridModel`` (Nemotron-H). Decoder
+    layers: ``TransformerLayer`` (attention, MoE and MLP layers of both stacks)
+    and ``MambaLayer``: a Mamba layer's fp16 sites are its in_proj / out_proj
+    inputs (``Fp16Linear``); its conv / SSD run in fp32 under the recipe (no
+    rounding site), so the layer runs the same two-pass lockstep.
+    """
     if _STATE["installed"]:
         return
     from megatron.core.models.common.embeddings.language_model_embedding import (
         LanguageModelEmbedding,
     )
-    from megatron.core.models.gpt.gpt_model import GPTModel
-    from megatron.core.transformer.transformer_layer import TransformerLayer
 
     from nemo_rl.models.megatron import fp16_gemm, fp16_moe
 
-    GPTModel.forward = _gpt_forward(GPTModel.forward)
-    LanguageModelEmbedding.forward = _embedding_forward(LanguageModelEmbedding.forward)
-    TransformerLayer.forward = _layer_forward(TransformerLayer.forward)
+    for cls in _model_classes():
+        _patch_forward(cls, _gpt_forward)
+    _patch_forward(LanguageModelEmbedding, _embedding_forward)
+    for cls in _layer_classes():
+        _patch_forward(cls, _layer_forward)
     fp16_gemm.set_sticky_hooks(site_cast, moe_preprocess)
     fp16_moe.set_fc2_input_hook(experts_fc2_input)
     _STATE["installed"] = True
@@ -633,12 +686,25 @@ def sticky_rounding_enabled(config: Any) -> bool:
 
 
 def lockstep_units(model: torch.nn.Module) -> list[torch.nn.Module]:
-    """This rank's lockstep units in forward order: embedding, then each layer."""
+    """This rank's lockstep units in forward order: embedding, then each decoder layer.
+
+    GPT (``TransformerBlock``) and hybrid (``HybridStack``: Mamba, attention,
+    MoE layers) decoders; any other layer type is rejected.
+    """
     while not hasattr(model, "decoder") and hasattr(model, "module"):
         model = model.module  # DDP / Float16Module wrappers
     units: list[torch.nn.Module] = []
     if getattr(model, "embedding", None) is not None and getattr(model, "pre_process", True):
         units.append(model.embedding)
+    classes = _layer_classes()
+    for layer in model.decoder.layers:
+        if not isinstance(layer, classes):
+            # e.g. hybrid shortcut MoE blocks / hyper-connection layers: their
+            # forward would run without an anchor pass (a silent plain policy)
+            raise NotImplementedError(
+                f"sticky rounding: decoder layer {type(layer).__name__} has no lockstep "
+                f"(built for {', '.join(c.__name__ for c in classes)})"
+            )
     units.extend(model.decoder.layers)
     return units
 

@@ -464,3 +464,69 @@ def test_anchor_store_keeps_the_drafting_weights(monkeypatch, kind):
     assert torch.equal(got, theta if kind is None else draft)
     assert torch.equal(unit.weight.detach(), theta)  # training weights back
     assert calls == ([] if kind is None else [("load", "momentum"), ("restore", "swap")])
+
+
+def test_hybrid_model_and_mamba_layer_get_the_lockstep():
+    """Nemotron-H: HybridModel forwards open policy forwards, Mamba layers run the lockstep.
+
+    Before, only GPTModel / TransformerLayer were patched, so on a hybrid model
+    sticky rounding was configured (theta_n snapshots taken) but no policy
+    forward was ever opened: a silent plain policy.
+    """
+    pytest.importorskip("megatron.core")
+    from megatron.core.models.hybrid.hybrid_model import HybridModel
+    from megatron.core.ssm.mamba_layer import MambaLayer
+    from megatron.core.transformer.transformer_layer import MoETransformerLayer, TransformerLayer
+
+    assert HybridModel in sr._model_classes()
+    assert {TransformerLayer, MambaLayer} <= set(sr._layer_classes())
+    assert issubclass(MoETransformerLayer, sr._layer_classes())
+
+
+def test_patch_forward_is_idempotent_and_skips_inherited_forwards():
+    class Base(torch.nn.Module):
+        def forward(self, x):
+            return x
+
+    class Child(Base):
+        pass
+
+    wraps = []
+
+    def wrap(orig):
+        def forward(self, *a, **k):
+            wraps.append(type(self).__name__)
+            return orig(self, *a, **k)
+
+        forward.__wrapped__ = orig
+        return forward
+
+    orig = Base.forward
+    try:
+        sr._patch_forward(Base, wrap)
+        sr._patch_forward(Base, wrap)  # second install: no double wrap
+        sr._patch_forward(Child, wrap)  # inherits the patched forward
+        assert Base.forward.__wrapped__ is orig and "forward" not in Child.__dict__
+        Child()(1)
+        assert wraps == ["Child"]
+    finally:
+        Base.forward = orig
+
+
+def test_lockstep_units_reject_layers_without_a_lockstep():
+    pytest.importorskip("megatron.core")
+
+    class Stack(torch.nn.Module):
+        def __init__(self, layers):
+            super().__init__()
+            self.layers = torch.nn.ModuleList(layers)
+
+    class Model(torch.nn.Module):
+        def __init__(self, layers):
+            super().__init__()
+            self.embedding = torch.nn.Embedding(4, 2)
+            self.decoder = Stack(layers)
+
+    with pytest.raises(NotImplementedError, match="no lockstep"):
+        sr.lockstep_units(Model([torch.nn.Linear(2, 2)]))
+    assert len(sr.lockstep_units(Model([]))) == 1
