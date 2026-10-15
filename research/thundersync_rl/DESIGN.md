@@ -2053,7 +2053,13 @@ half-anchored batch the self row equals the plain forward and the anchored row e
   and MLP layers of the hybrid stack are `TransformerLayer`s). A Mamba layer's rounding sites are its in_proj /
   out_proj inputs (`Fp16Linear`); conv1d and the SSD scan run in fp32 under the recipe and have no fp16 site. Before
   this, a hybrid model with `sticky_rounding: true` took θ_{k−1} snapshots but never opened a policy forward (only
-  `GPTModel` was patched): the policy was silently the plain recipe.
+  `GPTModel` was patched): the policy was silently the plain recipe. The Mamba mixer reads conv1d / dt_bias / A_log /
+  D through its `MambaContextParallel` helper, which holds the Parameter objects; the anchor pass rebinds such
+  captured parameters to the streamed θ_{k−1} tensors (`_captured_params_swapped`). Checked on GPU (Nano L8, BI, 1
+  GPU): lockstep logits == research emulation bitwise, all-self == plain, half-anchored rows bitwise; gradients are
+  not bitwise-checkable on the hybrid (the plain Mamba SSD backward is non-deterministic). 4-GPU E2E: queued.
+  Measured v cut (L8 harness, momentum drafts): ×.42 / .23 / .14 / .16 at Adam steps 2 / 4 / 8 / 16
+  (thundersync_work/research/agent_raise_acceptance.md).
 
 **Scaling (per rank; P_r = the rank's 16-bit parameter shard in bytes, U_max = its largest lockstep unit,
 T = tokens of a micro-batch on the rank, d = hidden size, k = top-k, n_mb = policy-forward micro-batches per
