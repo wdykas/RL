@@ -1016,7 +1016,16 @@ _WGRAD_CONFIGS: tuple[tuple[int, tuple], ...] = (
 
 
 def _train_gemm_kind(rows: int, experts: int) -> str:
-    mode = os.environ.get("NEMO_RL_FP16_MOE_TRAIN_GEMM", "auto")
+    """Training expert GEMM path: per-expert cuBLAS (default) or one segment launch.
+
+    Opt-in (NEMO_RL_FP16_MOE_TRAIN_GEMM=auto|segment, e.g. through
+    ``policy.megatron_cfg.env_vars``): the segment kernels are bitwise the
+    cuBLAS path and cut host time (full Nano EP4 fwd+bwd 1.6x at 1k tokens),
+    but at 8k the gain is ~2% and their GPU kernel time is ~2x cuBLAS's, so
+    they are not the default until the kernels are faster. ``auto`` picks
+    segment below _SEGMENT_MAX_ROWS rows per expert.
+    """
+    mode = os.environ.get("NEMO_RL_FP16_MOE_TRAIN_GEMM", "cublas")
     if mode in ("segment", "cublas"):
         return mode
     return "segment" if rows <= _SEGMENT_MAX_ROWS * max(experts, 1) else "cublas"

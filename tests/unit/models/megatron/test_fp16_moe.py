@@ -318,6 +318,8 @@ def test_training_segment_kernels_bitwise_equal_per_expert_cublas(monkeypatch, s
 
 def test_train_gemm_kind(monkeypatch):
     monkeypatch.delenv("NEMO_RL_FP16_MOE_TRAIN_GEMM", raising=False)
+    assert fm._train_gemm_kind(128 * 48, 128) == "cublas"  # default: opt-in only
+    monkeypatch.setenv("NEMO_RL_FP16_MOE_TRAIN_GEMM", "auto")
     assert fm._train_gemm_kind(128 * 48, 128) == "segment"
     assert fm._train_gemm_kind(8 * 4096, 8) == "cublas"
     monkeypatch.setenv("NEMO_RL_FP16_MOE_TRAIN_GEMM", "cublas")
