@@ -692,6 +692,7 @@ class SpeculativeGeneration:
                 del self._null_slots[t]  # never verified (no drafts reached it)
             self._null_slots[step + 1] = dict(null_slots)
         hkeys = self._hidden_keys([f"{step + 1}:{i}" for i in range(len(prompts))])
+        self._check_draft_capacity(rank0, len(prompts))
         t_start = time.perf_counter()
         ray.get(
             rank0.start_drafts.remote(
@@ -749,6 +750,30 @@ class SpeculativeGeneration:
             ]
 
         return collect
+
+    def _check_draft_capacity(self, rank0, n: int) -> None:
+        """Fail fast when the engine cannot run every draft of a cohort at once.
+
+        Drafts beyond the engine's concurrent request capacity start only when
+        earlier ones finish (a whole draft's decode time later), so they are
+        short or empty at the cut and their rows decode as long tails or
+        fresh. Raise the capacity with
+        ``policy.generation.mcore_generation_config.max_requests`` (hybrid
+        models: the Mamba region is then sized for that many requests, per
+        engine rank max_requests x Mamba state bytes per request) or fewer
+        drafts per cohort.
+        """
+        cap = self.__dict__.get("_draft_capacity")
+        if cap is None:
+            query = getattr(rank0, "engine_request_capacity", None)  # absent on test stubs
+            cap = self._draft_capacity = int(ray.get(query.remote())) if query else 0
+        if cap and n > cap:
+            raise RuntimeError(
+                f"{n} drafts per cohort but the engine runs {cap} requests at once "
+                "(max_requests x engine DP): set "
+                "policy.generation.mcore_generation_config.max_requests >= "
+                f"{n} / engine DP, or draft fewer rows per cohort"
+            )
 
     def _peek_streams(self, rank0, idx: list[int]) -> list:
         """(tokens, finished, engine log-probs) of running drafts, left running.
