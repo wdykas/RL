@@ -340,6 +340,11 @@ def behavior_logprobs(
     return out
 
 
+# Ordered learner call numbers (``SpeculativeGeneration.learner_seq``), shared by
+# every SpeculativeGeneration of the driver (one per engine lane).
+_LEARNER_SEQ = itertools.count()
+
+
 class SpeculativeGeneration:
     def __init__(
         self,
@@ -2323,9 +2328,9 @@ class SpeculativeGeneration:
         """
         if not self.__dict__.get("learner_ordered", False):
             return None
-        if "_learner_seq" not in self.__dict__:
-            self._learner_seq = itertools.count()
-        return next(self._learner_seq)
+        # One counter per process: the learner workers count every ordered call,
+        # whichever SpeculativeGeneration (engine lane) sent it.
+        return next(_LEARNER_SEQ)
 
     def learner_track(self, refs) -> None:
         """Ordered learner calls in flight (``learner_drain`` waits for them)."""

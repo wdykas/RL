@@ -530,6 +530,11 @@ def validate_cohort_lanes(master_config: ThunderSyncMasterConfig) -> None:
         )
     if ts_cfg.draft_after_verify or ts_cfg.fused_verify_train:
         problems.append("draft_after_verify and fused_verify_train must be off")
+    grpo = getattr(master_config, "grpo", None)
+    if (getattr(grpo, "max_rollout_turns", 1) or 1) > 1 or ts_cfg.rollout_lag:
+        problems.append("multi-turn rollouts and rollout_lag are not built on lanes yet")
+    if ts_cfg.draft_lookahead != 1:
+        problems.append("draft_lookahead must be 1 (two lanes hold two cohorts)")
     if problems:
         raise ValueError("thundersync.cohort_lanes: " + "; ".join(problems) + ".")
 
@@ -1938,7 +1943,7 @@ def thundersync_grpo_train(
             f"thundersync.cohort_lanes={ts_cfg.cohort_lanes} but "
             f"{'no' if lanes is None else len(lanes)} engine lanes were built"
         )
-    if lanes is not None:
+    if lanes is not None and not ts_cfg.stream_training_over_tails:
         return _train_on_lanes(
             policy, lanes, learner, adv_fn, dataloader, tokenizer, loss_fn,
             task_to_env, master_config, logger, on_step,
@@ -1948,7 +1953,20 @@ def thundersync_grpo_train(
     stale = False  # setup() already performed the initial refit
     step = 0
     spec = None
-    if ts_cfg.speculate:
+    sched = None
+    if lanes is not None:
+        # Cohort lanes on the streaming loop (DESIGN.md section 14j): one
+        # SpeculativeGeneration per lane; each step's cohort runs on lane
+        # step % 2 (verification, tails, fresh rows, streaming training) while
+        # the other lane drafts the next cohort from the top of the step.
+        for lane in lanes:
+            lane.generation.prepare_for_generation()
+            lane.spec = make_speculative_generation(
+                lane.generation, policy, tokenizer, master_config
+            )
+        sched = CohortLanes(lanes)
+        spec = lanes[0].spec
+    elif ts_cfg.speculate:
         policy_generation.prepare_for_generation()
         spec = make_speculative_generation(
             policy_generation, policy, tokenizer, master_config
@@ -2010,6 +2028,36 @@ def thundersync_grpo_train(
         t0 = time.perf_counter()
         t_verify = 0.0
         t_first = 0.0
+        lane_x = lane_y = lane_drafts = None
+        lane_stats: dict[str, float] = {}
+        if sched is not None:
+            lane_x, lane_y = sched.cohort_lane(step), sched.drafting_lane(step)
+            spec, policy_generation = lane_x.spec, lane_x.generation
+            for lane in lanes:
+                lane.spec.current_step = step
+            if next_batch is not None and step + 1 < max_steps:
+                # The drafting lane takes cohort step+1's drafter (theta_step, or
+                # theta_hat_{step+1}: learner load, refit of this lane only,
+                # learner restore) and starts drafting before this step's
+                # verification; nothing else is in flight on the learner here.
+                momentum = spec.draft_weights != "current"
+                version = ("theta_hat", step + 1) if momentum else ("theta", step)
+
+                def put_drafter(y=lane_y, momentum=momentum):
+                    if momentum:
+                        y.spec.stage_draft_weights(
+                            lambda: refit_lane(policy, y), stage_on_engine=False
+                        )
+                    else:
+                        refit_lane(policy, y)
+
+                sched.refit(lane_y, version, put_drafter)
+                sched.pin(lane_y, step + 1)
+                next_prompts, null_slots = next_draft_prompts(next_batch, ts_cfg, G)
+                lane_drafts = asyncio.run(
+                    lane_y.spec.draft_streaming(next_prompts, null_slots=null_slots)
+                )
+                lane_stats["lanes/draft_start_s"] = time.perf_counter() - t0
         if lag and pending is None:
             # Step 0 of the lagged baseline: its rollouts come from theta_0.
             t1 = time.perf_counter()
@@ -2048,9 +2096,16 @@ def thundersync_grpo_train(
             batch = select_null_prompts(batch, spec, ts_cfg.null_bv_spare_prompts)
         staged = (
             spec is not None
+            and sched is None  # lanes stage the drafter on the drafting lane
             and spec.draft_weights != "current"
             and next_batch is not None
             and step + 1 < max_steps
+        )
+        # Lanes: rows without a plan (never drafted, or dropped) decode at
+        # theta_step on the cohort lane after its tails; decided before any
+        # rollout takes a plan.
+        lane_fresh = sched is not None and not spec.plans_cover(
+            _prompts(batch), pending_ok=tails is not None
         )
         # Sticky: every drafted rollout is (or, streaming, will be) complete.
         # When every rollout of this step is served by a complete plan the
@@ -2065,6 +2120,19 @@ def thundersync_grpo_train(
         refit_s = []
 
         def refit_for_step(staged=staged, draft_now=draft_now):
+            if sched is not None:
+                # The cohort lane is free once its cohort's tails are done; it
+                # takes theta_step only if some row decodes fresh.
+                t_r = time.perf_counter()
+                if lane_x.cohort == step:
+                    sched.unpin(lane_x, step)
+                if lane_fresh:
+                    sched.refit(lane_x, ("theta", step), lambda: refit_lane(policy, lane_x))
+                else:
+                    lane_x.generation.prepare_for_generation()
+                refit_s.append(time.perf_counter() - t_r)
+                lane_stats["lanes/fresh_refit"] = float(lane_fresh)
+                return
             if staged:
                 # theta_hat_{step+1} needs only the state after the last
                 # update; the learner and the engine are idle (streaming: the
@@ -2182,6 +2250,15 @@ def thundersync_grpo_train(
                 if ts_cfg.verify_mode == "block"
                 else (lambda prompts=next_prompts: spec.draft(prompts))
             )
+        if sched is not None:
+            # The next cohort's drafts already run on the drafting lane.
+            if lane_drafts is not None:
+
+                async def drafter(collector=lane_drafts):
+                    return collector
+
+            else:
+                drafter = None
         policy.prepare_for_training()
         metrics = asyncio.run(
             _run_streaming_tails(spec, tails is not None)(
@@ -2197,7 +2274,11 @@ def thundersync_grpo_train(
                 ts_cfg=ts_cfg,
                 adv_fn=adv_fn,
                 drafter=drafter,
-                before_finish=spec.score_prev if spec is not None else None,
+                before_finish=(
+                    lane_y.spec.score_prev
+                    if sched is not None
+                    else (spec.score_prev if spec is not None else None)
+                ),
                 pre_rollout=pre_rollout,
                 claim_fused=spec.claim_fused
                 if spec is not None and ts_cfg.fused_verify_train
@@ -2209,8 +2290,8 @@ def thundersync_grpo_train(
                 draft_swap=(
                     spec.load_staged_draft_weights if staged and not draft_now else None
                 ),
-                draft_start_frac=0.0 if draft_now else None,
-                drafts_after_pre_rollout=tails is not None,
+                draft_start_frac=0.0 if (draft_now or sched is not None) else None,
+                drafts_after_pre_rollout=tails is not None and sched is None,
                 group_order=group_order,
                 group_blocks=group_blocks,
                 tail_groups=tail_groups,
@@ -2257,6 +2338,12 @@ def thundersync_grpo_train(
         if spec is not None:
             metrics.update(spec.stats)
             spec.stats = {}
+        if sched is not None:
+            metrics.update(lane_y.spec.stats)
+            lane_y.spec.stats = {}
+            lane_stats["lanes/cohort_lane"] = float(lane_x.index)
+            lane_stats["lanes/refits"] = float(sum(lane.refits for lane in lanes))
+            metrics.update(lane_stats)
         policy_generation.finish_generation()
         stale = True
         metrics["time/refit"] = t_refit
