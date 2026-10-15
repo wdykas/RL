@@ -32,6 +32,9 @@ export NVIDIA_TF32_OVERRIDE=1
 # confirms the run completed.
 if [ "${PERF:-0}" != 1 ]; then
   export THUNDERSYNC_MISMATCH_CHECK=1 THUNDERSYNC_ENGINE_Q_CHECK=1
+  # Ray merges log lines that differ only in numbers across workers ("[repeated Nx]"), which
+  # would hide check lines with other values from the log-parsing checks below.
+  export RAY_DEDUP_LOGS=0
   export THUNDERSYNC_SPEC_PROF=1 THUNDERSYNC_MEM_LOG=1
 fi
 
