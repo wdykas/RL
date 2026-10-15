@@ -71,10 +71,16 @@ def wrap(fn: Callable, cfg: dict) -> Callable:
         )
     c = _resolve(cfg)
 
+    name = f"{getattr(fn, '__module__', '?')}.{getattr(fn, '__name__', '?')}"
+    seen = {"logged": False}
+
     @functools.wraps(fn)
     def anchored(*args: Any, **kwargs: Any) -> Any:
         if kwargs.get("num_splits", 1) == 1 and kwargs.get("seqlen_k_per_split") is None:
             kwargs.update(c)
+            if not seen["logged"]:  # non-vacuity evidence: the anchored path actually ran
+                seen["logged"] = True
+                print(f"[bi_split_kv] first anchored call: {name} {c}", flush=True)
         return fn(*args, **kwargs)
 
     anchored._ts_bi_split_kv = True  # type: ignore[attr-defined]
