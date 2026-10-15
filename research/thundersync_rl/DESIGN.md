@@ -1329,6 +1329,16 @@ is exact apart from fp16 subnormals and widens the range by 2^s. Default 0; prob
 before running it and set s=2-4 if headroom is below ~4x. The setting must match in training and
 generation (checked by the mismatch validator).
 
+**Mamba layer input (2026-10-15, ts-mamba-fp32-in 6931e160; default on).** Stock `MambaLayer._prepare_mixer_input`
+casts the layer input to `params_dtype` before `in_proj`'s fused pre-norm, so with bf16 params the fp32 residual was
+rounded to bf16 at every Mamba layer, against this recipe (fp32 norm on the fp32 residual, as attention / MoE
+layers do). `_patch_mamba_layer_input` feeds the fp32 residual to the patched fused norm + fp16 GEMM; training and
+engine both run it, so batch invariance holds (m32-x1k / m32-x8k EXACT, 4 steps mismatch 0). Measured effect on
+draft acceptance: Nano L8 harness per-token log-ratio variance v 2.5e-6 -> 5.9e-7 (thundersync_work
+research/acceptance_offline_vs_inloop.md: the cast was the x~4 part of the in-loop vs offline gap). Per rank: no
+memory or communication change (one fewer cast). `policy.megatron_cfg.mamba_fp32_prenorm_input=false` restores the
+stock cast for control arms only; it must match between training and generation (validator field list).
+
 ## 14c. Sticky MoE routing anchored to the drafter (`thundersync.sticky_routing`)
 
 *Opt-in, off by default (`sticky_routing: false`; `sticky_routing_delta: 0.03` when on).
