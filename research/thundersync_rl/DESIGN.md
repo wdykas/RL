@@ -3881,6 +3881,48 @@ forward (remspec-nano4c: truncated models do not repeat text); real full-Nano te
 (agent_tail_remainder_spec.md). Results on dumped tail rows: agent_tail_speed.md.
 
 
+## 14ab. Integration round 3: ts-integ3 (2026-10-15)
+
+*Branch ts-integ3 (../RL-integ3) off ts-bughunt-integ 5f835b57 (= ts-nano-perf 9cf376a0 + deal_rows 14w +
+zero-advantage skip 14x + bughunt 14y). Notes, decisions and validation: thundersync_work/research/agent_integ3.md.*
+
+**Default vs opt-in, and why.**
+
+| feature | state | evidence |
+|---|---|---|
+| Mamba fp32 pre-norm input (14b) | **default on** (`mamba_fp32_prenorm_input=false` = control) | m32-x1k / m32-x8k EXACT; m32-ut failures a subset of base; L8 harness v 2.5e-6 -> 5.9e-7 |
+| learner micro-batch 2 rows, 20480-token cap (ab_base, every arm) | **default** | mbs2-full-base: 2x8192 1399 ms/row vs 1655 (1x8192), bench peak 112 GiB -> ~159 GB in-loop; 4x8192 OOM; mbs-l8x x4/xl4/xcap EXACT, grad-norm MBS1 vs 4 rel 8e-5 |
+| verify_yield, tail dump, graphed-prefill knob (14aa) | opt-in | ty-x1k / ty-xl2 EXACT; L8 perf within noise; full-Nano go_tail yield arm (tyy) not run -> tail-redesign defaults (growth 0, graphed prefill) not adopted. Prefix cache at >= 4k was already run_ab_arm's default |
+| streaming verify0 (14z) | opt-in, **one engine only** | v0s-x / v0s-x8k / v0s-xnonull EXACT, order replay same_as_real; **v0s-xlanes FAIL** (max\|dlogp\| 1.66 / 0.76 / 0.60) -> validator rejects cohort_lanes > 1; no full-Nano gain on record |
+| window pacing (14v) | opt-in | pace-x EXACT; pace-p1 on 9.77 vs ctl 9.60 s, pace-p2 8.57 vs 8.01 s (no gain) |
+| sticky rounding on hybrid (14g) | opt-in | sre2e-sr1-cur / sr1-mom / sr0-mom EXACT (c692af97); ~1.6x learner fwd+bwd; needs activation_checkpointing off |
+| callcost kernels (`NEMO_RL_FP16_MOE_TRAIN_GEMM=auto`) | opt-in | at the chosen MBS 2: mbs2-full-cc 2835 ms vs base 2797 ms per 2x8192 micro-batch (shim 2803): not faster |
+| engine verify (ts-engine-verify, prefetch / batched decisions) | **not merged** | every verify_on=engine arm at 486a4225 (ev4-*) and 3c013e3e (ev5-*) dies at step 1 ("canonical order incomplete ... 0 of 16 groups" after "draft verification failed"); branch is on lanes-stream 767917df and conflicts in 44 hunks with this tree's continuation code (carried walk vs pieces in flight). Merge after the crash is fixed and the branch is rebased on ts-integ3 |
+
+**Fixes in this round.**
+- *Verification seeds by canonical call identity.* Block verification (verify0, ⊥-BV waves, streamed verify0 calls)
+  and continuation-piece verification drew `next(verify_seeds)` from different tasks/threads, so which call got which
+  seed depended on arrival. `SpeculativeGeneration._call_seed` now hashes (grpo.seed, stream, step, kind, the call's
+  rows as (row key, row verification ordinal in this step)). A row's calls are sequential (one piece in flight per
+  stream; waves in order), so ordinals do not depend on timing; every (row, ordinal) is in exactly one call, so seeds
+  stay fresh per call (exact in law as before). Rows without a key are named by (prompt length, crc32 of tokens).
+  Cost: O(rows) driver hashing per call, nothing per rank. What remains timing-dependent: how many decoded tokens a
+  piece takes (multiple chunks when available), so continuation pieces are still not bitwise reproducible run to run.
+- *LEARNER_TORCHPROF.* The torch profiler's trace metadata enumerates every process group's backend config and
+  raised on Megatron groups without one (dr-x-lanes). The hook only prints a key_averages table, so it now skips that
+  metadata (`_get_distributed_info -> None`).
+- *Section numbers.* Tail speed 14x -> 14aa (zero-advantage skip keeps 14x), window pacing 14v placed before 14w.
+
+**Scale.** Nothing in this round adds per-rank state beyond the merged features' own (each section states it); the
+seed change is driver-only; the micro-batch cap is a config function (all ranks and the planner agree) and bounds
+activations by tokens (20480 per micro-batch), so longer caps fall back to 1 row automatically.
+
+**Validation.** CPU suite tip vs base 5f835b57: thundersync 1145 pass / 7 fail vs 1077 / 7, same failures (GPU-only
+test_streaming_pipeline); tests/unit/models/megatron 706 pass / 9 fail + 7 errors on both, same names. GPU single-node arms (research/integ3/val.sh, queue lines i3-*): ut, x1k, xlanes, x8k, xopt
+(every opt-in at once), xsr / xsrl (sticky rounding, one engine / lanes), xm0 (Mamba fix off), resume, perf pair
+p-lanes / p-async1. Full Nano: thundersync_work/sbatch/go_integ3.sh (`x`, `sr`, `mamba0`) on the frozen
+../RL-integ3-scale (fork branch ts-integ3-scale). Results: agent_integ3.md and ledger I3.
+
 ## 15. Open work
 
 - **Stragglers.** About one rejected draft per step decodes its remainder at about 3 ms
