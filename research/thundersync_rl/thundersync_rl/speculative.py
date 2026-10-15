@@ -367,7 +367,7 @@ class SpeculativeGeneration:
         null_bv_policy: Optional[dict[str, Any]] = None,
         null_bv_drop_is: bool = False,
         null_bv_spare_prompts: int = 0,
-        draft_admission: str = "primaries_first",
+        draft_admission: str = "group",
         sticky_chunk_tokens: int = 2048,
         sticky_chunk_growth: float = 0.0,
         draft_until_complete: bool = False,

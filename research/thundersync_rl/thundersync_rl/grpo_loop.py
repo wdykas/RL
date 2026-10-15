@@ -276,11 +276,13 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # counts only (null_bv.LogRatioCalibration). Logs spec/null_v_used and
     # spec/logratio_var_step. null_bv_tail_weight: critical-path cost of a
     # tail decode relative to a fresh decode of a slot (DP cost model).
-    # ⊥-BV draft admission order: "primaries_first" (every group's G
-    # primaries, then the extras) or "group" (whole pools, group by group).
+    # ⊥-BV draft admission order: "group" (whole pools, group by group;
+    # default: at max_requests = primaries the early groups finish fully
+    # drafted, 0.56-0.69 of groups at Nano L8 1k vs 0.31-0.50) or
+    # "primaries_first" (every group's G primaries, then the extras).
     # Exact either way (counts and batch order only); logged:
     # spec/null_groups_fully_drafted, spec/null_groups_whole_accepted.
-    draft_admission: str = "primaries_first"
+    draft_admission: str = "group"
     null_bv_calibrate: bool = False
     null_bv_calibration_decay: float = 0.5
     null_bv_tail_weight: float = 1.0
