@@ -3021,8 +3021,18 @@ def thundersync_grpo_train(
             for i in range(r.size)
         ]
 
+    # Debug (kill-and-resume tests): end the run after step boundary N, a checkpoint
+    # boundary, with grpo.max_num_steps unchanged (Megatron's LR scheduler checks
+    # train_iters = max_num_steps on load, so a shorter max_num_steps cannot be resumed
+    # with a longer one).
+    stop_at = int(os.environ.get("THUNDERSYNC_DEBUG_STOP_AT", "0") or 0)
+    if stop_at and not (stop_at > step and bounds.saves_after(stop_at - 1)):
+        raise ValueError(
+            f"THUNDERSYNC_DEBUG_STOP_AT={stop_at} must be a checkpoint boundary after the "
+            f"start step {step} (checkpointing.save_period multiple)"
+        )
     while upcoming:
-        if step >= max_steps:
+        if step >= max_steps or (stop_at and step >= stop_at):
             break
         batch = upcoming.popleft().batch
         nb = next(stream, None)
