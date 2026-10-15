@@ -3522,6 +3522,95 @@ partial to fp32. The partials are then added in rank order. That makes the round
 layouts whose engine EP differs from the learner's (lanes, Ultra/1T).
 
 
+## 14w. Dealing dispatch rows over every learner DP rank (`thundersync.deal_rows`, default on)
+
+*Branch ts-deal-rows (../RL-deal, off ts-nano-perf 9cf376a0). Code: `streaming.py` (`StreamPlanner(deal_rows=)`,
+`num_units`, `cut_units`, `deal_chunks`, `microbatch_counts`), `grpo_loop.py` (`canonical_groups_per_block`, metrics).
+Notes: thundersync_work/research/agent_deal_rows.md; analysis: research/learner_offload_design.md §1.3, §5.*
+
+**Problem [M + code].** Canonical dispatch sends blocks of `canonical_block_groups` (4) groups. The planner cut the
+dispatch's rows (length-sorted, zero / nonzero advantage apart) into chunks of `max_chunk_trajectories` (8) rows and
+placed whole chunks on DP ranks by tokens. Under EP every rank must run the same number of forwards, so
+`_pad_to_equal_microbatches` padded every rank to the busiest one with all-masked fillers.
+- Full Nano (learner DP 8, MBS 1): a 32-row dispatch = 4 ranks × 8 real + 4 ranks × 8 filler micro-batches. Per step
+  17 × 8 = 136 micro-batches per rank against 64 that carry rows (53% filler, ≈ 100 s of a ~200 s learner).
+- async1's 8-row leftover dispatch: 1 rank real, 7 ranks filler (13.9 s).
+- Every dispatch took ~11–13 s flat in rows and tokens (`timeline/dispatches`, x2-lanes and ab2 runs).
+- Filler fraction ≈ 1 − rows / (DP · chunk rows) per dispatch: it grows with DP. At DP 2 (Nano L8) it is 0, which is
+  why the L8 audits never saw it.
+
+**Design.** `next_dispatch` with `deal_rows`:
+1. The closed-group rows of the dispatch, sorted by tokens (stable on the canonical order), form one class (two —
+   nonzero / zero advantage — only when the worker skips zero-advantage rows, i.e. without EP).
+2. `cut_units` cuts each class into `num_units = min(rows, DP · ceil(ceil(rows / u) / DP))` consecutive units,
+   u = min(MBS, `max_chunk_trajectories`): one micro-batch per unit. Rounding the unit count up to a multiple of DP
+   never raises the per-rank micro-batch count; the units just hold fewer rows. A unit is length-contiguous, so it
+   pads only to its own longest row (the worker pads a chunk's micro-batches to the chunk's longest row; old 8-row
+   chunks padded every row to the longest of 8).
+3. `deal_chunks` places fused (pinned) chunks first, then the units longest first on the least-loaded rank, load =
+   (live micro-batches, live tokens, tokens), lowest rank on ties (a heap: O(log DP) per unit). With one-micro-batch
+   units this is a round-robin by count, longest against shortest within each round.
+4. `_pad_to_equal_microbatches` is unchanged; it now adds a filler only when rows cannot fill whole rounds of DP
+   units: never when rows is a multiple of DP or rows ≥ DP · ceil(ceil(rows / u) / DP), fewer than DP otherwise.
+- Result per dispatch: every rank runs ceil(ceil(rows / u) / DP) micro-batches. Full Nano 32-row block: 4 per rank,
+  0 filler (was 8 per rank, 32 filler); async1 8-row leftover: 1 per rank; async1 504 rows: 63 per rank; sync 512:
+  64 per rank.
+- `canonical_groups_per_block` (deal_rows on): a block has at least ceil(DP / G) groups, so its rows reach every
+  rank at any DP, and under PP at least ceil(min_pipeline_microbatches · DP · MBS / G) groups, so each rank's one
+  pipeline call per dispatch has 2·PP micro-batches (the canonical order never holds rows back the way the
+  arrival-order planner does). Both are 0 changes at Nano (DP 8 ≤ 4 · 8 rows, PP 1).
+- `deal_rows: false` restores the whole-chunk layout (`balance_chunks`) for A/Bs. VIT spread groups
+  (`vit.plan_group_layout`, opt-in) keep their own layout.
+
+**Exactness.** Only which rank and which micro-batch backpropagate a row change, and how far a row is padded
+(masked positions). That is fp32 summation order of the gradient (E2 in learner_offload_design §2), the same class as
+an MBS change; fillers add exactly ±0. The sampling law never touches training. The layout is a function of the
+dispatch's rows and the config (sort by tokens, stable on the canonical order; ties to the lowest rank), so canonical
+dispatches are still bitwise independent of arrival order (test: `test_canonical_dispatch_independent_of_arrival_order`)
+and every rank still receives the same numbered `ordered_call` sequence: the driver plans once, ranks get their shard.
+Global loss normalization (valid sequences / tokens summed over DP at `finish`) does not depend on placement.
+
+**Metrics.** Per step: `learner/real_microbatches`, `learner/filler_microbatches` (summed over ranks),
+`learner/microbatches_per_rank` (what one rank runs: sum over dispatches of the per-rank maximum),
+`learner/filler_frac`, `learner/filler_heavy_dispatches` (filler > 25% of a dispatch's forwards; the first one per
+step is also printed). `timeline/dispatches` rows gain (real micro-batches, filler micro-batches, micro-batches per
+rank, real tokens on the busiest rank) after the old five fields, so per-dispatch time can be regressed on real work.
+Opt-in attribution: `run_ab_arm.sh LEARNER_PROF=1` (per-rank per-call seconds and shapes) and `LEARNER_TORCHPROF=N`
+(one torch-profiler table) reach multi-node learner workers through `policy.megatron_cfg.env_vars`.
+
+**Scale (per-rank costs).** Driver: O(R log R) sort + O(U log DP) placement per dispatch (R rows, U units ≤ R).
+Wire: the same rows; one item per unit instead of per 8 rows (MBS 1), so more, smaller items per rank. Worker: one
+`_prepare_train_piece` per item (host-side counts and iterator, small next to the ~1.2 s full-Nano 8k micro-batch;
+measured per call by LEARNER_PROF, not yet per item). Memory: a unit is ≤ one micro-batch, the activation unit
+already; less sequence padding per micro-batch. Nothing new per parameter.
+
+**1T desk check** (TP8 PP8 EP64 on 512 GPUs: learner DP 8, G 16, MBS 1, `canonical_block_groups` 4).
+- DP 8, 64-row blocks: 8 units per rank, 0 filler with deal_rows. The old layout had no filler only when both
+  advantage classes chunked into ≤ 8 chunks in total; any split such as 37 nonzero + 27 zero (5 + 4 chunks) put two
+  8-row chunks on one rank and padded the other seven to 16 (44% filler).
+- PP 8: min_pipeline_microbatches = 16 → `canonical_groups_per_block` raises blocks to 8 groups (128 rows, 16
+  micro-batches per rank per call): bubble 7 / 23 = 30% per call instead of 7 / 15 = 47% at 8 per rank. Half as
+  many dispatches per step, so the streaming overlap is coarser. Untested on GPU (PP>1
+  streaming under the canonical order is itself untested end to end).
+- Large DP (e.g. DP 64 or 128 from smaller TP·PP): blocks grow to ceil(DP / G) groups; class-boundary blocks (the
+  last block of the ready / VIT / tail / fresh classes) can still hold fewer rows than DP and pad fewer than DP
+  fillers each, ≤ 4 such dispatches per step.
+- EP all-to-all: equal per-rank forward counts are kept by `_pad_to_equal_microbatches` exactly as before.
+- Not covered here: per-micro-batch host cost (callcost, d2), the PP bubble of the arrival-order planner, VIT spread.
+
+**Validation.**
+- CPU [M]: `tests/unit/test_deal_rows.py` (DP 8 EP MBS 1 G 8 blocks of 1/2/4: ceil(rows/8) per rank, 0 filler; old
+  layout ≥ half filler; DP 2 (L8) 16 per rank both layouts; one dispatch for rows ∈ {1, 3, 8, 12, 20, 32, 63, 504} × DP ∈ {2, 8, 12, 64}
+  × MBS ∈ {1, 2, 4, 8}: minimal per-rank count, fillers < DP; arrival-order invariance; gradient sum exact incl.
+  skip-zero; `final_microbatches` mirrors dispatch; 1T / large-DP / PP block sizes). Full unit suite: 952 passed, 1
+  failed = the base failure (`test_group_mode_runs_one_call_with_all_microbatches_in_order`, fails on 9cf376a0 too).
+- Nano L8 regression smoke (DP 2, no fillers before either): queue dr-x, dr-xl @ e141d03e (the placement code of the
+  tip; the later heap / PP changes give identical layouts at PP 1). Pending.
+- Full Nano (multi-node, `thundersync_work/sbatch/go_deal.sh`, frozen ../RL-deal-scale): EP4 × DP 2 lanes 2k
+  exactness (CHECKS=1, 4 steps) and the same-tree 8k perf trio (ts_por lanes, async1, sync; CHECKS=0, 6 steps, real
+  reward). Expected [D, learner_offload_design §6]: per 32-row dispatch ~4 micro-batches per rank and ~5.5–6.5 s
+  (was 11.3–13.2), ts_por training ≈ 96–110 s (was 193–209), async1 train ≈ 105–107 s (was 119–121). Pending.
+
 ## 15. Open work
 
 - **Stragglers.** About one rejected draft per step decodes its remainder at about 3 ms
