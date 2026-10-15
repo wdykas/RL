@@ -123,10 +123,15 @@ def install(megatron_cfg: dict) -> None:
             targets.append((te_backends, "flash_attn_varlen_func_v4"))
         dense = getattr(te_backends, "flash_attn_func_v4", None)
         if dense is not None and not getattr(dense, "_ts_bi_split_kv", False):
-            # The dense (bshd, unpadded) FA4 path has no anchored split-KV; a BI call there would
-            # silently use a different reduction order than the engine. Fail loudly instead.
-            te_backends.flash_attn_func_v4 = _refuse_bi(dense)
-            _STATE["patched"].append(f"{te_backends.__name__}.flash_attn_func_v4 (guard)")
+            # TE takes the dense FA4 path for unpacked (bshd, no padding) batches. Anchor it too when
+            # the build supports it; otherwise refuse BI calls there (a silent num_splits=1 would use a
+            # different reduction order than the engine).
+            if "seqlen_k_per_split" in inspect.signature(dense).parameters:
+                te_backends.flash_attn_func_v4 = wrap(dense, cfg)
+                _STATE["patched"].append(f"{te_backends.__name__}.flash_attn_func_v4")
+            else:
+                te_backends.flash_attn_func_v4 = _refuse_bi(dense)
+                _STATE["patched"].append(f"{te_backends.__name__}.flash_attn_func_v4 (guard)")
     except ImportError:
         pass
     for mod, name in targets:
