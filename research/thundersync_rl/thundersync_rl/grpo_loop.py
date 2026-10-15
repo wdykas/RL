@@ -1207,21 +1207,15 @@ def validate_engine_verify_source(
     ):
         train_v = megatron_cfg.get(key, 1)
         gen_v = mcore_gen.get(key)
-        # Measured (runs_1node/np-v2-lanes-ep, Nano L8, learner EP2, engine EP1,
-        # THUNDERSYNC_ALLOW_EP_MISMATCH=1): rows the engine samples plainly (step 0,
-        # fresh / undrafted rows) differ from the learner forward (max |dlogp| 0.89,
-        # exact_frac 2.5e-4); drafted rows are exact because their log-probs come
-        # from the learner's verification. So the engine's EP must equal the
-        # learner's until the MoE combine is EP-invariant (per-rank fp32 partials
-        # summed in rank order vs one rank's fixed-order sum). The override stays
-        # for debugging that fix. With policy.megatron_cfg.moe_ep_invariant_combine
-        # (exact fixed-point limb combine, ep_invariant_combine.py; the batch-
-        # invariance validator requires it on both sides) the MoE output has the
-        # same bits at every EP: runs_1node/epinv-lanes-ep (learner EP2, lanes
-        # EP1) EXACT with it, FAIL without. Cost: engine decode +0.4 ms/step at
-        # full Nano EP4 (7.5 -> 7.9 ms), RSV memory x4; learner combine cheaper.
-        allow = os.environ.get("THUNDERSYNC_ALLOW_EP_MISMATCH") == "1" or bool(
-            megatron_cfg.get("moe_ep_invariant_combine", False)
+        # The MoE combine is EP-dependent unless policy.megatron_cfg.
+        # moe_ep_invariant_combine is on: runs_1node/np-v2-lanes-ep (learner EP2,
+        # engine EP1, old combine) had plainly sampled rows off by up to 0.89 in
+        # log-prob; with the EP-invariant combine runs_1node/epinv-lanes-ep (same
+        # layout, forced fresh rows every step) is exact 4/4 steps and
+        # epinv-lanes-ep-off (control) fails. THUNDERSYNC_ALLOW_EP_MISMATCH=1
+        # without the combine is a debug override (inexact).
+        allow = bool(megatron_cfg.get("moe_ep_invariant_combine", False)) or (
+            os.environ.get("THUNDERSYNC_ALLOW_EP_MISMATCH") == "1"
         )
         if gen_v is not None and gen_v != train_v and not allow:
             problems.append(

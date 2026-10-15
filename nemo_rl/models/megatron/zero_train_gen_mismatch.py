@@ -262,22 +262,18 @@ def validate_batch_invariant_mode(config: PolicyConfig) -> ZeroTrainGenValidatio
             "down_proj_prescale_log2",
             "moe_ep_invariant_combine",
         )
-        if _resolved(megatron_cfg, "moe_ep_invariant_combine") and _resolved(
-            inference_cfg, "moe_ep_invariant_combine"
+        if megatron_cfg.get("moe_ep_invariant_combine", False) or (
+            os.environ.get("THUNDERSYNC_ALLOW_EP_MISMATCH") == "1"
         ):
-            # EP-invariant MoE combine (ep_invariant_combine.py) on both sides:
-            # every token's expert rows are summed exactly (fixed-point limbs), so
-            # the MoE output has the same bits at any EP. Measured:
-            # runs_1node/epinv-lanes-ep (learner EP2, engine EP1 lanes) EXACT with
-            # it, FAIL without; engine EP1/2/4 greedy dumps bitwise identical.
-            matching_fields = tuple(f for f in matching_fields if f != "expert_model_parallel_size")
-        elif os.environ.get("THUNDERSYNC_ALLOW_EP_MISMATCH") == "1":
-            # Debug: a different expert-parallel size on the engine (e.g. cohort
-            # lanes of EP4 under an EP8 learner). Per-token MoE math (row-local
-            # expert GEMMs, top-k combine in routing order) is not expected to
-            # depend on EP, but it does: runs_1node/np-v2-lanes-ep (learner EP2,
-            # engine EP1) has plainly sampled rows off by up to 0.89 in log-prob.
-            # Debug only, for working on an EP-invariant MoE combine.
+            # The expert-parallel size may differ between training and generation
+            # when the MoE combine is EP-invariant (ep_invariant_combine.py: exact
+            # fixed-point limbs, same bits at every EP). Measured
+            # (thundersync_work/runs_1node/epinv-lanes-ep, Nano L8, learner EP2,
+            # engine lanes EP1, forced fresh rows every step): 4/4 steps mismatch 0;
+            # control without the combine (epinv-lanes-ep-off) max |dlogp| 0.66-0.79.
+            # Engine EP1/2/4 greedy decode dumps bitwise identical (epinv-checks).
+            # THUNDERSYNC_ALLOW_EP_MISMATCH=1 without the combine: debug only
+            # (inexact; the old combine is EP-dependent).
             matching_fields = tuple(f for f in matching_fields if f != "expert_model_parallel_size")
         mismatched_fields = [
             field

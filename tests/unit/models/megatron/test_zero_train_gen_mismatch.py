@@ -1260,3 +1260,18 @@ def test_local_vocab_logprob_matches_autograd_and_saves_only_the_logits(monkeypa
     assert torch.equal(out, ref)
     torch.testing.assert_close(grad, ref_grad, rtol=1e-6, atol=1e-6)
     assert saved == [logits.shape, target.shape]
+
+
+def test_ep_may_differ_with_ep_invariant_combine():
+    """moe_ep_invariant_combine lifts the EP equality (runs_1node/epinv-lanes-ep)."""
+    config = _tp_config(2)
+    config["megatron_cfg"]["moe_ep_invariant_combine"] = True
+    config["generation"]["mcore_generation_config"].update(
+        expert_model_parallel_size=2, moe_ep_invariant_combine=True
+    )
+    result = zgm.validate_batch_invariant_mode(config)
+    assert not any("expert_model_parallel_size" in v for v in result.violations), result.violations
+    # The combine itself must match on both sides.
+    config["generation"]["mcore_generation_config"]["moe_ep_invariant_combine"] = False
+    result = zgm.validate_batch_invariant_mode(config)
+    assert any("moe_ep_invariant_combine" in v for v in result.violations), result.violations
