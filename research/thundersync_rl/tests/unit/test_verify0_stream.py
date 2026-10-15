@@ -474,9 +474,14 @@ def _engine_and_spec(make_spec, engine_cls, rounds, outcome):
     s = make_spec(handlers, base_handlers=engine.handlers(), verify_source="engine", hidden_transport="driver", sticky_delta=0.03)
     wg = s.learner_policy.worker_group
 
+    from test_speculative_driver import _ListRef
+
     def run(name, **kw):  # the fake's ``method`` parameter clashes with ordered_call's
         wg.calls.append((name, kw))
-        return [handlers[name](**kw)]
+        out = handlers[name](**kw)
+        if name == "ordered_call" and isinstance(out, list):
+            out = _ListRef(out)  # numbered calls are tracked in a set until drained
+        return [out]
 
     wg.run_all_workers_single_data = run
     return engine, s
@@ -484,12 +489,10 @@ def _engine_and_spec(make_spec, engine_cls, rounds, outcome):
 
 @pytest.mark.parametrize("window", [1, 2])
 def test_streamed_sticky_plans_equal_verify_sticky(window, monkeypatch):
-    import itertools
-
     from test_speculative_driver import _spec as make_spec
 
-    # Ordered learner calls are numbered by a process-wide counter: use a private one.
-    monkeypatch.setattr(spec_mod, "_LEARNER_SEQ", itertools.count())
+    # Ordered calls are numbered per worker group (``_group_seq``): each spec
+    # below has its own fake group, so its calls start at 0.
     from test_sticky_driver import EOD, _Engine
 
     def rounds():

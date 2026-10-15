@@ -229,7 +229,10 @@ def test_learner_sequencer_and_drain(monkeypatch):
     """Driver side: numbers only while streaming; drain waits for every sent call."""
     from thundersync_rl import speculative as sp
 
+    from types import SimpleNamespace
+
     spec = _spec()
+    spec.learner_policy = SimpleNamespace(worker_group=SimpleNamespace())
     assert spec.learner_seq() is None  # not streaming: plain calls
     waited = []
     monkeypatch.setattr(sp.ray, "wait", lambda refs, num_returns: waited.append(list(refs)))

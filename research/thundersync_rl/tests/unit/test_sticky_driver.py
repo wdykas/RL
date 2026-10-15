@@ -339,6 +339,10 @@ def test_continuations_are_verified_in_pieces_while_decoding():
     asyncio.run(s.verify_sticky(drafts))
     rows = [c[0][0] for c in calls]
     assert rows == [[1, 4], [1, 4, 5, 6], [1, 4, 5, 6, 7, 8], [1, 4, 5, 6, 7, 30, EOD]]
+    # Continuation pieces can be in flight together: numbered learner calls
+    # (ordered_call), 0, 1, 2 on this group; verify0 (alone, awaited) is plain.
+    assert s.learner_policy.worker_group.seqs == [0, 1, 2]
+    assert not s._learner_inflight and not s.learner_ordered
     # the first piece was verified while its stream was still decoding
     assert calls[1][2] < 7
     # the deadline draft's stream went on; one new stream after the rejection

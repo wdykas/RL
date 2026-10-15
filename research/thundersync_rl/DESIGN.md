@@ -4255,3 +4255,17 @@ Scaling: row-local kernels, one int32[max_requests] buffer per Mamba layer, no c
 At EP >= 32 the expert-GEMM share shrinks and the EP-independent terms (Mamba replay scan, small-op floor) grow in share.
 Not built: a target-row-only Mamba replay scan (must reproduce the training tile's tensor-core accumulation bitwise),
 router top-k fusion, norm -> fp16 emission for norm-fused linears, per-refit caching of Mamba A / D / dt_bias.
+
+## 14ae. Call order on asyncio Ray actors (branch ts-ray-order, 2026-10-15; thundersync_work/research/ray_order_audit.md)
+
+The learner and engine workers (`ThunderSyncMegatronPolicyWorker`) and `VerifyMailbox` are asyncio actors (each has an
+`async def`). Ray then starts a call once its arguments are local, not in submission order: on one node an A(ref)/B(plain)
+pair ran B first 48/50, and even plain/plain pairs flipped 4-18%; a top-level ref argument (`after=`) or a `ray.get` is the
+only order (0/50). Two ranks of a group can therefore run the same in-flight calls in different orders (simulated cross-node
+pull: 38/50), and their collectives pair across calls (hang, or mixed tensors when shapes match). Rule: whenever two calls
+to one group can be in flight together, they are numbered `ordered_call`s (`begin_ordered_learner` scope), else each is
+awaited before the next is sent. Fixed here: (1) chunked verification beside training dispatches (`ordered_chunks`);
+(2) `verify_sticky` continuation pieces (own ordered scope + drain); (3) call numbers are per worker group (`_group_seq`),
+so a second verifier pool no longer leaves gaps (a deadlock). Weights never change inside a step, so the pre-fix risk was
+cross-rank pairing at TP/PP/EP>1, not a forward at the wrong version. Engine sites all ordered by `ray.get` or refs (the
+lane head hand-off since 7a85a86d); latent: async refit transfers serve other calls mid-transfer (safe by schedule only).
