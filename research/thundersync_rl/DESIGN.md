@@ -2825,6 +2825,41 @@ All arms set:
 - no debug reward or noise (`submit_ab.sh` refuses them);
 - CHECKS=0.
 
+**Integration round 2 (2026-10-15, ts-nano-perf on eb351bc0).** Merged, in order (conflict choices are in the
+merge commit messages):
+- ts-lanes-stream e64345d9: token-bounded canonical blocks, deferred draft cut + serve yield, calibrated ⊥-BV with
+  measured verify cost (one calibrator shared by the lanes), group draft admission (default).
+  `ab_base` turns `thundersync.null_bv_calibrate` on: the fixed prior v is ~4.5x below the measured Nano v
+  (cal-x-l2: 3.5-3.8e-6); cal-x-l2 and adm2-x-l2-grp-cal are EXACT.
+- ts-run-ready 32d89735 (14s): checkpoints/resume, epochs, validation, seeds, NaN guards, always-on weight sentinel,
+  multi-turn prefix and collect_drafts guards, leftover-plan fix. Guards and sentinel are validated (rr-gpu-unit,
+  rr-sentinel-lanes-ep). Exact resume is NOT yet shown: rr-resume-nano failed (the resumed run's LR scheduler refused
+  the checkpoint of a shorter max_num_steps; the sync arm was not reproducible before the resume; comparator bug).
+  `THUNDERSYNC_DEBUG_STOP_AT=N` (ends a run at checkpoint boundary N with max_num_steps unchanged) is added for the
+  test.
+- ts-m2n-refit e31b781a (14q). m2n-xc-one / m2n-xc-lanes: crosscheck PASS on every refit (theta and theta-hat),
+  m2n-x-one / m2n-x-lanes EXACT 6/6. So `ab_base` sets `refit_transport: mcore` + `refit_backend: nccl` for every
+  arm on the ThunderSync loop (sync, async1, ts_*), so refit cost is equal across them; async1_nrl (stock loop) keeps
+  its transport.
+- ts-verify-in-train (14r), the 4c4ae593 tree plus the candidate-selection fix 1fe2cf7a (VIT never engaged before
+  it; vit-l2's "VIT on" perf arm therefore measured nothing). Opt-in, default off.
+- ts-carried-walk cb2a8415 (DESIGN section renumbered 14r -> 14t): continuation decision rules opt-in (default
+  `every`); prefix-cache `pin` policy and `auto` size are the defaults (LRU thrashes under cyclic rounds). cw-x-4k:
+  the row/dip rules hit a 68 GB OOM in a verification forward that materializes full-vocab logits on long rows
+  (chunked log p in the verify path is being added by the carried-walk agent; not in this merge).
+- ts-learner-callcost 45bbb962, opt-in: training expert GEMMs default to per-expert cuBLAS;
+  `NEMO_RL_FP16_MOE_TRAIN_GEMM=auto|segment` (e.g. via `policy.megatron_cfg.env_vars`) selects the bitwise segment
+  kernels (full-Nano EP4 fwd+bwd 1.6x at 1k, ~2 % at 8k, GPU kernel time ~2x cuBLAS's).
+- ts-ep-invariant a036bb7c (14u): EP-invariant MoE combine. The engine-vs-learner EP equality rule is lifted when it
+  is on (both validators); `run_ab_arm.sh` turns it on when GEN_EP != EP.
+
+*A/B layout after round 2.* Learner EP8 (8 GPUs, expert DP 1) on every arm. ts_por: 2 lanes x EP4 (8 GPUs) with the
+EP-invariant combine. sync / async1: one EP8 engine (8 GPUs), EP equal, combine off. 16 GPUs = 4 nodes per arm.
+Why: EP8 halves the per-rank expert weights, gradients and Adam state against EP4 x DP2 (the larger-EP direction
+Ultra needs anyway), and EP4 lanes fit two engine replicas in the same 8 engine GPUs. The combine costs the lanes
+~+0.4 ms per decode step (full Nano EP4 7.5 -> 7.9 ms, epinv-checks) and 4x the RSV symmetric memory; leaving it
+off on the one-engine baselines charges that cost to ThunderSync only (conservative for the comparison).
+
 ## 14o. Engine MoE kernels on live-row grids (2026-10-14)
 
 *Branch ts-moe-livegrid (../RL-livegrid) from ts-nano-perf. Code: `nemo_rl/models/megatron/fp16_moe.py`
@@ -3357,6 +3392,32 @@ Metrics: `spec/cw_decisions`, `_whole`, `_rejects`, `_scans`, `_scan_tokens`, `_
 forward reproduces the pieces' log p bitwise), `_hidden_retained_bytes_max`.
 Requirements (`validate_carried_walk`): sticky routing, verify_source=engine, verify_on=learner on this branch, no
 banded IS. Not built: carrying the walk through verify0 (it decides; ⊥-BV pools need its outcomes), speculative forks.
+
+## 14u. EP-invariant MoE combine (`policy.megatron_cfg.moe_ep_invariant_combine`, 2026-10-15)
+
+Code: `nemo_rl/models/megatron/ep_invariant_combine.py` (agent notes: thundersync_work/research/agent_ep_invariant.md).
+
+*Cause of EP dependence.* Expert rows are row-local GEMMs and do not depend on EP; under the fp16 recipe every row
+value is a multiple of 2^-48. The combine is the only EP-dependent step: each EP rank sums its local experts and rounds
+the partial to fp32, and the partials are added in rank order, so the rounding points move with EP. Over 23 MoE layers
+a 1-ulp difference grew to the 0.89 log-prob gap of np-v2-lanes-ep.
+
+*Fix.* Each row v maps to two fp64 integer limbs, hi = floor(v) and lo = (v - hi) * 2^48, which are exact. Limb sums
+stay integers below 2^53 (lo: k <= 32 rows; hi: `check_exact_range` at setup; Nano 45.4 bits, Super 47.9, 1T-class
+50), so every grouping and order gives the same sums. Finalize rounds the exact sum to fp32 once. Engine: the rank's
+limb partial goes into the NVLS reduce-scatter-V buffer (4x larger), then limb reduce-scatter + finalize; NCCL
+dispatcher: fp64 reduce-scatter. Learner (AlltoAll): the home rank sums the token's k rows through the limbs (no new
+bytes, cheaper kernel). Requires `forward_gemm_precision: fp16`.
+
+*Per-rank cost.* Engine combine bytes 16 B instead of 4 B per element; RSV symmetric memory max_tokens x EP x 16H
+(Nano at max_tokens 16384: 2.8 GB at EP4, 5.6 GB at EP8). Decode at full Nano EP4: 7.52 -> 7.94 ms (1 row/rank),
+8.46 -> 8.88 ms (8-128 rows/rank); prefill at 1k tokens/rank +4.4 ms/step. Learner combine fwd+bwd 0.64 -> 0.29 ms
+at 1-4k tokens. At Ultra-scale EP (32-64) the AllGather-V/RS-V engine design already grows with EP; there the engine
+needs an AlltoAll dispatcher that returns the k rows (4k B/token, EP-independent) to `unpermute_rows`. Not built yet.
+
+*Validation [M].* epinv-checks: 68 unit tests; engine EP1/EP2/EP4 greedy dumps bitwise identical with it (46/92
+differing requests without); new vs old at EP1 identical. epinv-lanes-ep (learner EP2, lanes EP1, forced fresh
+rows): EXACT 4/4 on; epinv-lanes-ep-off: FAIL (max |dlogp| 0.66-0.79).
 
 ## 15. Open work
 
