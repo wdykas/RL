@@ -623,9 +623,17 @@ class MegatronPolicyWorkerImpl(
         os.environ["LOCAL_RANK"] = str(local_rank)
         # Batch-invariant / zero-KL kernels must be enabled before CUDA init.
         enable_batch_invariant_mode(config)
-        if config["megatron_cfg"].get("batch_invariant_mode") and config[
-            "megatron_cfg"
-        ].get("fused_bi_unpermute", True):
+        if config["megatron_cfg"].get("moe_ep_invariant_combine", False):
+            # MoE combine through exact fixed-point limbs: the same bits at every
+            # EP size, learner (AlltoAll unpermute) and engine (limb reduce-scatter).
+            from nemo_rl.models.megatron import ep_invariant_combine
+
+            ep_invariant_combine.set_enabled(True)
+            ep_invariant_combine.install_engine_buffers()
+        if config["megatron_cfg"].get("batch_invariant_mode") and (
+            config["megatron_cfg"].get("fused_bi_unpermute", True)
+            or config["megatron_cfg"].get("moe_ep_invariant_combine", False)
+        ):
             # One Triton kernel for the AlltoAll batch-invariant unpermute, bitwise
             # Megatron's EP x top-k eager loop (fused_bi_unpermute=false keeps the loop).
             from nemo_rl.models.megatron import bi_unpermute

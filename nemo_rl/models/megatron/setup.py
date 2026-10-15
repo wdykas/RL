@@ -1124,7 +1124,15 @@ def setup_model_config(
     if config["megatron_cfg"].get("forward_gemm_precision") is not None:
         from nemo_rl.models.megatron import fp16_gemm
 
-        fp16_gemm.validate_model(model_cfg)
+        fp16_gemm.validate_model(
+            model_cfg,
+            bool(config["megatron_cfg"].get("moe_ep_invariant_combine", False)),
+        )
+    elif config["megatron_cfg"].get("moe_ep_invariant_combine", False):
+        raise ValueError(
+            "moe_ep_invariant_combine needs forward_gemm_precision='fp16' (the bf16 "
+            "batch-invariant MoE path is not built yet)."
+        )
 
     # Create final megatron config
     megatron_cfg = _create_megatron_config(

@@ -620,6 +620,13 @@ class MegatronConfig(TypedDict):
     # range there 2^s-fold for models whose SwiGLU outputs approach 65504. 0 = off.
     # Must match between training and generation.
     down_proj_prescale_log2: NotRequired[int | None]
+    # MoE under forward_gemm_precision="fp16": sum each token's expert rows through
+    # exact fixed-point limbs (nemo_rl/models/megatron/ep_invariant_combine.py), so
+    # the MoE output has the same bits at every expert-parallel size (training and
+    # generation may then use different EP). Engine combine bytes and RSV memory
+    # 4x (fp64 hi/lo limbs instead of fp32 rows). Must match between training and
+    # generation.
+    moe_ep_invariant_combine: NotRequired[bool]
     # Batch-invariant split-KV attention (nemo_rl.models.megatron.bi_split_kv), used by the
     # learner (TE FA4 varlen) and the engine (Megatron FA4 paged decode/prefill) alike.
     # Under batch_invariant_mode, FA4 otherwise runs num_splits=1 (one CTA per row and KV

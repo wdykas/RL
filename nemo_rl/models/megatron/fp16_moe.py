@@ -57,6 +57,10 @@ try:
 except ImportError:  # pragma: no cover
     HAVE_TRITON = False
 
+if HAVE_TRITON:
+    from nemo_rl.models.megatron.ep_invariant_combine import _finalize as _eic_finalize
+    from nemo_rl.models.megatron.ep_invariant_combine import _limbs as _eic_limbs
+
 # Tile shapes do not change a row's bits: tl.dot accumulates the K dimension in
 # order into one fp32 accumulator, and products of fp16 operands are exact, so the
 # result depends only on the row, its expert's weight and K order. Measured bitwise
@@ -243,12 +247,13 @@ if HAVE_TRITON:
         expert_out_ptr,  # [rows, H] fp32 expert outputs (probability-weighted)
         inverse_map_ptr,  # [num_tokens, num_local_experts] int32 row or -1
         valid_tokens_ptr,  # scalar int32
-        output_ptr,  # [num_tokens, H] fp32
+        output_ptr,  # [num_tokens, H] fp32, or [num_tokens, 2H] fp64 limbs (LIMBS == 1)
         hidden_dim,
         y_scale,  # fp32 factor on every expert row (HAS_SCALE)
         num_local_experts: tl.constexpr,
         BLOCK_H: tl.constexpr,
         HAS_SCALE: tl.constexpr,
+        LIMBS: tl.constexpr,  # 0: fp64 sum -> fp32; 1: limb partial; 2: limbs -> fp32
     ):
         # Persistent over the valid tokens; rows from valid_tokens on are not written.
         valid_tokens = tl.load(valid_tokens_ptr).to(tl.int64)
@@ -258,6 +263,7 @@ if HAVE_TRITON:
             tl.program_id(0).to(tl.int64), valid_tokens, tl.num_programs(0)
         ):
             acc = tl.zeros([BLOCK_H], dtype=tl.float64)
+            acc_lo = tl.zeros([BLOCK_H], dtype=tl.float64)
             for lid in tl.range(0, num_local_experts):
                 pos = tl.load(inverse_map_ptr + tok * num_local_experts + lid)
                 if pos >= 0:
@@ -267,12 +273,31 @@ if HAVE_TRITON:
                     )
                     if HAS_SCALE:
                         vals = vals * y_scale
-                    acc += vals.to(tl.float64)
-            tl.store(
-                output_ptr + tok * hidden_dim + offsets,
-                acc.to(tl.float32),
-                mask=mask_h,
-            )
+                    if LIMBS == 0:
+                        acc += vals.to(tl.float64)
+                    else:  # EP-invariant combine: exact fixed-point limbs
+                        hi, lo = _eic_limbs(vals)
+                        acc += hi
+                        acc_lo += lo
+            if LIMBS == 0:
+                tl.store(
+                    output_ptr + tok * hidden_dim + offsets,
+                    acc.to(tl.float32),
+                    mask=mask_h,
+                )
+            elif LIMBS == 1:
+                tl.store(output_ptr + tok * 2 * hidden_dim + offsets, acc, mask=mask_h)
+                tl.store(
+                    output_ptr + tok * 2 * hidden_dim + hidden_dim + offsets,
+                    acc_lo,
+                    mask=mask_h,
+                )
+            else:
+                tl.store(
+                    output_ptr + tok * hidden_dim + offsets,
+                    _eic_finalize(acc, acc_lo),
+                    mask=mask_h,
+                )
 
     @triton.jit
     def _permute_live_kernel(
@@ -871,18 +896,25 @@ def unpermute_fp64(
     out: Optional[torch.Tensor] = None,
     tokens_hint: Optional[int] = None,
     y_scale: Optional[float] = None,
+    limbs: int = 0,
 ) -> torch.Tensor:
     """Per-token sum of local-expert rows in fp64, ascending local expert, fp32 out.
 
     Rows from ``valid_tokens`` on are not written. ``tokens_hint`` (host bound of
     ``valid_tokens``) only sizes the persistent grid. ``y_scale``: every expert
     row is first multiplied by it in fp32, as ``expert_output * y_scale`` would.
+    ``limbs`` (EP-invariant combine, ep_invariant_combine.py): 1 returns the rank's
+    [num_tokens, 2H] fp64 limb partial for the cross-rank sum; 2 (a single EP rank)
+    sums the limbs and returns the final fp32 rows.
     """
     _, hidden_dim = expert_output.shape
     num_tokens, num_local_experts = inverse_map.shape
     if out is None:
         out = torch.empty(
-            num_tokens, hidden_dim, dtype=torch.float32, device=expert_output.device
+            num_tokens,
+            2 * hidden_dim if limbs == 1 else hidden_dim,
+            dtype=torch.float64 if limbs == 1 else torch.float32,
+            device=expert_output.device,
         )
     block_h = min(triton.next_power_of_2(hidden_dim), 1024)
     h_blocks = triton.cdiv(hidden_dim, block_h)
@@ -900,6 +932,7 @@ def unpermute_fp64(
         num_local_experts,
         BLOCK_H=block_h,
         HAS_SCALE=y_scale is not None,
+        LIMBS=limbs,
     )
     return out
 
@@ -1368,6 +1401,7 @@ def engine_experts(
     tokens_hint: Optional[int] = None,
     down_scale: int = 0,
     out: Optional[torch.Tensor] = None,
+    limbs: bool = False,
 ) -> torch.Tensor:
     """The engine's routed-expert output of the gathered tokens (CUDA-graph safe).
 
@@ -1380,6 +1414,8 @@ def engine_experts(
     CUDA-graph bucket's tokens x EP (None: the buffer's T). It picks the tile and
     sizes the persistent grids; no row's bits depend on it (any tile gives the same
     bits, and every kernel loops to its device-side live count).
+    ``limbs`` (EP-invariant combine): at ``ep_size`` > 1 returns [T, 2H] fp64 limb
+    partials (summed exactly across ranks by the combine); at 1, the final fp32 rows.
     """
     num_local_experts = fc1_weight.shape[0]
     topk = routing_map.shape[1]
@@ -1417,6 +1453,7 @@ def engine_experts(
         out,
         tokens_hint=hint,
         y_scale=2.0**down_scale if down_scale else None,
+        limbs=(1 if ep_size > 1 else 2) if limbs else 0,
     )
 
 
@@ -1435,10 +1472,22 @@ def inference_experts_forward(
         if hidden_states.dtype == torch.bfloat16
         else (hidden_states.to(torch.float16))
     )
+    from nemo_rl.models.megatron import ep_invariant_combine as eic
+
     cfg = getattr(module, "config", None)
+    ep_size = module.ep_group.size()
+    limbs = eic.enabled()
     out = None
-    if module._nvls_dispatcher:
+    if limbs and ep_size > 1:
+        # Limb partials straight into the symmetric RSV memory (sized for them).
+        if module._nvls_dispatcher:
+            out = eic.engine_limb_buffer(NVLSAllGatherVDispatcher, x16.shape[1])
+    elif limbs:
+        out = None  # EP 1: final fp32 rows, no cross-rank sum
+    elif module._nvls_dispatcher:
         out = NVLSAllGatherVDispatcher._get_rsv_tensor()
+    if limbs:
+        eic.log_once(f"engine: ep={ep_size} limb combine (EP-invariant)")
     y = engine_experts(
         x16,
         permuted_probs,
@@ -1447,13 +1496,14 @@ def inference_experts_forward(
         module._fc1_weight,
         module._fc2_weight,
         module.ep_group.rank() * module.num_local_experts,
-        module.ep_group.size(),
+        ep_size,
         "swiglu" if cfg is None else expert_activation(cfg),
         # The dispatcher's host estimate of the gathered tokens: this rank's
         # CUDA-graph bucket (or eager token count) x EP.
         tokens_hint=InferenceAllGatherDispatcherBase._get_host_valid_tokens_estimate(),
         down_scale=_down_scale(),
         out=out,
+        limbs=limbs,
     )
     return y, None
 

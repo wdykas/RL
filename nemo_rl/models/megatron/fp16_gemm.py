@@ -882,6 +882,8 @@ def _patch_moe() -> None:
         _STATE["orig"][(cls, "token_combine")] = orig
 
         def token_combine(self, hidden_states, _orig=orig, _fp32=combine):
+            if hidden_states.dtype == torch.float64:  # EP-invariant limb partials
+                return _limb_token_combine(self, hidden_states)
             if hidden_states.dtype != torch.float32:
                 return _orig(self, hidden_states)
             return _fp32(self, hidden_states)
@@ -927,6 +929,55 @@ def _nvls_token_combine_fp32(self, hidden_states):
         per_rank_max_tokens=self._per_rank_worst_case_token_count,
     )
     return output
+
+
+def _limb_token_combine(self, limbs):
+    """EP-invariant combine (ep_invariant_combine.py): exact limb sum over EP ranks -> fp32.
+
+    ``limbs``: [global tokens, 2H] fp64 partials of this rank's experts. The cross-rank
+    sum is exact, so the NVLS kernel and NCCL may add ranks in any order.
+    """
+    import torch.distributed as dist
+    from megatron.core.transformer.moe import token_dispatcher_inference as tdi
+    from megatron.core.utils import get_pg_rank
+
+    from nemo_rl.models.megatron import ep_invariant_combine as eic
+
+    hidden = limbs.shape[1] // 2
+    if isinstance(self, tdi.NVLSAllGatherVDispatcher):
+        cls = self.__class__
+        buf = eic.engine_limb_buffer(cls, hidden)
+        if limbs.data_ptr() != buf.data_ptr():
+            buf[: limbs.shape[0]].copy_(limbs)
+        output = torch.empty(
+            self._local_tokens, hidden, dtype=torch.float32, device=limbs.device
+        )
+        return eic.limbs_reduce_scatter_v(
+            output,
+            cls._symm_rsv["handle"],
+            rank_token_offset=self._rank_token_offset(),
+            ep_max_tokens=self._ep_max_tokens(),
+            per_rank_max_tokens=self._per_rank_worst_case_token_count,
+        )
+    # NCCL all-gather dispatcher: reduce-scatter the fp64 limbs (any order is exact).
+    if not self.__class__._use_allgather_v:  # CUDA-graph path: equal counts per rank
+        group = self.tp_ep_group
+        scattered = limbs.new_empty(limbs.shape[0] // group.size(), limbs.shape[1])
+        dist.reduce_scatter_tensor(scattered, limbs.contiguous(), group=group)
+        return eic.finalize_limbs(scattered)
+    tokens_per_rank = self.__class__._local_tokens_per_rank
+    max_tokens = max(tokens_per_rank)
+    ep_rank = get_pg_rank(self.ep_group)
+    padded = limbs.new_zeros(self.ep_size * max_tokens, limbs.shape[1])
+    offset = 0
+    for dst_rank, n_tokens in enumerate(tokens_per_rank):
+        padded[dst_rank * max_tokens : dst_rank * max_tokens + n_tokens] = limbs[
+            offset : offset + n_tokens
+        ]
+        offset += n_tokens
+    scattered = padded.new_empty(max_tokens, limbs.shape[1])
+    dist.reduce_scatter_tensor(scattered, padded, group=self.ep_group)
+    return eic.finalize_limbs(scattered[: tokens_per_rank[ep_rank]])
 
 
 def _nccl_token_combine_fp32(self, hidden_states):
@@ -1119,13 +1170,27 @@ def validate_config(
     return errors
 
 
-def validate_model(model_cfg: Any) -> None:
+def validate_model(model_cfg: Any, ep_invariant_combine: bool = False) -> None:
     """Reject model architectures the fp16 GEMM forward does not cover yet."""
     unsupported = []
     if getattr(model_cfg, "num_moe_experts", None):
         from nemo_rl.models.megatron import fp16_moe
 
         unsupported += [f"MoE {x}" for x in fp16_moe.validate_model(model_cfg)]
+        if ep_invariant_combine:
+            from nemo_rl.models.megatron import ep_invariant_combine as eic
+
+            unsupported += [
+                f"moe_ep_invariant_combine: {x}"
+                for x in eic.check_exact_range(
+                    int(getattr(model_cfg, "moe_router_topk", 1) or 1),
+                    int(
+                        getattr(model_cfg, "moe_ffn_hidden_size", None)
+                        or getattr(model_cfg, "ffn_hidden_size", 1)
+                    ),
+                    int(_STATE["down_scale"]),
+                )
+            ]
     if getattr(model_cfg, "multi_latent_attention", False):
         unsupported.append("multi_latent_attention")
     if getattr(model_cfg, "normalization", "RMSNorm") != "RMSNorm":
