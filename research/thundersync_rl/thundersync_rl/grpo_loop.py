@@ -355,7 +355,7 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     sticky_continuation_chunk_growth: float = 1.0
     # Continuation piece verifications sent while a training dispatch runs are
     # run at that dispatch's next micro-batch boundary instead of after it
-    # (verify_yield.py, DESIGN.md section 14x). Exact: training runs the same
+    # (verify_yield.py, DESIGN.md section 14aa). Exact: training runs the same
     # micro-batches with the same loss scaling, verification results do not
     # depend on when they run; only timing changes. Learner path while
     # streaming over the tails; pipeline parallel size 1 (PP > 1: posted calls
