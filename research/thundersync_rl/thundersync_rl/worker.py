@@ -3134,9 +3134,15 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 tau = max(t for t, _, _ in grid.values())
                 # log W* = max_t log prod_{u<=t} p/q over the draft (drop-IS weights).
                 lr = torch.cumsum(lpx.double() - lq.to(lpx.device).double(), 0)
+                d_lr = lpx.double() - lq.to(lpx.device).double()
                 res = {
                     "null_grid": grid,
                     "null_log_wstar": float(lr.max()) if lr.numel() else 0.0,
+                    # Per-token log p/q moments over the draft (the ⊥-BV
+                    # policy's calibration of later steps, null_bv.py).
+                    "null_lr_moments": (
+                        int(d_lr.numel()), float(d_lr.sum()), float((d_lr * d_lr).sum())
+                    ),
                     "token_logprobs": lpx[:tau].tolist(),
                     "draft_logq": lq[:tau].tolist(),
                 }

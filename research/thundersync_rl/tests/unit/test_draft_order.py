@@ -29,7 +29,7 @@ def _batch(prompts):
 
 def test_null_bv_primaries_first_and_pool_order_kept():
     G, prompts = 4, [[1, 2], [3], [4, 5, 6]]
-    cfg = SimpleNamespace(null_bv=True, null_bv_drafts_per_output=1.5)
+    cfg = SimpleNamespace(null_bv=True, null_bv_drafts_per_output=1.5, draft_admission="primaries_first")
     out, slots = next_draft_prompts(_batch(prompts), cfg, G)
     keys = [tuple(p.tolist()) for p in out]
     n = 6  # round(1.5 * 4) drafts per group
@@ -45,3 +45,11 @@ def test_without_null_bv_drafts_are_group_major():
     out, slots = next_draft_prompts(_batch(prompts), SimpleNamespace(null_bv=False), G)
     assert [tuple(p.tolist()) for p in out] == [(7,), (7,), (8, 9), (8, 9)]
     assert slots is None
+
+
+def test_group_admission_keeps_whole_pools_together():
+    G, prompts = 4, [[1, 2], [3]]
+    cfg = SimpleNamespace(null_bv=True, null_bv_drafts_per_output=1.5, draft_admission="group")
+    out, slots = next_draft_prompts(_batch(prompts), cfg, G)
+    assert [tuple(p.tolist()) for p in out] == [(1, 2)] * 6 + [(3,)] * 6
+    assert slots == {(1, 2): G, (3,): G}

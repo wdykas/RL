@@ -55,7 +55,7 @@ from thundersync_rl.engine_q import (
 )
 from thundersync_rl.fused_train import FusedRef
 from thundersync_rl.multi_turn import TurnEnvironment, TurnRecord, pair_rows, replay
-from thundersync_rl.null_bv import NullGroup, NullPolicy, row_envelopes
+from thundersync_rl.null_bv import LogRatioCalibration, NullGroup, NullPolicy, row_envelopes
 from thundersync_rl.prefix_cache import PrefixCacheDirectory, lpt_owners
 from thundersync_rl.tail_trace import TailTrace
 from thundersync_rl.routes import (
@@ -76,6 +76,7 @@ HIDDEN_FETCH_KEYS = ("hidden_bytes_fetched", "hidden_real_bytes_fetched", "hidde
 def _null_result(res: dict[str, Any], m: Optional[float]) -> dict[str, Any]:
     """A ⊥-BV row's result at envelope ``m`` from its grid (None: unused)."""
     base = {k: res.get(k, 0) for k in HIDDEN_FETCH_KEYS}
+    base["lr_moments"] = res.get("null_lr_moments", (0, 0.0, 0.0))
     if m is None:
         return {**base, "null": "unused", "accepted": 0, "next": -1, "logprobs": []}
     tau, y, lp_y = res["null_grid"][m]
@@ -366,6 +367,7 @@ class SpeculativeGeneration:
         null_bv_policy: Optional[dict[str, Any]] = None,
         null_bv_drop_is: bool = False,
         null_bv_spare_prompts: int = 0,
+        draft_admission: str = "group",
         sticky_chunk_tokens: int = 2048,
         sticky_chunk_growth: float = 0.0,
         draft_until_complete: bool = False,
@@ -551,14 +553,26 @@ class SpeculativeGeneration:
         # step -> {prompt key: slots} of the drafts made for that step.
         self.null_bv = null_bv
         self.null_bv_policy = dict(null_bv_policy or {})
-        # Built once: its DP table is memoised across steps.
+        calibrate = self.null_bv_policy.pop("calibrate", False)
+        decay = self.null_bv_policy.pop("calibration_decay", 0.5)
+        # Built once: its DP table is memoised across steps (rebuilt per step
+        # when calibrated: ``_verify_null``).
         self._null_policy = NullPolicy(**self.null_bv_policy) if null_bv else None
+        # Calibrated ⊥-BV policy: per-token Var log p/q from earlier steps'
+        # verified drafts only (null_bv.LogRatioCalibration: exactness).
+        self._null_calib = (
+            LogRatioCalibration(self.null_bv_policy.get("logratio_var", 8e-7), decay)
+            if null_bv and calibrate
+            else None
+        )
         # Drop-IS (opt-in, unbiased gradient, not exact samples): outputs that
         # need a tail decode are discarded like BOT; kept rows are weighted.
         self.null_bv_drop_is = null_bv_drop_is
         # Prompt drop: the step trains on the first (prompts - spares) prompts
         # whose pools were not dropped (``null_selected_keys``, drafting order).
         self.null_bv_spare_prompts = null_bv_spare_prompts
+        # Engine admission order of ⊥-BV drafts (``next_draft_prompts``).
+        self.draft_admission = draft_admission
         self.null_selected_keys: Optional[list[tuple[int, ...]]] = None
         self._null_slots: dict[int, dict[tuple[int, ...], int]] = {}
         if null_bv and (self.verify_source != "engine" or verify_mode != "block"):
@@ -686,7 +700,7 @@ class SpeculativeGeneration:
         rank0 = self.base._policy.worker_group.workers[0]
         budget = min(self.draft_budget, self.max_new_tokens)
         if self.sticky_delta is not None:
-            # Drafts are not aborted at the deadline (``_collect_running``):
+            # Drafts are not aborted at the deadline (``_handout_running``):
             # their streams go on toward the cap as continuations.
             budget = self.max_new_tokens
         step = self.current_step
@@ -695,11 +709,14 @@ class SpeculativeGeneration:
                 del self._null_slots[t]  # never verified (no drafts reached it)
             self._null_slots[step + 1] = dict(null_slots)
         hkeys = self._hidden_keys([f"{step + 1}:{i}" for i in range(len(prompts))])
-        # ⊥-BV: the primaries (one per output slot) come first and must all
-        # run at once; the extras may queue behind them.
-        self._check_draft_capacity(
-            rank0, sum(null_slots.values()) if null_slots else len(prompts)
-        )
+        # ⊥-BV, primaries first: the primaries (one per output slot) must all
+        # run at once; the extras may queue behind them. Group admission:
+        # at least one whole pool must fit (later pools queue as whole groups).
+        if null_slots and self.__dict__.get("draft_admission") == "group":
+            need = max(1, len(prompts) // max(len(null_slots), 1))
+        else:
+            need = sum(null_slots.values()) if null_slots else len(prompts)
+        self._check_draft_capacity(rank0, need)
         t_start = time.perf_counter()
         ray.get(
             rank0.start_drafts.remote(
@@ -710,9 +727,15 @@ class SpeculativeGeneration:
             )
         )
 
-        def collect():
+        def collect(defer: bool = False):
+            """The drafts at this deadline.
+
+            ``defer`` (sticky routing): take the cut (each draft's length)
+            now and return a callable that hands the drafts out (routes,
+            hidden rows) later, e.g. while another lane refits: the cut is
+            then a single snapshot call.
+            """
             plens = [p.numel() for p in prompts]
-            streams: list[Any] = [None] * len(prompts)
             if self.sticky_delta is not None:
                 t_cut = time.perf_counter()
                 if self.draft_until_complete:
@@ -721,17 +744,32 @@ class SpeculativeGeneration:
                         time.sleep(0.05)
                 self.stats["tail/next_draft_complete_wait_s"] = time.perf_counter() - t_cut
                 self.stats["tail/next_draft_window_s"] = time.perf_counter() - t_start
-                res, hid, anchors, streams = self._collect_running(
-                    rank0, hkeys, plens, budget, target=step + 1
+                t0 = time.perf_counter()
+                peeked = [_drafted(x) for x in self._peek_streams(rank0, list(range(len(prompts))))]
+                self.stats["cut/peek_s"] = time.perf_counter() - t0
+                calib = self.__dict__.get("_null_calib")
+                running = [len(toks) for toks, done, _ in peeked if not done]
+                if calib is not None and running:
+                    # Per-token decode latency of one stream, for later steps'
+                    # ⊥-BV verify cost (drafts admitted at the start run
+                    # the whole window; the longest unfinished one did).
+                    calib.update_decode(t0 - t_start, max(running))
+                handout = lambda: self._handout_running(  # noqa: E731
+                    peeked, hkeys, plens, budget, target=step + 1
                 )
+                return (lambda: build(*handout())) if defer else build(*handout())
+            res = [_drafted(x) for x in self._collect_drafts(rank0)]
+            res, hid, anchors = self._pop_logs(hkeys, plens, res, target=step + 1)
+            return build(res, hid, anchors, [None] * len(prompts))
+
+        def build(res, hid, anchors, streams):
+            plens = [p.numel() for p in prompts]
+            if self.sticky_delta is not None:
                 self.stats["tail/next_drafted_tokens"] = float(sum(len(x[0]) for x in res))
                 if os.environ.get("THUNDERSYNC_DEBUG_DRAFT_LENS"):
                     # Debug: drafted length per draft, in drafting (= admission) order.
                     print(f"[draft lens] target={step + 1} {[len(x[0]) for x in res]}", flush=True)
                 self.stats["tail/next_drafts"] = float(len(res))
-            else:
-                res = [_drafted(x) for x in self._collect_drafts(rank0)]
-                res, hid, anchors = self._pop_logs(hkeys, plens, res, target=step + 1)
             return [
                 [
                     (
@@ -756,6 +794,7 @@ class SpeculativeGeneration:
                 for i, (toks, done, lps) in enumerate(res)
             ]
 
+        collect.deferrable = self.sticky_delta is not None
         return collect
 
     def _check_draft_capacity(self, rank0, n: int) -> None:
@@ -810,8 +849,8 @@ class SpeculativeGeneration:
         others = self.base._policy.worker_group.workers[1:]
         return [w.draft_records.remote(request_ids=rids) for w in others], rids
 
-    def _collect_running(self, rank0, hkeys, prompt_lens, budget: int, target: int):
-        """Sticky routing: the deadline snapshot of the drafts, streams left running.
+    def _handout_running(self, res, hkeys, prompt_lens, budget: int, target: int):
+        """Sticky routing: hand out the drafts cut at ``res`` (``_peek_streams``), streams left running.
 
         Each draft is cut to its logged routes and hidden rows; its stream
         (``_continue_sticky``) keeps decoding at theta_{k-1}, which the
@@ -820,8 +859,6 @@ class SpeculativeGeneration:
         (drafts, hidden, anchors, stream handles).
         """
         n = len(prompt_lens)
-        t0 = time.perf_counter()
-        res = [_drafted(x) for x in self._peek_streams(rank0, list(range(n)))]
         t1 = time.perf_counter()
         routes = self._pop_routes(
             hkeys, prompt_lens, [budget] * n, target=target, close=False
@@ -834,7 +871,6 @@ class SpeculativeGeneration:
         hid = self._take_hidden(hkeys, [0] * n, [len(x[0]) for x in cut])
         t3 = time.perf_counter()
         # Where the deadline cut goes (driver wall seconds).
-        self.stats["cut/peek_s"] = t1 - t0
         self.stats["cut/routes_s"] = t2 - t1
         self.stats["cut/hidden_s"] = t3 - t2
         res = [self._truncate(x, h) for x, h in zip(cut, hid)]
@@ -1708,6 +1744,19 @@ class SpeculativeGeneration:
         (``decide_pools``); rows after the slots fill are "unused", and those
         never forwarded cost nothing (their hidden states are freed).
         """
+        calib = self.__dict__.get("_null_calib")  # absent on test stubs
+        if calib is not None:
+            # This step's v: earlier steps' rows only (fixed before any of
+            # this step's drafts is verified).
+            v = calib.estimate()
+            cv = calib.verify_cost(int(self.null_bv_policy.get("ref_len", self.max_new_tokens)))
+            if (v, cv) != (self._null_policy.logratio_var, self._null_policy.verify_cost):
+                self._null_policy = NullPolicy(
+                    **{**self.null_bv_policy, "logratio_var": v, "verify_cost": cv}
+                )
+            self.stats["spec/null_v_used"] = v
+            self.stats["spec/null_verify_cost_used"] = cv
+        t_verify, n_forwarded = time.perf_counter(), 0
         policy = self._null_policy
         queue: dict[str, list[int]] = defaultdict(list)
         for i, g in enumerate(groups):
@@ -1731,6 +1780,7 @@ class SpeculativeGeneration:
             if not batch:
                 break
             waves += 1
+            n_forwarded += len(batch)
             res = self._verify_block(
                 [flat[i] for i in batch],
                 [rows[i] for i in batch],
@@ -1757,6 +1807,9 @@ class SpeculativeGeneration:
         for i in skipped:
             out[i] = _null_result({}, None)
         self.stats["spec/null_waves"] = float(waves)
+        if calib is not None:
+            # This step's verification cost, for later steps' policies only.
+            calib.update_verify(time.perf_counter() - t_verify, n_forwarded)
         self.stats["spec/null_envelopes_per_row"] = sum(map(len, row_env.values())) / max(len(row_env), 1)
         self.stats["spec/null_skipped_drafts"] = float(len(skipped))
         return out
@@ -1778,6 +1831,10 @@ class SpeculativeGeneration:
         out_pairs: list[tuple[int, int]] = []
         rejected: list[tuple[int, int]] = []  # (draft length, tau) of tail decodes
         dropped_groups = getattr(self, "_null_dropped", set())
+        # Per group: every output's plan complete at verify0 (fully drafted),
+        # and also every draft accepted whole (trainable from its verify forward).
+        grp_done: dict[str, bool] = {}
+        grp_whole: dict[str, bool] = {}
         n_tail_drops = 0
         weights: list[float] = []
         for r, (_, d) in enumerate(flat):
@@ -1807,6 +1864,10 @@ class SpeculativeGeneration:
                 plan.log_weight = max(0.0, float(res["log_wstar"]) - math.log(res["null_m"]))
                 weights.append(math.exp(plan.log_weight))
             full += plan.complete and res["accepted"] == g
+            grp_done[groups[r]] = grp_done.get(groups[r], True) and plan.complete
+            grp_whole[groups[r]] = (
+                grp_whole.get(groups[r], True) and plan.complete and res["accepted"] == g
+            )
             kept += res["accepted"]
             total += g
             out_pairs.append((g, res["accepted"]))
@@ -1835,6 +1896,15 @@ class SpeculativeGeneration:
         )
         n_slots = sum(getattr(self, "_null_all_slots", {}).values())
         decided = n_out + n_bot
+        live = [grp for grp in slots if grp not in dropped_groups]
+        filled = {grp for grp in live if outs_by_group[grp] >= slots[grp]}
+        n_live = max(len(live), 1)
+        self.stats["spec/null_groups_fully_drafted"] = (
+            sum(grp_done.get(grp, False) for grp in filled) / n_live
+        )
+        self.stats["spec/null_groups_whole_accepted"] = (
+            sum(grp_whole.get(grp, False) for grp in filled) / n_live
+        )
         self.stats.update(
             {
                 "spec/draft_tokens": float(total),
@@ -1860,6 +1930,20 @@ class SpeculativeGeneration:
                 ),
             }
         )
+        # Per-token log p/q moments of every row verified this step (decided or
+        # not): the calibration of LATER steps' policies, and a logged signal.
+        moments = [tuple(by_row[r].get("lr_moments", (0, 0.0, 0.0))) for r in range(len(flat))]
+        n_lr = sum(m[0] for m in moments)
+        if n_lr >= 2:
+            mean = sum(m[1] for m in moments) / n_lr
+            self.stats["spec/logratio_var_step"] = max(
+                sum(m[2] for m in moments) / n_lr - mean * mean, 0.0
+            )
+            self.stats["spec/logratio_mean_step"] = mean
+        calib = self.__dict__.get("_null_calib")  # absent on test stubs
+        if calib is not None:
+            calib.update(moments)
+            self.stats["spec/null_v_next"] = calib.estimate()
         if self._null_policy.prompt_drop:
             inv = {name: key for key, name in self._null_names.items()}
             self.null_dropped_keys = {inv[g] for g in dropped_groups}
@@ -2676,7 +2760,7 @@ class SpeculativeGeneration:
         rank0 = self.base._policy.worker_group.workers[0]
         rows = [torch.cat([p, torch.tensor(t, dtype=torch.long)]) for p, t, _, _ in items]
         hkeys = self._hidden_keys([f"{name}:{j}" for j in range(len(items))])
-        # Next to the drafts' streams, which keep running (``_collect_running``).
+        # Next to the drafts' streams, which keep running (``_handout_running``).
         idx = ray.get(
             rank0.add_drafts.remote(
                 [r.tolist() for r in rows], [1] * len(rows), self.stream_interval,

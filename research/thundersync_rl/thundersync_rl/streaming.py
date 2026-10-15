@@ -208,8 +208,15 @@ class StreamPlanner:
         # Canonical dispatch order (``set_order``): None = as rows arrive.
         self.order: Optional[list[GroupId]] = None
         self._next = 0
+        self._block_tokens: Optional[int] = None
+        self._seg_pos = 0  # groups of the current segment already dispatched
 
-    def set_order(self, order: list[GroupId], block_sizes: Optional[list[int]] = None) -> None:
+    def set_order(
+        self,
+        order: list[GroupId],
+        block_sizes: Optional[list[int]] = None,
+        block_tokens: Optional[int] = None,
+    ) -> None:
         """Dispatch whole blocks of groups, in ``order``, whatever the arrival order.
 
         ``block_sizes`` partitions ``order`` into consecutive blocks (default:
@@ -221,6 +228,14 @@ class StreamPlanner:
         timing: the accumulated gradient is bitwise reproducible. A block
         dispatches once all its groups are complete, after every block before
         it. Fewer, larger blocks pay the learner's per-call cost fewer times.
+
+        ``block_tokens``: ``block_sizes`` gives segments instead, each cut into
+        blocks by size: a block is the next groups of the segment up to the
+        first one at which its rows reach ``block_tokens`` tokens (or the
+        segment ends). The cut points depend on the groups' token counts in
+        ``order``, which are data, so the dispatches stay canonical; a block
+        dispatches once all its groups are complete. Per dispatch the learner
+        then runs a bounded number of tokens, whatever the response length.
         """
         if self.max_open_groups:
             raise ValueError("a canonical group order needs group granularity")
@@ -229,7 +244,10 @@ class StreamPlanner:
         sizes = list(block_sizes) if block_sizes is not None else [1] * len(order)
         if any(b <= 0 for b in sizes) or sum(sizes) != len(order):
             raise ValueError(f"block sizes {sizes} do not partition {len(order)} groups")
-        self.order, self._next = list(order), 0
+        if block_tokens is not None and block_tokens <= 0:
+            raise ValueError(f"block_tokens must be positive (got {block_tokens})")
+        self.order, self._next, self._seg_pos = list(order), 0, 0
+        self._block_tokens = block_tokens
         self._blocks, at = [], 0
         for b in sizes:
             self._blocks.append(self.order[at : at + b])
@@ -309,14 +327,9 @@ class StreamPlanner:
         if self.order is not None:
             if self._next >= len(self._blocks):
                 return []
-            block = self._blocks[self._next]
-            for gid in block:
-                g = self.groups[gid]
-                # Its rows are still arriving: later blocks wait. (The
-                # tail-excluded baseline closes a group before its tail rows
-                # arrive; a canonical dispatch is still the whole group.)
-                if g.advantage_by_reward is None or len(g.rewards) < g.size:
-                    return []
+            block = self._next_block()
+            if block is None:
+                return []
             pos = {repr(gid): i for i, gid in enumerate(block)}
             return sorted(
                 (t for t in self.ready if repr(t.group) in pos),
@@ -337,6 +350,28 @@ class StreamPlanner:
             max_open_groups=self.max_open_groups,
             multiple_of=1,
         )
+
+    def _complete(self, gid: GroupId) -> bool:
+        # Its rows are still arriving: later blocks wait. (The tail-excluded
+        # baseline closes a group before its tail rows arrive; a canonical
+        # dispatch is still the whole group.)
+        g = self.groups[gid]
+        return g.advantage_by_reward is not None and len(g.rewards) == g.size
+
+    def _next_block(self) -> Optional[list[GroupId]]:
+        """The next canonical block if all its groups are complete, else None."""
+        seg = self._blocks[self._next]
+        if self._block_tokens is None:
+            return seg if all(map(self._complete, seg)) else None
+        tokens = 0
+        for j in range(self._seg_pos, len(seg)):
+            if not self._complete(seg[j]):
+                return None
+            key = repr(seg[j])
+            tokens += sum(t.num_tokens for t in self.ready if repr(t.group) == key)
+            if tokens >= self._block_tokens:
+                return seg[self._seg_pos : j + 1]
+        return seg[self._seg_pos :]
 
     def _pending_closes(self) -> list[tuple[GroupId, dict[float, float]]]:
         closes = []
@@ -368,7 +403,10 @@ class StreamPlanner:
     def next_dispatch(self, flush: bool = True) -> Dispatch:
         picked = self._pick(flush)
         if self.order is not None and picked:
-            self._next += 1
+            n_groups = len({repr(t.group) for t in picked})
+            self._seg_pos += n_groups
+            if self._seg_pos >= len(self._blocks[self._next]):
+                self._next, self._seg_pos = self._next + 1, 0
         taken = {id(t) for t in picked}
         self.ready = [t for t in self.ready if id(t) not in taken]
         final: list[Trajectory] = []
