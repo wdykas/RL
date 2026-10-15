@@ -331,7 +331,7 @@ def _apply_optional_inference_config_kwargs(
         "cuda_graph_max_tokens": int,
         # Prefill/mixed CUDA graphs up to max_tokens (exponential sizes) instead of
         # cuda_graph_max_tokens: removes the eager prefill-step floor (engine-side
-        # verification's small piece prefills; DESIGN 14q).
+        # verification's small piece prefills, restart prefills; DESIGN 14aa).
         "cuda_graph_all_prefills": bool,
         "cuda_graph_mixed_prefill_count": int,
         "vision_embedding_cache_max_bytes": int,
