@@ -484,7 +484,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
 
         ``learner=True``: the ``expert_bias`` buffers must equal their first
         digest on this rank (bias updates are rejected: a changed bias would
-        not reach the momentum stage, DESIGN.md section 14q).
+        not reach the momentum stage, DESIGN.md section 14s).
         """
         from megatron.core import parallel_state as ps
 

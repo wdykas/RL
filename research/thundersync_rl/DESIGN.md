@@ -2977,7 +2977,7 @@ with mixed starts vs the whole rows, logits compared with torch.equal).
   ~0.25 s (average 16k) ~ 60 s of learner work without the cache, ~1-2 s with it. The per-call cost is shared by all
   rows batched in one verification call and is not changed by the cache; it needs its own fix (profile first).
 
-## 14q. Run readiness: checkpoints, resume, epochs, validation, always-on guards (branch ts-run-ready)
+## 14s. Run readiness: checkpoints, resume, epochs, validation, always-on guards (branch ts-run-ready)
 
 Before this the loop could not run a long job (`research/future_training_dynamics_issues.md` issues 1-4,
 10-12, 14-15): no checkpoint, step counter hard-coded to 0, a stale NeMo-RL checkpoint loaded silently,

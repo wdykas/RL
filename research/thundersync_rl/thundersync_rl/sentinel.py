@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Always-on engine-vs-learner weight sentinel (DESIGN.md section 14q).
+"""Always-on engine-vs-learner weight sentinel (DESIGN.md section 14s).
 
 Exactness depends on three facts no other always-on check covers (accepted
 draft tokens store the learner's own p, so the log-prob mismatch check only

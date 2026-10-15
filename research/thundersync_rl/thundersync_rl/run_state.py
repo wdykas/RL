@@ -14,7 +14,7 @@
 """Run state of the ThunderSync loop: seeds, data stream, step boundaries, resume.
 
 Checkpoints are taken only at *quiescent* step boundaries (DESIGN.md section
-14q): the step before a boundary drafts nothing for the steps after it, so
+14s): the step before a boundary drafts nothing for the steps after it, so
 no draft, plan, anchor, ⊥-BV pool, lane pin or staged momentum weight crosses
 the boundary, and the run state there is exactly
 

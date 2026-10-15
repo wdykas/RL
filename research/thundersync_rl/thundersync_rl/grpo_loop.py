@@ -416,7 +416,7 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # and momentum draft weights (q is whatever the engine drafted with).
     banded_is_band: Optional[float] = None
     # Always-on engine-vs-learner weight sentinel (sentinel.py, DESIGN.md
-    # section 14q): after every refit (theta_k, theta_hat_{k+1}, the initial
+    # section 14s): after every refit (theta_k, theta_hat_{k+1}, the initial
     # weights and validation refits) each engine rank's weights are digested
     # and compared bitwise with the learner's shards of the same tensors under
     # the engine's storage dtype; the momentum host stage is re-checked when it
@@ -589,7 +589,7 @@ def _section(master_config: Any, name: str) -> dict[str, Any]:
 
 
 def validate_run_control(master_config: Any) -> None:
-    """Checkpointing, validation and epochs as the ThunderSync loop runs them (DESIGN 14q)."""
+    """Checkpointing, validation and epochs as the ThunderSync loop runs them (DESIGN 14s)."""
     ts_cfg = master_config.thundersync
     ckpt = _section(master_config, "checkpointing")
     grpo = master_config.grpo
@@ -2299,7 +2299,7 @@ def thundersync_grpo_train(
     ``lanes``: the engine lanes (``lanes.build_engine_lanes``) when
     ``thundersync.cohort_lanes`` is 2; ``policy_generation`` is then lane 0.
 
-    Run control (DESIGN.md section 14q, ``run_state.py``): batches come from
+    Run control (DESIGN.md section 14s, ``run_state.py``): batches come from
     ``grpo.max_num_epochs`` epochs of ``dataloader`` until ``grpo.max_num_steps``;
     checkpoints (``checkpointer``, NeMo-RL's, with ``checkpointing.enabled``)
     and validation (``val_period`` / ``val_at_start`` / ``val_at_end``, plain
