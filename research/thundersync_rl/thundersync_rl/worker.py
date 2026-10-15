@@ -54,7 +54,7 @@ from thundersync_rl.draft_weights import (
     restore_training,
 )
 from thundersync_rl import mem_debug
-from thundersync_rl import vit_check
+from thundersync_rl import vit, vit_check
 from thundersync_rl.fused_train import (
     FusedGraph,
     FusedGraphStore,
@@ -580,6 +580,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         _call_log(self, "stream_accumulate")
         t0 = time.perf_counter()
         fused_trained = fused_tokens = fused_fallback = 0
+        vit_results: list[dict[str, Any]] = []
         state = self._train_step_state
         calls = group_pipeline_calls(
             items, merge=getattr(self, "_stream_merge_calls", True)
@@ -630,6 +631,9 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 )
             )
             del graph  # only the substitute forward holds it now
+            if first.get("vit"):
+                vit_results.extend(self._vit_train_call(call_items, mbs_per_item, tprof))
+                continue
             try:
                 with substitute:
                     if self._vit_check_due(bucket, fused_key):
@@ -672,7 +676,75 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             "fused_trained": fused_trained,
             "fused_tokens": fused_tokens,
             "fused_fallback": fused_fallback,
+            "vit": vit_results,
         }
+
+    def _vit_train_call(
+        self,
+        call_items: list[dict[str, Any]],
+        mbs_per_item: list[int],
+        tprof: str | None,
+    ) -> list[dict[str, Any]]:
+        """Verify-in-train (``vit.py``): train each item (one group's rows, one
+        micro-batch) and decide its rows' block verification from that forward.
+
+        A failed micro-batch's loss is zeroed inside the loss (its backward still
+        runs: every rank keeps the same schedule) and its normalization counts and
+        metrics are taken back, so it leaves the step exactly as if never trained.
+        Zero-advantage rows are trained too: their forward is the verification.
+        Returns [{"group", "pass", "rows"}] per item in call order.
+        """
+        from megatron.core import parallel_state as ps
+
+        if (ps.get_pipeline_model_parallel_world_size() or 1) > 1:
+            raise RuntimeError("verify_in_train: pipeline parallelism is not built")
+        state = self._train_step_state
+        if any(int(it["data"].size) != int(m) for it, m in zip(call_items, mbs_per_item)):
+            raise RuntimeError("verify_in_train: every item must be exactly one micro-batch")
+        dev = torch.device("cuda", torch.cuda.current_device())
+        counts = []
+        for it in call_items:
+            d = it["data"]
+            d["vit_eta"] = torch.stack(
+                [
+                    vit.eta_last(int(d["vit_seed"][b]), int(d["vit_len"][b]), dev)
+                    if float(d["sample_mask"][b]) != 0.0
+                    else torch.ones((), dtype=torch.float64, device=dev)
+                    for b in range(d.size)
+                ]
+            ).cpu()
+            counts.append(vit.item_counts(d))
+        n_metrics = len(state["all_mb_metrics"])
+        n_losses = len(state["mb_losses"])
+        skip = state["skip_zero_advantage_rows"]
+        state["skip_zero_advantage_rows"] = False
+        results: list[dict[str, Any]] = []
+        try:
+            with vit.decision_hook(results):
+                self._stream_train_call(call_items, mbs_per_item, None, tprof)
+        finally:
+            state["skip_zero_advantage_rows"] = skip
+        if len(results) != len(call_items):
+            raise RuntimeError(
+                f"verify_in_train: {len(results)} decisions for {len(call_items)} micro-batches"
+            )
+        failed = [k for k, r in enumerate(results) if not r["pass"]]
+        for k in failed:
+            seqs, toks = counts[k]
+            for name, v in (("local_valid_seqs", seqs), ("local_valid_toks", toks)):
+                state[name] = state[name] - v.to(state[name].device)
+            for name, v in (("trained_valid_seqs", seqs), ("trained_valid_toks", toks)):
+                state[name] = state[name] - v.to(state[name].device)
+        new = state["all_mb_metrics"][n_metrics:]
+        if failed and len(new) == len(call_items):
+            kept = [m for k, m in enumerate(new) if k not in set(failed)]
+            del state["all_mb_metrics"][n_metrics:]
+            state["all_mb_metrics"].extend(kept)
+            del state["mb_losses"][n_losses:]
+            state["mb_losses"].extend(m["loss"] for m in kept if "loss" in m)
+        return [
+            {"group": it.get("vit_group", -1), **r} for it, r in zip(call_items, results)
+        ]
 
     def _vit_check_due(self, bucket, fused_key) -> bool:
         """Debug (``THUNDERSYNC_VIT_CHECK=1``): check the first final-advantage calls of each step."""
@@ -2880,9 +2952,15 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         prefix_keys: list[str | None] | None = None,
         prefix_release: list[str] | None = None,
         prefix_gpu_gb: float = 8.0,
+        row_seed_base: int | None = None,
         **_: Any,
     ) -> list[tuple[int, dict[str, Any]]]:
         """Block verification with q from the engine and p from the training model.
+
+        ``row_seed_base`` (verify-in-train fallback, ``vit.py``): row i draws its
+        uniforms from its own generator seeded ``vit.row_seed(row_seed_base,
+        keys[i])`` instead of the call's per-rank stream, so its decision is
+        the one the training forward already made with the same stream.
 
         Learner prefix-state cache (``prefix_keys``; DESIGN 14p): row i is
         cached under ``prefix_keys[i]`` (None: not cached) and forwarded only
@@ -3142,12 +3220,17 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                         out[j] = lp[k]
                 return torch.stack(out)
 
+            row_gen = (
+                gen
+                if row_seed_base is None
+                else vit.row_generator(vit.row_seed(row_seed_base, keys[i]), dev)
+            )
             if null_envelopes is not None:
                 # Banded IS is rejected with null_bv by validation (§14e).
                 assert band is None, "banded IS does not compose with pooled null_bv"
                 with timed("grid_scan_total"):
                     grid, lpx, n_eval = verify_engine_q_grid(
-                        p_lp, draft, lq, q_rows, gen, tuple(null_envelopes[i])
+                        p_lp, draft, lq, q_rows, row_gen, tuple(null_envelopes[i])
                     )
                 tau = max(t for t, _, _ in grid.values())
                 # log W* = max_t log prod_{u<=t} p/q over the draft (drop-IS weights).
@@ -3161,7 +3244,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 n_rows += n_eval
             else:
                 tau, y, logp, n_eval = verify_engine_q(
-                    p_lp, draft, lq, q_rows, gen, 1.0, band
+                    p_lp, draft, lq, q_rows, row_gen, 1.0, band
                 )
                 res = {
                     "accepted": tau,

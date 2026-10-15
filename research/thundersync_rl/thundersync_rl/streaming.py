@@ -210,6 +210,9 @@ class StreamPlanner:
         self._next = 0
         self._block_tokens: Optional[int] = None
         self._seg_pos = 0  # groups of the current segment already dispatched
+        # Verify-in-train: groups already trained by their own calls -> the
+        # reward multiset those calls used (checked when the rollouts arrive).
+        self._pretrained: dict[str, list[float]] = {}
 
     def set_order(
         self,
@@ -257,10 +260,52 @@ class StreamPlanner:
         """``tails``: rows of the group that need a continuation (tail-excluded baseline)."""
         self.groups[group] = _Group(size=size, tails=tails)
 
+    def mark_pretrained(self, group: GroupId, rewards: list[float]) -> None:
+        """``group`` was trained by verify-in-train with these rewards: never dispatch it.
+
+        It leaves the canonical order (it has no undispatched position to keep:
+        its rows arrive only after this call); its rows still count as
+        dispatched, and their rewards must be the ones it was trained with.
+        """
+        g = self.groups[group]
+        if g.rewards:
+            raise RuntimeError(f"verify_in_train: rows of {group} arrived before its decision")
+        if len(rewards) != g.size:
+            raise ValueError(f"{len(rewards)} rewards for a group of {g.size}")
+        k = repr(group)
+        self._pretrained[k] = sorted(map(float, rewards))
+        if self.order is None:
+            return
+        self.order = [x for x in self.order if repr(x) != k]
+        for bi, blk in enumerate(self._blocks):
+            pos = [j for j, x in enumerate(blk) if repr(x) == k]
+            if not pos:
+                continue
+            if bi < self._next or (bi == self._next and pos[0] < self._seg_pos):
+                raise RuntimeError(f"verify_in_train: {group} was already dispatched")
+            del blk[pos[0]]
+            if not blk:
+                del self._blocks[bi]
+            break
+
     def add(self, traj: Trajectory) -> None:
         g = self.groups[traj.group]
         assert traj.index not in g.rewards, f"duplicate trajectory {traj.index}"
         g.rewards[traj.index] = float(traj.reward)
+        pre = self._pretrained.get(repr(traj.group))
+        if pre is not None:
+            # Trained already; counts as dispatched, never enters ``ready``.
+            self.num_dispatched += 1
+            if len(g.rewards) == g.size:
+                rewards = [g.rewards[i] for i in sorted(g.rewards)]
+                if sorted(rewards) != pre:
+                    raise RuntimeError(
+                        f"verify_in_train: group {traj.group} rewards {sorted(rewards)} differ "
+                        f"from the ones it was trained with {pre} (nondeterministic environment?)"
+                    )
+                advantages = self.compute_group_advantages(rewards)
+                g.advantage_by_reward = dict(zip(rewards, map(float, advantages)))
+            return
         if self.tail_excluded_baseline is not None:
             if not traj.tail:
                 g.nontail[traj.index] = float(traj.reward)
