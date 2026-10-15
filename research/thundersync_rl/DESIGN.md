@@ -3646,6 +3646,22 @@ count per rank sets the pipeline call). 1T (DP 8, G 16): same rule, no new commu
 sync ≈ 106 → ≈ 55–60 s, ThunderSync (after deal_rows ≈ 105 s) → ≈ 55–60 s, async1 → generation-bound
 (~110 s). **Validation:** CPU tests `test_skip_zero_ep.py`; GPU: `sbatch/queue_1node.tsv` sz-* (L8, EP 2:
 exactness + skipped counts), multi-node `sbatch/go_bughunt.sh`.
+## 14y. Full-Nano bug hunt fixes (branch ts-bughunt, 2026-10-15; thundersync_work/research/fullnano_bug_hunt.md)
+
+- **async1 split dispatch [M → fixed].** With `rollout_lag=1` every row is in hand at the top of the step,
+  but the arrival loop yielded after each completed group, so the learner sent group 0 alone: async1-*-ab2
+  ran 8 rows (10.6–14.2 s, 8 micro-batches per rank under EP) then 504 rows, 72 micro-batches per rank vs
+  sync's 64 for the same rows (worker `[step] chunks=9 microbatches=72` vs `chunks=8 microbatches=64`).
+  The yield is now skipped for stale rollouts: one dispatch per step, like sync. Not an exactness arm.
+- **Weight sentinel cost [M → fixed].** `tensor_digest` synchronized the host once per tensor; ~6k tensors
+  per full-Nano rank made each check ~2 s (`sentinel/time_s` 1.9–2.0 s, inside `time/refit` 2.5–2.6 s on
+  async1 / sync's critical path). `digest_many` packs small tensors (int64 segment sums: the same sums mod
+  2**64), chunks large ones as before and reads all sums with one transfer: bitwise-equal digests
+  (CPU test), O(params / rank), one sync.
+- **verify-load metric [code → fixed].** `spec/verify_load_max_over_mean` was overwritten by every
+  verification call, so each step reported its last call (one piece on one rank) = DP = 8.0 in every
+  full-Nano history. Now ranks·Σbusiest/Σtotal over the step, plus `verify_load_first_max_over_mean`
+  (verify0).
 
 ## 15. Open work
 
