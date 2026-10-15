@@ -714,14 +714,19 @@ def test_enable_batch_invariant_kernels_passes_the_recipe_settings(monkeypatch):
     monkeypatch.setattr(zgm, "_use_inference_log_softmax", lambda: shimmed.append(True))
     mamba: list[bool] = []
     monkeypatch.setattr(zgm.mamba_ssd_parity, "install", lambda: mamba.append(True))
+    monkeypatch.setattr(
+        zgm.bi_mean, "install", lambda: calls.append(("bi_mean", (), {}))
+    )
 
     zgm.enable_batch_invariant_kernels(_policy_config())
 
     assert opened == [True]
     assert shimmed == [True]
     assert mamba == [True]
+    # The full-reduction mean fix is patched in before MCore registers aten::mean.dim.
     assert calls == [
         ("assert_te", (), {}),
+        ("bi_mean", (), {}),
         ("enable", (), {"backend": "te_native", "collective": "ordered"}),
     ]
 

@@ -35,7 +35,7 @@ from nemo_rl.algorithms.logits_sampling_utils import (
     need_top_k_or_top_p_filtering,
 )
 from nemo_rl.models.generation.megatron.config import merged_inference_megatron_cfg
-from nemo_rl.models.megatron import mamba_ssd_parity
+from nemo_rl.models.megatron import bi_mean, mamba_ssd_parity
 from nemo_rl.models.megatron.batch_invariant import batch_invariant_token_multiple
 
 if TYPE_CHECKING:
@@ -625,6 +625,8 @@ def enable_batch_invariant_kernels(config: PolicyConfig) -> None:
     )
 
     assert_te_supports_batch_invariant_attention()
+    # Full reductions (x.mean()) must be means, not sums, under the registered mean.dim.
+    bi_mean.install()
     enable_mcore_batch_invariant_mode(
         backend=megatron_cfg["batch_invariant_backend"], collective=collective
     )
