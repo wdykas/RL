@@ -717,6 +717,9 @@ class SpeculativeGeneration:
                     rank0, hkeys, plens, budget, target=step + 1
                 )
                 self.stats["tail/next_drafted_tokens"] = float(sum(len(x[0]) for x in res))
+                if os.environ.get("THUNDERSYNC_DEBUG_DRAFT_LENS"):
+                    # Debug: drafted length per draft, in drafting (= admission) order.
+                    print(f"[draft lens] target={step + 1} {[len(x[0]) for x in res]}", flush=True)
                 self.stats["tail/next_drafts"] = float(len(res))
             else:
                 res = [_drafted(x) for x in self._collect_drafts(rank0)]
