@@ -54,6 +54,7 @@ from thundersync_rl.draft_weights import (
     restore_training,
 )
 from thundersync_rl import mem_debug
+from thundersync_rl import vit_check
 from thundersync_rl.fused_train import (
     FusedGraph,
     FusedGraphStore,
@@ -631,7 +632,12 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             del graph  # only the substitute forward holds it now
             try:
                 with substitute:
-                    self._stream_train_call(call_items, mbs_per_item, bucket, tprof)
+                    if self._vit_check_due(bucket, fused_key):
+                        vit_check.run_check(
+                            self, call_items, mbs_per_item, bucket, tprof, self._vit_calls
+                        )
+                    else:
+                        self._stream_train_call(call_items, mbs_per_item, bucket, tprof)
             finally:
                 # Frees the graph's activations also when no forward ran (a
                 # zero-advantage row skipped by the worker).
@@ -667,6 +673,18 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             "fused_tokens": fused_tokens,
             "fused_fallback": fused_fallback,
         }
+
+    def _vit_check_due(self, bucket, fused_key) -> bool:
+        """Debug (``THUNDERSYNC_VIT_CHECK=1``): check the first final-advantage calls of each step."""
+        if not vit_check.enabled() or bucket is not None or fused_key is not None:
+            return False
+        key = id(self._train_step_state)
+        if getattr(self, "_vit_step_key", None) != key:
+            self._vit_step_key, self._vit_calls = key, 0
+        if self._vit_calls >= vit_check.max_calls():
+            return False
+        self._vit_calls += 1
+        return True
 
     def _stream_train_call(
         self,
