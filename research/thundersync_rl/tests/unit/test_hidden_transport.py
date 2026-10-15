@@ -151,6 +151,11 @@ def test_worker_pop_draft_hidden_as_refs(monkeypatch):
 # --------------------------------------------------------------------------
 
 
+def _decisions(r):
+    """A verification result without its transport accounting (bytes fetched, fetch time)."""
+    return {k: v for k, v in r.items() if k not in spec_mod.HIDDEN_FETCH_KEYS}
+
+
 def _as_refs(hids, segs, store):
     """Handles of the test drafts' hidden states (4-row blocks per segment)."""
     out = []
@@ -187,7 +192,8 @@ def test_engine_worker_object_store_matches_driver_path(monkeypatch):
     assert got.keys() == ref.keys()
     whole = rejected = 0
     for i, r in got.items():
-        assert {**r, "hidden_bytes_fetched": 0} == ref[i]  # same decisions, log p
+        # Same decisions and log p; transport accounting (bytes, fetch time) differs.
+        assert _decisions(r) == _decisions(ref[i])
         g = len(lqs[i])
         if r["accepted"] == g:
             whole += 1
@@ -224,13 +230,20 @@ def test_tp_ranks_fetch_the_same_segments(monkeypatch, tp):
         keys=keys,
     )
     res = grp.run(lambda r: rank_worker(r).verify_drafts_block_engine(**kw))
-    assert all(out == res[0] for out in res)
+    dec = [[(i, _decisions(r)) for i, r in out] for out in res]
+    assert all(d == dec[0] for d in dec)  # every TP rank: same decisions and log p
+    # ... and the same bytes fetched (transport time is per rank).
+    assert all(
+        [(i, r["hidden_bytes_fetched"], r["hidden_real_bytes_fetched"]) for i, r in out]
+        == [(i, r["hidden_bytes_fetched"], r["hidden_real_bytes_fetched"]) for i, r in res[0]]
+        for out in res
+    )
     per_rank = [[ref for t, ref in store.fetches if t == r] for r in range(tp)]
     assert per_rank[0] and all(p == per_rank[0] for p in per_rank)
     local.tp, local.rank = 1, 0
     monkeypatch.setattr(ray, "get", store.get)
-    assert [(i, {**r, "hidden_bytes_fetched": 0}) for i, r in res[0]] == [
-        (i, {**r, "hidden_bytes_fetched": 0})
+    assert [(i, _decisions(r)) for i, r in res[0]] == [
+        (i, _decisions(r))
         for i, r in w1.verify_drafts_block_engine(**{**kw, "hidden": hids})
     ]
 
