@@ -290,9 +290,14 @@ def test_fp16_weight_cache_holds_two_layers_and_is_bitwise():
 
 
 @needs_cuda
+@pytest.mark.parametrize("tma", [True, False])
 @pytest.mark.parametrize("splits", [[3, 0, 70, 19, 1, 0], [0, 0, 5, 0, 0, 0], [40] * 6])
-def test_training_segment_kernels_bitwise_equal_per_expert_cublas(monkeypatch, splits):
+def test_training_segment_kernels_bitwise_equal_per_expert_cublas(
+    monkeypatch, splits, tma
+):
     """One-launch segment kernels (fwd, dgrad, wgrad) give the per-expert cuBLAS bits."""
+    if not tma:
+        monkeypatch.setattr(fm, "_tma_ok", lambda *a: False)
     torch.manual_seed(0)
     dev = torch.device("cuda")
     ws = [
@@ -318,9 +323,15 @@ def test_training_segment_kernels_bitwise_equal_per_expert_cublas(monkeypatch, s
 
 def test_train_gemm_kind(monkeypatch):
     monkeypatch.delenv("NEMO_RL_FP16_MOE_TRAIN_GEMM", raising=False)
-    assert fm._train_gemm_kind(128 * 48, 128) == "cublas"  # default: opt-in only
+    nk = (1856, 2688)  # Nano expert shapes
+    assert fm._train_gemm_kind(128 * 48, 128, *nk) == "cublas"  # default: opt-in only
     monkeypatch.setenv("NEMO_RL_FP16_MOE_TRAIN_GEMM", "auto")
-    assert fm._train_gemm_kind(128 * 48, 128) == "segment"
-    assert fm._train_gemm_kind(8 * 4096, 8) == "cublas"
+    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":0:0")
+    assert fm._train_gemm_kind(128 * 48, 128, *nk) == "segment"
+    assert fm._train_gemm_kind(32 * 1536, 32, *nk) == "segment"
+    assert fm._train_gemm_kind(8 * 4096, 8, *nk) == "cublas"
+    monkeypatch.delenv("CUBLAS_WORKSPACE_CONFIG")
+    assert fm._train_gemm_kind(32 * 3072, 32, *nk) == "cublas"
+    assert fm._train_gemm_kind(32 * 192, 32, *nk) == "segment"
     monkeypatch.setenv("NEMO_RL_FP16_MOE_TRAIN_GEMM", "cublas")
-    assert fm._train_gemm_kind(10, 128) == "cublas"
+    assert fm._train_gemm_kind(10, 128, *nk) == "cublas"
