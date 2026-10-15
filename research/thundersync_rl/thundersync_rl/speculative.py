@@ -415,9 +415,16 @@ def behavior_logprobs(
     return out
 
 
-# Ordered learner call numbers (``SpeculativeGeneration.learner_seq``), shared by
-# every SpeculativeGeneration of the driver (one per engine lane).
-_LEARNER_SEQ = itertools.count()
+# Ordered call numbers (``SpeculativeGeneration.learner_seq``): one counter per
+# worker group, kept on the group object, so every SpeculativeGeneration of the
+# driver (one per engine lane) numbers the shared learner group's calls from one
+# sequence, and each group's ranks (``ordered_call``) see 0, 1, 2, ... with no
+# gap (a call numbered from another group's counter would leave one forever).
+def _group_seq(group) -> int:
+    counter = group.__dict__.get("_ts_ordered_seq")
+    if counter is None:
+        counter = group.__dict__.setdefault("_ts_ordered_seq", itertools.count())
+    return next(counter)
 
 # verify_yield (DESIGN 14aa): one VerifyMailbox per learner worker group, shared
 # by every SpeculativeGeneration (engine lane) of the process.
@@ -2193,7 +2200,7 @@ class SpeculativeGeneration:
                 if method != "verify_drafts_block_engine":
                     raise RuntimeError("verify_in_train needs engine-sourced q")
                 extra = {**extra, "row_seed_base": int(row_seed_base)}
-            seq = self.learner_seq() if ordered else None
+            seq = self.learner_seq(g) if ordered else None
             call = (method,) if seq is None else ("ordered_call",)
             if seq is not None and self._yield_ready(g):
                 # verify_yield (DESIGN 14aa): the call goes to the mailbox; the
@@ -2938,9 +2945,7 @@ class SpeculativeGeneration:
                 lazy=self.verify_lazy,
             )
             if self.fused_verify_train:
-                refs = group.run_all_workers_single_data(
-                    "verify_drafts_block_fused",
-                    **kwargs,
+                method, extra = "verify_drafts_block_fused", dict(
                     retain=[self._stopped(d) for _, d in flat[a:b]],
                     max_retained_tokens=self.fused_max_retained_tokens,
                 )
@@ -2948,7 +2953,18 @@ class SpeculativeGeneration:
                 method, extra = self._verify_method(flat[a:b])
                 if self.banded_is_band is not None:
                     extra["band"] = self.banded_is_band
+            # Every chunk is in flight at once, with the step's training
+            # dispatches: numbered calls when the caller holds the ordered
+            # scope (``begin_ordered_learner``), so all ranks of a pool run them
+            # in one order.
+            seq = self.learner_seq(group)
+            if seq is None:
                 refs = group.run_all_workers_single_data(method, **kwargs, **extra)
+            else:
+                refs = group.run_all_workers_single_data(
+                    "ordered_call", seq=seq, method=method, **kwargs, **extra
+                )
+                self.learner_track(refs)
             calls.append((a, refs))
         kept = total = full = fused = 0
         age_tok: dict[int, int] = {}
@@ -2964,6 +2980,8 @@ class SpeculativeGeneration:
 
         for fut in asyncio.as_completed([fetch(a, refs) for a, refs in calls]):
             a, refs, res = await fut
+            if getattr(self, "learner_ordered", False):
+                self._learner_inflight.difference_update(refs)
             by_row = dict(x for rank_res in res for x in rank_res)
             ends = [c[0] for c in calls[1:]] + [len(flat)]
             chunk_rows = ends[[c[0] for c in calls].index(a)] - a
@@ -3041,10 +3059,23 @@ class SpeculativeGeneration:
         piece is exact block verification of a q draft against the fixed
         target p, so the final rollout is an exact sample of p.
         """
-        pending = await self.begin_sticky(drafts)
-        # Also with nothing pending (every draft whole-accepted and complete):
-        # the step then reports zero continuation rounds instead of no stats.
-        await self._finish_tails(pending)
+        # Continuation rounds keep several piece verifications in flight on
+        # the learner at once: numbered calls (``begin_ordered_learner``), so
+        # every learner rank runs them in one order. Already numbered when a
+        # caller (streaming over the tails) holds the scope.
+        own = not self.__dict__.get("learner_ordered", False)
+        if own:
+            self.begin_ordered_learner()
+        try:
+            pending = await self.begin_sticky(drafts)
+            # Also with nothing pending (every draft whole-accepted and complete):
+            # the step then reports zero continuation rounds instead of no stats.
+            await self._finish_tails(pending)
+            if own:
+                await self.learner_drain()
+        finally:
+            if own:
+                self.end_ordered_learner()
 
     async def _finish_tails(self, pending) -> None:
         """The continuation rounds of ``pending``, then the step's tail timeline stats."""
@@ -3456,9 +3487,28 @@ class SpeculativeGeneration:
         self._tail_cv = asyncio.Condition()
         self._tail_error: Optional[BaseException] = None
         self._weights_ready = asyncio.Event()
-        # Learner calls in flight are numbered and run in that order on every
-        # rank (``learner_seq`` / ``ordered_call``); ``learner_drain`` waits
-        # for all of them before an unordered call (the refit).
+        self.begin_ordered_learner()
+
+    def end_streaming_tails(self) -> None:
+        self._tail_cv = None
+        self._weights_ready = None
+        self.end_ordered_learner()
+
+    def begin_ordered_learner(self) -> None:
+        """Number every verifier-pool call from now on (``learner_seq`` / ``ordered_call``).
+
+        Needed whenever several calls to one worker group can be in flight at
+        once (training dispatches, verification chunks, continuation pieces):
+        the workers are asyncio Ray actors, which start a call once its
+        arguments are local, not in submission order, so two ranks can run the
+        same two calls in different orders (their collectives then pair across
+        calls). Arguments sent through ``run_all_workers_*`` are object-store
+        refs; a rank on another node than the driver pulls them, and a call
+        with a larger payload starts after a later one with a smaller payload
+        (research/ray_order_audit.md). Numbered calls run in their number order
+        on every rank. ``learner_drain`` waits for all of them before an
+        unordered call that must not overlap them (the refit).
+        """
         self.learner_ordered = True
         self._learner_inflight: set = set()
         self.learner_wait = {"drain": 0.0}
@@ -3466,23 +3516,22 @@ class SpeculativeGeneration:
             # Before any ordered call of the step is sent (the setter is unordered).
             self._yield_ready(self.verifiers[0])
 
-    def end_streaming_tails(self) -> None:
+    def end_ordered_learner(self) -> None:
         for k, v in getattr(self, "learner_wait", {}).items():
-            self.stats[f"learner/{k}_wait_s"] = v
-        self._tail_cv = None
-        self._weights_ready = None
+            self.stats[f"learner/{k}_wait_s"] = self.stats.get(f"learner/{k}_wait_s", 0.0) + v
+        self.learner_wait = {"drain": 0.0}
         self.learner_ordered = False
 
-    def learner_seq(self) -> Optional[int]:
-        """The next ordered-call number while streaming over the tails, else None.
+    def learner_seq(self, group: Any = None) -> Optional[int]:
+        """The next ordered-call number of ``group`` (default: the learner) while ordered, else None.
 
         Persistent across steps: the workers count every ordered call they run.
+        ``group``: the worker group the call goes to (a verifier pool); each
+        group has its own sequence (``_group_seq``).
         """
         if not self.__dict__.get("learner_ordered", False):
             return None
-        # One counter per process: the learner workers count every ordered call,
-        # whichever SpeculativeGeneration (engine lane) sent it.
-        return next(_LEARNER_SEQ)
+        return _group_seq(group if group is not None else self.learner_policy.worker_group)
 
     def learner_track(self, refs) -> None:
         """Ordered learner calls in flight (``learner_drain`` waits for them)."""

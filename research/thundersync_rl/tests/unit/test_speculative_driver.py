@@ -31,15 +31,40 @@ class _Remote:
         self.remote = fn
 
 
+def _unwrap_ordered(group, method, kwargs):
+    """``ordered_call(seq, method, **kw)`` as the worker runs it: ``method(**kw)``.
+
+    Records the sequence number of each numbered call (``group.seqs``).
+    """
+    if method != "ordered_call":
+        return method, kwargs
+    kwargs = dict(kwargs)
+    group.seqs.append(kwargs.pop("seq"))
+    return kwargs.pop("method"), kwargs
+
+
+class _ListRef(list):
+    """A rank's result standing in for its object ref: hashable by identity (tracked refs)."""
+
+    __hash__ = object.__hash__
+
+
 class _WorkerGroup:
     def __init__(self, handlers):
         self.handlers = handlers
         self.calls = []
+        self.seqs = []
         self.workers = [SimpleNamespace(**{k: _Remote(v) for k, v in handlers.items()})]
 
-    def run_all_workers_single_data(self, method, **kwargs):
+    def run_all_workers_single_data(self, method_name, **kwargs):
+        # ``method_name`` as RayWorkerGroup names it (``ordered_call`` passes ``method=``).
+        n = len(self.seqs)
+        method, kwargs = _unwrap_ordered(self, method_name, kwargs)
         self.calls.append((method, kwargs))
-        return [self.handlers[method](**kwargs)]
+        out = self.handlers[method](**kwargs)
+        if len(self.seqs) > n and isinstance(out, list):
+            out = _ListRef(out)  # numbered calls are tracked in a set until drained
+        return [out]
 
 
 class _Base:
@@ -198,7 +223,9 @@ class _Ref:
 
 
 class _RefGroup(_WorkerGroup):
-    def run_all_workers_single_data(self, method, **kwargs):
+    def run_all_workers_single_data(self, method_name, **kwargs):
+        # ``method_name`` as RayWorkerGroup names it (``ordered_call`` passes ``method=``).
+        method, kwargs = _unwrap_ordered(self, method_name, kwargs)
         self.calls.append((method, kwargs))
         try:
             return [_Ref(self.handlers[method](**kwargs))]
@@ -228,6 +255,27 @@ def test_chunked_verification_uses_all_pools_and_publishes_every_plan():
     assert [len(p.calls) for p in pools] == [2, 2]
     assert sorted(k[0] for k in s.plans) == [50, 51, 52, 53, 54, 55]
     assert all(p[0].complete for p in s.plans.values())
+
+
+def test_chunked_verification_beside_training_is_numbered_per_pool():
+    """Chunk calls are in flight together with the step's training dispatches:
+    inside the ordered scope each is an ``ordered_call``, numbered from its
+    own pool's sequence (a shared counter would leave gaps on each pool)."""
+    s = _spec({})
+    pools = [_RefGroup({"verify_drafts_block_stashed": _accept_all}) for _ in range(2)]
+    s.verifiers = s._chunk_pools = pools
+    s.begin_ordered_learner()
+    try:
+        asyncio.run(s.verify_chunked(_drafts(6), chunks=4))
+        assert [p.seqs for p in pools] == [[0, 1], [0, 1]]
+        assert not s._learner_inflight  # every chunk's refs were fetched
+        asyncio.run(s.verify_chunked(_drafts(4), chunks=2))
+        assert [p.seqs for p in pools] == [[0, 1, 2], [0, 1, 2]]  # persists across steps
+    finally:
+        s.end_ordered_learner()
+    asyncio.run(s.verify_chunked(_drafts(2), chunks=2))  # outside the scope: plain calls
+    assert [p.seqs for p in pools] == [[0, 1, 2], [0, 1, 2]]
+    assert sorted(k[0] for k in s.plans) == [50, 51]
 
 
 def test_verification_failure_surfaces_instead_of_hanging():

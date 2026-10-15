@@ -1848,6 +1848,7 @@ async def _run_one_step(
     tail_groups: Optional[list[int]] = None,
     order_stream: Optional[StreamOrder] = None,
     ordered_learner: Optional[Any] = None,
+    cut_while_training: Optional[bool] = None,
     claim_row: Optional[Callable[[torch.Tensor, torch.Tensor], Any]] = None,
     tail_count: Optional[Callable[[torch.Tensor], int]] = None,
     claim_log_weight: Optional[Callable[[torch.Tensor, torch.Tensor], float]] = None,
@@ -1869,11 +1870,14 @@ async def _run_one_step(
     ``order_stream`` (streaming verify0, DESIGN 14z): ``group_order`` /
     ``group_blocks`` are its lists, which grow while the step runs; the
     planner follows them as they grow (``StreamPlanner.extend_order``).
-    ``ordered_learner`` (the spec while streaming over the tails): training
-    dispatches are numbered learner calls (``learner_seq``) that every learner
-    rank runs in the same order, interleaved with the tails' verification
-    forwards (asynchronous Ray actors do not keep submission order when
-    several calls wait; ``ordered_call`` does). ``stale_rollouts``
+    ``ordered_learner`` (the spec while streaming over the tails, or while
+    chunked verification overlaps training): training dispatches are numbered
+    learner calls (``learner_seq``) that every learner rank runs in the same
+    order, interleaved with the verification forwards (asynchronous Ray actors
+    do not keep submission order when several calls wait; ``ordered_call``
+    does). ``cut_while_training`` (default: with ``ordered_learner``; sticky
+    streaming): the next drafts are cut while the last dispatch trains.
+    ``stale_rollouts``
     (rollout_lag=1): this batch's rollouts, already generated at theta_{k-1},
     are trained instead of sampling new ones, while ``generate_next()``
     samples the next batch at theta_k on the engine concurrently (returned as
@@ -1899,6 +1903,8 @@ async def _run_one_step(
     # Streaming over the tails: training dispatches are ordered learner calls
     # (SpeculativeGeneration.learner_seq), interleaved with verification.
     ordered = ordered_learner
+    if cut_while_training is None:
+        cut_while_training = ordered is not None
     repeated = batch.repeat_interleave(G)
     n = repeated.size
     mbs = train_micro_batch_rows(master_config)
@@ -2589,7 +2595,7 @@ async def _run_one_step(
             await vit_task
         rollouts_done = True
         wake.set()
-        if ordered is not None and draft_task is not None:
+        if cut_while_training and draft_task is not None:
             # Sticky streams go on decoding after the cut (their tokens become
             # continuation pieces), so the cut time only moves tokens between
             # the next verify0 and its continuation rounds. A deferrable cut
@@ -2686,6 +2692,10 @@ async def _run_one_step(
         replay_metrics = {
             f"debug/order_replay_{k}_same": float(v == real) for k, v in replay_digests.items()
         }
+    if ordered is not None:
+        # The debug checks below and the optimizer step are unordered learner
+        # calls: every numbered call has finished first.
+        await ordered.learner_drain()
     t_rollout_end = last_rollout_t
     t_check = time.perf_counter()
     mismatch = (
@@ -3566,6 +3576,10 @@ def thundersync_grpo_train(
             # ⊥-BV pools are decided in one call before the rollouts start.
             and not ts_cfg.null_bv
         )
+        # Chunked verification overlaps the step's training dispatches on the
+        # learner: both are numbered learner calls then (``ordered_call``), as
+        # while streaming over the tails, so every rank runs them in one order.
+        ordered_chunks = False
         if cohort_mode and chunked:
             cohort = spec.cohorts.pop(step, None)
             if cohort is not None:
@@ -3573,8 +3587,10 @@ def thundersync_grpo_train(
                 pre_rollout = lambda c=cdrafts: spec.verify_chunked(
                     c, ts_cfg.verify_chunks
                 )  # noqa: E731
+                ordered_chunks = tails is None
         elif chunked and drafts is not None:
             pre_rollout = lambda d=drafts: spec.verify_chunked(d, ts_cfg.verify_chunks)  # noqa: E731
+            ordered_chunks = tails is None
         elif cohort_mode:
             t1 = time.perf_counter()
             spec.verify_cohort(step)
@@ -3616,7 +3632,7 @@ def thundersync_grpo_train(
                 drafter = None
         policy.prepare_for_training()
         metrics = asyncio.run(
-            _run_streaming_tails(spec, tails is not None)(
+            _run_streaming_tails(spec, tails is not None, ordered=ordered_chunks)(
             _run_one_step(
                 step=step,
                 batch=batch,
@@ -3651,7 +3667,9 @@ def thundersync_grpo_train(
                 group_blocks=group_blocks,
                 tail_groups=tail_groups,
                 order_stream=v0_order,
-                ordered_learner=spec if tails is not None else None,
+                ordered_learner=spec if tails is not None or ordered_chunks else None,
+                # Sticky streams: cut the next drafts while training ends.
+                cut_while_training=tails is not None,
                 vit_spec=spec if tails is not None and ts_cfg.verify_in_train else None,
                 claim_log_weight=spec.claim_log_weight
                 if spec is not None and ts_cfg.banded_is_band is not None
@@ -3669,7 +3687,7 @@ def thundersync_grpo_train(
             ))
         )
         t_refit = refit_s[0]
-        if tails is not None:
+        if tails is not None or ordered_chunks:
             # Every learner rank ran the same ordered calls in the same order.
             digests = ray.get(
                 policy.worker_group.run_all_workers_single_data("ordered_digest")
@@ -3681,7 +3699,7 @@ def thundersync_grpo_train(
             for method in sorted({m for b in busy for m in b}):
                 # Max over ranks: learner seconds in training vs piece verification.
                 metrics[f"learner/busy_{method}_s"] = max(b.get(method, 0.0) for b in busy)
-            if spec is not None:
+            if spec is not None and tails is not None:
                 # verify_yield: verifications run at training boundaries this step.
                 metrics.update(spec.yield_stats())
         if tails_s:
@@ -3786,17 +3804,27 @@ def resume_digest(policy: Policy, upcoming, stream, specs) -> dict[str, Any]:
     }
 
 
-def _run_streaming_tails(spec, on: bool):
-    """Run a step coroutine with ``spec``'s streaming-over-tails state (if ``on``)."""
+def _run_streaming_tails(spec, on: bool, ordered: bool = False):
+    """Run a step coroutine with ``spec``'s streaming-over-tails state (if ``on``).
+
+    ``ordered`` (not ``on``): only the ordered learner calls
+    (``begin_ordered_learner``), for chunked verification beside training.
+    """
 
     async def run(coro):
-        if not on:
+        if on:
+            spec.begin_streaming_tails()
+        elif ordered:
+            spec.begin_ordered_learner()
+        else:
             return await coro
-        spec.begin_streaming_tails()
         try:
             return await coro
         finally:
-            spec.end_streaming_tails()
+            if on:
+                spec.end_streaming_tails()
+            else:
+                spec.end_ordered_learner()
 
     return run
 
