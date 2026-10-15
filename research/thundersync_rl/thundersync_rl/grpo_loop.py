@@ -313,6 +313,11 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # index)), so the accumulated gradient is bitwise independent of arrival
     # times (StreamPlanner.set_order). False: dispatch as rows arrive.
     canonical_group_order: bool = True
+    # Canonical order: groups per training dispatch (blocks formed within each
+    # class -- ready now, pending tails, never drafted -- in group index order;
+    # a function of the data only). Each learner call has a fixed cost
+    # (~0.35 s at Nano L8 EP2), so one group per call made training 2x slower.
+    canonical_block_groups: int = 4
     # Measurement only (research/agent_tail.md): the drafting deadline waits
     # until every draft finished (EOS or the cap), so each step verifies whole
     # rollouts and its post-refit tail is the rejection tail alone. Exact (no
@@ -408,6 +413,16 @@ class ThunderSyncMasterConfig(MasterConfig):
 def validate_config(master_config: ThunderSyncMasterConfig) -> None:
     """Fail fast on settings that would break exact equivalence."""
     loss_cfg = master_config.loss_fn
+    data_cfg = getattr(master_config, "data", None) or {}
+    max_in = data_cfg.get("max_input_seq_length") if isinstance(data_cfg, dict) else None
+    max_total = master_config.policy["max_total_sequence_length"]
+    if max_in is not None and max_in > max_total:
+        # A prompt between the two passes the data filter (which masks prompts
+        # >= max_input_seq_length) but overflows the engine's total-length cap.
+        raise ValueError(
+            f"data.max_input_seq_length ({max_in}) must not exceed "
+            f"policy.max_total_sequence_length ({max_total})"
+        )
     assert loss_cfg.reference_policy_kl_penalty == 0.0, (
         "gradient streaming supports kl=0 (the reference KL term would need the "
         "reference policy on the learner)"
@@ -1298,6 +1313,7 @@ async def _run_one_step(
     draft_start_frac: Optional[float] = None,
     drafts_after_pre_rollout: bool = False,
     group_order: Optional[list[int]] = None,
+    group_blocks: Optional[list[int]] = None,
     tail_groups: Optional[list[int]] = None,
     ordered_learner: Optional[Any] = None,
     claim_row: Optional[Callable[[torch.Tensor, torch.Tensor], Any]] = None,
@@ -1347,34 +1363,37 @@ async def _run_one_step(
         master_config.policy["megatron_cfg"].get("pipeline_model_parallel_size", 1) or 1
     )
     min_pipeline_microbatches = resolve_min_pipeline_microbatches(ts_cfg, pp)
-    planner = StreamPlanner(
-        adv_fn,
-        dp_size=learner.dp_size,
-        max_chunk_trajectories=ts_cfg.max_chunk_trajectories,
-        max_open_groups=max_open_groups,
-        micro_batch_size=mbs,
-        equal_rank_microbatches=expert_parallel,
-        skip_zero_advantage_chunks=(
-            bool(getattr(loss_fn, "skip_zero_advantage_rows", False))
-            and not expert_parallel
-        ),
-        min_pipeline_microbatches=min_pipeline_microbatches,
-        tail_excluded_baseline=(
-            make_tail_excluded_fn(master_config) if ts_cfg.tail_excluded_baseline else None
-        ),
-    )
-    for p in range(n // G):
-        prompt = torch.cat([m["token_ids"] for m in repeated["message_log"][p * G]])
-        planner.register_group(
-            (step, p),
-            G,
-            tails=tail_count(prompt) if ts_cfg.tail_excluded_baseline and tail_count else 0,
+    def make_planner(order, block_sizes=None):
+        pl = StreamPlanner(
+            adv_fn,
+            dp_size=learner.dp_size,
+            max_chunk_trajectories=ts_cfg.max_chunk_trajectories,
+            max_open_groups=max_open_groups,
+            micro_batch_size=mbs,
+            equal_rank_microbatches=expert_parallel,
+            skip_zero_advantage_chunks=(
+                bool(getattr(loss_fn, "skip_zero_advantage_rows", False))
+                and not expert_parallel
+            ),
+            min_pipeline_microbatches=min_pipeline_microbatches,
+            tail_excluded_baseline=(
+                make_tail_excluded_fn(master_config) if ts_cfg.tail_excluded_baseline else None
+            ),
         )
-    if group_order is not None:
-        planner.set_order([(step, p) for p in group_order])
+        for p in range(n // G):
+            prompt = torch.cat([m["token_ids"] for m in repeated["message_log"][p * G]])
+            pl.register_group(
+                (step, p),
+                G,
+                tails=tail_count(prompt) if ts_cfg.tail_excluded_baseline and tail_count else 0,
+            )
+        if order is not None:
+            pl.set_order([(step, p) for p in order], block_sizes)
+        return pl
 
-    learner.begin(
-        loss_fn,
+    planner = make_planner(group_order, group_blocks)
+
+    begin_kw = dict(
         gbs=n,
         mbs=mbs,
         storage_device=ts_cfg.storage_device,
@@ -1382,6 +1401,55 @@ async def _run_one_step(
         max_open_groups=max_open_groups,
         merge_pipeline_calls=ts_cfg.merge_pipeline_calls,
     )
+    learner.begin(loss_fn, **begin_kw)
+    # Debug (THUNDERSYNC_DEBUG_ORDER_REPLAY): train only after the rollouts and
+    # first replay them in other arrival orders (``_order_replay``).
+    order_replay = bool(os.environ.get("THUNDERSYNC_DEBUG_ORDER_REPLAY")) and (
+        group_order is not None
+    )
+    replay_digests: dict[str, Any] = {}
+
+    def grad_digests():
+        return [tuple(x) for x in _run_workers(learner.policy, "grad_digest")]
+
+    def replay(trajs, order, seed, block_sizes=None):
+        """Train ``trajs`` (arrival order shuffled by ``seed``) on a fresh step; digest it."""
+        import random as _random
+
+        learner.abort()
+        learner.begin(loss_fn, **begin_kw)
+        pl = make_planner(order, block_sizes)
+        arrival = list(trajs)
+        _random.Random(seed).shuffle(arrival)
+        for t in arrival:
+            pl.add(t)
+            while pl.has_work(flush=False):
+                d = pl.next_dispatch(flush=False)
+                ray.get(learner.submit(_build_dispatch(d), d.closes))
+        while pl.has_work():
+            d = pl.next_dispatch()
+            ray.get(learner.submit(_build_dispatch(d), d.closes))
+        out = grad_digests()
+        learner.abort()
+        learner.begin(loss_fn, **begin_kw)
+        return out
+
+    def _build_dispatch(d):
+        # Pad only chunks larger than a micro-batch.
+        return [
+            [
+                {
+                    "data": build_chunk_data(
+                        c, tokenizer, master_config, 1 if len(c.trajectories) <= mbs else mbs
+                    ),
+                    "group": c.group,
+                    "reward": c.reward,
+                    "fused_key": None if c.fused is None else c.fused.key,
+                }
+                for c in chunks
+            ]
+            for chunks in d.per_rank
+        ]
 
     t_start = time.perf_counter()
     wake = asyncio.Event()
@@ -1436,27 +1504,10 @@ async def _run_one_step(
             # Under PP, rows of closed groups are held until they fill the
             # pipeline (min_pipeline_microbatches) unless the rollouts are done.
             while planner.has_work(flush=rollouts_done) and (
-                ts_cfg.granularity != "batch" or rollouts_done
+                (ts_cfg.granularity != "batch" and not order_replay) or rollouts_done
             ):
                 d = planner.next_dispatch(flush=rollouts_done)
-                per_rank = [
-                    [
-                        {
-                            # Pad only chunks larger than a micro-batch.
-                            "data": build_chunk_data(
-                                c,
-                                tokenizer,
-                                master_config,
-                                1 if len(c.trajectories) <= mbs else mbs,
-                            ),
-                            "group": c.group,
-                            "reward": c.reward,
-                            "fused_key": None if c.fused is None else c.fused.key,
-                        }
-                        for c in chunks
-                    ]
-                    for chunks in d.per_rank
-                ]
+                per_rank = _build_dispatch(d)
                 t0 = time.perf_counter()
                 seq = None if ordered is None else ordered.learner_seq()
                 refs = learner.submit(per_rank, d.closes, seq=seq)
@@ -1623,6 +1674,16 @@ async def _run_one_step(
             all_trajectories.append(traj)
             planner.add(traj)
             wake.set()
+        if order_replay:
+            # Same trajectories, two other arrival orders under the canonical
+            # order (must equal the real step bitwise) and one with arrival
+            # order dispatch (control: expected to differ).
+            if ordered is not None:
+                await ordered.learner_drain()
+            replay_digests["canonical_a"] = replay(all_trajectories, group_order, 1, group_blocks)
+            replay_digests["canonical_b"] = replay(all_trajectories, group_order, 2, group_blocks)
+            replay_digests["canonical_a_again"] = replay(all_trajectories, group_order, 1, group_blocks)
+            replay_digests["arrival"] = replay(all_trajectories, None, 3)
         rollouts_done = True
         wake.set()
         if ordered is not None and draft_task is not None:
@@ -1669,6 +1730,26 @@ async def _run_one_step(
         learner.abort()
         raise
     assert planner.all_done()
+    if order_replay:
+        real = grad_digests()
+        bad = []
+        for k, v in replay_digests.items():
+            same = v == real
+            print(f"[order replay] step={step} {k} same_as_real={same} real={real} {k}={v}", flush=True)
+            if k.startswith("canonical") and not same:
+                bad.append(k)
+        # canonical_a_again repeats canonical_a's exact order: if even it differs,
+        # the training kernels themselves are not deterministic.
+        print(
+            f"[order replay] step={step} canonical_a==canonical_a_again="
+            f"{replay_digests['canonical_a'] == replay_digests['canonical_a_again']}",
+            flush=True,
+        )
+        if bad:
+            raise RuntimeError(f"order replay: {bad} gradient differs from the real step")
+        replay_metrics = {
+            f"debug/order_replay_{k}_same": float(v == real) for k, v in replay_digests.items()
+        }
     t_rollout_end = last_rollout_t
     t_check = time.perf_counter()
     mismatch = (
@@ -1738,6 +1819,7 @@ async def _run_one_step(
         "time/draft_cut": draft_cut_s if draft_cut_s is not None else draft_wait,
         "_drafts": drafts,
         **mismatch,
+        **(replay_metrics if order_replay else {}),
     }
     if replay_row is not None:
         out["spec/replayed_multi_turn_rows"] = float(replayed[0])
@@ -1999,7 +2081,7 @@ def thundersync_grpo_train(
             refit_s.append(time.perf_counter() - t_r)
 
         tails_s = []
-        group_order = tail_groups = None
+        group_order = group_blocks = tail_groups = None
         if tails is None:
             refit_for_step()
         else:
@@ -2022,9 +2104,17 @@ def thundersync_grpo_train(
                     if n_plans[row_keys[p * G]] < need[row_keys[p * G]]
                 }
                 late = set(tail_groups) | fresh
-                group_order = [p for p in range(len(row_keys) // G) if p not in late]
-                group_order += [p for p in tail_groups if p not in fresh]
-                group_order += sorted(fresh)
+                classes = [
+                    [p for p in range(len(row_keys) // G) if p not in late],
+                    [p for p in tail_groups if p not in fresh],
+                    sorted(fresh),
+                ]
+                group_order = [p for c in classes for p in c]
+                # Blocks of canonical_block_groups within each class.
+                bg = max(1, int(ts_cfg.canonical_block_groups))
+                group_blocks = [
+                    min(bg, len(c) - i) for c in classes for i in range(0, len(c), bg)
+                ]
 
             async def tails_then_refit(pending=tails):
                 # Continuation rounds on the drafting weights, then theta_k:
@@ -2122,6 +2212,7 @@ def thundersync_grpo_train(
                 draft_start_frac=0.0 if draft_now else None,
                 drafts_after_pre_rollout=tails is not None,
                 group_order=group_order,
+                group_blocks=group_blocks,
                 tail_groups=tail_groups,
                 ordered_learner=spec if tails is not None else None,
                 claim_log_weight=spec.claim_log_weight

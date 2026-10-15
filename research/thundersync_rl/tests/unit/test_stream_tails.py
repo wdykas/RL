@@ -244,3 +244,33 @@ def test_learner_sequencer_and_drain(monkeypatch):
 
     asyncio.run(main())
     assert sorted(waited[0]) == ["a", "b"]
+
+
+def test_canonical_blocks_dispatch_whole_blocks_independent_of_arrival():
+    from thundersync_rl.streaming import Trajectory
+
+    groups = [(0, p) for p in range(5)]
+    rows = [
+        Trajectory(group=(0, p), index=2 * p + j, reward=float(j), payload=None, num_tokens=10 + p)
+        for p in range(5)
+        for j in range(2)
+    ]
+    order = [(0, 3), (0, 0), (0, 4), (0, 1), (0, 2)]
+    sigs = []
+    for arrival in (rows, rows[::-1], rows[3:] + rows[:3]):
+        pl = _planner(groups)
+        pl.set_order(order, [2, 2, 1])
+        got = []
+        for t in arrival:
+            pl.add(t)
+            while pl.has_work(flush=False):
+                got.extend(_dispatch_signature(pl))
+        got.extend(_dispatch_signature(pl))
+        assert pl.all_done()
+        sigs.append(got)
+    assert sigs[0] == sigs[1] == sigs[2]
+    blocks = [sorted({x[0] for cs in d for r in cs for x in r}) for d in sigs[0]]
+    assert blocks == [[(0, 0), (0, 3)], [(0, 1), (0, 4)], [(0, 2)]]
+    pl = _planner(groups)
+    with pytest.raises(ValueError, match="partition"):
+        pl.set_order(order, [2, 2])
