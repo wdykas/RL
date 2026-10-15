@@ -1915,6 +1915,13 @@ async def _run_one_step(
         "time/finish_step": t_end - t_finish,
         "time/step_total": t_end - t_start,
         "learner/busy_s": learner_busy,
+        # Non-vacuity of timing comparisons: rows whose GRPO advantage is
+        # nonzero (all-zero-advantage rows may be skipped by the learner, which
+        # makes training free when every reward is equal).
+        "train/rows": float(len(all_trajectories)),
+        "train/nonzero_adv_rows": float(
+            sum(1 for t in all_trajectories if planner._advantage(t) != 0.0)
+        ),
         "learner/dispatches": num_dispatches,
         "learner/pipeline_calls": pipeline_calls,
         "learner/peak_open_buffers": results["stream_peak_open_buffers"],

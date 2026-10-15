@@ -274,6 +274,10 @@ def _apply_optional_inference_config_kwargs(
         "allow_stale_multimodal_embeddings": bool,
         "prefix_cache_ttl_seconds": float,
         "prefix_caching_routing_alpha": float,
+        # Hybrid models: share of buffer_size_gb for Mamba states (per-request SSM /
+        # conv state + batch-invariant replay buffers). The default (0.1) admits only
+        # ~8 requests per rank at full Nemotron-3-Nano with a 10 GB buffer.
+        "mamba_memory_ratio": float,
         "logging_step_interval": int,
         # Lookup (n-gram) speculative decoding; forwarded only when set, so
         # Megatron versions without it are unaffected.
