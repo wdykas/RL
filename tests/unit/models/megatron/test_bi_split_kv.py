@@ -66,3 +66,19 @@ def test_validation(cfg):
 def test_install_requires_bi_mode():
     with pytest.raises(ValueError, match="batch_invariant_mode"):
         bi_split_kv.install({"bi_split_kv": CFG, "batch_invariant_mode": False})
+
+
+def test_defaults_and_derived_num_splits():
+    c = bi_split_kv._resolve({"enabled": True}, max_seq_len=131072)
+    assert c == {"seqlen_k_per_split": 2048, "num_splits": 64}
+    assert bi_split_kv._resolve({"enabled": True}, max_seq_len=1024)["num_splits"] == 2
+    with pytest.raises(ValueError):
+        bi_split_kv._resolve({"enabled": True})
+
+
+def test_split_anchor_passed_when_supported():
+    def fa4_up(q, k, v, num_splits=1, seqlen_k_per_split=None, split_anchor="relative", **kw):
+        return dict(num_splits=num_splits, seqlen_k_per_split=seqlen_k_per_split, split_anchor=split_anchor)
+
+    out = bi_split_kv.wrap(fa4_up, {"enabled": True}, max_seq_len=8192)(1, 2, 3, num_splits=1)
+    assert out == dict(num_splits=4, seqlen_k_per_split=2048, split_anchor="absolute")

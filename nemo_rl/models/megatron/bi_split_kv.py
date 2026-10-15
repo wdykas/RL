@@ -19,7 +19,8 @@ few-row long-context decode runs at ~60-115 GB/s (295 us/layer at 32k, 1.16 ms a
 
 ``install`` routes every such call (``num_splits == 1``) to FA4's anchored split-KV instead:
 
-- ``seqlen_k_per_split=S``: split s owns the absolute keys [s*S, (s+1)*S). A row's reduction order
+- ``seqlen_k_per_split=S`` (default 2048) with ``split_anchor="absolute"`` when the FA4 build has
+  it: split s owns the absolute keys [s*S, (s+1)*S). A row's reduction order
   depends only on its own keys -- not on the batch, the query count, the tiling or the split count.
 - ``num_splits=NS``: fixed for every call, so CUDA-graph grids are fixed; empty splits write
   lse=-inf, which the combine turns into an exact zero.
@@ -49,9 +50,17 @@ from typing import Any, Callable
 _STATE: dict[str, Any] = {"cfg": None, "patched": []}
 
 
-def _resolve(cfg: dict) -> dict:
-    s = int(cfg["seqlen_k_per_split"])
-    ns = int(cfg["num_splits"])
+DEFAULT_SEQLEN_K_PER_SPLIT = 2048  # chosen 10-14 from the GB200 decode sweep (bskv-upbench)
+
+
+def _resolve(cfg: dict, max_seq_len: int | None = None) -> dict:
+    s = int(cfg.get("seqlen_k_per_split") or DEFAULT_SEQLEN_K_PER_SPLIT)
+    ns = cfg.get("num_splits")
+    if ns is None:
+        if not max_seq_len:
+            raise ValueError("bi_split_kv.num_splits unset and no max sequence length to derive it from")
+        ns = max(2, -(-int(max_seq_len) // s))
+    ns = int(ns)
     if s <= 0 or s % 128:
         raise ValueError(f"bi_split_kv.seqlen_k_per_split={s} must be a positive multiple of 128")
     if not 2 <= ns <= 256:
@@ -59,7 +68,7 @@ def _resolve(cfg: dict) -> dict:
     return {"seqlen_k_per_split": s, "num_splits": ns}
 
 
-def wrap(fn: Callable, cfg: dict) -> Callable:
+def wrap(fn: Callable, cfg: dict, max_seq_len: int | None = None) -> Callable:
     """Wrap an FA4 ``flash_attn_varlen_func``: BI calls (num_splits=1) become anchored split-KV."""
     if getattr(fn, "_ts_bi_split_kv", False):
         return fn
@@ -69,7 +78,11 @@ def wrap(fn: Callable, cfg: dict) -> Callable:
             "bi_split_kv: this flash_attn.cute build lacks seqlen_k_per_split (build the overlay "
             "with research/bi_splitkv/patch_fa4_b19.py or use upstream flash-attention main)"
         )
-    c = _resolve(cfg)
+    c = _resolve(cfg, max_seq_len)
+    if "split_anchor" in params:
+        # Upstream FA4 (flash-attention PR #3000): absolute split boundaries are opt-in. They equal the
+        # relative ones without a sliding window, but only "absolute" keeps decode == prefill with one.
+        c["split_anchor"] = "absolute"
 
     name = f"{getattr(fn, '__module__', '?')}.{getattr(fn, '__name__', '?')}"
     seen = {"logged": False}
@@ -101,18 +114,21 @@ def _refuse_bi(fn: Callable) -> Callable:
     return guarded
 
 
-def install(megatron_cfg: dict) -> None:
-    """Patch the FA4 varlen entry points used by Megatron inference and TE training."""
+def install(megatron_cfg: dict, max_seq_len: int | None = None) -> None:
+    """Patch the FA4 entry points used by Megatron inference and TE training.
+
+    ``max_seq_len`` (the longest context any call sees) sets num_splits when the config leaves it unset.
+    """
     cfg = megatron_cfg["bi_split_kv"]
     if not megatron_cfg.get("batch_invariant_mode"):
         raise ValueError("bi_split_kv requires policy.megatron_cfg.batch_invariant_mode=true")
-    _resolve(cfg)
+    _resolve(cfg, max_seq_len)
     _STATE["cfg"] = cfg
     import flash_attn.cute as fa4_pkg
     import flash_attn.cute.interface as fa4_interface
 
     base = fa4_interface.flash_attn_varlen_func
-    wrapped = wrap(base, cfg)
+    wrapped = wrap(base, cfg, max_seq_len)
     targets: list[tuple[Any, str]] = [(fa4_interface, "flash_attn_varlen_func"),
                                       (fa4_pkg, "flash_attn_varlen_func")]
     try:  # Megatron inference attention binds the function at import time
@@ -133,7 +149,7 @@ def install(megatron_cfg: dict) -> None:
             # the build supports it; otherwise refuse BI calls there (a silent num_splits=1 would use a
             # different reduction order than the engine).
             if "seqlen_k_per_split" in inspect.signature(dense).parameters:
-                te_backends.flash_attn_func_v4 = wrap(dense, cfg)
+                te_backends.flash_attn_func_v4 = wrap(dense, cfg, max_seq_len)
                 _STATE["patched"].append(f"{te_backends.__name__}.flash_attn_func_v4")
             else:
                 te_backends.flash_attn_func_v4 = _refuse_bi(dense)
@@ -144,4 +160,4 @@ def install(megatron_cfg: dict) -> None:
         if not getattr(getattr(mod, name), "_ts_bi_split_kv", False):
             setattr(mod, name, wrapped)
             _STATE["patched"].append(f"{mod.__name__}.{name}")
-    print(f"[bi_split_kv] anchored split-KV: {_resolve(cfg)} -> {_STATE['patched']}", flush=True)
+    print(f"[bi_split_kv] anchored split-KV: {_resolve(cfg, max_seq_len)} -> {_STATE['patched']}", flush=True)

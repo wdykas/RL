@@ -620,11 +620,12 @@ class MegatronConfig(TypedDict):
 class BISplitKVConfig(TypedDict):
     enabled: bool
     # Keys per split, anchored at absolute positions: split s owns keys [s*S, (s+1)*S).
-    # Part of the numerics (training and generation must agree); multiple of 128.
-    seqlen_k_per_split: int
-    # Fixed number of splits launched by every call (>= ceil(max context / S), >= 2):
-    # fixed CUDA-graph grids; empty splits contribute an exact zero.
-    num_splits: int
+    # Part of the numerics (training and generation must agree); multiple of 128. Default 2048.
+    seqlen_k_per_split: NotRequired[int | None]
+    # Fixed number of splits launched by every call (>= ceil(max context / S), >= 2): fixed
+    # CUDA-graph grids; empty splits contribute an exact zero. Default: derived from
+    # max(max_total_sequence_length, generation max_model_len).
+    num_splits: NotRequired[int | None]
 
 
 class TokenizerConfig(TypedDict):

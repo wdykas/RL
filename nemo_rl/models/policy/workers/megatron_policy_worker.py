@@ -635,7 +635,14 @@ class MegatronPolicyWorkerImpl(
             # Anchored, batch-invariant split-KV FA4 attention for learner and engine.
             from nemo_rl.models.megatron import bi_split_kv
 
-            bi_split_kv.install(config["megatron_cfg"])
+            gen = (config.get("generation") or {}).get("mcore_generation_config") or {}
+            bi_split_kv.install(
+                config["megatron_cfg"],
+                max_seq_len=max(
+                    int(config.get("max_total_sequence_length") or 0),
+                    int(gen.get("max_model_len") or 0),
+                ),
+            )
         if config["megatron_cfg"].get("fp32_residual_connection"):
             from nemo_rl.models.megatron import fp32_residual
 
