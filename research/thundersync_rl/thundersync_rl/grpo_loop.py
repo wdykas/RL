@@ -587,6 +587,11 @@ def validate_cohort_lanes(master_config: ThunderSyncMasterConfig) -> None:
         )
     if ts_cfg.draft_after_verify or ts_cfg.fused_verify_train:
         problems.append("draft_after_verify and fused_verify_train must be off")
+    grpo = getattr(master_config, "grpo", None)
+    if (getattr(grpo, "max_rollout_turns", 1) or 1) > 1 or ts_cfg.rollout_lag:
+        problems.append("multi-turn rollouts and rollout_lag are not built on lanes yet")
+    if ts_cfg.draft_lookahead != 1:
+        problems.append("draft_lookahead must be 1 (two lanes hold two cohorts)")
     if problems:
         raise ValueError("thundersync.cohort_lanes: " + "; ".join(problems) + ".")
 
@@ -1465,11 +1470,22 @@ async def _run_one_step(
         group_order is not None
     )
     replay_digests: dict[str, Any] = {}
+    # =params: also name the parameters whose gradients differ (canonical_a vs
+    # canonical_a_again).
+    per_param_replay = os.environ.get("THUNDERSYNC_DEBUG_ORDER_REPLAY") == "params"
+    replay_params: dict[str, Any] = {}
+    dispatch_sigs: dict[str, list] = {"real": []}
+
+    def dispatch_sig(d):
+        return tuple(
+            tuple((c.padding, tuple((t.group[1], t.index) for t in c.trajectories)) for c in cs)
+            for cs in d.per_rank
+        )
 
     def grad_digests():
         return [tuple(x) for x in _run_workers(learner.policy, "grad_digest")]
 
-    def replay(trajs, order, seed, block_sizes=None):
+    def replay(key, trajs, order, seed, block_sizes=None):
         """Train ``trajs`` (arrival order shuffled by ``seed``) on a fresh step; digest it."""
         import random as _random
 
@@ -1478,15 +1494,22 @@ async def _run_one_step(
         pl = make_planner(order, block_sizes)
         arrival = list(trajs)
         _random.Random(seed).shuffle(arrival)
+        sigs = dispatch_sigs.setdefault(key, [])
         for t in arrival:
             pl.add(t)
             while pl.has_work(flush=False):
                 d = pl.next_dispatch(flush=False)
+                sigs.append(dispatch_sig(d))
                 ray.get(learner.submit(_build_dispatch(d), d.closes))
         while pl.has_work():
             d = pl.next_dispatch()
+            sigs.append(dispatch_sig(d))
             ray.get(learner.submit(_build_dispatch(d), d.closes))
         out = grad_digests()
+        if per_param_replay:
+            replay_params[key] = _run_workers(learner.policy, "grad_param_digests")
+            if key.startswith("canonical"):
+                _run_workers(learner.policy, "grad_param_snapshot", tag=key)
         learner.abort()
         learner.begin(loss_fn, **begin_kw)
         return out
@@ -1564,6 +1587,8 @@ async def _run_one_step(
                 (ts_cfg.granularity != "batch" and not order_replay) or rollouts_done
             ):
                 d = planner.next_dispatch(flush=rollouts_done)
+                if per_param_replay:
+                    dispatch_sigs["real"].append(dispatch_sig(d))
                 per_rank = _build_dispatch(d)
                 t0 = time.perf_counter()
                 seq = None if ordered is None else ordered.learner_seq()
@@ -1737,10 +1762,14 @@ async def _run_one_step(
             # order dispatch (control: expected to differ).
             if ordered is not None:
                 await ordered.learner_drain()
-            replay_digests["canonical_a"] = replay(all_trajectories, group_order, 1, group_blocks)
-            replay_digests["canonical_b"] = replay(all_trajectories, group_order, 2, group_blocks)
-            replay_digests["canonical_a_again"] = replay(all_trajectories, group_order, 1, group_blocks)
-            replay_digests["arrival"] = replay(all_trajectories, None, 3)
+            trajs = all_trajectories
+            for key, order, seed, blocks in (
+                ("canonical_a", group_order, 1, group_blocks),
+                ("canonical_b", group_order, 2, group_blocks),
+                ("canonical_a_again", group_order, 1, group_blocks),
+                ("arrival", None, 3, None),
+            ):
+                replay_digests[key] = replay(key, trajs, order, seed, blocks)
         rollouts_done = True
         wake.set()
         if ordered is not None and draft_task is not None:
@@ -1789,6 +1818,26 @@ async def _run_one_step(
     assert planner.all_done()
     if order_replay:
         real = grad_digests()
+        if per_param_replay:
+            _run_workers(learner.policy, "grad_param_snapshot", tag="real")
+            for k in ("canonical_a", "canonical_b", "canonical_a_again"):
+                diffs = _run_workers(
+                    learner.policy, "grad_param_compare", a=k, b="real", drop=False
+                )
+                for r, diff in enumerate(diffs):
+                    print(f"[order replay] step={step} rank={r} {k}_vs_real={diff}", flush=True)
+                sig = dispatch_sigs.get(k)
+                first = next(
+                    (i for i, (x, y) in enumerate(zip(sig, dispatch_sigs["real"])) if x != y),
+                    None,
+                )
+                print(
+                    f"[order replay] step={step} {k} dispatches={len(sig)} "
+                    f"real={len(dispatch_sigs['real'])} first_differing={first}"
+                    + ("" if first is None else f" {k}={sig[first]} real={dispatch_sigs['real'][first]}"),
+                    flush=True,
+                )
+            _run_workers(learner.policy, "grad_param_compare", a="real", b="real")
         bad = []
         for k, v in replay_digests.items():
             same = v == real
@@ -1802,6 +1851,15 @@ async def _run_one_step(
             f"{replay_digests['canonical_a'] == replay_digests['canonical_a_again']}",
             flush=True,
         )
+        if per_param_replay:
+            pairs = zip(replay_params["canonical_a"], replay_params["canonical_a_again"])
+            for r, (a, b) in enumerate(pairs):
+                diff = [k for k in a if a[k] != b.get(k)]
+                print(
+                    f"[order replay] step={step} rank={r} params_differ={len(diff)}/{len(a)} "
+                    f"{diff}",
+                    flush=True,
+                )
         if bad:
             raise RuntimeError(f"order replay: {bad} gradient differs from the real step")
         replay_metrics = {
@@ -2004,7 +2062,7 @@ def thundersync_grpo_train(
             f"thundersync.cohort_lanes={ts_cfg.cohort_lanes} but "
             f"{'no' if lanes is None else len(lanes)} engine lanes were built"
         )
-    if lanes is not None:
+    if lanes is not None and not ts_cfg.stream_training_over_tails:
         return _train_on_lanes(
             policy, lanes, learner, adv_fn, dataloader, tokenizer, loss_fn,
             task_to_env, master_config, logger, on_step,
@@ -2014,10 +2072,34 @@ def thundersync_grpo_train(
     stale = False  # setup() already performed the initial refit
     step = 0
     spec = None
-    if ts_cfg.speculate:
+    sched = None
+    if lanes is not None:
+        # Cohort lanes on the streaming loop (DESIGN.md section 14j): one
+        # SpeculativeGeneration per lane; each step's cohort runs on lane
+        # step % 2 (verification, tails, fresh rows, streaming training) while
+        # the other lane drafts the next cohort from the top of the step.
+        for lane in lanes:
+            lane.generation.prepare_for_generation()
+            lane.spec = make_speculative_generation(
+                lane.generation, policy, tokenizer, master_config
+            )
+        sched = CohortLanes(lanes)
+        spec = lanes[0].spec
+    elif ts_cfg.speculate:
         policy_generation.prepare_for_generation()
         spec = make_speculative_generation(
             policy_generation, policy, tokenizer, master_config
+        )
+    check_weights = bool(os.environ.get("THUNDERSYNC_MISMATCH_CHECK"))
+
+    def lane_fp(lane):
+        # Debug: the weights the lane's engine ranks hold, read from the engine.
+        return sum(
+            ray.get(
+                lane.generation._policy.worker_group.run_all_workers_single_data(
+                    "engine_weight_checksum"
+                )
+            )
         )
     sticky = spec is not None and spec.sticky_delta is not None
     G = master_config.grpo.num_generations_per_prompt
@@ -2076,6 +2158,38 @@ def thundersync_grpo_train(
         t0 = time.perf_counter()
         t_verify = 0.0
         t_first = 0.0
+        lane_x = lane_y = lane_drafts = None
+        lane_stats: dict[str, float] = {}
+        if sched is not None:
+            lane_x, lane_y = sched.cohort_lane(step), sched.drafting_lane(step)
+            spec, policy_generation = lane_x.spec, lane_x.generation
+            for lane in lanes:
+                lane.spec.current_step = step
+            if next_batch is not None and step + 1 < max_steps:
+                # The drafting lane takes cohort step+1's drafter (theta_step, or
+                # theta_hat_{step+1}: learner load, refit of this lane only,
+                # learner restore) and starts drafting before this step's
+                # verification; nothing else is in flight on the learner here.
+                momentum = spec.draft_weights != "current"
+                version = ("theta_hat", step + 1) if momentum else ("theta", step)
+
+                def put_drafter(y=lane_y, momentum=momentum):
+                    if momentum:
+                        y.spec.stage_draft_weights(
+                            lambda: refit_lane(policy, y), stage_on_engine=False
+                        )
+                    else:
+                        refit_lane(policy, y)
+
+                sched.refit(lane_y, version, put_drafter)
+                sched.pin(lane_y, step + 1)
+                if check_weights:
+                    lane_y.cohort_fingerprint = lane_fp(lane_y)
+                next_prompts, null_slots = next_draft_prompts(next_batch, ts_cfg, G)
+                lane_drafts = asyncio.run(
+                    lane_y.spec.draft_streaming(next_prompts, null_slots=null_slots)
+                )
+                lane_stats["lanes/draft_start_s"] = time.perf_counter() - t0
         if lag and pending is None:
             # Step 0 of the lagged baseline: its rollouts come from theta_0.
             t1 = time.perf_counter()
@@ -2114,9 +2228,16 @@ def thundersync_grpo_train(
             batch = select_null_prompts(batch, spec, ts_cfg.null_bv_spare_prompts)
         staged = (
             spec is not None
+            and sched is None  # lanes stage the drafter on the drafting lane
             and spec.draft_weights != "current"
             and next_batch is not None
             and step + 1 < max_steps
+        )
+        # Lanes: rows without a plan (never drafted, or dropped) decode at
+        # theta_step on the cohort lane after its tails; decided before any
+        # rollout takes a plan.
+        lane_fresh = sched is not None and not spec.plans_cover(
+            _prompts(batch), pending_ok=tails is not None
         )
         # Sticky: every drafted rollout is (or, streaming, will be) complete.
         # When every rollout of this step is served by a complete plan the
@@ -2131,6 +2252,27 @@ def thundersync_grpo_train(
         refit_s = []
 
         def refit_for_step(staged=staged, draft_now=draft_now):
+            if sched is not None:
+                # The cohort lane is free once its cohort's tails are done; it
+                # takes theta_step only if some row decodes fresh.
+                t_r = time.perf_counter()
+                lane_stats["lanes/tail_end_s"] = t_r - t0
+                if "lanes/draft_start_s" in lane_stats:
+                    # Drafting of the next cohort that ran under this cohort's tails.
+                    lane_stats["lanes/overlap_s"] = t_r - t0 - lane_stats["lanes/draft_start_s"]
+                if lane_x.cohort == step:
+                    if check_weights and lane_x.cohort_fingerprint is not None:
+                        lane_stats.update(
+                            sched._check_fingerprint(lane_x, step, lane_fp(lane_x))
+                        )
+                    sched.unpin(lane_x, step)
+                if lane_fresh:
+                    sched.refit(lane_x, ("theta", step), lambda: refit_lane(policy, lane_x))
+                else:
+                    lane_x.generation.prepare_for_generation()
+                refit_s.append(time.perf_counter() - t_r)
+                lane_stats["lanes/fresh_refit"] = float(lane_fresh)
+                return
             if staged:
                 # theta_hat_{step+1} needs only the state after the last
                 # update; the learner and the engine are idle (streaming: the
@@ -2248,6 +2390,15 @@ def thundersync_grpo_train(
                 if ts_cfg.verify_mode == "block"
                 else (lambda prompts=next_prompts: spec.draft(prompts))
             )
+        if sched is not None:
+            # The next cohort's drafts already run on the drafting lane.
+            if lane_drafts is not None:
+
+                async def drafter(collector=lane_drafts):
+                    return collector
+
+            else:
+                drafter = None
         policy.prepare_for_training()
         metrics = asyncio.run(
             _run_streaming_tails(spec, tails is not None)(
@@ -2263,7 +2414,11 @@ def thundersync_grpo_train(
                 ts_cfg=ts_cfg,
                 adv_fn=adv_fn,
                 drafter=drafter,
-                before_finish=spec.score_prev if spec is not None else None,
+                before_finish=(
+                    lane_y.spec.score_prev
+                    if sched is not None
+                    else (spec.score_prev if spec is not None else None)
+                ),
                 pre_rollout=pre_rollout,
                 claim_fused=spec.claim_fused
                 if spec is not None and ts_cfg.fused_verify_train
@@ -2275,8 +2430,8 @@ def thundersync_grpo_train(
                 draft_swap=(
                     spec.load_staged_draft_weights if staged and not draft_now else None
                 ),
-                draft_start_frac=0.0 if draft_now else None,
-                drafts_after_pre_rollout=tails is not None,
+                draft_start_frac=0.0 if (draft_now or sched is not None) else None,
+                drafts_after_pre_rollout=tails is not None and sched is None,
                 group_order=group_order,
                 group_blocks=group_blocks,
                 tail_groups=tail_groups,
@@ -2323,6 +2478,12 @@ def thundersync_grpo_train(
         if spec is not None:
             metrics.update(spec.stats)
             spec.stats = {}
+        if sched is not None:
+            metrics.update(lane_y.spec.stats)
+            lane_y.spec.stats = {}
+            lane_stats["lanes/cohort_lane"] = float(lane_x.index)
+            lane_stats["lanes/refits"] = float(sum(lane.refits for lane in lanes))
+            metrics.update(lane_stats)
         policy_generation.finish_generation()
         stale = True
         metrics["time/refit"] = t_refit
