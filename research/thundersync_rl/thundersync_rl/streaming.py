@@ -275,8 +275,9 @@ class StreamPlanner:
     def begin_order(self, block_tokens: Optional[int] = None) -> None:
         """A canonical order that grows while the step runs (``extend_order``).
 
-        Streaming verify0 (DESIGN 14z): the order is known chunk by chunk, as
-        the drafts' verification decides them. Dispatch follows the order
+        Streaming verify0 (DESIGN 14z) and engine-side verification
+        (verify_on=engine, DESIGN 14ac): the order is known chunk by chunk
+        (block by block), as the drafts' verification decides them. Dispatch follows the order
         known so far exactly as ``set_order`` would (a block waits for all its
         groups, after every block before it); groups not yet in the order wait.
         ``close_order`` checks that every registered group was listed once.
@@ -290,10 +291,15 @@ class StreamPlanner:
         self._blocks = []
         self._order_open = True
 
-    def extend_order(self, groups: list[GroupId], block_sizes: list[int]) -> None:
-        """Append ``groups`` (partitioned by ``block_sizes``) to a growing order."""
+    def extend_order(
+        self, groups: list[GroupId], block_sizes: Optional[list[int]] = None
+    ) -> None:
+        """Append ``groups`` (partitioned by ``block_sizes``; default one group per
+        block) to a growing order."""
         if not getattr(self, "_order_open", False):
             raise RuntimeError("extend_order needs begin_order (and an order not yet closed)")
+        if block_sizes is None:
+            block_sizes = [1] * len(groups)
         if any(b <= 0 for b in block_sizes) or sum(block_sizes) != len(groups):
             raise ValueError(f"block sizes {block_sizes} do not partition {len(groups)} groups")
         known = set(map(repr, self.order))
@@ -312,6 +318,15 @@ class StreamPlanner:
         if sorted(map(repr, self.order)) != sorted(map(repr, self.groups)):
             raise ValueError("the order must list every registered group once")
         self._order_open = False
+
+
+    def order_complete(self) -> bool:
+        """Whether every registered group is in the canonical order or was trained
+        by verify-in-train (``mark_pretrained``), or there is no order."""
+        if self.order is None:
+            return True
+        listed = {repr(x) for x in self.order} | set(self._pretrained)
+        return len(listed) == len(self.groups)
 
     def register_group(self, group: GroupId, size: int, tails: int = 0) -> None:
         """``tails``: rows of the group that need a continuation (tail-excluded baseline)."""

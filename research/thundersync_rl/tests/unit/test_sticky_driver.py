@@ -1131,3 +1131,72 @@ def test_piece_size_grows_with_position_only():
     assert pieces(32768, 1.0) <= 9
     s.sticky_chunk_growth = 0.0
     assert all(s._piece_tokens(g) == 128 for g in (0, 5000))  # growth 0: fixed pieces
+
+
+class _FastDecodingEngine(_DecodingEngine):
+    """Two tokens per status poll: the next piece is ready before a result returns."""
+
+    def lengths(self, indices):
+        super().lengths(indices)
+        return super().lengths(indices)
+
+
+def _two_in_flight(reject_at, rounds):
+    """Verification rule: a piece is accepted whole unless it holds token
+    ``t`` of ``reject_at`` = {t: residual}, where it is rejected there."""
+    engine = _FastDecodingEngine(rounds)
+    calls = []
+
+    def verify(rows, prompt_lens, engine_logq, anchors, **_):
+        out = []
+        for i, (r, plen) in enumerate(zip(rows, prompt_lens)):
+            r = r.tolist()
+            calls.append((r, plen))
+            piece = r[plen:]
+            a, y = len(piece), 99
+            for j, t in enumerate(piece):
+                if t in reject_at:
+                    a, y = j, reject_at[t]
+                    break
+            if a == len(piece) and piece and piece[-1] == EOD:
+                y = EOD
+            out.append((i, {"accepted": a, "next": y, "logprobs": [-1.0] * (a + 1),
+                            "draft_logq": engine_logq[i][:a]}))
+        return out
+
+    s = make_spec(
+        {"verify_drafts_block_engine": verify},
+        base_handlers=engine.handlers(),
+        verify_source="engine",
+        hidden_transport="driver",
+        sticky_delta=0.03,
+        sticky_chunk_tokens=2,
+    )
+    s.pieces_in_flight = 2
+    drafts = asyncio.run(s.draft_streaming([torch.tensor([1])]))()
+    s.current_step = 1
+    asyncio.run(s.verify_sticky(drafts))
+    return s, calls, engine
+
+
+def test_two_pieces_in_flight_reach_the_same_rollout():
+    s, calls, engine = _two_in_flight(
+        {8: 30},
+        [[([4], False, [-0.1], 2, [5, 6, 7, 8, 9, EOD])], [([EOD], True, [-0.3], 0)]],
+    )
+    (plan,) = s.plans[(1,)]
+    assert plan.complete and plan.prefix == [4, 5, 6, 7, 30, EOD]
+    assert plan.anchors.length == 7
+
+
+def test_rejection_discards_later_pieces_in_flight():
+    s, calls, engine = _two_in_flight(
+        {5: 50},
+        [[([4], False, [-0.1], 2, [5, 6, 7, 8, 9, EOD])], [([EOD], True, [-0.3], 0)]],
+    )
+    # A piece verified against the prefix extended by the in-flight piece
+    # [5, 6] (later rejected): only possible with two in flight.
+    assert any(r[:4] == [1, 4, 5, 6] and plen >= 4 for r, plen in calls)
+    (plan,) = s.plans[(1,)]
+    assert plan.complete and plan.prefix == [4, 50, EOD]
+    assert [p for p, _, _ in engine.started[1:]] == [[[1, 4, 50]]]

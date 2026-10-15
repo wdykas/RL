@@ -661,16 +661,18 @@ def cat_hidden(parts: list) -> Any:
 
 
 def hidden_num_rows(h: Any) -> int:
-    """Rows of draft tuple index 7 (tensor or ``HiddenRefs``)."""
-    return h.rows if isinstance(h, HiddenRefs) else int(h.shape[0])
+    """Rows of draft tuple index 7 (tensor, ``HiddenRefs`` or ``HiddenRecompute``)."""
+    if isinstance(h, torch.Tensor):
+        return int(h.shape[0])
+    return int(h.rows)
 
 
 def hidden_nbytes(h: Any) -> int:
     if h is None:
         return 0
-    if isinstance(h, HiddenRefs):
-        return h.nbytes
-    return h.numel() * h.element_size()
+    if isinstance(h, torch.Tensor):
+        return h.numel() * h.element_size()
+    return int(h.nbytes)
 
 
 class HiddenRows:

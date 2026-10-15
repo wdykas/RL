@@ -37,6 +37,7 @@ import math
 import os
 import threading
 import time
+import traceback
 import zlib
 from collections import Counter, defaultdict
 import dataclasses
@@ -57,6 +58,7 @@ from thundersync_rl.engine_q import (
     hidden_num_rows,
     ray_free,
 )
+from thundersync_rl.engine_verify import HiddenRecompute
 from thundersync_rl.fused_train import FusedRef
 from thundersync_rl.multi_turn import TurnEnvironment, TurnRecord, pair_rows, replay
 from thundersync_rl.null_bv import LogRatioCalibration, NullGroup, NullPolicy, row_envelopes
@@ -444,6 +446,27 @@ def verify_yield_mailbox(group) -> tuple[Any, bool]:
     return _YIELD_MAILBOXES[id(group)]
 
 
+@dataclass
+class EngineVerifier:
+    """The engine that verifies this step's drafts (``verify_on="engine"``).
+
+    ``group``: its generation worker group (holds the current weights);
+    ``q_lane``: [rank-0 actor, worker actors] of the lane that drafted the
+    cohort and still holds its drafting weights (``hidden_transport=
+    "recompute"``: q rows are rebuilt there), or None (q from logged rows).
+    """
+
+    group: Any
+    q_lane: Optional[list[Any]] = None
+    # Calls the first verification of the step must wait for (LM-head stash
+    # and import on the verifier lane), sent at the top of the step.
+    wait_refs: list = field(default_factory=list)
+
+    @property
+    def workers(self) -> list[Any]:
+        return list(self.group.workers)
+
+
 class SpeculativeGeneration:
     def __init__(
         self,
@@ -489,6 +512,7 @@ class SpeculativeGeneration:
         learner_prefix_cache: Optional[dict[str, float]] = None,
         seed: int = 0,
         seed_stream: str = "0",
+        engine_max_len: Optional[int] = None,
     ):
         self.base = base
         self.learner_policy = learner_policy
@@ -517,7 +541,10 @@ class SpeculativeGeneration:
         # only handles; the learner fetches a block when its lazy scan first
         # needs a q row in it (fully accepted drafts fetch nothing). "driver": the rows travel
         # generation worker -> driver -> every learner worker (A/B baseline).
-        if hidden_transport not in ("object_store", "driver"):
+        # "recompute" (engine-side verification on lanes, engine_verify.py): no
+        # per-token logging; q rows are rebuilt by a prefill of the draft on the
+        # lane that drafted it, only for drafts whose lazy scan needs them.
+        if hidden_transport not in ("object_store", "driver", "recompute"):
             raise ValueError(f"unknown hidden_transport {hidden_transport!r}")
         self.hidden_transport = hidden_transport
         # Deletes freed hidden-state objects (None: ray_free; tests replace it).
@@ -539,8 +566,18 @@ class SpeculativeGeneration:
         # Where stash + block verification run: "learner" or "inference" (the
         # generation workers hold theta_k until the refit and theta_{k+1} after
         # it, and sit idle while rollouts wait for verification).
+        # verify_on="engine" (engine_verify.py): drafts and continuation pieces
+        # are verified by an engine holding the current weights
+        # (``engine_verifier``, set per step); the learner pool stays for the
+        # learner fallback (rows longer than the engine's length cap) and the
+        # THUNDERSYNC_ENGINE_VERIFY_CHECK comparison.
+        self.verify_on = verify_on
+        self.engine_verifier: Optional[EngineVerifier] = None
+        self.engine_max_len = engine_max_len
+        self._ev_ids = itertools.count()
         groups = {
             "learner": [learner_policy.worker_group],
+            "engine": [learner_policy.worker_group],
             "inference": [base._policy.worker_group],
             # Split rows across both pools: all GPUs are idle at verification.
             "both": [learner_policy.worker_group, base._policy.worker_group],
@@ -581,7 +618,7 @@ class SpeculativeGeneration:
         self.eod = next(e for e in eods if e is not None)
         if tail_lookup:
             ray.get(workers.run_all_workers_single_data("install_lookup_references"))
-        if verify_source == "engine":
+        if verify_source == "engine" and hidden_transport != "recompute":
             ok = ray.get(
                 workers.run_all_workers_single_data(
                     "install_draft_hidden_log",
@@ -877,10 +914,19 @@ class SpeculativeGeneration:
             if self.sticky_delta is not None:
                 t_cut = time.perf_counter()
                 pacer = self.__dict__.get("_pacer")  # absent on test stubs
-                if self.draft_until_complete:
+                slack = float(getattr(self, "draft_cut_slack_s", 0.0) or 0.0)
+                if self.draft_until_complete or slack > 0:
+                    # draft_cut_slack_s: the cut is at a fixed time, slack seconds
+                    # after training ends, or earlier once every draft finished
+                    # (then nothing is cut). Each draft is complete or cut at that
+                    # fixed time, as with a plain deadline: exact. Breaks the
+                    # window feedback loop (a step whose drafts miss the cap by a
+                    # few tokens pays a whole continuation phase).
                     idx = list(range(len(prompts)))
                     while not all(d for _, d in ray.get(rank0.draft_lengths.remote(idx))):
-                        time.sleep(0.05)
+                        if not self.draft_until_complete and time.perf_counter() - t_cut >= slack:
+                            break
+                        time.sleep(0.02)
                 elif pacer is not None:
                     n = len(prompts)
                     self.stats.update(
@@ -1071,6 +1117,9 @@ class SpeculativeGeneration:
         """
         if hkeys is None:
             return [None] * len(lengths)
+        if self.hidden_transport == "recompute":
+            # Nothing logged: q rows are rebuilt on the drafting lane if needed.
+            return [HiddenRecompute(int(n)) for n in lengths]
         refs = self.hidden_transport == "object_store"
         merged: dict[str, Any] = {}
         t_call, sts = time.perf_counter(), []
@@ -1104,6 +1153,8 @@ class SpeculativeGeneration:
         self, hkeys: list[str], starts: list[int], lengths: list[int]
     ) -> list[Any]:
         """Hidden rows start..start+m-1 of running drafts (``_pop_hidden`` for pieces)."""
+        if self.hidden_transport == "recompute":
+            return [HiddenRecompute(int(n)) for n in lengths]
         refs = self.hidden_transport == "object_store"
         merged: dict[str, Any] = {}
         t_call, sts = time.perf_counter(), []
@@ -1423,10 +1474,16 @@ class SpeculativeGeneration:
             method, kw = "stash_head", {}
         else:
             method, kw = "stash_weights", {"precision": self.verify_precision}
+        groups = list(self.verifiers)
+        if getattr(self, "ev_stash_on_engine", False):
+            # One engine verifying itself (verify_on=engine): it computes q rows,
+            # so it keeps the drafting head too (its live weights drafted).
+            groups.append(self.base._policy.worker_group)
+            method, kw = "stash_head", {}
         ray.get(
             [
                 ref
-                for g in self.verifiers
+                for g in groups
                 for ref in g.run_all_workers_single_data(
                     method, version=self.current_step, keep=sorted(keep), **kw
                 )
@@ -2038,6 +2095,10 @@ class SpeculativeGeneration:
         ``band``: banded IS (only a draft's first verification; never with
         ``null_envelopes``).
         """
+        if self.verify_on == "engine":
+            by_row = self._engine_verify_rows(flat, rows, null_envelopes, band)
+            self._verified_hidden(flat, by_row)
+            return by_row
         futs = self._submit_verify_block(flat, rows, null_envelopes, band=band)
         return self._verify_block_results(flat, [(a, ray.get(refs)) for a, refs in futs])
 
@@ -2060,6 +2121,20 @@ class SpeculativeGeneration:
         may start queued calls in different orders on different ranks; the
         numbered calls run in the same order everywhere.
         """
+        if self.verify_on == "engine":
+            # Continuation pieces on the engine at theta_k: no learner call.
+            # Plain block verification only (validated: carried-walk decisions
+            # are "every"; pieces carry no null envelopes / band).
+            if walks is not None or walk_scans is not None or null_envelopes is not None or band is not None:
+                raise NotImplementedError(
+                    "verify_on=engine: continuation pieces support plain block "
+                    "verification only (no carried walk, null_bv envelopes or band)"
+                )
+            by_row = await asyncio.to_thread(
+                self._engine_verify_rows, flat, rows, None, None, True
+            )
+            self._verified_hidden(flat, by_row)
+            return by_row
         futs = self._submit_verify_block(
             flat, rows, null_envelopes=null_envelopes, ordered=True, band=band,
             prefix_keys=prefix_keys, walks=walks, walk_scans=walk_scans, pins=pins,
@@ -2141,6 +2216,7 @@ class SpeculativeGeneration:
         walks=None,
         walk_scans=None,
         pins=None,
+        extra_kw: Optional[dict[str, Any]] = None,
     ) -> list:
         """Send ``flat``'s block verification to the verifier pools: [(first row, refs)].
 
@@ -2193,6 +2269,8 @@ class SpeculativeGeneration:
                 if method != "verify_drafts_block_engine":
                     raise RuntimeError("verify_in_train needs engine-sourced q")
                 extra = {**extra, "row_seed_base": int(row_seed_base)}
+            if extra_kw:
+                extra = {**extra, **extra_kw}
             seq = self.learner_seq() if ordered else None
             call = (method,) if seq is None else ("ordered_call",)
             if seq is not None and self._yield_ready(g):
@@ -2268,6 +2346,289 @@ class SpeculativeGeneration:
             out[f"learner/yield_{k}"] = float(max((p.get(k, 0) for p in per), default=0))
         return out
 
+    def _ev_prepare(self, flat, rows) -> dict[str, Any]:
+        """Keys and engine items of ``flat`` (no envelopes / band yet), rows cut to the cap.
+
+        A row must leave room for the request's one sampled token. Longer
+        drafts are verified as their prefix of the longest length that fits:
+        a cut at a fixed position (the cap), never at a token value, so the
+        prefix is a valid draft and the result an exact verification of it
+        (its "next" token is then a sample of p after that prefix).
+        """
+        cap = self.engine_max_len
+        eng_idx = [
+            j for j, (_, d) in enumerate(flat) if cap is None or d[0].numel() + 1 < cap
+        ]
+        eng_set = set(eng_idx)
+        learner_idx = [j for j in range(len(rows)) if j not in eng_set]
+        keys = {j: f"v{next(self._ev_ids)}" for j in eng_idx}
+        rows = list(rows)
+        items = []
+        n_cut = 0
+        cut_rows: set[int] = set()
+        for j in eng_idx:
+            d = flat[j][1]
+            g = len(d[2]) if cap is None else min(len(d[2]), cap - 1 - d[0].numel())
+            if g < len(d[2]):
+                n_cut += 1
+                cut_rows.add(j)
+                rows[j] = rows[j][: d[0].numel() + g]
+            items.append(
+                {
+                    "key": keys[j],
+                    "prompt": d[0].tolist(),
+                    "plen": int(d[0].numel()),
+                    # numpy, not Python lists: the same values (fp32 log q as the
+                    # engine side rounds them), far cheaper to build and send.
+                    "tokens": np.asarray(d[2][:g], dtype=np.int64),
+                    "logq": np.asarray(d[6][:g], dtype=np.float32),
+                    "hidden": d[7],
+                    "segments": d[5],
+                }
+            )
+        return {
+            "eng_idx": eng_idx,
+            "learner_idx": learner_idx,
+            "keys": keys,
+            "items": items,
+            "rows": rows,
+            "cut_rows": cut_rows,
+            "n_cut": n_cut,
+            "akeys": None,
+            "ref": None,
+            "flat_ids": tuple(id(e[1]) for e in flat),
+            "flat_d": [e[1] for e in flat],
+        }
+
+    def _ev_submit(self, h: dict[str, Any], st: dict[str, float]) -> None:
+        """Register the rows' anchors and send their prefill (``run_verify_requests``; not awaited)."""
+        ev = self.engine_verifier
+        workers = ev.workers
+        if ev.wait_refs:
+            t_w = time.perf_counter()
+            ray.get(list(ev.wait_refs))  # resolved refs return at once
+            st["head_wait_s"] += time.perf_counter() - t_w
+        if not h["items"]:
+            return
+        eng_idx, keys = h["eng_idx"], h["keys"]
+        flat_d = h["flat_d"]
+        if self.sticky_delta is not None:
+            h["akeys"] = [keys[j] for j in eng_idx]
+            ray.get(
+                [
+                    w.add_engine_anchors.remote({keys[j]: flat_d[j][8] for j in eng_idx})
+                    for w in workers
+                ]
+            )
+        h["ref"] = workers[0].run_verify_requests.remote(
+            [h["rows"][j].numpy() for j in eng_idx],
+            [keys[j] for j in eng_idx],
+            [it["plen"] for it in h["items"]],
+            h["akeys"],
+        )
+
+    def _ev_prefetch(self, flat, rows) -> None:
+        """Send ``flat``'s verification prefill now; ``_engine_verify_rows`` of the same rows takes it.
+
+        ``engine_verify_prefetch``: the next block's first wave is prefilled
+        while the current block is decided. The prefetched call is the call
+        the block makes anyway (same rows, cap cuts, anchors); its keys are
+        fresh like any call's, and the decision draws its seed when it runs.
+        """
+        if not flat:
+            return
+        h = self._ev_prepare(flat, rows)
+        st: dict[str, float] = defaultdict(float)
+        self._ev_submit(h, st)
+        if self.__dict__.get("_ev_prefetched") is None:
+            self._ev_prefetched = {}
+        self._ev_prefetched[h["flat_ids"]] = h
+        k = "spec/engine_verify_head_wait_s"
+        self.stats[k] = self.stats.get(k, 0.0) + st["head_wait_s"]
+
+    def _ev_take_prefetch(self, flat) -> Optional[dict[str, Any]]:
+        pre = self.__dict__.get("_ev_prefetched")
+        if not pre:
+            return None
+        return pre.pop(tuple(id(e[1]) for e in flat), None)
+
+    def _ev_drop_prefetch(self) -> None:
+        """Forget prefetched calls no block took (captured rows and anchors)."""
+        pre = self.__dict__.get("_ev_prefetched") or {}
+        workers = self.engine_verifier.workers if self.engine_verifier is not None else []
+        for h in pre.values():
+            keys = [h["keys"][j] for j in h["eng_idx"]]
+            if h["ref"] is not None:
+                ray.get(h["ref"])
+            if keys:
+                ray.get([w.engine_verify_drop.remote(keys) for w in workers])
+            if h["akeys"]:
+                ray.get([w.drop_engine_anchors.remote(h["akeys"]) for w in workers])
+            self.stats["spec/engine_verify_prefetch_dropped"] = (
+                self.stats.get("spec/engine_verify_prefetch_dropped", 0.0) + len(keys)
+            )
+        self._ev_prefetched = {}
+
+    def _engine_verify_rows(
+        self, flat, rows, null_envelopes=None, band=None, ordered: bool = False
+    ) -> dict[int, dict[str, Any]]:
+        """Block-verify ``flat`` on the engine verifier (``verify_on="engine"``).
+
+        1. With sticky routing, every verifier worker registers the rows'
+           anchors (``add_engine_anchors``: handles only; the admitting rank
+           fetches its stage's blocks).
+        2. Rank 0 submits each row (prompt + draft) as a one-token request
+           tagged with its key (``run_verify_requests``); the rank that runs it
+           keeps the head inputs of positions plen-1 .. n-1.
+        3. Each worker is asked which keys it holds (``engine_verify_ready``)
+           and decides only those (``engine_verify_decide``): per-rank bytes
+           are its own rows' token ids and log q, never the whole step's.
+        Rows the engine cannot take (prompt + draft + 1 over its length cap)
+        go to the learner path (``spec/engine_verify_learner_rows``).
+        ``THUNDERSYNC_ENGINE_VERIFY_CHECK=1``: the learner also verifies every
+        row and the two p (log p of each drafted token) are compared bitwise
+        (``spec/engine_verify_check_*``; the decisions use different random
+        streams). Synchronous (``ray.get``); the async path runs it in a thread.
+        """
+        import threading
+
+        ev = self.engine_verifier
+        if ev is None:
+            raise RuntimeError("verify_on=engine: no engine verifier set for this step")
+        if not hasattr(self, "_ev_lock"):
+            self._ev_lock = threading.Lock()
+        t0 = time.perf_counter()
+        check = os.environ.get("THUNDERSYNC_ENGINE_VERIFY_CHECK") == "1"
+        st: dict[str, float] = defaultdict(float)
+        h = self._ev_take_prefetch(flat)
+        if h is None:
+            h = self._ev_prepare(flat, rows)
+            self._ev_submit(h, st)
+        else:
+            st["prefetched_rows"] += float(len(h["eng_idx"]))
+        eng_idx, learner_idx, keys = h["eng_idx"], h["learner_idx"], h["keys"]
+        # Canonical call identity (DESIGN 14ab), not arrival order: the engine
+        # rows of this call, each with its verification ordinal this step.
+        seed = self._call_seed("engine", [flat[j][1] for j in eng_idx])
+        items, rows, cut_rows, n_cut = h["items"], h["rows"], h["cut_rows"], h["n_cut"]
+        eng_set = set(eng_idx)
+        for it, j in zip(items, eng_idx):
+            if null_envelopes is not None:
+                it["envelopes"] = list(null_envelopes[j])
+            if band is not None:
+                it["band"] = band
+        workers = ev.workers
+        by_row: dict[int, dict[str, Any]] = {}
+        if items:
+            akeys = h["akeys"]
+            try:
+                t1 = time.perf_counter()
+                ray.get(h["ref"])
+                t2 = time.perf_counter()
+                all_keys = [keys[j] for j in eng_idx]
+                ready = ray.get([w.engine_verify_ready.remote(all_keys) for w in workers])
+                by_key = {it["key"]: it for it in items}
+                calls = [
+                    w.engine_verify_decide.remote(
+                        items=[by_key[k] for k in ks],
+                        seed=seed,
+                        vocab_limit=self.vocab_limit,
+                        q_lane=ev.q_lane,
+                        check=check,
+                    )
+                    for w, ks in zip(workers, ready)
+                    if ks
+                ]
+                results = [x for r in ray.get(calls) for x in r]
+                t3 = time.perf_counter()
+            except BaseException:
+                ray.get([w.engine_verify_drop.remote([keys[j] for j in eng_idx]) for w in workers])
+                raise
+            finally:
+                if akeys:
+                    ray.get([w.drop_engine_anchors.remote(akeys) for w in workers])
+            row_of = {keys[j]: j for j in eng_idx}
+            for k, r in results:
+                est = r.pop("_engine_stats", None)
+                if est:
+                    for name, v in est.items():
+                        if name in ("captured_rows", "capture_overflow"):
+                            st[name] = max(st[name], v)
+                        else:
+                            st[name] += v
+                by_row[row_of[k]] = r
+            missing = [j for j in eng_idx if j not in by_row]
+            if missing:
+                raise RuntimeError(
+                    f"engine verify: no decision for rows {missing[:8]} "
+                    f"(ready per worker: {[len(x) for x in ready]})"
+                )
+            # prefill_s: waiting for the prefill (with prefetch, only the part
+            # not hidden behind the previous block's decisions).
+            st["prefill_s"] += t2 - t1
+            st["decide_wall_s"] += t3 - t2
+            st["tokens"] += float(sum(rows[j].numel() for j in eng_idx))
+        # The check compares whole rows (a cut row's learner forward would be
+        # of the full draft).
+        lrows = sorted(set(learner_idx) | ((eng_set - cut_rows) if check else set()))
+        if lrows:
+            sub_flat = [flat[j] for j in lrows]
+            futs = self._submit_verify_block(
+                sub_flat,
+                [rows[j] for j in lrows],
+                None if null_envelopes is None else [null_envelopes[j] for j in lrows],
+                ordered=ordered,
+                band=band,
+                extra_kw={"return_token_logprobs": True} if check else None,
+            )
+            lres: dict[int, dict[str, Any]] = {}
+            for a, refs in futs:
+                out = ray.get(refs)
+                if getattr(self, "learner_ordered", False):
+                    self._learner_inflight.difference_update(refs)
+                for rank_res in out:
+                    for j, r in rank_res:
+                        lres[lrows[a + j]] = r
+            for j in learner_idx:
+                by_row[j] = lres[j]
+            if check:
+                tok = exact = 0
+                worst = 0.0
+                for j in eng_idx:
+                    e = by_row[j].pop("p_token_logprobs", None)
+                    lp = lres[j].get("p_token_logprobs") if j in lres else None
+                    if e is None or lp is None:
+                        continue
+                    a = torch.tensor(e, dtype=torch.float32)
+                    b = torch.tensor(lp, dtype=torch.float32)
+                    tok += a.numel()
+                    exact += int((a == b).sum())
+                    if a.numel():
+                        worst = max(worst, float((a - b).abs().max()))
+                st["check_tok"] += tok
+                st["check_exact"] += exact
+                st["check_max_abs_dlogp"] = max(st["check_max_abs_dlogp"], worst)
+                print(
+                    f"[engine verify check] rows={len(eng_idx)} tok={tok} exact={exact} "
+                    f"max|dlogp|={worst:.3e}",
+                    flush=True,
+                )
+            for j in learner_idx:
+                by_row[j].pop("p_token_logprobs", None)
+        st["rows"] += float(len(eng_idx))
+        st["cut_rows"] += float(n_cut)
+        st["learner_rows"] += float(len(learner_idx))
+        st["calls"] += 1.0
+        st["wall_s"] += time.perf_counter() - t0
+        with self._ev_lock:
+            for name, v in st.items():
+                k = f"spec/engine_verify_{name}"
+                if name in ("check_max_abs_dlogp", "captured_rows", "capture_overflow"):
+                    self.stats[k] = max(self.stats.get(k, 0.0), v)
+                else:
+                    self.stats[k] = self.stats.get(k, 0.0) + v
+        return by_row
+
     def _verify_block_results(self, flat, done, keep_hidden: bool = False) -> dict[int, dict[str, Any]]:
         """Results by row from [(first row, per-rank results)] of ``_submit_verify_block``."""
         by_row = dict(
@@ -2322,11 +2683,22 @@ class SpeculativeGeneration:
                 best[t] = (d, by_row[r])
         return best
 
-    def _finish_verify(self, drafts, flat, by_row, dropped, published=None) -> None:
+    def _finish_verify(
+        self,
+        drafts,
+        flat,
+        by_row,
+        dropped,
+        published=None,
+        clear: bool = True,
+        publish: bool = True,
+    ) -> None:
         """Plans and acceptance statistics from verification results.
 
-        ``published`` (streaming verify0): trajectory index -> the plan already
-        published for it (``_best_plan``); only the statistics are computed.
+        published (streaming verify0): trajectory index -> the plan already
+        published for it (_best_plan); only the statistics are computed.
+        clear: drop earlier plans first; publish: add the plans (False:
+        statistics only, e.g. over all blocks of a pipelined engine verification).
         """
         # Every verified prefix is a prefix of the same keyed target sequence, so
         # the longest one per trajectory is kept.
@@ -2337,7 +2709,7 @@ class SpeculativeGeneration:
                 if t in best:
                     variant_wins += 1
                 best[t] = (d, by_row[r])
-        if published is None:
+        if clear and published is None:
             self.plans.clear()
         kept = total = full = 0
         # Draft age (versions between the drafting weights and the verifying
@@ -2345,12 +2717,15 @@ class SpeculativeGeneration:
         age_tok: dict[int, int] = {}
         age_kept: dict[int, int] = {}
         pairs: list[tuple[int, int]] = []
-        for i in range(len(drafts)):
+        for i in sorted(best):
             d, r = best[i]
-            if published is None:
+            if published is not None:
+                plan = published[i]
+            elif publish:
                 plan = self._best_plan(d, r)
             else:
-                plan = published[i]
+                plan = self._plan_tokens(d, r)
+                plan.verified = (len(d[2]), r["accepted"])
             pairs.append((len(d[2]), r["accepted"]))
             # Complete at verify0 (streamed plans may have finished their tails since).
             done = plan.complete if published is None else not plan.tail
@@ -2358,7 +2733,7 @@ class SpeculativeGeneration:
             kept += r["accepted"]
             total += len(d[2])
             self._count_ages(d, r["accepted"], age_tok, age_kept)
-            if published is None:
+            if publish and published is None:
                 self.plans[_key(d[0])].append(plan)
         self.stats.update(
             {
@@ -2389,6 +2764,26 @@ class SpeculativeGeneration:
                 )
             self.stats["spec/null_v_used"] = v
             self.stats["spec/null_verify_cost_used"] = cv
+
+    def _null_first_wave(self, groups: list[str], slots: dict[str, int]) -> list[int]:
+        """Rows (indices into ``groups``) of ``_verify_null``'s first wave, in its order.
+
+        A function of the counts only (no outcome is known before the first
+        wave), so the wave can be sent ahead (``engine_verify_prefetch``).
+        """
+        self._update_null_calibration()  # idempotent; the policy _verify_null uses
+        policy = self._null_policy
+        queue: dict[str, list[int]] = defaultdict(list)
+        for i, g in enumerate(groups):
+            queue[g].append(i)
+        batch: list[int] = []
+        for g, q in queue.items():
+            st = NullGroup(len(q), int(slots[g]), policy)
+            m = st.next_m()
+            if m is None or not q:
+                continue
+            batch += q[: min(len(q), math.ceil(st.s * m))]
+        return batch
 
     def _verify_null(
         self, flat, rows, groups: list[str], slots: dict[str, int]
@@ -2480,15 +2875,18 @@ class SpeculativeGeneration:
         state = res.get("null")
         return state not in ("unused", "tail_dropped", "bot") and group not in dropped_groups
 
-    def _finish_verify_null(self, flat, by_row, groups, slots, dropped, n_empty, published=None):
+    def _finish_verify_null(
+        self, flat, by_row, groups, slots, dropped, n_empty, published=None, clear=True, publish=True
+    ):
         """Plans and ⊥-BV statistics: each prompt's outputs in drafting order.
 
         Slots left empty (drafts ran out) get no plan: those rollouts decode
-        fresh from the current policy, an exact p-sample. ``published``
+        fresh from the current policy, an exact p-sample. published
         (streaming verify0): row -> the plan already published for it
-        (``_null_plan``); only the statistics are computed.
+        (_null_plan); only the statistics are computed. clear /
+        publish: as _finish_verify.
         """
-        if published is None:
+        if clear and published is None:
             self.plans.clear()
         kept = total = full = 0
         n_out = n_bot = n_unused = n_tail = 0
@@ -2528,7 +2926,18 @@ class SpeculativeGeneration:
                 continue
             n_out += 1
             outs_by_group[groups[r]] += 1
-            plan = self._null_plan(d, res) if published is None else published[r]
+            if published is not None:
+                plan = published[r]
+            elif publish:
+                plan = self._null_plan(d, res)
+            else:
+                # Statistics only (pipelined engine verification published per block).
+                plan = self._plan_tokens(d, res)
+                plan.verified = (g, res["accepted"])
+                if self.null_bv_drop_is:
+                    plan.log_weight = max(
+                        0.0, float(res["log_wstar"]) - math.log(res["null_m"])
+                    )
             if self.null_bv_drop_is:
                 weights.append(math.exp(plan.log_weight))
             # Complete at verify0 (streamed plans may have finished their tails since).
@@ -2545,7 +2954,7 @@ class SpeculativeGeneration:
                 n_tail += 1
                 rejected.append((g, res["accepted"]))
             self._count_ages(d, res["accepted"], age_tok, age_kept)
-            if published is None:
+            if publish and published is None:
                 self.plans[_key(d[0])].append(plan)
         self._v0_pairs = out_pairs
         # Earliest rejection among the longest decided drafts (top decile by
@@ -2848,6 +3257,23 @@ class SpeculativeGeneration:
             self.stats[f"spec/age{label}_token_frac"] = n / max(n_aged, 1)
             self.stats[f"spec/age{label}_accepted_frac"] = age_kept[age] / max(n, 1)
 
+    def _log_verify_error(self) -> None:
+        """Print the verification error's full traceback once per error.
+
+        The error reaches the rollouts as "draft verification failed" (one per
+        waiting sample) and the learner as an incomplete canonical order; this
+        is the one place its cause is printed.
+        """
+        err = getattr(self, "_verify_error", None)
+        if err is None or getattr(self, "_verify_error_logged", None) is err:
+            return
+        self._verify_error_logged = err
+        print(
+            "[thundersync] draft verification failed:\n"
+            + "".join(traceback.format_exception(err)),
+            flush=True,
+        )
+
     async def verify_chunked(self, drafts, chunks: int) -> None:
         """Run ``_verify_chunked``; on failure, wake every waiting rollout.
 
@@ -2858,6 +3284,7 @@ class SpeculativeGeneration:
             await self._verify_chunked(drafts, chunks)
         except BaseException as e:
             self._verify_error = e
+            self._log_verify_error()
             cv = getattr(self, "_plan_cv", None)
             if cv is not None:
                 async with cv:
@@ -3441,6 +3868,376 @@ class SpeculativeGeneration:
             [(p.verified[0], p.verified[1], len(p.prefix)) for p in published.values() if p.verified is not None]
         )
 
+    def engine_prefill_bench(self, group, prompts: list[torch.Tensor], gen_len: int, label: str) -> None:
+        """Debug (THUNDERSYNC_EV_PREFILL_BENCH): engine prefill throughput.
+
+        Each prompt is extended to prompt + ``gen_len`` tokens (its own tokens
+        tiled) and prefilled as tagged one-token verification requests on
+        ``group``'s engine, all at once, as engine-side verification submits a
+        block; the captured rows are dropped. Prints and records tokens/s
+        (``spec/ev_bench_<label>_tok_s``): ``alone`` on an idle engine, ``mixed``
+        while it decodes drafts.
+        """
+        workers = list(group.workers)
+        # Decode rate of the engine's running drafts before and during the prefill.
+        win = float(os.environ.get("THUNDERSYNC_EV_BENCH_WINDOW_S", "1.0"))
+        d0, live0 = ray.get(workers[0].draft_token_total.remote())
+        time.sleep(win)
+        d1, live1 = ray.get(workers[0].draft_token_total.remote())
+        rows, keys, plens = [], [], []
+        cap = self.engine_max_len
+        for p in prompts:
+            n = p.numel() + gen_len
+            if cap is not None:
+                n = min(n, cap - 1)
+            reps = -(-n // max(1, p.numel()))
+            rows.append(p.repeat(reps)[:n].numpy().astype(np.int64))
+            keys.append(f"bench{next(self._ev_ids)}")
+            plens.append(int(p.numel()))
+        t0 = time.perf_counter()
+        ray.get(workers[0].run_verify_requests.remote(rows, keys, plens, None))
+        dt = time.perf_counter() - t0
+        d2, live2 = ray.get(workers[0].draft_token_total.remote())
+        ray.get([w.engine_verify_drop.remote(keys) for w in workers])
+        tok = float(sum(len(r) for r in rows))
+        r0, r1 = (d1 - d0) / win, (d2 - d1) / max(dt, 1e-9)
+        self.stats[f"spec/ev_bench_{label}_decode_tok_s_before"] = r0
+        self.stats[f"spec/ev_bench_{label}_decode_tok_s_during"] = r1
+        print(
+            f"[ev prefill bench] {label} decode tok/s before={r0:.0f} (live {live0}->{live1}) "
+            f"during prefill={r1:.0f} (live {live2})",
+            flush=True,
+        )
+        self.stats[f"spec/ev_bench_{label}_tok_s"] = tok / max(dt, 1e-9)
+        self.stats[f"spec/ev_bench_{label}_s"] = dt
+        print(
+            f"[ev prefill bench] {label} rows={len(rows)} tok={int(tok)} s={dt:.3f} "
+            f"tok/s={tok / max(dt, 1e-9):.0f} engine_gpus={len(workers)}",
+            flush=True,
+        )
+
+    # -- premise check: engine prefill p == learner p (THUNDERSYNC_ENGINE_PREFILL_CHECK) --
+
+    def prefill_check_begin(self) -> None:
+        """Record up to THUNDERSYNC_ENGINE_PREFILL_CHECK_ROWS complete verified plans this step."""
+        self._prefill_check_rows = []
+
+    async def engine_prefill_check(self) -> None:
+        """Prefill the recorded rows on this engine (now at theta_k) and compare p.
+
+        Each row is prompt + the plan's tokens, with its anchors applied
+        (sticky routing); the engine's log p of every token from its captured
+        head inputs (``engine_prefill_logprobs``; TP>1: TP rank 0 runs every
+        shard's head GEMM) must equal, bitwise, the log-probs the learner's
+        verification produced for the plan (``prefix_logprobs``: log p at
+        theta_k of drafted, residual and continuation tokens). Prints
+        ``[engine prefill check]`` and sets ``spec/engine_prefill_check_*``.
+        """
+        rows = getattr(self, "_prefill_check_rows", None) or []
+        self._prefill_check_rows = None
+        if rows:
+            await asyncio.to_thread(self._engine_prefill_check, rows)
+
+    def _engine_prefill_check(self, rows) -> None:
+        group = self.base._policy.worker_group
+        workers = list(group.workers)
+        cap = self.engine_max_len
+        rows = [r for r in rows if cap is None or r[0].numel() + len(r[1]) + 1 <= cap]
+        keys = [f"pc{next(self._ev_ids)}" for _ in rows]
+        if not rows:
+            return
+        items = [
+            {"key": k, "tokens": [int(t) for t in r[1]]} for k, r in zip(keys, rows)
+        ]
+        akeys = None
+        if self.sticky_delta is not None:
+            akeys = list(keys)
+            ray.get(
+                [
+                    w.add_engine_anchors.remote(
+                        {k: r[3] for k, r in zip(keys, rows) if r[3] is not None}
+                    )
+                    for w in workers
+                ]
+            )
+        try:
+            ray.get(
+                workers[0].run_verify_requests.remote(
+                    [np.asarray(r[0].tolist() + list(r[1]), dtype=np.int64) for r in rows],
+                    keys,
+                    [int(r[0].numel()) for r in rows],
+                    akeys,
+                )
+            )
+            ranks = ray.get([w.parallel_ranks.remote() for w in workers])
+            tp = 1 + max(r["tp"] for r in ranks)
+            shards: dict[int, list] = {}
+            if tp > 1:
+                for w, r in sorted(zip(workers, ranks), key=lambda x: (x[1]["dp"], x[1]["tp"])):
+                    if r["last"]:
+                        shards.setdefault(r["dp"], []).append(w.live_head_cpu.remote())
+            calls = []
+            for w, r in zip(workers, ranks):
+                if r["last"] and r["tp"] == 0:
+                    calls.append(
+                        w.engine_prefill_logprobs.remote(
+                            items=items,
+                            vocab_limit=self.vocab_limit,
+                            head_shards=shards.get(r["dp"]) if tp > 1 else None,
+                        )
+                    )
+                else:
+                    calls.append(w.engine_verify_drop.remote(keys))
+            got: dict[str, list[float]] = {}
+            for x in ray.get(calls):
+                if isinstance(x, dict):
+                    got.update(x)
+        finally:
+            if akeys:
+                ray.get([w.drop_engine_anchors.remote(akeys) for w in workers])
+        tok = exact = 0
+        worst = 0.0
+        missing = 0
+        for k, r in zip(keys, rows):
+            e = got.get(k)
+            if e is None:
+                missing += 1
+                continue
+            a = torch.tensor(e, dtype=torch.float32)
+            b = torch.tensor(r[2], dtype=torch.float32)
+            tok += a.numel()
+            exact += int((a == b).sum())
+            if a.numel():
+                worst = max(worst, float((a - b).abs().max()))
+        self.stats["spec/engine_prefill_check_rows"] = float(len(rows) - missing)
+        self.stats["spec/engine_prefill_check_tok"] = float(tok)
+        self.stats["spec/engine_prefill_check_exact"] = float(exact)
+        self.stats["spec/engine_prefill_check_max_abs_dlogp"] = worst
+        print(
+            f"[engine prefill check] rows={len(rows) - missing} missing={missing} tok={tok} "
+            f"exact={exact} max|dlogp|={worst:.3e} tp={tp}",
+            flush=True,
+        )
+
+    # -- pipelined engine verification (verify_on=engine, sticky, streaming) ------
+
+    def prepare_verify_blocks(self, block_keys: list[list[tuple[int, ...]]]) -> None:
+        """Before the step's rollouts start: every prompt waits for its block's plans.
+
+        ``_one`` waits while its prompt key has no published plan and its
+        block is still pending (``_pending``), so no rollout takes an empty plan
+        (a fresh decode) before its pool is decided.
+        """
+        self._plan_cv = asyncio.Condition()
+        self._verify_error = None
+        self._pending = defaultdict(int)
+        for keys in block_keys:
+            for k in keys:
+                self._pending[k] = 1
+        self.plans.clear()
+        self._tail_plans = set()
+
+    async def verify_sticky_blocks(
+        self,
+        drafts,
+        block_keys: list[list[tuple[int, ...]]],
+        on_block: Callable[[int, dict], None],
+        after_verify: Optional[Callable[[], None]] = None,
+    ) -> None:
+        """``verify_sticky`` with engine verification pipelined against training.
+
+        The drafts are verified block by block (``block_keys[b]``: the prompt
+        keys of block b's groups, in group index order) on the engine verifier.
+        After each block its plans are published (the rollouts waiting on
+        them are served, ``prepare_verify_blocks``), its pending plans join the
+        continuation rounds, which run from the first block on, the draft
+        streams no plan of the block continues are stopped, and
+        ``on_block(b)`` lets the caller extend the canonical training order
+        with the block's ready groups, so the learner trains block b while the
+        engine verifies block b+1. ``after_verify()`` runs once every block is
+        verified (the tail and fresh groups are known). Returns when every
+        continuation is complete.
+
+        Exactness is that of ``verify_sticky``: each block is block-verified
+        (pooled ⊥-BV per prompt: a pool lives in one block) against the fixed
+        target p = F(theta_k; A), only the time at which it happens changes;
+        every row has its own random stream.
+        """
+        trace = TailTrace()
+        self._tail_trace = None
+        try:
+            if os.environ.get("THUNDERSYNC_ENGINE_Q_CHECK") == "1":
+                t_check = time.perf_counter()
+                await self._route_check(drafts)
+                trace.mark("route_check")
+                self.stats["time/route_check"] = time.perf_counter() - t_check
+            streams_by_key: dict[tuple[int, ...], list] = defaultdict(list)
+            for v in drafts:
+                for d in v:
+                    if len(d) > 9 and d[9] is not None:
+                        streams_by_key[_key(d[0])].append(d[9])
+            drafts, dropped = self._engine_q_filter(drafts)
+            self.null_dropped_keys, self._null_dropped = set(), set()
+            self.null_selected_keys = None
+            null = self._null_prepare(drafts)
+            names = slots = None
+            n_empty = 0
+            if null is not None:
+                drafts, names, slots, n_empty = null
+            flat, rows = self._flat_rows(drafts)
+            self._record_siblings(flat)
+            groups = [names[_key(d[0])] for _, d in flat] if null is not None else None
+            incoming: asyncio.Queue = asyncio.Queue()
+            cont = asyncio.create_task(
+                self._continue_sticky([], trace, (), incoming=incoming)
+            )
+            by_row: dict[int, dict[str, Any]] = {}
+            null_dropped: set = set()
+            waves = 0.0
+            kept_streams: set[int] = set()
+            t0 = time.perf_counter()
+            block_idx = []
+            for keys in block_keys:
+                kset = set(keys)
+                block_idx.append([i for i, (_, d) in enumerate(flat) if _key(d[0]) in kset])
+            # (__dict__: the class delegates unknown attributes to its base.)
+            prefetch = self.__dict__.get("verify_on") == "engine" and bool(
+                self.__dict__.get("engine_verify_prefetch", False)
+            )
+            self._ev_prefetched = {}
+
+            def prefetch_block(b: int) -> None:
+                # The block's first verification call, sent ahead (engine FIFO:
+                # behind the blocks sent before it).
+                if not prefetch or b >= len(block_idx) or not block_idx[b]:
+                    return
+                idx = block_idx[b]
+                sub_flat, sub_rows = [flat[i] for i in idx], [rows[i] for i in idx]
+                if null is not None:
+                    sub_groups = [groups[i] for i in idx]
+                    first = self._null_first_wave(
+                        sub_groups, {g: slots[g] for g in set(sub_groups)}
+                    )
+                    sub_flat = [sub_flat[i] for i in first]
+                    sub_rows = [sub_rows[i] for i in first]
+                self._ev_prefetch(sub_flat, sub_rows)
+
+            try:
+                if prefetch:
+                    # Blocking Ray calls (head wait, anchors): off the event loop.
+                    await asyncio.to_thread(prefetch_block, 0)
+                for b, keys in enumerate(block_keys):
+                    if prefetch:
+                        await asyncio.to_thread(prefetch_block, b + 1)
+                    idx = block_idx[b]
+                    sub_flat = [flat[i] for i in idx]
+                    if idx:
+                        sub_rows = [rows[i] for i in idx]
+                        if null is not None:
+                            sub_groups = [groups[i] for i in idx]
+                            res = await asyncio.to_thread(
+                                self._verify_null,
+                                sub_flat,
+                                sub_rows,
+                                sub_groups,
+                                {g: slots[g] for g in set(sub_groups)},
+                            )
+                            waves += self.stats.get("spec/null_waves", 0.0)
+                            null_dropped |= self._null_dropped
+                            self._finish_verify_null(
+                                sub_flat,
+                                res,
+                                sub_groups,
+                                {g: slots[g] for g in set(sub_groups)},
+                                0,
+                                0,
+                                clear=False,
+                            )
+                        else:
+                            res = await asyncio.to_thread(
+                                self._verify_block, sub_flat, sub_rows, None, self.banded_is_band
+                            )
+                            sub_drafts = [[d] for _, d in sub_flat]
+                            self._finish_verify(
+                                sub_drafts,
+                                [(j, d) for j, (_, d) in enumerate(sub_flat)],
+                                res,
+                                0,
+                                clear=False,
+                            )
+                        for j, i in enumerate(idx):
+                            by_row[i] = res[j]
+                    new = [(k, plan) for k in keys for plan in self.plans.get(k, [])]
+                    for k, plan in new:
+                        plan.tail = not plan.complete
+                        if plan.verified is not None:
+                            trace.verified(k, plan, *plan.verified)
+                    pending = [(k, plan) for k, plan in new if not plan.complete]
+                    kept_streams |= {id(p.stream) for _, p in pending if p.stream is not None}
+                    self._stop_streams(
+                        [x for k in keys for x in streams_by_key.get(k, []) if id(x) not in kept_streams]
+                    )
+                    self._tail_plans |= {id(p) for _, p in pending}
+                    # (plans, all complete) per key, before any rollout takes one.
+                    info = {
+                        k: (
+                            len(self.plans.get(k, [])),
+                            all(p.complete for p in self.plans.get(k, [])),
+                        )
+                        for k in keys
+                    }
+                    if pending:
+                        incoming.put_nowait(pending)
+                    async with self._plan_cv:
+                        for k in keys:
+                            self._pending[k] = 0
+                        self._plan_cv.notify_all()
+                    if b == 0:
+                        self.stats["time/ev_verify_first_block"] = time.perf_counter() - t0
+                        trace.mark("verify_first_block")
+                    on_block(b, info)
+            finally:
+                incoming.put_nowait(None)
+                if prefetch:
+                    await asyncio.to_thread(self._ev_drop_prefetch)
+            trace.mark("verify0")
+            self.stats["time/ev_verify_all"] = time.perf_counter() - t0
+            self._tail_counts = {
+                key: sum(p.tail for p in q) for key, q in self.plans.items()
+            }
+            # Statistics over every block (plans were published per block).
+            self._null_dropped = null_dropped
+            if null is not None:
+                self._finish_verify_null(
+                    flat, by_row, groups, slots, dropped, n_empty, clear=False, publish=False
+                )
+                self.stats["spec/null_waves"] = waves
+            else:
+                self._finish_verify(
+                    [[d] for _, d in flat],
+                    [(j, d) for j, (_, d) in enumerate(flat)],
+                    by_row,
+                    dropped,
+                    clear=False,
+                    publish=False,
+                )
+            self.stats["spec/ev_blocks"] = float(len(block_keys))
+            if after_verify is not None:
+                after_verify()
+            await cont
+            self.stats.update(trace.summary())
+        except BaseException as exc:
+            self._verify_error = exc
+            self._tail_error = exc
+            self._log_verify_error()
+            raise
+        finally:
+            cv = self._plan_cv
+            if cv is not None:
+                async with cv:
+                    cv.notify_all()
+            await self._notify_tails()
+
     # -- streaming training over the tails (one engine, sticky) ------------------
 
     def begin_streaming_tails(self) -> None:
@@ -3844,12 +4641,17 @@ class SpeculativeGeneration:
         ended=(),
         max_retries: int = 100,
         feed: Optional[TailFeed] = None,
+        incoming: Optional[asyncio.Queue] = None,
     ) -> None:
         """Complete incomplete plans at theta_{k-1}, verifying while the engine decodes.
 
         ``feed`` (streaming verify0, DESIGN 14z): more pending plans arrive
         while the rounds run, as verify0 decides their pools; the rounds end
         once the feed is closed and every admitted plan is complete.
+
+        ``incoming`` (pipelined engine verification): more pending plans arrive
+        on this queue as their verification blocks finish (lists of (key, plan));
+        None closes it. The rounds end once it is closed and nothing is live.
 
         One engine stream per plan decodes from prompt + kept prefix toward
         EOS or the cap. Whenever a stream has ``sticky_chunk_tokens`` new
@@ -3883,6 +4685,7 @@ class SpeculativeGeneration:
         rank0 = self.base._policy.worker_group.workers[0]
         version = self.current_step - 1
         stats = dict(rounds=0, streams=0, tokens=0, kept=0, retries=0, turns=0)
+        stats["round_s"] = []
         pieces_per_plan: dict[int, int] = defaultdict(int)
         stats.update(prefix_rows=0, prefix_hits=0, prefix_skipped=0)
         self._prefix_cache_begin(len(pending))
@@ -3988,10 +4791,28 @@ class SpeculativeGeneration:
             start(fresh_start)
 
         admit(pending)
+        open_queue = incoming is not None
+        ev_admitted: list = []  # plans admitted from incoming
         for key, plan in ended:
             end_turn(key, plan)
-        inflight: dict[asyncio.Task, tuple[list, list, float]] = {}
-        busy: set[int] = set()
+        inflight: dict[asyncio.Task, tuple[list, list, float, str]] = {}
+        busy: set[int] = set()  # carried walk: streams with a piece or scan in flight
+        # Pieces in flight per stream (verified in order, applied in order): the
+        # next piece is cut while earlier ones are verified, assuming they are
+        # accepted whole; a rejection discards the later ones (their results are
+        # ignored: each used result is a block verification of a q draft against
+        # p given the exact prefix it was verified with, with fresh randomness).
+        k_inflight = max(1, int(getattr(self, "pieces_in_flight", 1)))
+
+        def pend(s) -> list:
+            return s.setdefault("pend", [])
+
+        def pend_tokens(s) -> list[int]:
+            return [t for e in pend(s) for t in e["d"][2]]
+
+        def can_cut(s) -> bool:
+            q = pend(s)
+            return len(q) < k_inflight and not (q and q[-1]["d"][3])
 
         def pieces(cand):
             """(flat drafts, rows, owner streams) of the ready pieces of ``cand``."""
@@ -4000,9 +4821,11 @@ class SpeculativeGeneration:
             ready = []
             for s, (toks, done, lps) in zip(cand, snaps):
                 toks = toks.tolist() if isinstance(toks, np.ndarray) else list(toks)
-                a = s["taken"]
+                a = s["taken"] + len(pend_tokens(s))
                 s["decoded"] = len(toks)  # stream length when its piece is taken
-                chunk = self._piece_tokens(len(s["plan"].prefix) + self._cw_pending(s))
+                chunk = self._piece_tokens(
+                    len(s["plan"].prefix) + self._cw_pending(s) + len(pend_tokens(s))
+                )
                 n = len(toks) - a if done else ((len(toks) - a) // chunk) * chunk
                 if n > 0 or done:
                     # (stream, piece, stream finished, piece log-probs)
@@ -4029,7 +4852,9 @@ class SpeculativeGeneration:
             cut = []
             for (s, toks, done, lps), a in zip(ready, routes):
                 s["routes"] = a
-                plen = len(s["key"]) + len(s["plan"].prefix) + self._cw_pending(s)
+                plen = (
+                    len(s["key"]) + len(s["plan"].prefix) + self._cw_pending(s) + len(pend_tokens(s))
+                )
                 m = (
                     0
                     if a is None
@@ -4044,7 +4869,7 @@ class SpeculativeGeneration:
                     (id(c[0]) for c in some),
                     self._take_hidden(
                         [c[0]["hkey"] for c in some],
-                        [c[0]["taken"] for c in some],
+                        [c[0]["taken"] + len(pend_tokens(c[0])) for c in some],
                         [c[5] for c in some],
                     )
                     if some
@@ -4060,6 +4885,7 @@ class SpeculativeGeneration:
                         torch.tensor(s["key"], dtype=torch.long),
                         torch.tensor(s["plan"].prefix, dtype=torch.long),
                         torch.tensor(s["cw"]["toks"] if "cw" in s else [], dtype=torch.long),
+                        torch.tensor(pend_tokens(s), dtype=torch.long),
                     ]
                 )
                 d = (
@@ -4083,7 +4909,7 @@ class SpeculativeGeneration:
                     owners.append(s)
                     continue
                 self._release_hidden([d])
-                if done:
+                if done and not pend(s):
                     # Finished, but its remaining tokens cannot be verified (a
                     # logging gap); nothing more will be logged: start again
                     # from the prefix. A running stream just waits.
@@ -4106,11 +4932,36 @@ class SpeculativeGeneration:
             return flat, rows, owners
 
         async def apply(flat, owners, by_row, t_verify) -> None:
-            """Extend or cut each owner's plan by its piece's verification result."""
+            """Extend or cut each owner's plan by its pieces' verification results.
+
+            A stream's results are applied in piece order: a result waits until
+            every earlier piece of its stream is applied; a stream that stopped
+            (rejection, end) drops its later results.
+            """
             done_streams, restart = [], []
             n_rejects = 0
-            for r, ((_, d), s) in enumerate(zip(flat, owners)):
-                out = by_row[r]
+            live_ids = {id(x) for x in live}
+            for r, s in enumerate(owners):
+                if id(s) not in live_ids:
+                    continue
+                for e in pend(s):
+                    if e["by_row"] is None and e["flat"] is flat and e["r"] == r:
+                        e["by_row"] = by_row
+            seq = []
+            for s in {id(x): x for x in owners}.values():
+                if id(s) not in live_ids:
+                    continue
+                while pend(s) and pend(s)[0]["by_row"] is not None:
+                    e = pend(s).pop(0)
+                    seq.append((e, s))
+                    stopped = e["by_row"][e["r"]]["accepted"] < len(e["d"][2])
+                    if stopped:
+                        pend(s).clear()
+                        break
+            for e, s in seq:
+                out, d = e["by_row"][e["r"]], e["d"]
+                if any(x is s for x in done_streams):
+                    continue
                 plan, p, toks, done = s["plan"], d[0], d[2], d[3]
                 pieces_per_plan[id(plan)] += 1
                 g, n_acc = len(toks), out["accepted"]
@@ -4137,6 +4988,7 @@ class SpeculativeGeneration:
                         s["key"], plan, plan.prefix[-1]
                     ):
                         done_streams.append(s)
+                        pend(s).clear()
                         end_turn(s["key"], plan)
                 else:
                     n_rejects += 1
@@ -4157,6 +5009,7 @@ class SpeculativeGeneration:
                         trace.completed(plan)
             if trace is not None:
                 trace.round(len(live), len(flat), t_verify, n_rejects)
+            stats["round_s"].append(t_verify)
             if self.prefix_cache is not None:
                 # Complete rollouts need no more pieces: free their learner state.
                 self.prefix_cache.release(
@@ -4282,13 +5135,29 @@ class SpeculativeGeneration:
         cw_force = int(os.environ.get("THUNDERSYNC_DEBUG_CW_FORCE_REJECT", "0") or 0)
         cw_forced: dict[int, int] = defaultdict(int)
         try:
-            while live or inflight or turns or (feed is not None and feed.open):
+            while live or inflight or turns or (feed is not None and feed.open) or open_queue:
                 progressed = False
                 if feed is not None and feed.items:
                     admit(feed.take())
                     # Prefix cache: this step's budget follows the continued rows so far.
                     self._prefix_cache_begin(len(pending) + len(feed.admitted))
                     progressed = True
+                while open_queue:
+                    try:
+                        more = incoming.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    progressed = True
+                    if more is None:
+                        open_queue = False
+                    else:
+                        admit(more)
+                        ev_admitted.extend(more)
+                        if self.prefix_cache is not None:
+                            self._prefix_cache_begin(
+                                len(pending) + len(ev_admitted)
+                                + (len(feed.admitted) if feed is not None else 0)
+                            )
                 if turns:
                     n_turns = len(turns)
                     next_turns()
@@ -4320,15 +5189,17 @@ class SpeculativeGeneration:
                             inflight[stask] = (sflat, sowners, time.perf_counter(), "scan")
                             busy.update(id(s) for s in sowners)
                     progressed = True
-                idle = [s for s in live if id(s) not in busy]
+                idle = [s for s in live if id(s) not in busy and can_cut(s)]
                 if idle:
                     status = ray.get(rank0.draft_lengths.remote([s["idx"] for s in idle]))
                     cand = [
                         s
                         for s, (n, done) in zip(idle, status)
-                        if done
-                        or n - s["taken"]
-                        >= self._piece_tokens(len(s["plan"].prefix) + self._cw_pending(s))
+                        if (done and (n > s["taken"] + len(pend_tokens(s)) or not pend(s)))
+                        or n - s["taken"] - len(pend_tokens(s))
+                        >= self._piece_tokens(
+                            len(s["plan"].prefix) + self._cw_pending(s) + len(pend_tokens(s))
+                        )
                     ]
                     flat, rows, owners = pieces(cand) if cand else ([], [], [])
                     if flat:
@@ -4362,7 +5233,13 @@ class SpeculativeGeneration:
                                 )
                             )
                         inflight[task] = (flat, owners, time.perf_counter(), "piece")
-                        busy.update(id(s) for s in owners)
+                        if self.cw_rule is None:
+                            # Pieces in flight per stream (applied in piece order).
+                            for r, (s, (_, d)) in enumerate(zip(owners, flat)):
+                                pend(s).append({"flat": flat, "r": r, "d": d, "by_row": None})
+                        else:
+                            # Carried walk: one piece (or scan) per stream at a time.
+                            busy.update(id(s) for s in owners)
                         progressed = True
                 if not progressed:
                     if inflight:
@@ -4377,8 +5254,19 @@ class SpeculativeGeneration:
             for s in live:
                 self._cw_reset(s)
             if self.prefix_cache is not None:
-                admitted = list(pending) + (feed.admitted if feed is not None else [])
+                admitted = list(pending) + (feed.admitted if feed is not None else []) + ev_admitted
                 self.prefix_cache.release(plan.prefix_key for _, plan in admitted)
+            if open_queue:
+                # Stopped early (an error): stop the streams of plans still queued.
+                while True:
+                    try:
+                        more = incoming.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    if more:
+                        self._stop_streams(
+                            [p.stream for _, p in more if p.stream is not None]
+                        )
         if stats["prefix_rows"]:
             self.stats.update(
                 {
@@ -4409,6 +5297,12 @@ class SpeculativeGeneration:
             self.stats.update({f"spec/cw_{k}": float(v) for k, v in cw_stats.items()})
             self.stats["spec/cw_hidden_retained_bytes_max"] = float(self._cw_retained_max)
             self._cw_retained_max = 0
+        if stats["round_s"]:
+            # Piece verification latency per round (sent -> result back).
+            rs = sorted(stats["round_s"])
+            self.stats["spec/piece_round_s_p50"] = rs[len(rs) // 2]
+            self.stats["spec/piece_round_s_p90"] = rs[min(len(rs) - 1, int(0.9 * len(rs)))]
+            self.stats["spec/piece_round_s_max"] = rs[-1]
         if self.turn_env is not None:
             # Environment latency now sits before the refit (DESIGN 14m).
             self.stats["spec/sticky_env_s"] = self.turn_env.env_s
@@ -4648,6 +5542,7 @@ class SpeculativeGeneration:
             async with cv:
                 while not self.plans.get(key) and self._pending.get(key, 0) > 0:
                     if getattr(self, "_verify_error", None) is not None:
+                        self._log_verify_error()
                         raise RuntimeError(
                             "draft verification failed"
                         ) from self._verify_error
@@ -4672,6 +5567,16 @@ class SpeculativeGeneration:
                 self._check_fresh_weights(key)
         gen = list(plan.prefix)
         lps = list(plan.prefix_logprobs)
+        pc = getattr(self, "_prefill_check_rows", None)
+        if (
+            pc is not None
+            and plan.verified is not None
+            and plan.complete
+            and len(pc) < int(os.environ.get("THUNDERSYNC_ENGINE_PREFILL_CHECK_ROWS", "16"))
+        ):
+            # The engine prefill check compares the engine's p of these tokens
+            # with the learner's (prefix_logprobs) once the engine holds theta_k.
+            pc.append((prompt, list(gen), list(lps), plan.anchors))
         if plan.fused is not None:
             self._fused_claims.add(key, gen, plan.fused)
         if self.banded_is_band is not None and plan.log_weight != 0.0:
