@@ -709,6 +709,36 @@ def _patch_attention() -> None:
     Attention.forward_post_core_attn = forward_post_core_attn
 
 
+def _patch_mamba_layer_input() -> None:
+    """Mamba layers: keep the fp32 residual as the input of the fused pre-norm.
+
+    Stock ``MambaLayer._prepare_mixer_input`` casts the layer input to
+    ``config.params_dtype`` before ``in_proj``'s fused norm. With bf16 params
+    that rounds the fp32 residual stream to bf16 (8-bit mantissa) at every
+    Mamba layer, against this recipe's contract (fp32 norm on the fp32
+    residual, as for attention and MoE layers). Training and engine both run
+    ``_prepare_mixer_input``, so they stay identical; the patched layer feeds
+    the fp32 residual to the patched fused norm + fp16 GEMM instead.
+    """
+    from megatron.core.ssm import mamba_layer as ml
+
+    cls = ml.MambaLayer
+    orig = cls._prepare_mixer_input
+    _STATE["orig"][(cls, "prepare")] = orig
+
+    def _prepare_mixer_input(self, hidden_states):
+        in_proj = getattr(getattr(self, "mixer", None), "in_proj", None)
+        if (
+            not _active(getattr(in_proj, "weight", None))
+            or not self.config.fp32_residual_connection
+            or hidden_states.dtype != torch.float32
+        ):
+            return orig(self, hidden_states)
+        return ml.apply_module(self.norm)(hidden_states), hidden_states
+
+    cls._prepare_mixer_input = _prepare_mixer_input
+
+
 def _patch_inference_pp_logits() -> None:
     """Engine PP > 1: keep last-stage logits fp32 and broadcast them in fp32.
 
@@ -1091,6 +1121,7 @@ def install(
     )
     _patch_te_rmsnorm()
     _patch_attention()
+    _patch_mamba_layer_input()
     _patch_inference_buffers()
     _patch_inference_pp_logits()
     _patch_moe()
