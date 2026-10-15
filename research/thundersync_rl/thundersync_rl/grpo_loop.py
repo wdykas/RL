@@ -302,6 +302,12 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # remainder (2048 > a 1024 cap re-decoded the remainder: 1.2-1.9x plain
     # decode per kept token, DESIGN.md section 14k).
     sticky_continuation_chunk_tokens: int = 128
+    # Continuation piece size grows with the row's generated position:
+    # max(chunk_tokens, growth * position) (SpeculativeGeneration._piece_tokens).
+    # Each piece costs one forward of the whole row on the learner, so fixed
+    # pieces are O(L^2 / chunk) per continued row; growth 1.0 keeps <= 7 pieces
+    # per 8k row. 0: fixed pieces.
+    sticky_continuation_chunk_growth: float = 1.0
     # Sticky, one engine: serve and train every rollout whose plan is complete
     # while the continuation rounds of the other rows still run (both are
     # learner-side at theta_k; DESIGN.md section 14k). False: training starts
@@ -1821,6 +1827,7 @@ def make_speculative_generation(
         null_bv_drop_is=ts_cfg.null_bv_drop_is,
         null_bv_spare_prompts=ts_cfg.null_bv_spare_prompts,
         sticky_chunk_tokens=ts_cfg.sticky_continuation_chunk_tokens,
+        sticky_chunk_growth=ts_cfg.sticky_continuation_chunk_growth,
         draft_until_complete=ts_cfg.draft_until_complete,
         draft_weights=ts_cfg.draft_weights,
         banded_is_band=ts_cfg.banded_is_band,
