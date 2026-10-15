@@ -545,6 +545,7 @@ def test_verify0_stream_config_validation():
         (dict(verify0_stream=True, tail_excluded_baseline=True), "tail_excluded_baseline"),
         (dict(verify0_stream=True, verify0_stream_window=0), "window"),
         (dict(verify0_stream=True, stream_training_over_tails=False), "stream_training_over_tails"),
+        (dict(verify0_stream=True, cohort_lanes=2), "cohort_lanes"),
     ):
         with pytest.raises(ValueError, match=match):
             validate_verify0_stream(_master(**bad))

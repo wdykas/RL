@@ -756,6 +756,12 @@ def validate_verify0_stream(master_config: ThunderSyncMasterConfig) -> None:
             problems.append(f"{name} must be off (not built with verify0_stream)")
     if ts_cfg.sticky_anchor_horizon is not None:
         problems.append("the anchor horizon is not built with verify0_stream")
+    if (getattr(ts_cfg, "cohort_lanes", 1) or 1) > 1:
+        # Measured inexact (thundersync_work/runs_1node/v0s-xlanes, 6fc1ae9c: Nano
+        # L8, learner EP2 + two EP1 lanes, max|dlogp| 1.66 / 0.76 / 0.60 on steps
+        # 1-3, while the same layout without verify0_stream is EXACT on 5f835b57,
+        # bh-xlanes). Allowed again once the lanes path is fixed and re-validated.
+        problems.append("cohort_lanes > 1 failed its exactness check (v0s-xlanes); one engine only")
     if min(
         ts_cfg.verify0_stream_first_chunk_tokens,
         ts_cfg.verify0_stream_chunk_tokens,
