@@ -49,3 +49,30 @@ def test_incomplete_rows_close_at_summary():
     tr.now = lambda: 4.0
     out = tr.summary()
     assert out["tail/end_s"] == 4.0 and out["tail/group_done_q50_s"] == 4.0
+
+
+def test_tail_dump_records_rows_rejections_and_dead_tokens(tmp_path, monkeypatch):
+    """THUNDERSYNC_TAIL_DUMP: prompt, draft, final rollout, rejection positions and dead tokens."""
+    import torch
+    from types import SimpleNamespace
+
+    from thundersync_rl.tail_trace import TailTrace
+
+    monkeypatch.setenv("THUNDERSYNC_TAIL_DUMP", str(tmp_path))
+    tr = TailTrace()
+    p = SimpleNamespace(prefix=[1, 2, 9], complete=False, draft_tokens=[1, 2, 3, 4, 5])
+    q = SimpleNamespace(prefix=[7, 7], complete=True, draft_tokens=[7, 7])
+    tr.verified((100, 101), p, 5, 2)  # rejected at 2: dead [3, 4, 5]
+    tr.verified((100, 101), q, 2, 2)
+    p.prefix += [6, 6, 8]  # piece [6, 6, 7, 7] verified from position 3, rejected at its 2
+    tr.piece(p, 3, 4, 2, 7, toks=[6, 6, 7, 7])
+    p.complete = True
+    tr.completed(p)
+    tr.summary()
+    (f,) = list(tmp_path.iterdir())
+    d = torch.load(f, weights_only=False)
+    rows = {tuple(r["draft"].tolist()): r for r in d["rows"]}
+    r = rows[(1, 2, 3, 4, 5)]
+    assert r["key"].tolist() == [100, 101] and r["final"].tolist() == [1, 2, 9, 6, 6, 8]
+    assert [(s, pos, dead.tolist()) for s, pos, dead in r["rejects"]] == [(0, 2, [3, 4, 5]), (1, 5, [7, 7])]
+    assert rows[(7, 7)]["rejects"] == []

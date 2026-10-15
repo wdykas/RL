@@ -343,6 +343,14 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # pieces are O(L^2 / chunk) per continued row; growth 1.0 keeps <= 7 pieces
     # per 8k row. 0: fixed pieces.
     sticky_continuation_chunk_growth: float = 1.0
+    # Continuation piece verifications sent while a training dispatch runs are
+    # run at that dispatch's next micro-batch boundary instead of after it
+    # (verify_yield.py, DESIGN.md section 14v). Exact: training runs the same
+    # micro-batches with the same loss scaling, verification results do not
+    # depend on when they run; only timing changes. Learner path while
+    # streaming over the tails; pipeline parallel size 1 (PP > 1: posted calls
+    # run in order).
+    verify_yield: bool = False
     # Carried-walk continuation verification (DESIGN.md section 14t; carried_walk.py).
     # "every": every piece is its own block (decided at its end; the walk restarts).
     # "row": the pieces of a stream form one block, decided only at the stream's end
@@ -643,6 +651,7 @@ def validate_config(master_config: ThunderSyncMasterConfig) -> None:
     validate_banded_is(master_config)
     validate_run_control(master_config)
     validate_verify_in_train(master_config)
+    validate_verify_yield(master_config)
 
 
 def _section(master_config: Any, name: str) -> dict[str, Any]:
@@ -745,6 +754,20 @@ def validate_learner_prefix_cache(master_config: ThunderSyncMasterConfig) -> Non
         problems.append("learner_prefix_cache_policy must be 'pin' or 'lru'")
     if problems:
         raise ValueError("thundersync.learner_prefix_cache: " + "; ".join(problems) + ".")
+
+
+def validate_verify_yield(master_config: ThunderSyncMasterConfig) -> None:
+    """Reject settings verify_yield is not built for (verify_yield.py)."""
+    ts_cfg = master_config.thundersync
+    if not ts_cfg.verify_yield:
+        return
+    problems = []
+    if sticky_delta(ts_cfg) is None or not ts_cfg.stream_training_over_tails:
+        problems.append("needs sticky_routing and stream_training_over_tails (ordered learner calls)")
+    if ts_cfg.verify_on != "learner":
+        problems.append("needs verify_on=learner (continuation pieces verified by the learner)")
+    if problems:
+        raise ValueError("thundersync.verify_yield: " + "; ".join(problems) + ".")
 
 
 def validate_verify_in_train(master_config: ThunderSyncMasterConfig) -> None:
@@ -2737,6 +2760,7 @@ def make_speculative_generation(
         seed_stream=str(stream),
     )
     spec.verify_in_train = bool(ts_cfg.verify_in_train)
+    spec.verify_yield = bool(ts_cfg.verify_yield)
     spec.vit_group_size = int(master_config.grpo.num_generations_per_prompt)
     spec.vit_mbs = int(train_micro_batch_rows(master_config))
     spec.vit_min_pass_prob = float(ts_cfg.vit_min_pass_prob)
@@ -3384,6 +3408,9 @@ def thundersync_grpo_train(
             for method in sorted({m for b in busy for m in b}):
                 # Max over ranks: learner seconds in training vs piece verification.
                 metrics[f"learner/busy_{method}_s"] = max(b.get(method, 0.0) for b in busy)
+            if spec is not None:
+                # verify_yield: verifications run at training boundaries this step.
+                metrics.update(spec.yield_stats())
         if tails_s:
             # Continuation rounds, overlapped with this step's training.
             metrics["time/tails"] = tails_s[0]

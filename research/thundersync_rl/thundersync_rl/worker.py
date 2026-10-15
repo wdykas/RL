@@ -56,7 +56,7 @@ from thundersync_rl.draft_weights import (
     restore_training,
 )
 from thundersync_rl import mem_debug
-from thundersync_rl import vit, vit_check
+from thundersync_rl import verify_yield, vit, vit_check
 from thundersync_rl.fused_train import (
     FusedGraph,
     FusedGraphStore,
@@ -300,7 +300,7 @@ if engine_prof.enabled():
 @ray.remote(
     runtime_env=get_runtime_env_for_policy_worker("megatron_policy_worker")
 )  # pragma: no cover
-class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
+class ThunderSyncMegatronPolicyWorker(verify_yield.YieldWorkerMixin, MegatronPolicyWorkerImpl):
     """Driver-friendly wrappers over the core split API's streaming mode."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -388,6 +388,23 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
 
     def get_logprobs(self, *, data, **kwargs):
         return super().get_logprobs(data=self._with_routes(data), **kwargs)
+
+    def _run_train_pieces(self, state, pieces, variable_shapes=False):
+        """Pipeline call; under ``verify_yield`` its micro-batch boundaries may run
+        posted continuation verifications (``verify_yield.py``)."""
+        if getattr(self, "_yield_ok", False):
+            import dataclasses
+
+            pieces = [
+                dataclasses.replace(
+                    p,
+                    data_iterator=verify_yield.boundary_iter(
+                        p.data_iterator, self._yield_point, self._yield_first
+                    ),
+                )
+                for p in pieces
+            ]
+        return super()._run_train_pieces(state, pieces, variable_shapes)
 
     def finish_train_step(self) -> dict[str, Any]:
         """Finish the train step; optionally perturb expert gradients (test only).
@@ -645,12 +662,18 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                     raise RuntimeError(f"ordered learner call {seq} arrived after {self._ordered_next}")
                 await cv.wait()
         t0 = time.perf_counter()
+        # verify_yield: the running call (a training dispatch's boundaries may
+        # run posted verifications numbered after it).
+        y0 = verify_yield.YieldWorkerMixin._yield_begin_call(self, seq)
         try:
             return getattr(self, method)(**kwargs)
         finally:
             # Learner seconds per method (``ordered_digest``): verification vs training.
             busy = self.__dict__.setdefault("_ordered_busy", {})
-            busy[method] = busy.get(method, 0.0) + time.perf_counter() - t0
+            inline = verify_yield.YieldWorkerMixin._yield_end_call(self, y0)
+            busy[method] = busy.get(method, 0.0) + time.perf_counter() - t0 - inline
+            if inline:
+                busy["verify_inlined"] = busy.get("verify_inlined", 0.0) + inline
             self._ordered_next += 1
             # What this rank ran, in order (``ordered_digest``).
             self._ordered_crc = zlib.crc32(
@@ -824,7 +847,18 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                             self, call_items, mbs_per_item, bucket, tprof, self._vit_calls
                         )
                     else:
-                        self._stream_train_call(call_items, mbs_per_item, bucket, tprof)
+                        # verify_yield: plain training calls only (a fused call's
+                        # substitute forward would serve the verification too).
+                        self._yield_ok = (
+                            fused_key is None
+                            and getattr(self, "_yield_mailbox", None) is not None
+                            and getattr(self, "_yield_domain", None) is not None
+                            and getattr(self, "_ordered_running", None) is not None
+                        )
+                        try:
+                            self._stream_train_call(call_items, mbs_per_item, bucket, tprof)
+                        finally:
+                            self._yield_ok = False
             finally:
                 # Frees the graph's activations also when no forward ran (a
                 # zero-advantage row skipped by the worker).
