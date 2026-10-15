@@ -204,10 +204,13 @@ class StreamOrder:
         groups_per_block: int,
         block_tokens: Optional[int] = None,
         fresh_keys: Iterable[Hashable] = (),
+        tail_order: Optional[Callable[[list[int]], list[int]]] = None,
     ):
         self.row_keys = list(row_keys)
         self.need = need
         self.fresh_keys = frozenset(fresh_keys)
+        # Canonical order of the tail class at close (default: group index order).
+        self.tail_order = tail_order
         self.bg = max(1, int(groups_per_block))
         self.block_tokens = block_tokens
         self.order: list[int] = []
@@ -272,7 +275,12 @@ class StreamOrder:
         rest = [p for p in range(len(self.row_keys)) if p not in listed]
         self.fresh = [p for p in rest if self._fresh(self.row_keys[p])]
         fresh = set(self.fresh)
-        self.tail_groups[:] = [p for p in rest if p not in fresh]
+        tails = [p for p in rest if p not in fresh]
+        if self.tail_order is not None:
+            tails = list(self.tail_order(tails))
+            if sorted(tails) != sorted(p for p in rest if p not in fresh):
+                raise RuntimeError("StreamOrder: tail_order must permute the tail groups")
+        self.tail_groups[:] = tails
         self._extend(list(self.tail_groups))
         self._extend(list(self.fresh))
         if sorted(self.order) != list(range(len(self.row_keys))):

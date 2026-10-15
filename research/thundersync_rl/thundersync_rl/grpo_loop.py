@@ -443,6 +443,16 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # With deal_rows a block is raised to at least ceil(DP / G) groups so every
     # learner DP rank gets a row (canonical_groups_per_block).
     canonical_block_groups: int = 4
+    # Canonical order of the TAIL class (groups with a pending continuation after
+    # verify0; DESIGN 14ae). "index": group index order (the slowest row's group
+    # blocks every later tail block: at full Nano 8k 7-9 tail dispatches, 20-41 s,
+    # ran after the chain ended, bh-ab). "kept": by the fewest tokens kept at the
+    # verify0 decision among the group's tail plans, most kept first (least
+    # remaining decode), ties by index. A function of the verification results
+    # only, so the accumulated gradient stays bitwise independent of arrival
+    # times; it changes which groups share a dispatch (summation order), not
+    # what is trained.
+    tail_group_order: str = "index"
     # Set: canonical blocks are cut by tokens instead (a block ends at the
     # first group at which its rows reach this many tokens, within each class
     # of the canonical order), so a dispatch's size does not depend on the
@@ -775,6 +785,10 @@ def validate_config(master_config: ThunderSyncMasterConfig) -> None:
     validate_run_control(master_config)
     validate_verify_in_train(master_config)
     validate_verify_yield(master_config)
+    if getattr(ts, "tail_group_order", "index") not in ("index", "kept"):
+        raise ValueError(
+            f"thundersync.tail_group_order must be index or kept (got {ts.tail_group_order!r})"
+        )
     validate_verify0_stream(master_config)
 
 
@@ -2006,6 +2020,27 @@ def classify_groups(
         else:
             out[p] = "ready"
     return out
+
+
+def order_tail_groups(
+    groups: list[int], row_keys: list, G: int, kept: Callable[[Any], Optional[int]], how: str
+) -> list[int]:
+    """The tail class in canonical order (``thundersync.tail_group_order``).
+
+    ``kept(key)``: fewest tokens kept at verify0 among the prompt's tail plans
+    (``SpeculativeGeneration.tail_kept``; None: no recorded tail plan, listed
+    first). "kept": most kept first (least left to decode), ties by group index.
+    """
+    if how == "index":
+        return list(groups)
+    if how != "kept":
+        raise ValueError(f"thundersync.tail_group_order must be index or kept (got {how!r})")
+
+    def rank(p):
+        k = kept(row_keys[p * G])
+        return (-(k if k is not None else 1 << 40), p)
+
+    return sorted(groups, key=rank)
 
 
 def block_chunks(groups: list[int], b: int) -> list[int]:
@@ -3811,7 +3846,13 @@ def thundersync_grpo_train(
                 def after_verify():
                     every = [p for blk in blocks for p in blk]
                     cls = classify_groups(row_keys, G, every, ev_info)
-                    tails_g = [p for p in every if cls[p] == "tail"]
+                    tails_g = order_tail_groups(
+                        [p for p in every if cls[p] == "tail"],
+                        row_keys,
+                        G,
+                        spec.tail_kept,
+                        ts_cfg.tail_group_order,
+                    )
                     fresh_g = [p for p in every if cls[p] == "fresh"]
                     ev_fresh.append(bool(fresh_g))
                     tail_groups.extend(tails_g)
@@ -3871,6 +3912,9 @@ def thundersync_grpo_train(
                 # rows): their groups count as fresh, so the cohort lane takes
                 # theta_k for them (lanes) and they train after the tails.
                 fresh_keys=stream_fresh_keys(row_keys),
+                tail_order=lambda tails, rk=row_keys: order_tail_groups(
+                    tails, rk, G, spec.tail_kept, ts_cfg.tail_group_order
+                ),
             )
             group_order, group_blocks = v0_order.order, v0_order.blocks
             tail_groups = v0_order.tail_groups
@@ -3932,7 +3976,13 @@ def thundersync_grpo_train(
                 classes = [
                     [p for p in range(len(row_keys) // G) if p not in late],
                     [p for p in vit_groups if p not in fresh],
-                    [p for p in tail_groups if p not in fresh],
+                    order_tail_groups(
+                        [p for p in tail_groups if p not in fresh],
+                        row_keys,
+                        G,
+                        spec.tail_kept,
+                        ts_cfg.tail_group_order,
+                    ),
                     sorted(fresh),
                 ]
                 group_order = [p for c in classes for p in c]

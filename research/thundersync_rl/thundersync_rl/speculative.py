@@ -2071,6 +2071,24 @@ class SpeculativeGeneration:
                 plan.tail = not plan.complete
             self._tail_counts[key] = sum(plan.tail for plan in queue)
 
+    def _note_tails(self, items) -> None:
+        """Record, per prompt, the fewest tokens kept at verify0 among its plans that
+        still need a continuation (``plan.verified[1]``: fixed at the decision, so a
+        function of the verification results, not of when the tails finish).
+        Read by the canonical tail-group order (``thundersync.tail_group_order``)."""
+        # (instance dict: the class forwards unknown attributes to the base engine)
+        tail_kept = self.__dict__.setdefault("_tail_kept", {})
+        for key, plan in items:
+            if plan.complete or plan.verified is None:
+                continue
+            kept = int(plan.verified[1])
+            prev = tail_kept.get(key)
+            tail_kept[key] = kept if prev is None else min(prev, kept)
+
+    def tail_kept(self, key) -> Optional[int]:
+        """Fewest verify0-kept tokens among the prompt's tail plans (None: no tail plan)."""
+        return self.__dict__.get("_tail_kept", {}).get(key)
+
     def tail_count(self, prompt: torch.Tensor) -> int:
         """Rollouts of this prompt whose plan needed a continuation (tail rows)."""
         return self._tail_counts.get(_key(prompt), 0)
@@ -3545,6 +3563,8 @@ class SpeculativeGeneration:
         # on with theirs, every other stream stops.
         kept = {id(plan.stream) for _, plan in pending if plan.stream is not None}
         self._stop_streams([x for x in streams if id(x) not in kept])
+        self._tail_kept = {}
+        self._note_tails(pending)
         self._tail_plans = {id(plan) for _, plan in pending}
         # Verify-in-train placeholders: their rollouts wait for the training forward.
         self._tail_plans |= {id(plan) for _, plan in plans if plan.vit}
@@ -3616,6 +3636,7 @@ class SpeculativeGeneration:
         self._fused_claims.clear()
         self._tail_plans = set()
         self._tail_counts = {}
+        self._tail_kept = {}
         self._verify_error = None
         self._pending = defaultdict(int)
         for k in by_key:
@@ -3777,6 +3798,7 @@ class SpeculativeGeneration:
                     if plan.verified is not None:
                         trace.verified(k, plan, *plan.verified)
                 pending = [(k, plan) for plan in plans if not plan.complete]
+                self._note_tails(pending)
                 # The drafts' streams still decode: whole-accepted unfinished
                 # plans go on with theirs, every other stream of k stops.
                 kept = {id(plan.stream) for _, plan in pending if plan.stream is not None}
@@ -4036,6 +4058,7 @@ class SpeculativeGeneration:
                 self._pending[k] = 1
         self.plans.clear()
         self._tail_plans = set()
+        self._tail_kept = {}
 
     async def verify_sticky_blocks(
         self,
@@ -4173,6 +4196,7 @@ class SpeculativeGeneration:
                         if plan.verified is not None:
                             trace.verified(k, plan, *plan.verified)
                     pending = [(k, plan) for k, plan in new if not plan.complete]
+                    self._note_tails(pending)
                     kept_streams |= {id(p.stream) for _, p in pending if p.stream is not None}
                     self._stop_streams(
                         [x for k in keys for x in streams_by_key.get(k, []) if id(x) not in kept_streams]
