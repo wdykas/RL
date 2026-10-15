@@ -329,6 +329,11 @@ def _apply_optional_inference_config_kwargs(
     }
     cast_fields = {
         "cuda_graph_max_tokens": int,
+        # Prefill/mixed CUDA graphs up to max_tokens (exponential sizes) instead of
+        # cuda_graph_max_tokens: removes the eager prefill-step floor (engine-side
+        # verification's small piece prefills; DESIGN 14q).
+        "cuda_graph_all_prefills": bool,
+        "cuda_graph_mixed_prefill_count": int,
         "vision_embedding_cache_max_bytes": int,
         "allow_stale_multimodal_embeddings": bool,
         "prefix_cache_ttl_seconds": float,

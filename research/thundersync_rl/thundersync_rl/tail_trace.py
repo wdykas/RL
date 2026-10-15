@@ -24,8 +24,17 @@ cont_rejects, cont_tokens, final_len, t_complete], ``timeline/tail_rounds``
 
 from __future__ import annotations
 
+import itertools
+import os
 import time
 from typing import Any, Hashable, Optional
+
+# Debug (``THUNDERSYNC_TAIL_DUMP=<dir>``): the token contents of every drafted row
+# of the step -- prompt, draft, final rollout, each rejection's position and dead
+# tokens -- written by ``summary`` to <dir>/tail_<pid>_<n>.pt for offline replays
+# (research/tail_speed/lookup_replay.py: lookup speculation on real tail rows).
+# Rank-0 driver memory: one copy of the step's drafted tokens (int32).
+_DUMP_SEQ = itertools.count()
 
 
 def _q(xs: list[float], q: float) -> float:
@@ -43,6 +52,8 @@ class TailTrace:
         self._groups: dict[Hashable, int] = {}
         self.rounds: list[list[float]] = []
         self.rejects: list[list[float]] = []
+        self.dump = os.environ.get("THUNDERSYNC_TAIL_DUMP") or None
+        self._tok: dict[int, dict[str, Any]] = {}  # id(plan) -> tokens (dump only)
 
     def now(self) -> float:
         return time.perf_counter() - self.t0
@@ -65,8 +76,16 @@ class TailTrace:
         )
         if rejected:
             self.rejects.append([0, accepted, t, drafted - accepted, g])
+        if self.dump:
+            draft = list(getattr(plan, "draft_tokens", None) or [])
+            self._tok[id(plan)] = dict(
+                key=list(key), plan=plan, draft=draft, group=g,
+                rejects=[(0, accepted, draft[accepted:])] if rejected else [],
+            )
 
-    def piece(self, plan, start: int, tokens: int, accepted: int, decoded: int) -> None:
+    def piece(
+        self, plan, start: int, tokens: int, accepted: int, decoded: int, toks=None
+    ) -> None:
         """A verified continuation piece: tokens [start, start + tokens) of its stream.
 
         ``decoded``: the stream's length when the piece was taken, so a
@@ -83,6 +102,8 @@ class TailTrace:
             r["cont_rej"] += 1
             pos = len(plan.prefix) - 1  # the residual token just appended
             self.rejects.append([1, pos, self.now(), max(0, decoded - start - accepted), r["group"]])
+            if self.dump and id(plan) in self._tok and toks is not None:
+                self._tok[id(plan)]["rejects"].append((1, pos, list(toks)[accepted:]))
 
     def completed(self, plan) -> None:
         r = self._rows.get(id(plan))
@@ -137,4 +158,29 @@ class TailTrace:
         ]
         out["timeline/tail_rounds"] = [[round(x, 4) for x in r] for r in self.rounds]
         out["timeline/tail_rejects"] = [[round(x, 4) for x in r] for r in self.rejects]
+        if self.dump:
+            self._write_dump()
         return out
+
+    def _write_dump(self) -> None:
+        import torch
+
+        def t(x):
+            return torch.tensor(list(x), dtype=torch.int32)
+
+        rows = []
+        for pid, e in self._tok.items():
+            r = self._rows.get(pid, {})
+            rows.append(
+                dict(
+                    key=t(e["key"]), draft=t(e["draft"]), final=t(e["plan"].prefix),
+                    group=e["group"], done=r.get("done"),
+                    rejects=[(src, int(pos), t(dead)) for src, pos, dead in e["rejects"]],
+                )
+            )
+        os.makedirs(self.dump, exist_ok=True)
+        torch.save(
+            {"rows": rows, "rounds": self.rounds, "marks": self.marks},
+            os.path.join(self.dump, f"tail_{os.getpid()}_{next(_DUMP_SEQ):04d}.pt"),
+        )
+        self._tok.clear()

@@ -352,6 +352,30 @@ def behavior_logprobs(
 # every SpeculativeGeneration of the driver (one per engine lane).
 _LEARNER_SEQ = itertools.count()
 
+# verify_yield (DESIGN 14x): one VerifyMailbox per learner worker group, shared
+# by every SpeculativeGeneration (engine lane) of the process.
+_YIELD_MAILBOXES: dict[int, tuple[Any, bool]] = {}
+
+
+def verify_yield_mailbox(group) -> tuple[Any, bool]:
+    """(mailbox, whether learner ranks yield at boundaries) for ``group``, made once.
+
+    Call while no learner call is in flight: the setter waits for each rank.
+    """
+    if id(group) not in _YIELD_MAILBOXES:
+        from thundersync_rl.verify_yield import VerifyMailbox
+
+        mb = VerifyMailbox.remote()
+        on = ray.get(group.run_all_workers_single_data("set_verify_mailbox", mailbox=mb))
+        _YIELD_MAILBOXES[id(group)] = (mb, bool(all(on)))
+        if not all(on):
+            print(
+                "[thundersync] verify_yield: pipeline parallel size > 1, posted "
+                "verifications run in order (boundary yields not built for PP > 1)",
+                flush=True,
+            )
+    return _YIELD_MAILBOXES[id(group)]
+
 
 class SpeculativeGeneration:
     def __init__(
@@ -1957,11 +1981,34 @@ class SpeculativeGeneration:
             walks=walks, walk_scans=walk_scans, pins=pins,
         )
         done = []
+        posted = self.__dict__.get("_posted_keys", {})
         for a, refs in futs:
-            # A worker thread waits on the results; the event loop keeps going.
-            done.append((a, await asyncio.to_thread(ray.get, refs)))
-        if getattr(self, "learner_ordered", False):
-            self._learner_inflight.difference_update(r for _, refs in futs for r in refs)
+            key = posted.pop(id(refs), None)
+            if key is None:
+                # A worker thread waits on the results; the event loop keeps going.
+                done.append((a, await asyncio.to_thread(ray.get, refs)))
+                if getattr(self, "learner_ordered", False):
+                    self._learner_inflight.difference_update(refs)
+                continue
+            # verify_yield: the result comes from the mailbox as soon as some rank
+            # path ran it (a training boundary or the ordered call); the ordered
+            # call's refs stay tracked until they finish (``learner_drain``).
+            res = asyncio.ensure_future(
+                asyncio.to_thread(ray.get, self._yield_mb.result.remote(key))
+            )
+            calls = asyncio.ensure_future(asyncio.to_thread(ray.get, refs))
+            await asyncio.wait({res, calls}, return_when=asyncio.FIRST_COMPLETED)
+            if calls.done() and calls.exception() is not None:
+                res.cancel()
+                raise calls.exception()  # a rank failed in the ordered call
+            boxes = await res
+            errors = [b[1] for b in boxes if b[0] is None]
+            if errors:
+                raise RuntimeError(f"verify_yield: posted verification {key} failed: {errors[0]}")
+            if not calls.done():
+                # Still tracked (learner_drain); its outcome surfaces there.
+                calls.add_done_callback(lambda f: f.exception())
+            done.append((a, await asyncio.to_thread(ray.get, [b[0] for b in boxes])))
         return self._verify_block_results(flat, done, keep_hidden=keep_hidden)
 
     def _submit_verify_block(
@@ -2029,6 +2076,33 @@ class SpeculativeGeneration:
                 extra = {**extra, "row_seed_base": int(row_seed_base)}
             seq = self.learner_seq() if ordered else None
             call = (method,) if seq is None else ("ordered_call",)
+            if seq is not None and self._yield_ready(g):
+                # verify_yield (DESIGN 14x): the call goes to the mailbox; the
+                # ordered call only holds its place in the learner order.
+                kwargs = dict(
+                    extra,
+                    rows=rows[a:b],
+                    prompt_lens=[d[0].numel() for _, d in flat[a:b]],
+                    segments=[d[5] for _, d in flat[a:b]],
+                    vocab_limit=self.vocab_limit,
+                    seed=next(self._verify_seeds),
+                    keys=[d[4] for _, d in flat[a:b]],
+                    precision=self.verify_precision,
+                    batch_tokens=self.verify_batch_tokens,
+                    lazy=self.verify_lazy,
+                )
+                ray.get(
+                    self._yield_mb.post.remote(
+                        seq, [ray.put({"method": method, "kwargs": kwargs})], len(g.workers)
+                    )
+                )
+                refs = g.run_all_workers_single_data(
+                    "ordered_call", seq=seq, method="posted_call", key=seq
+                )
+                self.__dict__.setdefault("_posted_keys", {})[id(refs)] = seq
+                futs.append((a, refs))
+                self.learner_track(refs)
+                continue
             if seq is not None:
                 extra = {**extra, "seq": seq, "method": method}
             futs.append(
@@ -2058,6 +2132,24 @@ class SpeculativeGeneration:
             if seq is not None:
                 self.learner_track(futs[-1][1])
         return futs
+
+    def _yield_ready(self, g) -> bool:
+        """``verify_yield`` posts this pool's ordered verifications (learner pool, one pool)."""
+        if not self.__dict__.get("verify_yield", False) or len(self.verifiers) != 1:
+            return False
+        if self.__dict__.get("_yield_mb") is None:
+            self._yield_mb, self._yield_on = verify_yield_mailbox(g)
+        return True
+
+    def yield_stats(self) -> dict[str, float]:
+        """Learner ranks' inlined verifications since the last call (max over ranks)."""
+        if self.__dict__.get("_yield_mb") is None:
+            return {}
+        per = ray.get(self.verifiers[0].run_all_workers_single_data("yield_stats"))
+        out = {}
+        for k in ("inlined", "inline_s", "boundaries", "poll_s"):
+            out[f"learner/yield_{k}"] = float(max((p.get(k, 0) for p in per), default=0))
+        return out
 
     def _verify_block_results(self, flat, done, keep_hidden: bool = False) -> dict[int, dict[str, Any]]:
         """Results by row from [(first row, per-rank results)] of ``_submit_verify_block``."""
@@ -2470,6 +2562,9 @@ class SpeculativeGeneration:
     def _plan(self, d, r) -> Plan:
         """Turn one draft and its verification result into a rollout plan."""
         plan = self._plan_tokens(d, r)
+        if os.environ.get("THUNDERSYNC_TAIL_DUMP"):
+            # Debug: the draft's tokens for the tail dump (TailTrace).
+            plan.draft_tokens = [int(x) for x in d[2]]
         if "band_log_weight" in r:
             plan.log_weight = float(r["band_log_weight"])
             self._band_rows.append((plan.log_weight, bool(r["band_exited"])))
@@ -2896,6 +2991,9 @@ class SpeculativeGeneration:
         self.learner_ordered = True
         self._learner_inflight: set = set()
         self.learner_wait = {"drain": 0.0}
+        if self.__dict__.get("verify_yield", False) and self.__dict__.get("verifiers"):
+            # Before any ordered call of the step is sent (the setter is unordered).
+            self._yield_ready(self.verifiers[0])
 
     def end_streaming_tails(self) -> None:
         for k, v in getattr(self, "learner_wait", {}).items():
@@ -3543,7 +3641,7 @@ class SpeculativeGeneration:
                     else:
                         restart.append(s)
                 if trace is not None:
-                    trace.piece(plan, start_pos, g, n_acc, s["decoded"])
+                    trace.piece(plan, start_pos, g, n_acc, s["decoded"], toks=toks)
                     if plan.complete:
                         trace.completed(plan)
             if trace is not None:
@@ -3632,10 +3730,11 @@ class SpeculativeGeneration:
                 plan.prefix += cw["toks"][:tau] + [y]
                 plan.prefix_logprobs += cw["lps"][:tau] + [lpy]
                 plan.anchors = cw["anchors"].truncate(len(s["key"]) + start_pos + tau)
+                blk_toks = cw["toks"] if trace is not None and trace.dump else None
                 self._cw_reset(s)
                 done_streams.append(s)
                 if trace is not None:
-                    trace.piece(plan, start_pos, n_blk, tau, s["decoded"])
+                    trace.piece(plan, start_pos, n_blk, tau, s["decoded"], toks=blk_toks)
                 if self._horizon_done(plan, len(s["key"])):
                     pass
                 elif self._turn_ended(s["key"], plan, y):

@@ -3521,6 +3521,69 @@ partial to fp32. The partials are then added in rank order. That makes the round
 **Default.** Opt-in: +5% engine decode at EP4 and +16 ms per 4k-token-per-rank prefill step. Turn it on for
 layouts whose engine EP differs from the learner's (lanes, Ultra/1T).
 
+## 14x. Tail speed: verification yields into training, graphed restart prefill, lookup on real tail rows
+
+*Branch ts-tail-speed (../RL-tail). Code: `thundersync_rl/verify_yield.py`, `worker.py` (`_run_train_pieces`,
+`ordered_call`), `speculative.py` (`_submit_verify_block`, `_verify_block_async`), `tail_trace.py` (dump). Notes,
+numbers and scripts: thundersync_work/research/agent_tail_speed.md, research/tail_speed/.*
+
+**Where the post-refit tail goes [M, TailTrace timelines; tail_crit.py, round_wait.py].** One rejected row usually
+sets the step. Its critical path is: rejection detected → restart (re-prefill of prompt + kept prefix) → decode a
+piece → wait for the piece's verification → ... → decode the remainder → verify the last piece.
+- Nano L8 1k, lanes (cut-p-l2*, ev3-*): tail after verify0 1.0–3.0 s per step; the slowest row has 1–2 restarts and
+  its last segment decodes at ~3 ms/token, plus 0.1–1.3 s waiting for its last piece's verification. Piece-round
+  latency p50 0.2–0.9 s, of which 20–75% is time behind a running training dispatch (~1.0–1.6 s each).
+- Full Nano 8k EP8 (ts_nonull acc-momentum, 16 GPUs): tail 150–195 s of a 290–370 s step. The slowest row has 3–5
+  rejections on its path; each continuation rejection is found 20–35 s after its token was decoded (2–4k wasted
+  tokens at ~10 ms/token). Piece-round latency p50 ~21 s, ~half of it behind a training dispatch (~15 s each,
+  17 dispatches per step); the rest is the verification forwards themselves queued behind each other (learner
+  verify busy 45–95 s per step). The remainder decode itself runs at ~10 ms/token.
+- Restart prefill: ≤ 5 restarts on the slowest row → ≤ 0.15 s (L8 eager, 25–31 ms each) and ≤ 0.8 s (full Nano
+  eager, 125–170 ms each) per step; graphed prefill steps (`cuda_graph_all_prefills`, measured by the engine-verify
+  agent: L8 27 → 7.6 ms, join +32 → +5.5 ms; full Nano 120 → 35 ms, join +148 → +32 ms at 1k) cut that ~4x.
+
+**Verification yields into training (`thundersync.verify_yield`, opt-in).** While streaming over the tails every
+learner call is numbered and runs in that order on every rank (14k ordered calls), so a piece verification sent
+while a training dispatch runs waits for the whole dispatch. With `verify_yield` the driver posts each
+continuation verification (pieces, carried-walk scans) to a `VerifyMailbox` actor and sends a small ordered call
+(`posted_call`) to hold its place. A rank running a training dispatch asks the mailbox at every micro-batch
+boundary whether the next ordered call is a posted verification; if so it runs it there (PP = 1: the boundary is
+Megatron taking micro-batch i, after micro-batch i−1's backward; hook: a wrapper over the call's micro-batch
+iterator) and posts the result. The ordered call then finds it done. The driver reads results from the mailbox.
+- Agreement: ranks whose forwards share collectives decide together. Domain = the EP group (EP > 1; its ranks
+  train in lockstep, equal micro-batch counts) or one DP replica (EP = 1; its TP/CP ranks hold the same rows).
+  The mailbox makes one decision per (domain, dispatch, boundary, slot), atomically; every rank of the domain
+  reads it. Ranks of different domains share no collective in a verification.
+- Exactness: the dispatch runs the same micro-batches in the same order with the same loss scaling and the same
+  gradient captures; the inlined call is a no-grad forward, and router-replay targets, RNG states and module modes
+  are restored after it. Verification results do not depend on when they run (θ_k fixed within the step, explicit
+  seeds, batch-invariant kernels). So gradients, decisions and tokens equal the ordered path's; only timing
+  changes. Not inlined: fused-verify-train calls (their substitute forward), verify-in-train calls.
+- Per-rank cost: one mailbox round trip per micro-batch boundary (~1 ms against 0.3–4 s micro-batches), the
+  posted payload fetched once per rank (what the ordered call carried before), one result put. The mailbox holds
+  the payload references of verifications in flight and the decisions of the running dispatch per domain
+  (dropped when the domain moves on). One actor per learner; at thousands of ranks the boundary queries are one
+  small RPC per rank per micro-batch.
+- Wait bound: a verification waits at most one micro-batch (plus the posted verifications ahead of it) instead of
+  a dispatch: Nano L8 1k (2 micro-batches per rank per dispatch) ~1.1 s → ≤ ~0.55 s; full Nano 8k EP8 (8
+  micro-batches per rank per dispatch at mbs 1, deal-rows note DR) 11–15 s → ≤ ~1.5–2 s.
+- Not built: PP > 1 (a 1F1B schedule has no boundary common to all stages; posted calls then run in order as
+  before). Untested: TP > 1, CP > 1.
+
+**Graphed restart prefill.** `mcore_generation_config.cuda_graph_all_prefills` (engine-verify 523cc454,
+cherry-picked) graphs prefill and mixed steps up to `max_tokens`; every restart (verify0 rejection, piece
+rejection, stale stream) pays the graphed step instead of the eager floor. Bitwise: the engine-verify agent's
+graphed-prefill arms (evl-x-g, ev3-ex-l2-s05) are EXACT with engine-q checks; on the learner-verify path the
+engine's q is checked per token by THUNDERSYNC_ENGINE_Q_CHECK (ty-x-* arms).
+
+**Lookup speculation on real tail rows.** `THUNDERSYNC_TAIL_DUMP=<dir>` (debug) writes each step's drafted rows
+(prompt, draft, final rollout, rejection positions and dead tokens). `research/tail_speed/lookup_replay.py` replays
+the remainder lookup proposer (own context + dead tokens + group drafts; tail_remainder_spec `sim.py`) on the
+remainders that were actually sampled and kept: with sample-and-match the forwards a lookup engine would need
+follow exactly from those tokens. In-loop on Nano L8/L16 the remainder lookup engine path gave 1.00 tokens per
+forward (remspec-nano4c: truncated models do not repeat text); real full-Nano text gave 1.74 offline
+(agent_tail_remainder_spec.md). Results on dumped tail rows: agent_tail_speed.md.
+
 
 ## 14w. Dealing dispatch rows over every learner DP rank (`thundersync.deal_rows`, default on)
 
