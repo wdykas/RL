@@ -3565,7 +3565,8 @@ iterator) and posts the result. The ordered call then finds it done. The driver 
   (dropped when the domain moves on). One actor per learner; at thousands of ranks the boundary queries are one
   small RPC per rank per micro-batch.
 - Wait bound: a verification waits at most one micro-batch (plus the posted verifications ahead of it) instead of
-  a dispatch: Nano L8 1k ~0.5 s → ≤ 0.5 s; full Nano 8k (4 rows/rank/dispatch at mbs 1) ~15 s → ≤ ~4 s.
+  a dispatch: Nano L8 1k (2 micro-batches per rank per dispatch) ~1.1 s → ≤ ~0.55 s; full Nano 8k EP8 (8
+  micro-batches per rank per dispatch at mbs 1, deal-rows note DR) 11–15 s → ≤ ~1.5–2 s.
 - Not built: PP > 1 (a 1F1B schedule has no boundary common to all stages; posted calls then run in order as
   before). Untested: TP > 1, CP > 1.
 
