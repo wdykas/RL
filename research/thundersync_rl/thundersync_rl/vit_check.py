@@ -45,6 +45,10 @@ step's gradient buffers snapshotted before and restored after:
       on the same rows                                         -> GP
       * ``corr``: GP vs G0 (the "linear correction" is exact in exact arithmetic;
         this measures its fp difference)
+  WZ  every micro-batch's loss x 0 (verify-in-train's masking of a micro-batch
+      with a rejection); WM  every row of every item masked as padding:
+      * ``wz`` / ``wm`` vs the gradient before the call: must be 0 (a whole
+        masked micro-batch contributes exact zeros; the production condition)
   final: restore the snapshot and rerun R0 (the regular result is what trains;
       ``ctl2``: equal to G0).
 
@@ -123,9 +127,10 @@ def grads_to_host(worker) -> dict[str, torch.Tensor]:
     return {n: g.detach().to("cpu", copy=True) for n, g in param_grads(worker)}
 
 
-def compare(worker, ref: dict[str, torch.Tensor]) -> tuple[int, float, float, int]:
-    """(differing elements, max |d|, max |d| / max |ref| over params, params differing)."""
-    bad, worst_abs, worst_rel, nparams = 0, 0.0, 0.0, 0
+def compare(worker, ref: dict[str, torch.Tensor]) -> tuple[int, float, float, int, int]:
+    """(differing elements, max |d|, max |d| / max |ref| over params, params differing,
+    differing elements in MoE expert weights)."""
+    bad, worst_abs, worst_rel, nparams, bad_exp = 0, 0.0, 0.0, 0, 0
     for n, g in param_grads(worker):
         r = ref[n].to(g.device, non_blocking=True)
         if torch.equal(r, g):
@@ -135,11 +140,13 @@ def compare(worker, ref: dict[str, torch.Tensor]) -> tuple[int, float, float, in
             continue
         bad += ne
         nparams += 1
+        if ".experts." in n:
+            bad_exp += ne
         d = float((r.float() - g.float()).abs().max())
         m = float(r.float().abs().max())
         worst_abs = max(worst_abs, d)
         worst_rel = max(worst_rel, d / m if m > 0 else float("inf"))
-    return bad, worst_abs, worst_rel, nparams
+    return bad, worst_abs, worst_rel, nparams, bad_exp
 
 
 def _live(data) -> torch.Tensor:
@@ -189,6 +196,33 @@ def scale_adv(items, f: Callable[[torch.Tensor], torch.Tensor]) -> None:
         it["data"]["advantages"] = f(it["data"]["advantages"].clone())
 
 
+def mask_all(items) -> None:
+    """Every row of every item masked like a padding row (whole micro-batches)."""
+    for it in items:
+        d = it["data"]
+        for k in ("sample_mask", "token_mask", "advantages"):
+            d[k] = torch.zeros_like(d[k])
+
+
+@contextmanager
+def zero_loss():
+    """Every micro-batch's loss multiplied by 0 (what verify-in-train does to a
+    micro-batch with a rejection: the backward runs, contributing exact zeros)."""
+    from nemo_rl.algorithms.loss.loss_functions import ClippedPGLossFn
+
+    orig = ClippedPGLossFn.__call__
+
+    def patched(self, *args, **kwargs):
+        loss, metrics = orig(self, *args, **kwargs)
+        return loss * 0.0, metrics
+
+    ClippedPGLossFn.__call__ = patched
+    try:
+        yield
+    finally:
+        ClippedPGLossFn.__call__ = orig
+
+
 @contextmanager
 def capture_logprobs(stats: dict[str, float]):
     """Patch ClippedPGLossFn.__call__ to compare the training forward's p with generation_logprobs."""
@@ -223,6 +257,7 @@ def run_check(worker, call_items, mbs_per_item, bucket, tprof, call_index: int) 
     """Replaces one ``_stream_train_call`` (final chunks); leaves the regular result in place."""
     pristine = copy_items(call_items)
     snap = snapshot(worker)
+    g_pre = grads_to_host(worker)
     train = lambda items, mbs: worker._stream_train_call(items, list(mbs), bucket, tprof)
     out: dict[str, Any] = {}
 
@@ -268,6 +303,18 @@ def run_check(worker, call_items, mbs_per_item, bucket, tprof, call_index: int) 
     scale_adv(items, lambda a: a - a * 0.7)
     train(items, mbs_per_item)
     out["corr"] = compare(worker, g0)
+    # WZ / WM: whole micro-batches masked (the production condition): the call
+    # must leave the accumulated gradient bitwise unchanged.
+    restore(worker, snap)
+    with zero_loss():
+        train(copy_items(pristine), mbs_per_item)
+    out["wz"] = compare(worker, g_pre)
+    restore(worker, snap)
+    items = copy_items(pristine)
+    mask_all(items)
+    train(items, mbs_per_item)
+    out["wm"] = compare(worker, g_pre)
+    del g_pre
     # final: the regular result
     restore(worker, snap)
     train(copy_items(pristine), mbs_per_item)
@@ -278,8 +325,8 @@ def run_check(worker, call_items, mbs_per_item, bucket, tprof, call_index: int) 
         f"p_tokens={int(out['p_tokens'])} p_diff_tokens={int(out['p_diff_tokens'])} "
         f"p_max_abs={out['p_max_abs']:.3e} p_shape_skips={int(out['p_shape_skips'])} "
         + " ".join(
-            f"{k}=" + ("None" if out[k] is None else f"{out[k][0]}/{out[k][1]:.3e}/{out[k][2]:.3e}/{out[k][3]}")
-            for k in ("ctl", "ctl2", "mask", "absent", "corr")
+            f"{k}=" + ("None" if out[k] is None else f"{out[k][0]}/{out[k][1]:.3e}/{out[k][2]:.3e}/{out[k][3]}/{out[k][4]}")
+            for k in ("ctl", "ctl2", "mask", "absent", "corr", "wz", "wm")
         ),
         flush=True,
     )
