@@ -33,6 +33,14 @@ thundersync:
   verify_overlap: true  # verify concurrently with the rollouts
   verify_longest_first: true  # longest drafts (likely stragglers) first
   verify_batch_tokens: 16384  # tokens per scorer forward (bounds logits memory)
+  # Risk-first streaming verify0 (DESIGN.md 14z; opt-in, sticky streaming over the tails): verify0 runs inside
+  # the step in calls of whole prompts, riskiest first (draft length x past steps' whole acceptance); each
+  # prompt's tails start at its decision and its ready groups train between the calls.
+  verify0_stream: false
+  verify0_stream_first_chunk_tokens: 262144  # forward tokens of the first call (the riskiest prompts)
+  verify0_stream_chunk_tokens: 524288  # forward tokens of each later call
+  verify0_stream_window: 2  # verification calls queued on the learner at once
+  verify0_stream_order: risk  # risk (past-only score, riskiest first) | drafting (control)
   # EXPERIMENTAL (untested on GPU): fused verification + training under
   # policy.megatron_cfg.batch_invariant_mode. Needs verify_on=learner and
   # verify_precision=model; see DESIGN.md section 14.

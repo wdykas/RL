@@ -272,6 +272,47 @@ class StreamPlanner:
             self._blocks.append(self.order[at : at + b])
             at += b
 
+    def begin_order(self, block_tokens: Optional[int] = None) -> None:
+        """A canonical order that grows while the step runs (``extend_order``).
+
+        Streaming verify0 (DESIGN 14z): the order is known chunk by chunk, as
+        the drafts' verification decides them. Dispatch follows the order
+        known so far exactly as ``set_order`` would (a block waits for all its
+        groups, after every block before it); groups not yet in the order wait.
+        ``close_order`` checks that every registered group was listed once.
+        """
+        if self.max_open_groups:
+            raise ValueError("a canonical group order needs group granularity")
+        if block_tokens is not None and block_tokens <= 0:
+            raise ValueError(f"block_tokens must be positive (got {block_tokens})")
+        self.order, self._next, self._seg_pos = [], 0, 0
+        self._block_tokens = block_tokens
+        self._blocks = []
+        self._order_open = True
+
+    def extend_order(self, groups: list[GroupId], block_sizes: list[int]) -> None:
+        """Append ``groups`` (partitioned by ``block_sizes``) to a growing order."""
+        if not getattr(self, "_order_open", False):
+            raise RuntimeError("extend_order needs begin_order (and an order not yet closed)")
+        if any(b <= 0 for b in block_sizes) or sum(block_sizes) != len(groups):
+            raise ValueError(f"block sizes {block_sizes} do not partition {len(groups)} groups")
+        known = set(map(repr, self.order))
+        for g in groups:
+            if repr(g) in known or g not in self.groups:
+                raise ValueError(f"group {g!r} is listed twice or not registered")
+            known.add(repr(g))
+        at = 0
+        for b in block_sizes:
+            self._blocks.append(list(groups[at : at + b]))
+            at += b
+        self.order.extend(groups)
+
+    def close_order(self) -> None:
+        """The growing order is complete: it must list every registered group once."""
+        if sorted(map(repr, self.order)) != sorted(map(repr, self.groups)):
+            raise ValueError("the order must list every registered group once")
+        self._order_open = False
+
     def register_group(self, group: GroupId, size: int, tails: int = 0) -> None:
         """``tails``: rows of the group that need a continuation (tail-excluded baseline)."""
         self.groups[group] = _Group(size=size, tails=tails)

@@ -641,6 +641,7 @@ hidden states and print how many drafted tokens' log q match the engine bitwise)
 | `thundersync_rl/block_verification.py` | Reference block verification, shared acceptance helpers, exact output law |
 | `thundersync_rl/block_verification_fused.py` | Block verification from raw logits with a Triton residual-mass kernel; lazy variant from per-position statistics |
 | `thundersync_rl/null_bv.py` | Pooled ⊥-BV: envelope policy (DP over drafts/slots left, Brownian tail-decode model), per-prompt slot state (section 14d) |
+| `thundersync_rl/verify0_stream.py` | Risk-first streaming verify0: past-only risk model, call schedule over whole prompts, growing canonical order, tail feed (section 14z) |
 | `thundersync_rl/lanes.py` | Cohort lanes: lane roles, the cohort pinning invariant, lane timeline, lane builder and per-lane refit (section 14j) |
 | `thundersync_rl/routes.py` | Sticky routing: engine route log, object-store route blocks (`RouteRefs`), per-stage fetch (section 14c); rule in `nemo_rl/models/megatron/sticky_routing.py` |
 | `thundersync_rl/engine_q.py` | Engine-sourced q under BI: engine hidden-state log, per-step row mapping, verification from engine log q + rows on demand |
@@ -3662,6 +3663,109 @@ exactness + skipped counts), multi-node `sbatch/go_bughunt.sh`.
   verification call, so each step reported its last call (one piece on one rank) = DP = 8.0 in every
   full-Nano history. Now ranks·Σbusiest/Σtotal over the step, plus `verify_load_first_max_over_mean`
   (verify0).
+
+## 14z. Risk-first streaming verify0 (`thundersync.verify0_stream`, opt-in; branch ts-verify0-stream, 2026-10-15)
+
+*Notes, enumeration and replay: `thundersync_work/research/agent_verify0_stream.md`, `research/v0s/`.
+Base: ts-bughunt-integ 5f835b57 (deal_rows 14w + zero-advantage skip 14x + 14y).*
+
+**Why.** verify0 (block verification of cohort k's drafts at θ_k) runs serially in front of every sticky
+step: full Nano 8k lanes (ab2) 40.6–45.4 s for 768 drafts / 3.4–3.6M drafted tokens, and every plan is
+published at its end (`tail/rows_done_q50_s` = `tail/verify0_s`). So the slowest row's tail starts at
+~41 s, and training of rows that verify0 accepted whole waits for the last draft's decision. With the
+filler and zero-advantage fixes the chain (verify0 + tail decode) is the binding term (fullnano_bug_hunt §0 #4).
+
+**What it does.**
+1. `prepare_stream` (step top, synchronous): filters and pools the drafts exactly as `verify` does,
+   then `schedule_chunks`: calls of **whole prompts**, sorted by (−risk score, drafting index), cut at
+   ≥ `verify0_stream_first_chunk_tokens` (262144) forward tokens for the first call and
+   ≥ `verify0_stream_chunk_tokens` (524288) for each later one. Rollouts of a drafted prompt wait for its
+   decision (`_plan_cv`, as chunked non-sticky verification already did); prompts never drafted decode at
+   θ_k after the tails, as before.
+2. `run_stream` (inside the step, the pre-rollout task): a pipeline of `verify0_stream_window` (2)
+   ordered learner calls. Call c + window is sent once call c's results are applied; it carries the
+   ⊥-BV follow-up waves of the pools decided so far (`_NullPoolRun`, shared with `_verify_null`) and the
+   next scheduled prompts, so follow-up waves never cost an extra call. Results are applied in call
+   order. A prompt whose pool is decided is **published at once**: plans in drafting order, its tails
+   (`plan.tail`) handed to the already-running continuation rounds (`_continue_sticky(feed=TailFeed)`),
+   its other draft streams stopped, its rollouts woken.
+3. **Training overlap.** `StreamOrder` grows the canonical order with the decisions: the ready groups
+   of the prompts decided after call 1 (group index order), after call 2, ..., then (once every prompt
+   is decided) the groups with tails, then the groups with a rollout never drafted; blocks of
+   `canonical_block_groups` within each segment (or `canonical_block_tokens` segments). The planner
+   follows the order as it grows (`StreamPlanner.begin_order / extend_order / close_order`), so ready
+   groups train between verification calls, ordered learner calls as before.
+4. **Risk = past only.** `Verify0Risk` (one object shared by the lanes): per draft-length bucket
+   (<256, <1k, <2k, <4k, <8k, ≥8k), the past steps' whole-acceptance rate (shrunk to a constant-hazard
+   prior e^{−2e−5·L}) times the past mean remainder after a verify0 rejection (final length − accepted,
+   shrunk to L). A prompt's score is the sum over its drafts (at 8k most prompts have a capped draft,
+   so a max ties everywhere). Updated once a step's tails are done: step k's schedule reads steps < k.
+   `verify0_stream_order: drafting` keeps drafting order (the control).
+
+**Exactness (argument).** Each pool's decision is a function of (its drafts, its rows' verification
+draws, the count process); the draws of a call are a fresh seed per call (`next(_verify_seeds)`), iid
+and independent of every draft. Streaming changes only (a) which call a row's draws come from and when,
+(b) when a decided plan is published / its tail starts / its group trains. Rules that keep both
+law-neutral, all enforced in code:
+- the schedule (call membership and order) is a function of counts (draft lengths, drafts per prompt,
+  tokens) and earlier steps only — never this step's tokens, log-ratios or decisions;
+- a prompt's pool is never split across calls (its follow-up waves ride in later calls but its count
+  process runs in drafting order inside the pool); drafts inside a pool keep drafting order;
+- every drafted row is decided whatever the order: no deadline, budget or other order-dependent switch
+  to another sampler (prompt drop, which selects prompts after all pools, is rejected by the validator);
+- tails start at the decision but are the same exogenous-piece continuation on D_k (§14c / 14k), and
+  their law does not depend on start time;
+- the canonical training order is a function of the schedule and the decisions; it moves fp32 summation
+  order only, never which rows train.
+Within these rules ordering by a content-derived count (draft length ends at EOS) is still exact: the
+order permutes which fresh iid draws a pool gets, and nothing switches on it.
+
+**Enumeration [T]** (`research/v0s/v0s_enum.py` → `v0s_enum.log`, 4 seeds; two prompts, N = 3/2 drafts,
+G = 2/1 slots, ⊥-BV M ∈ {1, 1.5}, variable-length sequences so length is content; the STREAM arms run the
+production `run_stream` / `schedule_chunks` / `_NullPoolRun` on every content combination):
+| scheme | TV to p×p×p | gradient bias (|∇| 0.02–0.20) | per-token mismatch / engine-q |
+|---|---|---|---|
+| one-shot verify0 | ≤ 1.8e-15 | ≤ 2e-16 | 0 |
+| streamed, risk-first by length, window 1 / 2 | ≤ 1.8e-15 (identical decisions) | ≤ 2e-16 | 0 |
+| content order **inside a pool** (shortest first) | 0.090–0.139 | up to 0.091 | 0 |
+| order-dependent switch (verify the first prompt only, by length) | 0.005–0.096 | up to 0.040 | 0 |
+| same switch, past-only order | ≤ 2.8e-15 | ≤ 1e-16 | 0 |
+The biased variants pass every in-loop check (each output carries p's own log-probs), so the
+enumeration, not an E2E run, is the guard. Unit tests [T, `tests/unit/test_verify0_stream.py`, 33]:
+streamed ⊥-BV decisions equal `_verify_null`'s for random grids, schedules and windows 1–3; call
+composition independent of result timing; growing order == final order dispatches under any arrival
+order; schedule reads counts only; driver end to end on the fake engine (streamed plans == `verify_sticky`'s).
+CPU suite: 1071 pass / 0 fail (base 5f835b57: 1040 / 0).
+
+**Costs (full Nano 8k, EP4 learner DP 8, lanes).**
+- Per rank: no new GPU or host state. Driver: O(drafts) pools / plans (as today), O(groups) order,
+  6-bucket risk table. Undecided prompts' draft streams keep decoding until their decision (today: until
+  verify0 ends; with streaming the last decisions can come later, behind interleaved training).
+  Prefix cache (14p): the per-step budget follows the tails admitted so far (same final "auto" size).
+- Fixed per verify call [D, unmeasured]: at 8k a verify forward holds one row (padded rows × max length
+  ≤ 16384), ~0.47 s per row-forward (ab2: 41.5 s / ~88 forwards per rank); a call waits for its busiest
+  rank (≤ 1 row above the mean) plus a Ray / ordered-call round trip: ~0.2–0.5 s per call, ~8 calls per
+  step (3.4M tokens / 524k) → +2–4 s learner time per step. (Training slots cost ~1.4 s each; verify
+  forwards are cheaper per call.) `v0s/verify_service_s` vs the control's `time/verify` measures it.
+- Ultra: calls stay EP-lockstep collectives of whole rows; their number is tokens / chunk tokens, the
+  schedule is O(prompts log prompts) on the driver; nothing per rank grows.
+
+**Expected effect [D, `research/v0s/replay_schedule.py` on ab2's measured tail rows; optimistic: training
+interleave and engine contention not modelled].** Chain end (latest row done) vs measured, 0.4 s/call:
+risk-first −14.4 s mean (0 … −36 s), drafting order −14.0 s, an oracle that knows the slowest tails −39.8 s.
+So per-call publication brings ~half of verify0 off the chain on average; the past-only length/remainder
+predictor is **no better than drafting order** on this run (at 8k most prompts look alike by length; the
+strongest known predictors — drafter entropy, sibling drafts, ICC .75 — read this step's content and are
+excluded by the rule above).
+
+**Not built.** Prompt drop, verify-in-train, multi-turn, anchor horizon, tail-excluded baseline (validator).
+Risk state is not checkpointed (a resumed run schedules differently; law unchanged). verify0 still starts
+after the drafter stage at the step top (lanes: θ̂_{k+1} is staged through the learner, ~3 s). ⊥-BV
+calibration's verify cost is the calls' service time, which includes interleaved training dispatches.
+
+**Validation queued.** L8 single node (queue_1node, v0s-*): exactness one engine / lanes / ts_nonull /
+8k with CHECKS=1, parity reward, forced fresh rows, zero-advantage groups; order replay. Full Nano 8k pair
+(control vs streaming, same frozen tree ../RL-v0s-scale): `bash thundersync_work/sbatch/go_v0s.sh`.
 
 ## 15. Open work
 

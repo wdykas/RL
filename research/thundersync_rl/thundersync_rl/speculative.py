@@ -61,6 +61,13 @@ from thundersync_rl.null_bv import LogRatioCalibration, NullGroup, NullPolicy, r
 from thundersync_rl.prefix_cache import PrefixCacheDirectory, lpt_owners
 from thundersync_rl import vit
 from thundersync_rl.tail_trace import TailTrace
+from thundersync_rl.verify0_stream import (
+    PromptCounts,
+    StreamOrder,
+    TailFeed,
+    Verify0Risk,
+    schedule_chunks,
+)
 from thundersync_rl.run_state import SeedStream
 from thundersync_rl.routes import (
     RouteRefs,
@@ -94,6 +101,63 @@ def _null_result(res: dict[str, Any], m: Optional[float]) -> dict[str, Any]:
         "null_m": m,
         "log_wstar": res.get("null_log_wstar", 0.0),
     }
+
+
+class _NullPoolRun:
+    """⊥-BV waves of one prompt's pool (``_verify_null`` / streaming verify0).
+
+    ``rows``: the pool's flat row indices in drafting order. ``next_wave``
+    gives the next ceil(s * M) rows to forward (s slots left, M the envelope
+    the counts give now; none once the pool is decided); ``decide`` takes one
+    forwarded row's grid result at the M the count process gives it, rows in
+    drafting order; ``close`` returns the rows never forwarded (unused).
+    Everything that selects rows or envelopes is a function of counts, so a
+    pool decides the same way whatever call its waves ride in.
+    """
+
+    def __init__(self, rows: list[int], slots: int, policy: NullPolicy):
+        self.queue = list(rows)
+        self.state = NullGroup(len(rows), slots, policy)
+        self.env = {i: row_envelopes(policy, len(rows), slots, j) for j, i in enumerate(rows)}
+        self.out: dict[int, dict[str, Any]] = {}
+        self.inflight = 0
+        self.waves = 0
+
+    def next_wave(self) -> list[int]:
+        if self.inflight:
+            return []
+        m = self.state.next_m()
+        if m is None or not self.queue:
+            return []
+        k = min(len(self.queue), math.ceil(self.state.s * m))
+        batch, self.queue = self.queue[:k], self.queue[k:]
+        self.inflight = len(batch)  # decided before the next wave
+        self.waves += 1
+        return batch
+
+    @property
+    def decided(self) -> bool:
+        """No row left to forward or decide (``next_wave`` is empty, none in flight)."""
+        return not self.inflight and (not self.queue or self.state.next_m() is None)
+
+    def decide(self, i: int, r: dict[str, Any], drop_is: bool, drafted: int) -> None:
+        self.inflight -= 1
+        m = self.state.next_m()
+        tail_drop = False
+        if m is not None:
+            tau, y, _ = r["null_grid"][m]
+            output = y >= 0
+            # Drop-IS: an output rejected inside its draft is dropped.
+            tail_drop = drop_is and output and tau < drafted
+            self.state.record(output, tail_dropped=tail_drop)
+        self.out[i] = _null_result(r, m)
+        if tail_drop:
+            self.out[i]["null"] = "tail_dropped"
+
+    def close(self) -> list[int]:
+        self.state.next_m()  # a pool left short after its last draft is dropped too
+        skipped, self.queue = self.queue, []
+        return skipped
 
 
 def data_parallel_size(group) -> int:
@@ -1944,6 +2008,8 @@ class SpeculativeGeneration:
         walk_scans: Optional[list] = None,
         pins: Optional[list] = None,
         keep_hidden: bool = False,
+        null_envelopes: Optional[list[tuple[float, ...]]] = None,
+        band: Optional[float] = None,
     ) -> dict[int, dict[str, Any]]:
         """``_verify_block`` without blocking the driver's event loop.
 
@@ -1953,8 +2019,8 @@ class SpeculativeGeneration:
         numbered calls run in the same order everywhere.
         """
         futs = self._submit_verify_block(
-            flat, rows, ordered=True, prefix_keys=prefix_keys,
-            walks=walks, walk_scans=walk_scans, pins=pins,
+            flat, rows, null_envelopes=null_envelopes, ordered=True, band=band,
+            prefix_keys=prefix_keys, walks=walks, walk_scans=walk_scans, pins=pins,
         )
         done = []
         for a, refs in futs:
@@ -2098,8 +2164,27 @@ class SpeculativeGeneration:
             )
             s.setdefault("spec/verify_load_first_max_over_mean", max(load) * ranks / sum(load))
 
-    def _finish_verify(self, drafts, flat, by_row, dropped) -> None:
-        """Plans and acceptance statistics from verification results."""
+    def _best_plan(self, d, r) -> Plan:
+        """The plan of a trajectory's best verified variant (``_finish_verify``)."""
+        plan = self._plan(d, r)
+        plan.verified = (len(d[2]), r["accepted"])
+        return plan
+
+    @staticmethod
+    def _best_variants(flat, by_row) -> dict[int, tuple[Any, dict[str, Any]]]:
+        """Per trajectory: its variant with the most accepted tokens (first on ties)."""
+        best: dict[int, tuple[Any, dict[str, Any]]] = {}
+        for r, (t, d) in enumerate(flat):
+            if t not in best or by_row[r]["accepted"] > best[t][1]["accepted"]:
+                best[t] = (d, by_row[r])
+        return best
+
+    def _finish_verify(self, drafts, flat, by_row, dropped, published=None) -> None:
+        """Plans and acceptance statistics from verification results.
+
+        ``published`` (streaming verify0): trajectory index -> the plan already
+        published for it (``_best_plan``); only the statistics are computed.
+        """
         # Every verified prefix is a prefix of the same keyed target sequence, so
         # the longest one per trajectory is kept.
         best: dict[int, tuple[tuple[torch.Tensor, int, list[int]], dict[str, Any]]] = {}
@@ -2109,7 +2194,8 @@ class SpeculativeGeneration:
                 if t in best:
                     variant_wins += 1
                 best[t] = (d, by_row[r])
-        self.plans.clear()
+        if published is None:
+            self.plans.clear()
         kept = total = full = 0
         # Draft age (versions between the drafting weights and the verifying
         # ones), token-weighted: drafted and kept tokens per age bucket.
@@ -2118,14 +2204,19 @@ class SpeculativeGeneration:
         pairs: list[tuple[int, int]] = []
         for i in range(len(drafts)):
             d, r = best[i]
-            plan = self._plan(d, r)
-            plan.verified = (len(d[2]), r["accepted"])
+            if published is None:
+                plan = self._best_plan(d, r)
+            else:
+                plan = published[i]
             pairs.append((len(d[2]), r["accepted"]))
-            full += plan.complete and r["accepted"] == len(d[2])
+            # Complete at verify0 (streamed plans may have finished their tails since).
+            done = plan.complete if published is None else not plan.tail
+            full += done and r["accepted"] == len(d[2])
             kept += r["accepted"]
             total += len(d[2])
             self._count_ages(d, r["accepted"], age_tok, age_kept)
-            self.plans[_key(d[0])].append(plan)
+            if published is None:
+                self.plans[_key(d[0])].append(plan)
         self.stats.update(
             {
                 "spec/draft_tokens": float(total),
@@ -2134,6 +2225,7 @@ class SpeculativeGeneration:
                 "spec/variant_wins": float(variant_wins),
             }
         )
+        self._v0_pairs = pairs
         self._age_stats(age_tok, age_kept)
         self._band_stats()
         self._longest_stats(pairs)
@@ -2176,70 +2268,85 @@ class SpeculativeGeneration:
         self._update_null_calibration()
         calib = self.__dict__.get("_null_calib")  # absent on test stubs
         t_verify, n_forwarded = time.perf_counter(), 0
-        policy = self._null_policy
-        queue: dict[str, list[int]] = defaultdict(list)
-        for i, g in enumerate(groups):
-            queue[g].append(i)
-        row_env: dict[int, tuple[float, ...]] = {}
-        for g, q in queue.items():
-            for j, i in enumerate(q):
-                row_env[i] = row_envelopes(policy, len(q), int(slots[g]), j)
-        state = {g: NullGroup(len(q), int(slots[g]), policy) for g, q in queue.items()}
-        out: dict[int, dict[str, Any]] = {}
+        pools = self._null_pools(flat, groups, slots)
         waves = 0
         while True:
-            batch = []
-            for g, q in queue.items():
-                m = state[g].next_m()
-                if m is None or not q:
-                    continue
-                k = min(len(q), math.ceil(state[g].s * m))
-                batch += q[:k]
-                del q[:k]
+            # One wave: every pool's next rows, pools in first-row order.
+            batch = [i for run in pools.values() for i in run.next_wave()]
             if not batch:
                 break
             waves += 1
             n_forwarded += len(batch)
+            row_env = {i: pools[groups[i]].env[i] for i in batch}
             res = self._verify_block(
                 [flat[i] for i in batch],
                 [rows[i] for i in batch],
                 null_envelopes=[row_env[i] for i in batch],
             )
-            for j in sorted(range(len(batch)), key=lambda j: batch[j]):
-                i, r = batch[j], res[j]
-                m = state[groups[i]].next_m()
-                tail_drop = False
-                if m is not None:
-                    tau, y, _ = r["null_grid"][m]
-                    output = y >= 0
-                    # Drop-IS: an output rejected inside its draft is dropped.
-                    tail_drop = self.null_bv_drop_is and output and tau < len(flat[i][1][2])
-                    state[groups[i]].record(output, tail_dropped=tail_drop)
-                out[i] = _null_result(r, m)
-                if tail_drop:
-                    out[i]["null"] = "tail_dropped"
-        for st in state.values():
-            st.next_m()  # a pool left short after its last draft is dropped too
-        self._null_dropped = {g for g, st in state.items() if st.dropped}
-        skipped = [i for q in queue.values() for i in q]
-        self._release_hidden(flat[i][1] for i in skipped)
-        for i in skipped:
-            out[i] = _null_result({}, None)
+            self._null_apply(pools, groups, flat, {i: res[j] for j, i in enumerate(batch)})
+        out = self._null_close(pools, flat)
         self.stats["spec/null_waves"] = float(waves)
         if calib is not None:
             # This step's verification cost, for later steps' policies only.
             calib.update_verify(time.perf_counter() - t_verify, n_forwarded)
-        self.stats["spec/null_envelopes_per_row"] = sum(map(len, row_env.values())) / max(len(row_env), 1)
+        return out
+
+    def _null_pools(self, flat, groups: list[str], slots: dict[str, int]) -> dict[str, "_NullPoolRun"]:
+        """One wave runner per prompt pool (first-row order); rows in drafting order."""
+        queue: dict[str, list[int]] = defaultdict(list)
+        for i, g in enumerate(groups):
+            queue[g].append(i)
+        return {g: _NullPoolRun(q, int(slots[g]), self._null_policy) for g, q in queue.items()}
+
+    def _null_apply(self, pools, groups, flat, results: dict[int, dict[str, Any]]) -> None:
+        """Decide the rows of ``results`` (row -> grid result), each pool in drafting order."""
+        for i in sorted(results):
+            pools[groups[i]].decide(
+                i, results[i], self.null_bv_drop_is,
+                len(flat[i][1][2]) if self.null_bv_drop_is else 0,
+            )
+
+    def _null_close(self, pools, flat) -> dict[int, dict[str, Any]]:
+        """Finish every pool: rows never forwarded are unused (hidden freed); stats."""
+        out: dict[int, dict[str, Any]] = {}
+        skipped: list[int] = []
+        for run in pools.values():
+            out.update(run.out)
+            skipped += run.close()
+        self._null_dropped = {g for g, run in pools.items() if run.state.dropped}
+        self._release_hidden(flat[i][1] for i in skipped)
+        for i in skipped:
+            out[i] = _null_result({}, None)
+        envs = [len(e) for run in pools.values() for e in run.env.values()]
+        self.stats["spec/null_envelopes_per_row"] = sum(envs) / max(len(envs), 1)
         self.stats["spec/null_skipped_drafts"] = float(len(skipped))
         return out
 
-    def _finish_verify_null(self, flat, by_row, groups, slots, dropped, n_empty):
+    def _null_plan(self, d, res) -> Plan:
+        """The plan of a ⊥-BV output row (``_finish_verify_null``)."""
+        plan = self._plan(d, res)
+        plan.verified = (len(d[2]), res["accepted"])
+        if self.null_bv_drop_is:
+            # max(1, W*/M): the kept row's law is p P(no tail | y) / P(no tail).
+            plan.log_weight = max(0.0, float(res["log_wstar"]) - math.log(res["null_m"]))
+        return plan
+
+    @staticmethod
+    def _null_is_output(res, group, dropped_groups) -> bool:
+        """Whether a decided ⊥-BV row is an output (gets a plan)."""
+        state = res.get("null")
+        return state not in ("unused", "tail_dropped", "bot") and group not in dropped_groups
+
+    def _finish_verify_null(self, flat, by_row, groups, slots, dropped, n_empty, published=None):
         """Plans and ⊥-BV statistics: each prompt's outputs in drafting order.
 
         Slots left empty (drafts ran out) get no plan: those rollouts decode
-        fresh from the current policy, an exact p-sample.
+        fresh from the current policy, an exact p-sample. ``published``
+        (streaming verify0): row -> the plan already published for it
+        (``_null_plan``); only the statistics are computed.
         """
-        self.plans.clear()
+        if published is None:
+            self.plans.clear()
         kept = total = full = 0
         n_out = n_bot = n_unused = n_tail = 0
         m_sum = 0.0
@@ -2278,16 +2385,15 @@ class SpeculativeGeneration:
                 continue
             n_out += 1
             outs_by_group[groups[r]] += 1
-            plan = self._plan(d, res)
-            plan.verified = (g, res["accepted"])
+            plan = self._null_plan(d, res) if published is None else published[r]
             if self.null_bv_drop_is:
-                # max(1, W*/M): the kept row's law is p P(no tail | y) / P(no tail).
-                plan.log_weight = max(0.0, float(res["log_wstar"]) - math.log(res["null_m"]))
                 weights.append(math.exp(plan.log_weight))
-            full += plan.complete and res["accepted"] == g
-            grp_done[groups[r]] = grp_done.get(groups[r], True) and plan.complete
+            # Complete at verify0 (streamed plans may have finished their tails since).
+            done = plan.complete if published is None else not plan.tail
+            full += done and res["accepted"] == g
+            grp_done[groups[r]] = grp_done.get(groups[r], True) and done
             grp_whole[groups[r]] = (
-                grp_whole.get(groups[r], True) and plan.complete and res["accepted"] == g
+                grp_whole.get(groups[r], True) and done and res["accepted"] == g
             )
             kept += res["accepted"]
             total += g
@@ -2296,7 +2402,9 @@ class SpeculativeGeneration:
                 n_tail += 1
                 rejected.append((g, res["accepted"]))
             self._count_ages(d, res["accepted"], age_tok, age_kept)
-            self.plans[_key(d[0])].append(plan)
+            if published is None:
+                self.plans[_key(d[0])].append(plan)
+        self._v0_pairs = out_pairs
         # Earliest rejection among the longest decided drafts (top decile by
         # length): the step waits on these continuations.
         n_dec = len(decided_len)
@@ -2875,6 +2983,318 @@ class SpeculativeGeneration:
         self._sticky_ended, self._sticky_plans = ended, plans
         return pending
 
+    # -- risk-first streaming verify0 (DESIGN 14z) ------------------------------
+
+    def prepare_stream(
+        self,
+        drafts,
+        risk: Verify0Risk,
+        first_tokens: int,
+        chunk_tokens: int,
+        window: int,
+        order: str = "risk",
+    ) -> dict[str, Any]:
+        """The synchronous part of streaming verify0, before the step's rollouts start.
+
+        Filters the drafts and forms the pools exactly as ``verify`` does, then
+        the schedule: calls of whole prompts, riskiest first, as a function of
+        counts and of past steps only (``schedule_chunks``). Every drafted
+        prompt's rollouts wait for its decision (``_plan_cv``); prompts never
+        drafted decode at theta_k as before. ``run_stream`` does the rest.
+        """
+        if self.turn_env is not None or self.verify_in_train or self.anchor_horizon is not None:
+            raise RuntimeError(
+                "verify0_stream: multi-turn, verify-in-train and the anchor horizon are not built"
+            )
+        if window < 1:
+            raise ValueError("verify0_stream_window must be >= 1")
+        trace = TailTrace()
+        originals = drafts
+        streams = [d[9] for v in drafts for d in v if len(d) > 9 and d[9] is not None]
+        drafts, dropped = self._engine_q_filter(drafts)
+        self.null_dropped_keys, self._null_dropped = set(), set()
+        self.null_selected_keys = None
+        self._vit_groups = []
+        null = self._null_prepare(drafts)
+        names = slots = None
+        n_empty = 0
+        if null is not None:
+            drafts, names, slots, n_empty = null
+            # Past steps only: fixed before any of this step's drafts is verified.
+            self._update_null_calibration()
+        flat, rows = self._flat_rows(drafts)
+        self._record_siblings(flat)
+        keys = [_key(d[0]) for _, d in flat]
+        by_key: dict[tuple[int, ...], list[int]] = {}
+        for i, k in enumerate(keys):
+            by_key.setdefault(k, []).append(i)
+        prompts = [
+            PromptCounts(
+                key=k,
+                first=idx[0],
+                lengths=tuple(len(flat[i][1][2]) for i in idx),
+                tokens=sum(int(rows[i].numel()) for i in idx),
+            )
+            for k, idx in by_key.items()
+        ]
+        schedule = schedule_chunks(prompts, risk, first_tokens, chunk_tokens, order)
+        in_flat = {id(d[9]) for _, d in flat if len(d) > 9 and d[9] is not None}
+        self.plans.clear()
+        self._fused_claims.clear()
+        self._tail_plans = set()
+        self._tail_counts = {}
+        self._verify_error = None
+        self._pending = defaultdict(int)
+        for k in by_key:
+            self._pending[k] = 1  # rollouts of k wait for its pool's decision
+        self._plan_cv = asyncio.Condition()
+        return dict(
+            trace=trace,
+            originals=originals,
+            orphans=[x for x in streams if id(x) not in in_flat],
+            drafts=drafts,
+            flat=flat,
+            rows=rows,
+            keys=keys,
+            by_key=by_key,
+            groups=None if null is None else [names[k] for k in keys],
+            slots=slots,
+            null=null is not None,
+            dropped=dropped,
+            n_empty=n_empty,
+            schedule=schedule,
+            window=int(window),
+            risk=risk,
+        )
+
+    async def run_stream(
+        self,
+        v0: dict[str, Any],
+        on_decided: Optional[Callable[[dict], Any]] = None,
+        on_closed: Optional[Callable[[], Any]] = None,
+    ) -> None:
+        """Streaming verify0 and the continuation rounds; wakes waiters on failure."""
+        try:
+            await self._run_stream(v0, on_decided, on_closed)
+        except BaseException as e:
+            self._verify_error = e
+            cv = getattr(self, "_plan_cv", None)
+            if cv is not None:
+                async with cv:
+                    cv.notify_all()
+            raise
+
+    async def _run_stream(self, v0, on_decided, on_closed) -> None:
+        """Verify the schedule's calls; publish each prompt at its decision.
+
+        A pipeline of ``window`` ordered learner calls: call c+window is sent
+        once call c's results are applied, carrying the follow-up ⊥-BV waves
+        of the pools decided so far and the next scheduled prompts. Results
+        are applied in call order, so which rows share a call, the decisions
+        published together and the canonical training order are functions of
+        the schedule and the decisions, not of timing. A decided prompt's
+        plans are published at once: its tails join the running continuation
+        rounds (``TailFeed``), its complete rollouts are served and trained.
+        """
+        trace: TailTrace = v0["trace"]
+        flat, rows, by_key, groups = v0["flat"], v0["rows"], v0["by_key"], v0["groups"]
+        null, schedule, window = v0["null"], v0["schedule"], v0["window"]
+        t0 = time.perf_counter()
+        if os.environ.get("THUNDERSYNC_ENGINE_Q_CHECK") == "1":
+            await self._route_check(v0["originals"])
+            trace.mark("route_check")
+        # Streams of drafts verification never sees (filtered / empty) stop now.
+        self._stop_streams(v0["orphans"])
+        feed = TailFeed()
+        tails = asyncio.create_task(self._continue_sticky([], trace, (), feed=feed))
+        pools = self._null_pools(flat, groups, v0["slots"]) if null else None
+        pool_of = {k: (groups[idx[0]] if null else k) for k, idx in by_key.items()}
+        sent: set = set()  # plain prompts already sent
+        by_row: dict[int, dict[str, Any]] = {}
+        published: dict[int, Plan] = {}
+        follow: list[int] = []
+        calls: list[tuple[asyncio.Task, list[int], float]] = []
+        nxt = 0
+        n_calls = n_forwarded = 0
+        service = 0.0
+        t_prev = t0
+        undecided = list(k for chunk in schedule for k in chunk)
+        decide_t: list[float] = []
+        n_skipped = [0]
+
+        def rows_of(k) -> list[int]:
+            if null:
+                return pools[pool_of[k]].next_wave()
+            if k in sent:
+                return []
+            sent.add(k)
+            return list(by_key[k])
+
+        def submit() -> bool:
+            nonlocal follow, nxt, n_calls, n_forwarded
+            batch, follow = follow, []
+            if nxt < len(schedule):
+                for k in schedule[nxt]:
+                    batch += rows_of(k)
+                nxt += 1
+            if not batch:
+                return False
+            env = [pools[groups[i]].env[i] for i in batch] if null else None
+            task = asyncio.create_task(
+                self._verify_block_async(
+                    [flat[i] for i in batch],
+                    [rows[i] for i in batch],
+                    null_envelopes=env,
+                    band=None if null else self.banded_is_band,
+                )
+            )
+            calls.append((task, batch, time.perf_counter()))
+            n_calls += 1
+            n_forwarded += len(batch)
+            return True
+
+        def fill() -> None:
+            while len(calls) < window and (follow or nxt < len(schedule)):
+                if not submit() and not follow and nxt >= len(schedule):
+                    break
+
+        async def publish() -> None:
+            """Publish every prompt whose pool is now decided (schedule order)."""
+            done = []
+            for k in undecided:
+                if null:
+                    run = pools[pool_of[k]]
+                    if not run.decided:
+                        continue
+                    skipped = run.close()  # never forwarded: unused
+                    self._release_hidden(flat[i][1] for i in skipped)
+                    n_skipped[0] += len(skipped)
+                    for i in skipped:
+                        by_row[i] = _null_result({}, None)
+                    for i in by_key[k]:
+                        if i in run.out:
+                            by_row[i] = run.out[i]  # the decision replaces the raw grid
+                    dropped = {pool_of[k]} if run.state.dropped else set()
+                    plans = []
+                    for i in by_key[k]:
+                        if self._null_is_output(by_row[i], pool_of[k], dropped):
+                            published[i] = plan = self._null_plan(flat[i][1], by_row[i])
+                            plans.append(plan)
+                else:
+                    if any(i not in by_row for i in by_key[k]):
+                        continue
+                    best = self._best_variants([flat[i] for i in by_key[k]], {
+                        j: by_row[i] for j, i in enumerate(by_key[k])
+                    })
+                    plans = []
+                    for t in sorted(best):
+                        d, r = best[t]
+                        published[t] = plan = self._best_plan(d, r)
+                        plans.append(plan)
+                done.append((k, plans))
+            if not done:
+                return
+            info = {}
+            t_pub = time.perf_counter() - t0
+            stop = []
+            for k, plans in done:
+                undecided.remove(k)
+                for plan in plans:
+                    plan.tail = not plan.complete
+                    if plan.verified is not None:
+                        trace.verified(k, plan, *plan.verified)
+                pending = [(k, plan) for plan in plans if not plan.complete]
+                # The drafts' streams still decode: whole-accepted unfinished
+                # plans go on with theirs, every other stream of k stops.
+                kept = {id(plan.stream) for _, plan in pending if plan.stream is not None}
+                stop += [
+                    flat[i][1][9]
+                    for i in by_key[k]
+                    if len(flat[i][1]) > 9
+                    and flat[i][1][9] is not None
+                    and id(flat[i][1][9]) not in kept
+                ]
+                self._tail_plans |= {id(plan) for _, plan in pending}
+                self._tail_counts[k] = len(pending)
+                self.plans[k].extend(plans)
+                feed.put(pending)
+                info[k] = (len(plans), len(pending))
+                decide_t.append(t_pub)
+            self._stop_streams(stop)
+            if on_decided is not None:
+                on_decided(info)
+            async with self._plan_cv:
+                for k, _ in done:
+                    self._pending[k] = 0
+                self._plan_cv.notify_all()
+
+        try:
+            # Prompts with nothing to forward (e.g. no slot left) are decided at once.
+            await publish()
+            fill()
+            while calls:
+                task, batch, t_sub = calls.pop(0)
+                res = await task
+                now = time.perf_counter()
+                # Learner service time of this call (not its queueing behind earlier ones).
+                service += now - max(t_sub, t_prev)
+                t_prev = now
+                results = {i: res[j] for j, i in enumerate(batch)}
+                by_row.update(results)
+                if null:
+                    self._null_apply(pools, groups, flat, results)
+                    for g in dict.fromkeys(groups[i] for i in batch):
+                        follow += pools[g].next_wave()
+                await publish()
+                fill()
+            if undecided:
+                raise RuntimeError(f"verify0_stream: {len(undecided)} prompts left undecided")
+            trace.mark("verify0")
+            if null:
+                out = {i: by_row[i] for i in range(len(flat))}
+                self._null_dropped = {g for g, run in pools.items() if run.state.dropped}
+                envs = [len(e) for run in pools.values() for e in run.env.values()]
+                self.stats["spec/null_envelopes_per_row"] = sum(envs) / max(len(envs), 1)
+                self.stats["spec/null_skipped_drafts"] = float(n_skipped[0])
+                self.stats["spec/null_waves"] = float(max((run.waves for run in pools.values()), default=0))
+                calib = self.__dict__.get("_null_calib")
+                if calib is not None:
+                    calib.update_verify(service, n_forwarded)
+                self._finish_verify_null(
+                    flat, out, groups, v0["slots"], v0["dropped"], v0["n_empty"], published
+                )
+            else:
+                self._finish_verify(v0["drafts"], flat, by_row, v0["dropped"], published)
+            self.stats.update(
+                {
+                    "v0s/calls": float(n_calls),
+                    "v0s/chunks": float(len(schedule)),
+                    "v0s/forwarded_rows": float(n_forwarded),
+                    "v0s/first_decision_s": min(decide_t, default=0.0),
+                    "v0s/last_decision_s": max(decide_t, default=0.0),
+                    "v0s/decision_q50_s": float(np.median(decide_t)) if decide_t else 0.0,
+                    "v0s/verify_service_s": service,
+                    **v0["risk"].snapshot(),
+                }
+            )
+        except BaseException:
+            feed.close()
+            tails.cancel()
+            for task, _, _ in calls:
+                task.cancel()
+            raise
+        finally:
+            feed.close()
+            if on_closed is not None and not undecided:
+                on_closed()
+        await tails
+        self.stats.update(trace.summary())
+        # This step's outcomes (drafted, accepted, final length after the tail)
+        # feed later steps' schedules only.
+        v0["risk"].update(
+            [(p.verified[0], p.verified[1], len(p.prefix)) for p in published.values() if p.verified is not None]
+        )
+
     # -- streaming training over the tails (one engine, sticky) ------------------
 
     def begin_streaming_tails(self) -> None:
@@ -2938,6 +3358,16 @@ class SpeculativeGeneration:
         """The continuation rounds of ``pending`` (``begin_sticky``), waking waiters."""
         try:
             await self._finish_tails(pending)
+        except BaseException as exc:
+            self._tail_error = exc
+            raise
+        finally:
+            await self._notify_tails()
+
+    async def complete_stream(self, v0, on_decided=None, on_closed=None) -> None:
+        """Streaming verify0 + continuation rounds (``run_stream``), waking waiters."""
+        try:
+            await self.run_stream(v0, on_decided, on_closed)
         except BaseException as exc:
             self._tail_error = exc
             raise
@@ -3245,8 +3675,13 @@ class SpeculativeGeneration:
         trace: Optional[TailTrace] = None,
         ended=(),
         max_retries: int = 100,
+        feed: Optional[TailFeed] = None,
     ) -> None:
         """Complete incomplete plans at theta_{k-1}, verifying while the engine decodes.
+
+        ``feed`` (streaming verify0, DESIGN 14z): more pending plans arrive
+        while the rounds run, as verify0 decides their pools; the rounds end
+        once the feed is closed and every admitted plan is complete.
 
         One engine stream per plan decodes from prompt + kept prefix toward
         EOS or the cap. Whenever a stream has ``sticky_chunk_tokens`` new
@@ -3373,12 +3808,18 @@ class SpeculativeGeneration:
             for s in streams:
                 live.remove(s)
 
-        # Plans whose draft stream still decodes go on with it (no new prefill).
-        for key, plan in pending:
-            if plan.stream is not None:
-                live.append(dict(plan.stream, key=key, plan=plan))
-                plan.stream = None
-        start([(key, plan) for key, plan in pending if not any(s["plan"] is plan for s in live)])
+        def admit(items) -> None:
+            # Plans whose draft stream still decodes go on with it (no new prefill).
+            fresh_start = []
+            for key, plan in items:
+                if plan.stream is not None:
+                    live.append(dict(plan.stream, key=key, plan=plan))
+                    plan.stream = None
+                else:
+                    fresh_start.append((key, plan))
+            start(fresh_start)
+
+        admit(pending)
         for key, plan in ended:
             end_turn(key, plan)
         inflight: dict[asyncio.Task, tuple[list, list, float]] = {}
@@ -3672,8 +4113,13 @@ class SpeculativeGeneration:
         cw_force = int(os.environ.get("THUNDERSYNC_DEBUG_CW_FORCE_REJECT", "0") or 0)
         cw_forced: dict[int, int] = defaultdict(int)
         try:
-            while live or inflight or turns:
+            while live or inflight or turns or (feed is not None and feed.open):
                 progressed = False
+                if feed is not None and feed.items:
+                    admit(feed.take())
+                    # Prefix cache: this step's budget follows the continued rows so far.
+                    self._prefix_cache_begin(len(pending) + len(feed.admitted))
+                    progressed = True
                 if turns:
                     n_turns = len(turns)
                     next_turns()
@@ -3762,7 +4208,8 @@ class SpeculativeGeneration:
             for s in live:
                 self._cw_reset(s)
             if self.prefix_cache is not None:
-                self.prefix_cache.release(plan.prefix_key for _, plan in pending)
+                admitted = list(pending) + (feed.admitted if feed is not None else [])
+                self.prefix_cache.release(plan.prefix_key for _, plan in admitted)
         if stats["prefix_rows"]:
             self.stats.update(
                 {
