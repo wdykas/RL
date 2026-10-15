@@ -146,8 +146,10 @@ needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUD
 
 
 @needs_cuda
-def test_training_cublas_path_bitwise_equals_engine_kernel():
-    """Training (per-expert cuBLAS) and engine (Triton) expert GEMMs give identical bits."""
+@pytest.mark.parametrize("mode", ["cublas", "segment"])
+def test_training_paths_bitwise_equal_engine_kernel(monkeypatch, mode):
+    """Training (per-expert cuBLAS or segment kernel) and engine (Triton) expert GEMMs give identical bits."""
+    monkeypatch.setenv("NEMO_RL_FP16_MOE_TRAIN_GEMM", mode)
     torch.manual_seed(0)
     dev = torch.device("cuda")
     ws = [
@@ -167,7 +169,9 @@ def test_training_cublas_path_bitwise_equals_engine_kernel():
 
 
 @needs_cuda
-def test_fp16_weight_cache_invalidation():
+def test_fp16_weight_cache_invalidation(monkeypatch):
+    # The fp16 weight cache serves the per-expert cuBLAS path only.
+    monkeypatch.setenv("NEMO_RL_FP16_MOE_TRAIN_GEMM", "cublas")
     dev = torch.device("cuda")
     w = (torch.randn(32, 64, device=dev) * 0.02).to(torch.bfloat16)
     x = torch.randn(8, 64, device=dev)
@@ -256,19 +260,65 @@ def test_fp16_weight_cache_holds_two_layers_and_is_bitwise():
     torch.manual_seed(0)
     fm.invalidate_weight_cache()
     layers = [
-        tuple((torch.randn(32, 64, device=dev) * 0.02).to(torch.bfloat16) for _ in range(3))
+        tuple(
+            (torch.randn(32, 64, device=dev) * 0.02).to(torch.bfloat16)
+            for _ in range(3)
+        )
         for _ in range(5)
     ]
     x = (torch.randn(12, 64, device=dev)).half()
     for ws in layers:
         y = fm._expert_gemm_cublas(x, [4, 4, 4], ws)
         ref = torch.cat(
-            [torch.mm(x[4 * i : 4 * i + 4], w.to(torch.float16).t(), out_dtype=torch.float32)
-             for i, w in enumerate(ws)]
+            [
+                torch.mm(
+                    x[4 * i : 4 * i + 4],
+                    w.to(torch.float16).t(),
+                    out_dtype=torch.float32,
+                )
+                for i, w in enumerate(ws)
+            ]
         )
         assert torch.equal(y, ref)
-        assert torch.equal(fm._stacked_fp16(ws), torch.stack([w.to(torch.float16) for w in ws]))
+        assert torch.equal(
+            fm._stacked_fp16(ws), torch.stack([w.to(torch.float16) for w in ws])
+        )
         assert len(fm._WEIGHT_CACHE) <= fm._CACHE_LINEARS
         with fm.weight_cache_disabled():
             assert torch.equal(fm._expert_gemm_cublas(x, [4, 4, 4], ws), y)
     fm.invalidate_weight_cache()
+
+
+@needs_cuda
+@pytest.mark.parametrize("splits", [[3, 0, 70, 19, 1, 0], [0, 0, 5, 0, 0, 0], [40] * 6])
+def test_training_segment_kernels_bitwise_equal_per_expert_cublas(monkeypatch, splits):
+    """One-launch segment kernels (fwd, dgrad, wgrad) give the per-expert cuBLAS bits."""
+    torch.manual_seed(0)
+    dev = torch.device("cuda")
+    ws = [
+        (torch.randn(96, 200, device=dev) * 0.02).to(torch.bfloat16).requires_grad_()
+        for _ in splits
+    ]
+    x = torch.randn(sum(splits), 200, device=dev)
+    x[:, ::3] = 0.0  # exact zeros: outputs / wgrads whose products are all +-0
+    outs = {}
+    for mode in ("cublas", "segment"):
+        monkeypatch.setenv("NEMO_RL_FP16_MOE_TRAIN_GEMM", mode)
+        fm.invalidate_weight_cache()
+        xg = x.clone().requires_grad_()
+        y = fm.grouped_linear(xg, splits, ws)
+        grads = torch.autograd.grad(y.square().sum(), [xg, *ws])
+        outs[mode] = (y, *grads)
+    for a, b in zip(outs["cublas"], outs["segment"]):
+        # bits, not values: torch.equal treats -0.0 == +0.0
+        ints = torch.int16 if a.element_size() == 2 else torch.int32
+        assert torch.equal(a.view(ints), b.view(ints))
+    fm.invalidate_weight_cache()
+
+
+def test_train_gemm_kind(monkeypatch):
+    monkeypatch.delenv("NEMO_RL_FP16_MOE_TRAIN_GEMM", raising=False)
+    assert fm._train_gemm_kind(128 * 48, 128) == "segment"
+    assert fm._train_gemm_kind(8 * 4096, 8) == "cublas"
+    monkeypatch.setenv("NEMO_RL_FP16_MOE_TRAIN_GEMM", "cublas")
+    assert fm._train_gemm_kind(10, 128) == "cublas"
