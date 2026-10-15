@@ -1831,6 +1831,14 @@ class ThunderSyncMegatronPolicyWorker(verify_yield.YieldWorkerMixin, MegatronPol
         tokens, done = self._draft_tokens, self._draft_done
         return [(len(tokens[i]), bool(done[i])) for i in indices]
 
+    def count_unfinished_drafts(self, n: int) -> int:
+        """How many of drafts 0..n-1 are still running (rank 0; O(1) reply).
+
+        A count only (``window_pace.WindowPacer.hold`` releases the cut at 0).
+        """
+        done = self._draft_done
+        return sum(1 for i in range(n) if not done[i])
+
     def peek_drafts(
         self,
         indices: list[int],

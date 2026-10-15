@@ -85,6 +85,7 @@ from thundersync_rl.sentinel import WeightSentinel
 from thundersync_rl.speculative import SpeculativeGeneration, cohort_draft
 from thundersync_rl.verify0_stream import StreamOrder, Verify0Risk
 from thundersync_rl import vit
+from thundersync_rl.window_pace import share_window_pacer
 from thundersync_rl.streaming import (
     Chunk,
     StreamingLearner,
@@ -434,6 +435,20 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # draft is cut, so none is truncated by content); serializes drafting
     # after training, so never for step-time runs. Requires sticky_routing.
     draft_until_complete: bool = False
+    # Drafting-window pacing (window_pace.py, research/agent_window_pace.md):
+    # the draft cut waits until a target window fitted from earlier cuts
+    # (the expected time for every draft to reach the cap, x (1 + margin)),
+    # released once no draft runs, and never when that deadline is more than
+    # max_wait_frac x target away. Damps the fast/slow step alternation (a
+    # fast step leaves the next cohort a window just short of full drafts).
+    # Exact: the deadline uses earlier steps' timings and lengths only.
+    # Requires sticky_routing (streams run past the cut).
+    draft_window_pace: bool = False
+    draft_window_pace_margin: float = 0.05
+    draft_window_pace_max_wait_frac: float = 0.3
+    # Prior full window (s) before any cut is observed; None: no pacing until
+    # a cohort is cut short once.
+    draft_window_pace_init_s: Optional[float] = None
     # Sticky routing anchor horizon H (generated positions; DESIGN.md section
     # 14i). None: anchors up to the rollout cap (every drafted rollout is
     # completed at theta_{k-1} before the refit). Set: anchors only at
@@ -698,6 +713,13 @@ def validate_config(master_config: ThunderSyncMasterConfig) -> None:
         raise ValueError(
             "thundersync.draft_until_complete requires sticky_routing (the only "
             "path that keeps draft streams running past the deadline)"
+        )
+    if master_config.thundersync.draft_window_pace and not (
+        master_config.thundersync.sticky_routing
+    ):
+        raise ValueError(
+            "thundersync.draft_window_pace requires sticky_routing (the only "
+            "path whose drafts keep running to the deferred cut)"
         )
     validate_draft_weights(master_config)
     validate_cohort_lanes(master_config)
@@ -2903,6 +2925,15 @@ def make_speculative_generation(
         sticky_decision=ts_cfg.sticky_continuation_decision,
         sticky_decision_dip=ts_cfg.sticky_continuation_decision_dip,
         draft_until_complete=ts_cfg.draft_until_complete,
+        window_pace=(
+            dict(
+                margin=ts_cfg.draft_window_pace_margin,
+                max_wait_frac=ts_cfg.draft_window_pace_max_wait_frac,
+                init_s=ts_cfg.draft_window_pace_init_s,
+            )
+            if ts_cfg.draft_window_pace
+            else None
+        ),
         draft_weights=ts_cfg.draft_weights,
         banded_is_band=ts_cfg.banded_is_band,
         max_seq_len=master_config.policy["max_total_sequence_length"],
@@ -3018,6 +3049,7 @@ def thundersync_grpo_train(
                 lane.generation, policy, tokenizer, master_config, stream=lane.index
             )
         share_null_calibration([lane.spec for lane in lanes])
+        share_window_pacer([lane.spec for lane in lanes])
         sched = CohortLanes(lanes)
         spec = lanes[0].spec
     elif ts_cfg.speculate:
@@ -3820,6 +3852,7 @@ def _train_on_lanes(
         lane.spec.sentinel = sentinel
         sentinel.check(lane.generation, f"initial weights (lane {lane.index})")
     share_null_calibration([lane.spec for lane in lanes])
+    share_window_pacer([lane.spec for lane in lanes])
     sched = CohortLanes(lanes)
     check_weights = bool(os.environ.get("THUNDERSYNC_MISMATCH_CHECK"))
 
