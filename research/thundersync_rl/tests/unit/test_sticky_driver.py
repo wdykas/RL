@@ -357,6 +357,59 @@ def test_continuations_are_verified_in_pieces_while_decoding():
     assert len(s.stats["timeline/tail_rounds"]) == 3
 
 
+def test_continuation_pieces_carry_prefix_cache_keys():
+    """learner_prefix_cache: every piece of a rollout is verified under one key
+    on the rank that holds its state; the rollout's key is released once it is
+    complete; the first verification of the drafts carries no key."""
+    engine = _DecodingEngine(
+        [
+            [([4], False, [-0.1], 2, [5, 6, 7, 8, 9, EOD])],
+            [([EOD], True, [-0.3], 0)],
+        ]
+    )
+    calls, costs = [], []
+    results = [(1, 99), (2, 99), (1, 30), (1, EOD)]
+
+    def verify(rows, prompt_lens, engine_logq, row_ranks=None, **kw):
+        calls.append(({k: kw.get(k) for k in ("prefix_keys", "prefix_release", "prefix_gpu_gb")}, row_ranks))
+        a, y = results.pop(0)
+        out = {"accepted": a, "next": y, "logprobs": [-1.0] * (a + 1), "draft_logq": engine_logq[0][:a]}
+        if kw.get("prefix_keys") is not None:
+            out["prefix_start"] = 0 if len(calls) == 2 else 4
+        return [(0, out)]
+
+    def report_costs():
+        costs.append(1)
+        return {"kv_bytes_per_token": 64, "state_bytes_per_boundary": 4096, "chunk": 4, "max_keep": 4}
+
+    s = make_spec(
+        {"verify_drafts_block_engine": verify, "prefix_state_cache_costs": report_costs},
+        base_handlers=engine.handlers(),
+        verify_source="engine",
+        hidden_transport="driver",
+        sticky_delta=0.03,
+        sticky_chunk_tokens=2,
+        learner_prefix_cache={"gpu_gb": 1.0, "max_gb": 2.0},
+    )
+    drafts = asyncio.run(s.draft_streaming([torch.tensor([1])]))()
+    s.current_step = 1
+    asyncio.run(s.verify_sticky(drafts))
+    assert costs and s.prefix_cache.configured and s.prefix_cache.chunk == 4
+    first, *pieces = calls
+    assert first[0]["prefix_keys"] is None  # the drafts' verification: whole rows
+    keys = {c[0]["prefix_keys"][0] for c in pieces}
+    assert len(pieces) == 3 and len(keys) == 1 and None not in keys
+    assert all(c[0]["prefix_gpu_gb"] == 1.0 for c in pieces)
+    assert len({tuple(c[1]) for c in pieces}) == 1  # same owner rank every round
+    (plan,) = s.plans[(1,)]
+    assert plan.complete and plan.prefix_key in keys
+    # complete: released (sent with the next call), and no longer placed
+    assert plan.prefix_key not in s.prefix_cache.owner
+    assert s.prefix_cache.take_release() == [plan.prefix_key]
+    assert s.stats["spec/prefix_cache_hit_frac"] == pytest.approx(2 / 3)
+    assert s.stats["spec/prefix_cache_tokens_skipped"] == 8.0
+
+
 def test_sticky_round_retries_unlogged_continuations():
     engine = _Engine(
         [

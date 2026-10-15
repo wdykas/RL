@@ -2722,6 +2722,98 @@ Notes: thundersync_work/research/agent_nano_perf.md.*
     today [D]), so EP8 gains more.
   - Also: `select_engine_config` picks the grouped-GEMM tile from the padded row count.
 
+## 14p. Learner prefix-state cache for exact piece verification (`thundersync.learner_prefix_cache`)
+
+*Branch ts-learner-prefix-cache (../RL-prefixcache). Notes: thundersync_work/research/agent_prefix_cache.md.
+Problem statement: thundersync_work/research/piece_verify_scaling.md.*
+
+**Problem [code].** `_continue_sticky` verifies every continuation piece (128 tokens) as the row prompt + prefix +
+piece, and `verify_drafts_block_engine` forwards the whole row (`_training_forward_rows`). A continued row of length L
+costs sum_j F(P + j c): O(L^2 / c), ~32x one forward at 8k and ~128x at 32k.
+
+**Mechanism.** Per continued row, each learner rank keeps the state of its own layers at chunk boundaries s (multiples
+of the Mamba chunk size from position 0):
+- attention K/V of positions [0, s) as fed to core attention (this rank's KV heads);
+- Mamba conv inputs (xBC) of [s - d_conv + 1, s) and the fp32 SSM state at s (this rank's heads).
+
+The next piece's row is forwarded only from the largest cached boundary s <= prompt - 1 whose tokens [0, s) equal the
+row's (longest common prefix, so a rejected piece falls back to an earlier boundary). At most chunk - 1 positions
+before the piece are recomputed; per row the work is O(L) total. After the forward the rank keeps the start boundary
+and those in (start, n - 1] (at most `max_keep` = 4, evenly spaced, for long pieces).
+
+**Why the logits are bitwise the whole-row forward's (batch invariance).**
+- Attention: FA4 varlen over the new queries and cached + new keys, called through TE's own FA4 entry point with TE's
+  causal window and num_splits (anchored split-KV when `bi_split_kv` is installed, num_splits=1 otherwise). Key
+  blocks are aligned to absolute position 0 in both forwards, so each query row reduces the same blocks in the same
+  order.
+- Mamba (`mamba_ssd_parity.ssm_prefix_forward`): the conv of every output position reads the same d_conv inputs; the
+  chunked SSD scan restarted at a chunk boundary from that boundary's fp32 state runs the same per-chunk kernels and
+  the same state recurrence `s_c = exp(dA_c) s_{c-1} + S_c` as the full scan (the identity the engine's BI prefill
+  with prefix caching relies on). Pinned kernel configs as in training.
+- Everything else is per token: row-invariant GEMMs (BI), norms, embedding, dropless MoE; sticky anchors are taken
+  per position from the segment start (`fetch_anchors(lo=...)`).
+
+**Who decides what (no new collectives).** The driver (`thundersync_rl/prefix_cache.py`, `PrefixCacheDirectory`)
+decides membership and placement and sends the same lists to every rank of a replica, so all TP/PP ranks pick the
+same starts (same shapes) without talking to each other:
+- placement: a continued row is verified on the DP rank holding its state; new rows LPT by tokens they will forward;
+- budget: per rank `max_gb` (positions x K/V bytes + kept boundaries x state bytes, the largest per-rank costs the
+  workers report at first use); least recently verified rows are released beyond it (they forward whole: slower,
+  same bits);
+- lifetime: released when the rollout is complete (piggybacked on the next verify call), at the end of the step's
+  continuation rounds, and dropped by the worker whenever its weights version changes (optimizer step, draft
+  weight swap);
+- residency: within the budget the worker keeps `gpu_gb` on device; colder rows move to pinned host memory (LRU) and
+  come back when used. Residency never changes shapes or bits.
+
+EP: rows per rank already differ under EP; the lockstep counts forward calls, which the cache does not change. PP: each
+stage caches its own layers; the pipeline's sequence length is the segment length, identical on all stages.
+
+**Interactions.** Training forwards (streamed over tails, canonical or block dispatch, activation recompute) run the
+whole rows with the hooks inactive (they only act inside `PrefixStateCache.forward`). verify0 (the drafts' first
+verification) forwards whole rows and caches nothing (a row's first piece then forwards whole once). Multi-turn: the
+cached prefix stays valid across turns (observations extend the row). Not built yet: RoPE models (absolute position
+offsets), context parallelism, sticky rounding's theta_n anchor forward, verify_on=inference/both, caching verify0
+(needs the accepted length on every PP stage).
+
+**Per-rank memory [D].** Entry = n x KV/token + (kept boundaries, typically 2) x state.
+| | KV per token | state per boundary | per 32k row | per 128k row |
+|---|---|---|---|---|
+| Nano (6 attn, 23 Mamba; TP1, EP8 does not shard them) | 6 KiB | 46.8 MiB | 0.28 GB | 0.84 GB |
+| Ultra [H] per TP4 x PP4 group (12 KB/token, 0.40 GB state) | 12 KB | 0.40 GB | 1.2 GB / group = 0.08 GB per GPU | 2.4 GB / group = 0.15 GB per GPU |
+At 16 continued rows per learner rank: Nano 4.5 GB (32k) / 13 GB (128k) per rank (of which `gpu_gb` on device);
+Ultra 1.2 / 2.4 GB per GPU. KV heads are replicated, not sharded, when TP exceeds the KV head count.
+
+**Validation [M]** (thundersync_work/research/prefix_cache/*.log; check script tests/functional/check_prefix_cache.py:
+continuation rounds of 128-token pieces with random rejections, the cached forward of each round's rows in one batch
+with mixed starts vs the whole rows, logits compared with torch.equal).
+- Bitwise, 0 mismatches, max |d| 0 everywhere: Nano L8 quick (15 pieces, 4 rejections, 12 hits, host eviction);
+  L8 sticky anchors, 6 rows to 4k (201 pieces, 57 rejections, 195 hits; sticky kept the anchor on 17.9% of
+  token-layers); L8 plain, rejection prob 0.5; L16 sticky; L8 TP2 (sequence parallel) sticky; L8 EP2 sticky.
+- In-loop (local Nano L8 EP2 ts_por, 1k cap, parity reward, expert-grad noise, CHECKS=1 and
+  THUNDERSYNC_PREFIX_CACHE_CHECK=1; runs_prefixcache/pcl-x-1k-c): exactness EXACT 4/4 steps (mismatch 0, engine q
+  exact), 123/123 cached piece forwards bitwise equal to the whole-row forward. At a 1k cap most continued rows need
+  one piece, whose first forward is whole (verify0 is not cached): 3 hits. A first run hung: the check's extra forward
+  was not matched by EP dummy forwards on a rank without rows (fixed 0472a8b3).
+- Piece forward time, one row, prefix P + 128-token piece, cached start = last boundary (1 GPU, median of 5):
+
+  | P | L8 full | L8 cached | L16 full | L16 cached |
+  |---|---|---|---|---|
+  | 1k | 98.5 ms | 96.3 | 200.4 | 189.3 |
+  | 2k | 100.4 | 96.7 | 206.1 | 191.1 |
+  | 4k | 101.1 | 94.7 | 206.7 | 189.2 |
+  | 8k | 108.3 | 93.9 | 217.4 | 189.2 |
+
+  At L8/L16 and <= 8k a one-row forward is dominated by per-call cost (~90 ms per 8 layers on this node, flat in
+  length: research/determinism/fwdlen.json, 85 ms at 1k, 98 ms at 8k, 122 ms at 16k for L8). The cache removes the
+  length-dependent part: cached time is flat in P, full grows 10 ms (L8) / 17 ms (L16) from 1k to 8k. Measured gain
+  at this scale: x1.0-1.2.
+- Projection [D] to full Nano (52 layers ~ 3.3 x L16) and 32k: length-dependent work of a whole-row forward
+  ~ 2.4 us/token per 8 layers (fwdlen 8k->16k) -> ~16 us/token full depth, plus attention growing with L; a 32k
+  piece forward ~0.5 s of token work vs ~4 ms for a 256-token cached segment. Per continued 32k row: 256 pieces x
+  ~0.25 s (average 16k) ~ 60 s of learner work without the cache, ~1-2 s with it. The per-call cost is shared by all
+  rows batched in one verification call and is not changed by the cache; it needs its own fix (profile first).
+
 ## 15. Open work
 
 - **Stragglers.** About one rejected draft per step decodes its remainder at about 3 ms
