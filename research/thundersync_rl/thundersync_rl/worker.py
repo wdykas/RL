@@ -3387,6 +3387,9 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         prefix_release: list[str] | None = None,
         prefix_gpu_gb: float = 8.0,
         row_seed_base: int | None = None,
+        walks: list[dict[str, Any] | None] | None = None,
+        walk_scans: list[dict[str, Any] | None] | None = None,
+        prefix_pins: list[int | None] | None = None,
         **_: Any,
     ) -> list[tuple[int, dict[str, Any]]]:
         """Block verification with q from the engine and p from the training model.
@@ -3395,6 +3398,16 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         uniforms from its own generator seeded ``vit.row_seed(row_seed_base,
         keys[i])`` instead of the call's per-rank stream, so its decision is
         the one the training forward already made with the same stream.
+
+        Carried-walk continuation pieces (DESIGN 14t, ``carried_walk.py``):
+        ``walks[i]`` = {"log_b", "floor", "n", "final", "rule"}: row i's draft is a
+        piece of a carried block; the walk advances and a decision is taken only
+        when ``rule`` says so (result "walk", "decision", "token_logprobs"; with
+        "reject" also "accepted"/"next"/"logprobs" relative to the piece).
+        ``walk_scans[i]`` = {"log_ratio", "log_b0", "pos0", "floor", "stop"}: the
+        rejection scan of a carried block below its deciding piece; row i's draft is
+        block positions [pos0, stop). ``prefix_pins[i]``: keep the cached boundary
+        at or below this row position (the block's floor) for such a scan.
 
         Learner prefix-state cache (``prefix_keys``; DESIGN 14p): row i is
         cached under ``prefix_keys[i]`` (None: not cached) and forwarded only
@@ -3588,6 +3601,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                         [starts[i] for i in batch],
                         None if anchors is None else [anchors[i] for i in batch],
                         [prompt_lens[i] for i in batch],
+                        None if prefix_pins is None else [prefix_pins[i] for i in batch],
                     )
                 elif anchors is not None:
                     lb = self._training_forward_rows(
@@ -3659,12 +3673,24 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 if row_seed_base is None
                 else vit.row_generator(vit.row_seed(row_seed_base, keys[i]), dev)
             )
+            walk = None if walks is None else walks[i]
+            scan = None if walk_scans is None else walk_scans[i]
             with nonfinite_context(
                 rank=self.rank, row=i, prompt_len=prompt_lens[i], g=g,
                 seed=seed, segments=segments[i],
                 weights_version=getattr(self, "_weights_version", None),
             ):
-                if null_envelopes is not None:
+                if walk is not None or scan is not None:
+                    from thundersync_rl.engine_q import verify_engine_q_scan, verify_engine_q_walk
+
+                    assert null_envelopes is None and band is None, "carried walk: plain BV only"
+                    assert row_seed_base is None, "carried walk: not a verify-in-train fallback call"
+                    if walk is not None:
+                        res = verify_engine_q_walk(p_lp, draft, lq, q_rows, gen, walk)
+                    else:
+                        res = verify_engine_q_scan(p_lp, draft, lq, q_rows, gen, scan)
+                    n_rows += res.get("rows_evaluated", 0)
+                elif null_envelopes is not None:
                     # Banded IS is rejected with null_bv by validation (§14e).
                     assert band is None, "banded IS does not compose with pooled null_bv"
                     with timed("grid_scan_total"):
@@ -3884,7 +3910,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         return self._prefix_state_cache(8.0).costs()
 
     def _prefix_cached_forward(
-        self, cache, keys, rows, starts, anchors, prompt_lens
+        self, cache, keys, rows, starts, anchors, prompt_lens, pins=None
     ) -> torch.Tensor | None:
         """Logits [B, S, V] of rows[b][starts[b]:] continued from the prefix-state cache.
 
@@ -3893,7 +3919,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         (expected: all).
         """
         segs = [r[s:] for r, s in zip(rows, starts)]
-        with cache.forward(keys, rows, starts):
+        with cache.forward(keys, rows, starts, pins):
             lb = self._training_forward_rows(segs, anchors=anchors, anchor_starts=starts)
         if _prefix_check_on():
             full = self._training_forward_rows(rows, anchors=anchors)

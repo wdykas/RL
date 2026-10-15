@@ -1005,3 +1005,87 @@ def verify_engine_q_grid(
         lpx, lqx, zeros, zeros[:g], p_rows, q_logprob_rows, generator, envelopes
     )
     return out, lpx, n_eval
+
+
+def _p_stats(p_logprobs, draft):
+    g = draft.numel()
+    if isinstance(p_logprobs, GatheredLogprobRows):
+        dev = p_logprobs.local.device
+        return dev, p_logprobs.token_logprobs(draft.to(dev)), p_logprobs
+    dev = p_logprobs.device
+
+    def p_rows(idx):
+        return p_logprobs[idx]
+
+    return dev, p_logprobs[torch.arange(g, device=dev), draft.to(dev)], p_rows
+
+
+def verify_engine_q_walk(
+    p_logprobs: Union[torch.Tensor, GatheredLogprobRows],
+    draft: torch.Tensor,
+    engine_logq: torch.Tensor,
+    q_logprob_rows: Callable[[torch.Tensor], torch.Tensor],
+    generator: Optional[torch.Generator],
+    walk: dict,
+) -> dict:
+    """One continuation piece of a carried block (``carried_walk.carried_piece``).
+
+    Placement-agnostic: the inputs are those of ``verify_engine_q`` plus the
+    driver's walk state {"log_b", "floor", "n", "final", "rule"}. q rows are read
+    only when a decision is due and fails (the scan of this piece).
+    """
+    from thundersync_rl.carried_walk import DecisionRule, carried_piece
+
+    g = draft.numel()
+    dev, lpx, p_rows = _p_stats(p_logprobs, draft)
+    lqx = engine_logq.to(device=dev, dtype=torch.float32)
+    zeros = torch.zeros(g + 1, dtype=torch.float32, device=dev)
+    out = carried_piece(
+        lpx, lqx, zeros, zeros[:g], p_rows, q_logprob_rows, generator,
+        walk, DecisionRule.of(walk["rule"]), bool(walk["final"]),
+    )
+    lp = lpx.tolist()
+    out["token_logprobs"] = lp
+    out["log_ratio"] = (lpx.float() - lqx).tolist()
+    if out["decision"] == "reject":
+        acc = out["tau"] - int(walk["n"])
+        out.update(accepted=acc, next=out["next"], logprobs=lp[:acc] + [out["next_logp"]],
+                   draft_logq=engine_logq[:acc].tolist())
+    return out
+
+
+def verify_engine_q_scan(
+    p_logprobs: Union[torch.Tensor, GatheredLogprobRows],
+    draft: torch.Tensor,
+    engine_logq: torch.Tensor,
+    q_logprob_rows: Callable[[torch.Tensor], torch.Tensor],
+    generator: Optional[torch.Generator],
+    scan: dict,
+) -> dict:
+    """Rejection scan of a carried block (``carried_walk.carried_scan``).
+
+    ``draft``: block positions [pos0, stop). The walk uses the driver's carried
+    log-ratios ``scan["log_ratio"]`` (the values the pieces computed); this
+    forward's own log p of the same tokens must equal them bitwise (counted in
+    "walk_ratio_mismatch": under batch invariance and the prefix-state cache, 0).
+    """
+    from thundersync_rl.carried_walk import carried_scan
+
+    g = draft.numel()
+    dev, lpx, p_rows = _p_stats(p_logprobs, draft)
+    lqx = engine_logq.to(device=dev, dtype=torch.float32)
+    mine = (lpx.float() - lqx).tolist()
+    carried = [float(x) for x in scan["log_ratio"]]
+    zeros = torch.zeros(g + 1, dtype=torch.float32, device=dev)
+    out = carried_scan(
+        carried, float(scan["log_b0"]), int(scan["pos0"]), int(scan["floor"]),
+        int(scan["stop"]), zeros, zeros[:g], p_rows, q_logprob_rows, generator,
+    )
+    out["walk_ratio_mismatch"] = sum(
+        a != b for a, b in zip(mine, carried)
+    )
+    acc = out["tau"] - int(scan["pos0"])
+    lp = lpx.tolist()
+    out.update(accepted=acc, logprobs=lp[:acc] + [out["next_logp"]],
+               draft_logq=engine_logq[:acc].tolist(), token_logprobs=lp)
+    return out

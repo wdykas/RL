@@ -111,6 +111,9 @@ class _Row:
     start: int  # first forwarded position (a chunk boundary)
     entry: Optional[_Entry]  # cached state used for [0, start) (None: start == 0)
     keep: list[int]  # boundaries to cache after the forward (ascending; [] if key is None)
+    # Older cached boundaries (< start) kept as they are (``pins``: carried-walk scans
+    # re-forward a block from its floor, DESIGN 14t).
+    retain: list[int] = field(default_factory=list)
     pending_kv: dict[int, tuple[torch.Tensor, torch.Tensor]] = field(default_factory=dict)
     pending_states: dict[int, dict[int, tuple[torch.Tensor, torch.Tensor]]] = field(
         default_factory=dict
@@ -340,17 +343,31 @@ class PrefixStateCache:
             out = sorted({out[round(j * (len(out) - 1) / k)] for j in range(k + 1)})
         return out if out[-1] > 0 else []
 
+    @staticmethod
+    def retain(entry: Optional[_Entry], start: int, keep: list[int], pin: Optional[int]) -> list[int]:
+        """Older boundary to keep for ``pin``: the largest cached one <= pin below start."""
+        if pin is None or entry is None or not keep or not start:
+            return []
+        old = [b for b in entry.states if b <= pin and b < start]
+        return [max(old)] if old else []
+
     # ---- forward ---------------------------------------------------------------------
     @contextlib.contextmanager
     def forward(
-        self, keys: list[Optional[str]], rows: list[torch.Tensor], starts: list[int]
+        self,
+        keys: list[Optional[str]],
+        rows: list[torch.Tensor],
+        starts: list[int],
+        pins: Optional[list[Optional[int]]] = None,
     ) -> Iterator[None]:
         """Run the model's forward of rows[i][starts[i]:] (left-aligned, padded) inside.
 
         Hooked layers continue each row from its cached state at starts[i] and record
         the state at the boundaries ``keep(starts[i], n_i)``; on success the rows'
         entries are replaced by the new state. Rows with key None are forwarded from
-        their start without caching.
+        their start without caching. ``pins[i]`` (a position or None): also keep the
+        largest boundary <= pins[i] that row i's entry already holds below its start
+        (all ranks get the same pins, so they keep the same boundaries).
         """
         if _ACTIVE[0] is not None:
             raise RuntimeError("nested prefix-state forwards")
@@ -359,7 +376,8 @@ class PrefixStateCache:
         if len(set(k for k in keys if k is not None)) != sum(k is not None for k in keys):
             raise ValueError("a key appears twice in one prefix-state forward")
         call_rows = []
-        for key, row, s in zip(keys, rows, starts):
+        pins = pins if pins is not None else [None] * len(keys)
+        for key, row, s, pin in zip(keys, rows, starts, pins):
             entry = self.entries.get(key) if key is not None else None
             if s:
                 if entry is None or s not in entry.states:
@@ -369,7 +387,8 @@ class PrefixStateCache:
                     self.stats["host_loads"] = self.stats.get("host_loads", 0) + 1
             tokens = row.detach().to("cpu", torch.long)
             keep = self.keep(s, tokens.numel()) if key is not None else []
-            call_rows.append(_Row(key, tokens, s, entry if s else None, keep))
+            retain = self.retain(entry, s, keep, pin) if key is not None else []
+            call_rows.append(_Row(key, tokens, s, entry if s else None, keep, retain))
         _ACTIVE[0] = _Call(self, call_rows)
         try:
             yield
@@ -405,6 +424,9 @@ class PrefixStateCache:
                 states[s] = old.states[s] if s and old is not None else None
             else:
                 states[s] = r.pending_states[s]
+        for s in r.retain:
+            if old is not None and s in old.states:
+                states[s] = old.states[s]
         states = {s: v for s, v in states.items() if v is not None}
         self.entries[r.key] = _Entry(
             tokens=r.tokens[:new_len].clone(), kv_len=new_len, kv=kv, states=states

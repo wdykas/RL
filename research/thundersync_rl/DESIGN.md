@@ -2946,9 +2946,16 @@ and those in (start, n - 1] (at most `max_keep` = 4, evenly spaced, for long pie
 decides membership and placement and sends the same lists to every rank of a replica, so all TP/PP ranks pick the
 same starts (same shapes) without talking to each other:
 - placement: a continued row is verified on the DP rank holding its state; new rows LPT by tokens they will forward;
-- budget: per rank `max_gb` (positions x K/V bytes + kept boundaries x state bytes, the largest per-rank costs the
-  workers report at first use); least recently verified rows are released beyond it (they forward whole: slower,
-  same bits);
+- budget (ts-carried-walk): per rank at most `max_gb`; `learner_prefix_cache_size: auto` (default) sizes it to the
+  step's continued rows per rank x one row's bytes at the row cap (positions x K/V bytes + kept boundaries x state
+  bytes, the largest per-rank costs the workers report). `learner_prefix_cache_policy: pin` (default) admits a row
+  only if its reservation at the row cap fits and never evicts; the former least-recently-verified eviction
+  (`lru`) misses on every access once the working set exceeds the budget, because continuation rounds visit rows
+  cyclically (unit test `test_lru_thrashes_under_cyclic_rounds_and_pinning_does_not`): at 128k that silently fell
+  back to O(L^2 / c). Uncached rows forward whole (slower, same bits). Metrics `spec/prefix_cache_eligible_hit_frac`
+  (hits / pieces of rows forwarded before), `_admitted`, `_denied`, `_evicted`, `_need_gb_per_rank`,
+  `_budget_gb_per_rank`, `_max_rank_gb`; a `[prefix cache] WARNING` line below 0.9 or on any denial/eviction;
+  `learner_prefix_cache_min_hit_frac` > 0 raises below it;
 - lifetime: released when the rollout is complete (piggybacked on the next verify call), at the end of the step's
   continuation rounds, and dropped by the worker whenever its weights version changes (optimizer step, draft
   weight swap);
@@ -3265,6 +3272,91 @@ optimizer, θ̂, next prompts, seed counters) saved = loaded (enforced in-run wi
 `THUNDERSYNC_RESUME_DIGEST`), exactness checks after the resume, sentinel; (X) stale-checkpoint refusal.
 A speculative run is not bitwise reproducible run to run (engine sampler and deadline cuts), so (T)
 compares state, not trajectories.
+
+## 14t. Carried-walk continuation verification (`thundersync.sticky_continuation_decision`)
+
+*Opt-in (default `every` = section 14k unchanged). Branch ts-carried-walk (../RL-cwalk). Notes, MC and
+measurements: `thundersync_work/research/agent_carried_walk.md`. Code: `carried_walk.py`, `engine_q.verify_engine_q_walk`
+/ `verify_engine_q_scan`, `_continue_sticky` (driver), `PrefixStateCache` pins.*
+
+**Problem [code].** Continuation pieces were verified as independent blocks: each piece restarts the walk at b = 1 and
+ends with a terminal test, so a row of L tokens in pieces of c takes ~L/c terminal tests, each rejecting with
+probability ≈ the walk's dip over that piece. Modeled [D, `research/future_longctx/piece_mc.log`, v = 1.1e-6]:
+rejections per continued row 2.43 / 9.5 (32k / 128k) at c = 128, 0.36 / 0.72 with growth 1.0, 0.14 / 0.27 as one block.
+
+**Rule.** The pieces of one engine stream form one *block*, decided only at *decision points*. Between them a piece
+only advances the walk, log b_i = min(0, log b_{i-1} + log p(x_i) − log q(x_i)), and the *floor* f (last position with
+b_f = 1). Per row the state is two scalars (log b, f). At a decision point T: eta_T ≤ b_T keeps the block (no bonus;
+the stream goes on with a new block); otherwise tau = max{ i ∈ (f, T) : eta_i ≤ h_i } with fresh eta_i, or f if there
+is none (h_f = 1), and y ~ norm(max(b_tau p_tau − q_tau, 0)). Decision rules (`DecisionRule`): `row` (only at the
+stream's end: EOS, cap, turn end, anchor horizon), `dip` (also at a piece end where −log b ≥
+`sticky_continuation_decision_dip`), `every` (each piece end: today's law). Forward pieces keep their sizes
+(`sticky_continuation_chunk_tokens` / `_growth`); decisions are a separate schedule.
+
+**Exactness.** (1) *Martingale lemma.* Forward block verification draws, at each position i not decided, a hit
+(eta_i ≤ h_i) and the next token x_{i+1} ~ q_i. Let O_i be the output if the block were decided at i (keep with
+prob b_i, else residual at the last hit). Given everything up to i, O_{i+1} has the law of O_i: the mass on
+"prefix x_{≤i} then token y" is min(q(y), b_i p(y)) (kept) + h_i (1 − b_i + r_i) (b_i p(y) − q(y))_+ / r_i (hit at i)
+= min(q, b p)(y) + (b p − q)_+(y) = b_i p(y), and the no-hit branch carries (1 − h_i)(1 − b_i + r_i) = 1 − b_i to
+the earlier residual. So any a.s. finite stopping time of the past (tokens, the walk, positions, EOS, engine timing,
+other rows, and even the forward-drawn hits) yields an exact p sample; deciding at T = L is plain block
+verification of the whole block, deciding at every piece end is today's rule. Only the decision's own terminal draw
+and future tokens are off limits. (2) The implementation draws no hit before the decision (the rules do not read
+them), then eta_T, then eta_{<T} top-down — the same joint law as drawing them forward. (3) Below the floor no
+position can matter (h_f = 1), so the rejection scan covers (f, T) only.
+Tests (`tests/unit/test_carried_walk.py`, CPU): exact enumeration of complete-row laws (V = 3, cap 4, pieces of 1 and
+2, rules every / row / dip 0.05 / dip 0.3 / token-random / two hit-dependent rules: TV < 1e-12 vs p); control that
+ignores a failed terminal draw half the time: TV > 1e-3; exact expected rejections: row < every, row ≤ dip ≤ every
+(5 models); pathwise: `carried_piece` + `carried_scan` over random cuts give the one-block tau with the same draws
+(60 cases); Monte Carlo of the implementation's whole continuation process (20k rows, chi-square z < 4 for row,
+dip 0.1, every; non-vacuous: rejections, scans and undecided pieces all occur) and a control that forgets the walk
+between pieces (z > 20). Driver: `test_carried_walk_driver.py`. GPU residual path: `test_carried_walk_gpu.py`.
+
+**No exact incremental form of the one-block law with early final rejections** (sketch). Under the one-block rule
+P(reject | x_{1..T}) = 1 − b_T depends on the whole draft, and P(tau ≤ g | F_g) = E[(1 − b_T) Π_{g<j<T}(1 − h_j) | F_g]
+is an expectation over the q-continuation. A rule that finally rejects at g < T decides on an F_g-measurable event, so
+its conditional rejection law given the full draft differs from the one-block law unless it could compute that
+expectation (a sum over all continuations) and then continue on a q-law tilted by "tau > g", which a q stream does
+not sample. What can be done exactly is the family above: one block at the end (fewest rejections, latest detection)
+or decisions at stopping times (earlier detection, more rejections). Exact speculative forks would keep the one-block
+law and buy latency with engine decode (a q stream from the tentative (tau, y), used only if the final decision lands
+there): not built.
+
+**MC [modeled, `research/carried_walk/cw_mc.py` → `cw_mc_focus.log`, 4000 rows at 32k / 1500 at 128k; ±3–5% on
+rejections]** (Brownian walk, drift −v/2, the rejection at the block's last running max; per continued row; rounds =
+learner piece calls; waste = tokens decoded past tau before the decision):
+
+| schedule | rounds 32k / 128k | rejections, age 1 (v 1.1e-6) 32k / 128k | waste, age 1 | rejections, age 2 (v 3.3e-6) | waste, age 2 |
+|---|---|---|---|---|---|
+| every, growth 0.25 (today's law) | 24 / 30 | 0.56 / 1.20 | 1.0k / 8.5k | 0.97 / 2.13 | 1.7k / 14.7k |
+| every, growth 1.0 (tip default) | 9 / 12 | 0.34 / 0.73 | 1.8k / 14.8k | 0.60 / 1.27 | 3.2k / 24.2k |
+| carried, growth 0.25, dip 0.05 | 24 / 30 | 0.40 / 0.97 | 1.2k / 8.5k | 0.82 / 1.87 | 1.9k / 14.7k |
+| carried, growth 0.25, dip 0.1 | 24 / 31 | 0.28 / 0.78 | 1.7k / 10.0k | 0.65 / 1.71 | 2.2k / 15.8k |
+| carried, growth 0.25, dip 0.2 | 24 / 31 | 0.19 / 0.55 | 2.5k / 13.3k | 0.45 / 1.36 | 3.2k / 18.7k |
+| carried, growth 0.25, row (one block) | 24 / 32 | 0.16 / 0.38 | 3.5k / 31.7k | 0.28 / 0.61 | 6.2k / 52.1k |
+
+Reading: the decision schedule is a rejections-vs-detection-delay trade; carrying the walk moves the frontier. At
+the same forward pieces, `dip 0.05` has 20–30% fewer rejections than deciding every piece at the same waste;
+`dip 0.1`–`0.2` match or beat growth 1.0 on both rejections and waste (age 1: −17% / −26% rejections, −6% / −10%
+waste) at 2.6x the learner calls (each a cached O(c) forward); one block halves rejections again and triples the
+waste. Recommendation until v is measured at 16k–128k: forward growth 0.25 + `dip` 0.1 (0.2 when a rejection
+costs more than ~5k decode tokens, e.g. a 128k restart prefill). Full grid (all rules, forward growth 0 / 0.125 /
+0.25, Nano L8 v, 16k): `cw_mc_pieces.log` (400–1000 rows, noisier).
+
+**Per-rank costs.**
+- Driver: per undecided block, log-ratio and log q as fp32 arrays (8 B/token) plus the kept-token log-probs.
+- Hidden rows of the q stream (object-store transport) are kept from the floor's piece to the decision (positions
+  below are freed as the floor advances): ≤ (T − f + piece) × d × 4 B per row, Nano 10.75 KB/token (352 MB per 32k
+  row worst case), 1T-class ~41 KB/token. `spec/cw_hidden_retained_bytes_max`. With the engine's recompute transport
+  (14q, ts-engine-verify) nothing is retained; the scan re-prefills on the drafting lane.
+- Learner: one pinned Mamba boundary per cached row (Nano 46.8 MiB; Ultra ~25 MB per GPU [H]) so the scan forwards
+  from the floor's piece; scan forwards only on rejections (modeled scan tokens ≤ wasted decode above).
+- Placement: `verify_engine_q_walk` / `verify_engine_q_scan` take the same inputs as `verify_engine_q`, so the engine
+  path (14q) calls them unchanged; the walk state and decisions travel through the driver.
+Metrics: `spec/cw_decisions`, `_whole`, `_rejects`, `_scans`, `_scan_tokens`, `_ratio_mismatch` (must be 0: the scan's
+forward reproduces the pieces' log p bitwise), `_hidden_retained_bytes_max`.
+Requirements (`validate_carried_walk`): sticky routing, verify_source=engine, verify_on=learner on this branch, no
+banded IS. Not built: carrying the walk through verify0 (it decides; ⊥-BV pools need its outcomes), speculative forks.
 
 ## 15. Open work
 
