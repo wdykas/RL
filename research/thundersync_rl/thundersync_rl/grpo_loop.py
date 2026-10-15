@@ -1971,6 +1971,17 @@ def thundersync_grpo_train(
         spec = make_speculative_generation(
             policy_generation, policy, tokenizer, master_config
         )
+    check_weights = bool(os.environ.get("THUNDERSYNC_MISMATCH_CHECK"))
+
+    def lane_fp(lane):
+        # Debug: the weights the lane's engine ranks hold, read from the engine.
+        return sum(
+            ray.get(
+                lane.generation._policy.worker_group.run_all_workers_single_data(
+                    "engine_weight_checksum"
+                )
+            )
+        )
     sticky = spec is not None and spec.sticky_delta is not None
     G = master_config.grpo.num_generations_per_prompt
     multi_turn = sticky and (master_config.grpo.max_rollout_turns or 1) > 1
@@ -2053,6 +2064,8 @@ def thundersync_grpo_train(
 
                 sched.refit(lane_y, version, put_drafter)
                 sched.pin(lane_y, step + 1)
+                if check_weights:
+                    lane_y.cohort_fingerprint = lane_fp(lane_y)
                 next_prompts, null_slots = next_draft_prompts(next_batch, ts_cfg, G)
                 lane_drafts = asyncio.run(
                     lane_y.spec.draft_streaming(next_prompts, null_slots=null_slots)
@@ -2124,7 +2137,15 @@ def thundersync_grpo_train(
                 # The cohort lane is free once its cohort's tails are done; it
                 # takes theta_step only if some row decodes fresh.
                 t_r = time.perf_counter()
+                lane_stats["lanes/tail_end_s"] = t_r - t0
+                if "lanes/draft_start_s" in lane_stats:
+                    # Drafting of the next cohort that ran under this cohort's tails.
+                    lane_stats["lanes/overlap_s"] = t_r - t0 - lane_stats["lanes/draft_start_s"]
                 if lane_x.cohort == step:
+                    if check_weights and lane_x.cohort_fingerprint is not None:
+                        lane_stats.update(
+                            sched._check_fingerprint(lane_x, step, lane_fp(lane_x))
+                        )
                     sched.unpin(lane_x, step)
                 if lane_fresh:
                     sched.refit(lane_x, ("theta", step), lambda: refit_lane(policy, lane_x))
