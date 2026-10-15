@@ -2974,6 +2974,19 @@ verification inside the continuation prefill for the rest), linear correction dr
 continuation's own prefill). Per-rank cost of VIT: no memory beyond a training micro-batch; q (4 B/token) and the row
 seed to the row's last PP stage; one [V/TP] head row per rejected position.
 
+**Built (opt-in `thundersync.verify_in_train`, 647deaec).** Pooled ⊥-BV, sticky routing, streaming over the tails
+with the canonical order, group granularity, PP 1. Pools whose first G drafts are finished skip verify0. Their draft
+rewards come from the rollout function run on the draft text. Their training calls (one micro-batch per group, on
+ranks by tokens in group order) are the step's first ordered learner calls. Each row's decision is
+eta_g(row seed) <= b_g(M_j), computed in the loss from the training forward's log-probs, bitwise the verifier's rule.
+A failed micro-batch's loss is multiplied by 0 (the backward runs on every rank), and its counts and metrics are
+removed. Its pool is then verified the regular way with the same per-row streams, its tails run before the refit,
+and it trains in its canonical position (after the groups ready at verify0). Passed groups leave the planner's order
+(`mark_pretrained`). Their rollouts are served from the drafts, with the training forward's log-probs as generation
+log-probs, so the in-loop mismatch check covers p == verifier bitwise. vit-x: training p == verifier p bitwise
+(278k tokens). A masked ROW inside a live micro-batch is not bitwise under EP (routing changes the expert GEMM
+shapes); VIT only ever masks whole micro-batches, which the check tests separately (wz/wm).
+
 ## 15. Open work
 
 - **Stragglers.** About one rejected draft per step decodes its remainder at about 3 ms
