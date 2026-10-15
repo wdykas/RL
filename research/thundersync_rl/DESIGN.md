@@ -4230,7 +4230,7 @@ ported as one deliberate squash of its final state (incl. the fix), not merged; 
   (`THUNDERSYNC_FUSED_CHECK=1`, gradient against the unfused path) and measure the saved
   learner time on short-output tasks (section 14).
 
-## 14ac. Engine decode step: fused small-op sequences (ts-decode-speed, 2026-10-15)
+## 14ad. Engine decode step: fused small-op sequences (ts-decode-speed, 2026-10-15)
 
 Measured (research/agent_decode_speed.md, ledger DEC): the full-Nano engine decode step is GPU-bound at every row count
 (host blocked on the forward's events 78-87% of the step; GPU busy 95-97%). EP4 with rows held live: 7.6 / 8.7 / 12.2 /
