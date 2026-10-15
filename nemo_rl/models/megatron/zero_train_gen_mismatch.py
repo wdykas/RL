@@ -262,7 +262,16 @@ def validate_batch_invariant_mode(config: PolicyConfig) -> ZeroTrainGenValidatio
             "down_proj_prescale_log2",
             "moe_ep_invariant_combine",
         )
-        if os.environ.get("THUNDERSYNC_ALLOW_EP_MISMATCH") == "1":
+        if _resolved(megatron_cfg, "moe_ep_invariant_combine") and _resolved(
+            inference_cfg, "moe_ep_invariant_combine"
+        ):
+            # EP-invariant MoE combine (ep_invariant_combine.py) on both sides:
+            # every token's expert rows are summed exactly (fixed-point limbs), so
+            # the MoE output has the same bits at any EP. Measured:
+            # runs_1node/epinv-lanes-ep (learner EP2, engine EP1 lanes) EXACT with
+            # it, FAIL without; engine EP1/2/4 greedy dumps bitwise identical.
+            matching_fields = tuple(f for f in matching_fields if f != "expert_model_parallel_size")
+        elif os.environ.get("THUNDERSYNC_ALLOW_EP_MISMATCH") == "1":
             # Debug: a different expert-parallel size on the engine (e.g. cohort
             # lanes of EP4 under an EP8 learner). Per-token MoE math (row-local
             # expert GEMMs, top-k combine in routing order) is not expected to

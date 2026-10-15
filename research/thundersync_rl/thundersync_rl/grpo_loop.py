@@ -1214,8 +1214,15 @@ def validate_engine_verify_source(
         # from the learner's verification. So the engine's EP must equal the
         # learner's until the MoE combine is EP-invariant (per-rank fp32 partials
         # summed in rank order vs one rank's fixed-order sum). The override stays
-        # for debugging that fix.
-        allow = os.environ.get("THUNDERSYNC_ALLOW_EP_MISMATCH") == "1"
+        # for debugging that fix. With policy.megatron_cfg.moe_ep_invariant_combine
+        # (exact fixed-point limb combine, ep_invariant_combine.py; the batch-
+        # invariance validator requires it on both sides) the MoE output has the
+        # same bits at every EP: runs_1node/epinv-lanes-ep (learner EP2, lanes
+        # EP1) EXACT with it, FAIL without. Cost: engine decode +0.4 ms/step at
+        # full Nano EP4 (7.5 -> 7.9 ms), RSV memory x4; learner combine cheaper.
+        allow = os.environ.get("THUNDERSYNC_ALLOW_EP_MISMATCH") == "1" or bool(
+            megatron_cfg.get("moe_ep_invariant_combine", False)
+        )
         if gen_v is not None and gen_v != train_v and not allow:
             problems.append(
                 f"policy.generation.mcore_generation_config.{key} ({gen_v}) must "

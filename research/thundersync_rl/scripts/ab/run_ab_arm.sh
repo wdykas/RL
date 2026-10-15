@@ -53,7 +53,8 @@ if (( GPS > 2 && GPS % 4 )); then echo "GPUS_PER_SIDE must be 1, 2 or a multiple
 # Engine (generation) layout: GEN_EP (default EP) / GEN_PP (default PP) per engine replica of
 # GEN_GPS = lcm(TP, GEN_EP) * GEN_PP GPUs. LANES=2 (ThunderSync arms, thundersync.cohort_lanes):
 # two such engines, lane 1 built by run_thundersync_grpo.py outside cluster.* (learner + lane 0).
-# Equal-GPU A/B at EP8: one engine GEN_EP=8 (8 GPUs) vs LANES=2 GEN_EP=4 (2 x 4 GPUs).
+# Equal-GPU A/B at EP8: one engine GEN_EP=8 (8 GPUs) vs LANES=2 GEN_EP=4 (2 x 4 GPUs; EP-invariant
+# combine switched on below because the engine EP differs from the learner's).
 GEN_EP=${GEN_EP:-$EP} GEN_PP=${GEN_PP:-$PP} LANES=${LANES:-1}
 GEN_GPS=${GEN_GPUS:-$(( TP * GEN_EP / $(gcd $TP $GEN_EP) * GEN_PP ))}
 ENGINES=$([ "$LANES" = 2 ] && echo 2 || echo 1)
@@ -95,6 +96,12 @@ PAR=(policy.megatron_cfg.tensor_model_parallel_size=$TP
      ++policy.generation.mcore_generation_config.pipeline_model_parallel_size=$GEN_PP
      ++policy.generation.mcore_generation_config.expert_model_parallel_size=$GEN_EP)
 (( PP > 1 || GEN_PP > 1 )) && PAR+=(++policy.megatron_cfg.pipeline_dtype=float32)
+# Engine EP != learner EP (e.g. EP4 lanes under an EP8 learner) needs the EP-invariant MoE combine
+# (exact limb sums; DESIGN 14u): without it plainly sampled rows differ (np-v2-lanes-ep, epinv-lanes-ep-off).
+# EPINV=1 forces it on at equal EP, EPINV=0 off (the validators then refuse an EP mismatch).
+if [ "${EPINV:-$([ "$GEN_EP" != "$EP" ] && echo 1 || echo 0)}" = 1 ]; then
+  PAR+=(++policy.megatron_cfg.moe_ep_invariant_combine=true)
+fi
 # Micro-batch sizes (default: ab_base.yaml, 1 / 1 for long caps; the 1k-cap single-node runs use 8 / 4).
 [ -n "${MBS:-}" ] && PAR+=(policy.train_micro_batch_size=$MBS)
 [ -n "${LPBS:-}" ] && PAR+=(policy.logprob_batch_size=$LPBS)
