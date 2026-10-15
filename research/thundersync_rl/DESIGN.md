@@ -2358,6 +2358,28 @@ finished early behind an earlier-index tail group still decoding) [unit test: id
 under three arrival orders; GPU reproducibility runs queued]. Per-rank cost: none (no extra buffer;
 U/V buffers to remove the last group's training are agent_tail_exact_schemes §3.1(b), not built).
 
+**Training determinism (the kernels under the canonical order) [M].** A canonical order only fixes
+the gradient bits if every backward kernel is reproducible. Under batch invariance (all four are
+installed by `enable_batch_invariant_kernels`; forward bits unchanged, gradients change by rounding
+only):
+- MoE token gather (`moe_deterministic.GatherRows`): Megatron's permute backward `index_add_`s a token's
+  top-k copies with atomics; now a fixed-order fp32 segment sum. Per rank: a [tokens, top-k] index
+  table and one gather of the permuted-activation gradient in backward.
+- TE attention: `NVTE_ALLOW_NONDETERMINISTIC_ALGO=0` (set by default) selects the deterministic
+  flash-attention backward. Cost not measurable at Nano L8.
+- Mamba conv1d (`mamba_ssd_parity._ConvFixedOrderGradFn`): causal_conv1d adds the rows' weight / bias
+  gradients with atomics (one row is reproducible); now the kernel's backward per row, fp32 partials
+  summed in row order. Per rank: `rows` kernel launches per Mamba layer per micro-batch (~+0.9 ms per
+  layer at 8 x 2048 tokens, Nano channels), no extra activation memory.
+- mamba_ssm chunk-scan backward: its deterministic mode (A_log / dt_bias partials reduced in order,
+  no measurable cost at Nano-L8 shapes).
+Validation: in-loop order replay (`THUNDERSYNC_DEBUG_ORDER_REPLAY=params`: each step's trajectories
+retrained in two other arrival orders and the same order twice, per-parameter gradient crc32 and
+dispatch signatures vs the real step), Nano L8 EP2, parity reward: canonical == real bitwise on both
+learner ranks, steps 1–5 of 6; the arrival-order control differs every step (ts-lanes-stream
+cb90f824, local; exactness PASS 6/6). Before the conv / mamba_ssm fixes: same-order replays differed
+in the conv1d weight / bias gradients (8 of 435 tensors), then in one dt_bias element.
+
 **Continuation rounds (exact, faster).** `sticky_continuation_chunk_tokens` 2048 → 128 (256 at first; 128 per the tail agent's Nano L8
 measurement, 20.9 → 16.7 s per step; below the
 1024-token caps of the test runs; 2048 > cap meant every piece was a whole remainder, so a rejection
