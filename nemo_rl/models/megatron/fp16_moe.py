@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import os
 from typing import Any, Iterator, Optional
 
 import torch
@@ -253,7 +254,9 @@ if HAVE_TRITON:
         valid_tokens = tl.load(valid_tokens_ptr).to(tl.int64)
         offsets = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
         mask_h = offsets < hidden_dim
-        for tok in tl.range(tl.program_id(0).to(tl.int64), valid_tokens, tl.num_programs(0)):
+        for tok in tl.range(
+            tl.program_id(0).to(tl.int64), valid_tokens, tl.num_programs(0)
+        ):
             acc = tl.zeros([BLOCK_H], dtype=tl.float64)
             for lid in tl.range(0, num_local_experts):
                 pos = tl.load(inverse_map_ptr + tok * num_local_experts + lid)
@@ -293,10 +296,14 @@ if HAVE_TRITON:
         # where the token does not route), so the map needs no separate fill.
         valid_tokens = tl.load(valid_tokens_ptr).to(tl.int64)
         lids = tl.arange(0, E_POW2)
-        for tok in tl.range(tl.program_id(0).to(tl.int64), valid_tokens, tl.num_programs(0)):
+        for tok in tl.range(
+            tl.program_id(0).to(tl.int64), valid_tokens, tl.num_programs(0)
+        ):
             inv = tl.full([E_POW2], -1, tl.int32)
             for k in tl.static_range(TOPK):
-                lid = (tl.load(routing_ptr + tok * TOPK + k) - local_expert_start).to(tl.int32)
+                lid = (tl.load(routing_ptr + tok * TOPK + k) - local_expert_start).to(
+                    tl.int32
+                )
                 if (lid >= 0) & (lid < E):
                     pos = tl.atomic_add(counters_ptr + lid, 1)
                     for h in tl.range(0, hidden_dim, BLOCK_H):
@@ -310,6 +317,142 @@ if HAVE_TRITON:
                     tl.store(out_probs_ptr + pos, tl.load(probs_ptr + tok * TOPK + k))
                     inv = tl.where(lids == lid, pos, inv)
             tl.store(inverse_map_ptr + tok * E + lids, inv, mask=lids < E)
+
+
+if HAVE_TRITON:
+
+    @triton.jit
+    def _segment_tile(counts_ptr, t, E, E_POW2: tl.constexpr, BLOCK_M: tl.constexpr):
+        """(expert, first row, end row) of row tile ``t`` over unpadded expert segments.
+
+        Segment e holds counts[e] rows from sum(counts[:e]); its rows are cut into
+        ceil(counts[e] / BLOCK_M) tiles, numbered in expert order. expert >= E: no tile.
+        """
+        idx = tl.arange(0, E_POW2)
+        c = tl.load(counts_ptr + idx, mask=idx < E, other=0).to(tl.int64)
+        tiles = (c + BLOCK_M - 1) // BLOCK_M
+        tile_end = tl.cumsum(tiles, axis=0)
+        row_end = tl.cumsum(c, axis=0)
+        expert = tl.sum((tile_end <= t).to(tl.int32), axis=0)
+        sel = idx == expert
+        first_tile = tl.sum(tl.where(sel, tile_end - tiles, 0), axis=0)
+        seg_end = tl.sum(tl.where(sel, row_end, 0), axis=0)
+        seg_start = seg_end - tl.sum(tl.where(sel, c, 0), axis=0)
+        return expert, seg_start + (t - first_tile) * BLOCK_M, seg_end
+
+    @triton.jit
+    def _segment_gemm_kernel(
+        a_ptr,  # [M, R] rows grouped by expert (unpadded), 16-bit
+        w_ptr,  # base pointer of the first expert's weight
+        w_off_ptr,  # [E] int64 element offset of each expert's weight from w_ptr
+        counts_ptr,  # [E] int32 rows per expert
+        out_ptr,  # [M, C] fp32
+        C,
+        R,
+        stride_wr,  # weight element stride along the reduction dimension
+        stride_wc,  # weight element stride along the output dimension
+        E,
+        E_POW2: tl.constexpr,
+        B_FP16: tl.constexpr,  # convert weight elements to fp16 (else keep the dtype)
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        # out[r] = a[r] @ B_e for the rows r of expert e, B_e[j, c] = w_e[j * stride_wr +
+        # c * stride_wc]: the forward (B = W_e^T, operands fp16) and dgrad (B = W_e,
+        # operands bf16) of the training expert GEMMs. Exact products, the reduction
+        # accumulated in order into one fp32 accumulator per row, as _grouped_gemm_kernel
+        # (bitwise equal to cuBLAS without split-K). Rows outside the tile's segment are
+        # masked (loaded as 0, not stored), so no padded copies of the rows are needed.
+        expert, row0, seg_end = _segment_tile(
+            counts_ptr, tl.program_id(0), E, E_POW2, BLOCK_M
+        )
+        if expert >= E:
+            return
+        w_base = w_ptr + tl.load(w_off_ptr + expert)
+        rm = row0 + tl.arange(0, BLOCK_M).to(tl.int64)
+        rn = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+        rk = tl.arange(0, BLOCK_K)
+        row_ok = rm < seg_end
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for k0 in range(0, R, BLOCK_K):
+            kk = k0 + rk
+            a = tl.load(
+                a_ptr + rm[:, None] * R + kk[None, :],
+                mask=row_ok[:, None] & (kk[None, :] < R),
+                other=0.0,
+            )
+            b = tl.load(
+                w_base
+                + kk[:, None].to(tl.int64) * stride_wr
+                + rn[None, :].to(tl.int64) * stride_wc,
+                mask=(rn[None, :] < C) & (kk[:, None] < R),
+                other=0.0,
+            )
+            if B_FP16:
+                b = b.to(tl.float16)
+            acc = tl.dot(a, b, acc)
+        tl.store(
+            out_ptr + rm[:, None] * C + rn[None, :],
+            acc,
+            mask=row_ok[:, None] & (rn[None, :] < C),
+        )
+
+    @triton.jit
+    def _segment_wgrad_kernel(
+        g_ptr,  # [M, N] bf16 output gradients, rows grouped by expert (unpadded)
+        x_ptr,  # [M, K] bf16 inputs, same rows
+        counts_ptr,  # [E] int32 rows per expert
+        out_ptr,  # [E, N, K] fp32
+        N,
+        K,
+        E,
+        E_POW2: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        BLOCK_R: tl.constexpr,
+    ):
+        # out[e] = g_e^T @ x_e: the reduction runs over expert e's rows in order, one
+        # fp32 accumulator per element (an expert without rows gets zeros).
+        e = tl.program_id(2)
+        idx = tl.arange(0, E_POW2)
+        c = tl.load(counts_ptr + idx, mask=idx < E, other=0).to(tl.int64)
+        row_end = tl.cumsum(c, axis=0)
+        sel = idx == e
+        end = tl.sum(tl.where(sel, row_end, 0), axis=0)
+        start = end - tl.sum(tl.where(sel, c, 0), axis=0)
+        rn = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+        rk = tl.program_id(1) * BLOCK_K + tl.arange(0, BLOCK_K)
+        rr = tl.arange(0, BLOCK_R)
+        acc = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
+        for r0 in range(start, end, BLOCK_R):
+            r = (r0 + rr).to(tl.int64)
+            ok = r < end
+            gt = tl.load(
+                g_ptr + r[None, :] * N + rn[:, None],
+                mask=ok[None, :] & (rn[:, None] < N),
+                other=0.0,
+            )
+            xb = tl.load(
+                x_ptr + r[:, None] * K + rk[None, :],
+                mask=ok[:, None] & (rk[None, :] < K),
+                other=0.0,
+            )
+            acc = tl.dot(gt, xb, acc)
+        if end - start == 1:
+            # One row: cuBLAS forms the outer product with plain fp32 multiplies
+            # (a zero keeps its sign); the MMA path above would return +0.0.
+            gv = tl.load(g_ptr + start * N + rn, mask=rn < N, other=0.0)
+            xv = tl.load(x_ptr + start * K + rk, mask=rk < K, other=0.0)
+            acc = gv.to(tl.float32)[:, None] * xv.to(tl.float32)[None, :]
+        tl.store(
+            out_ptr
+            + e.to(tl.int64) * N * K
+            + rn[:, None].to(tl.int64) * K
+            + rk[None, :],
+            acc,
+            mask=(rn[:, None] < N) & (rk[None, :] < K),
+        )
 
 
 def _weight_table(weights: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
@@ -419,7 +562,9 @@ def _persistent_programs(
     return max(1, n)
 
 
-def live_rows_bound(tokens: int, topk: int, num_local_experts: int, block_m: int) -> int:
+def live_rows_bound(
+    tokens: int, topk: int, num_local_experts: int, block_m: int
+) -> int:
     """Upper bound of the permuted rows (``offsets[-1]``) for ``tokens`` gathered tokens.
 
     Each token routes to at most min(topk, local experts) local experts, and each
@@ -637,7 +782,9 @@ def relu2_probs_fwd(
     out = torch.empty((rows, f), dtype=out_dtype, device=h.device)
     block = min(triton.next_power_of_2(f), 1024)
     col_blocks = triton.cdiv(f, block)
-    _relu2_probs_kernel[(_persistent_programs(rows, rows_hint, h.device, col_blocks), col_blocks)](
+    _relu2_probs_kernel[
+        (_persistent_programs(rows, rows_hint, h.device, col_blocks), col_blocks)
+    ](
         h.contiguous(),
         probs.reshape(-1).float().contiguous(),
         out,
@@ -791,7 +938,11 @@ def permute_live(
     max_tokens, hidden_dim = x16.shape
     topk = probs.shape[1]
     counts = compute_local_tokens_per_expert(
-        routing_map, local_expert_start, num_local_experts, valid_tokens, persistent=True
+        routing_map,
+        local_expert_start,
+        num_local_experts,
+        valid_tokens,
+        persistent=True,
     )
     exclusive, inclusive = compute_expert_offsets(counts, alignment=block_m)
     rows = max_tokens * min(topk, num_local_experts) + block_m * num_local_experts
@@ -819,6 +970,7 @@ def permute_live(
     )
     return xp, pp, inclusive, inverse_map
 
+
 # ---------------------------------------------------------------------------
 # Training: autograd grouped linear over host-side expert splits.
 # ---------------------------------------------------------------------------
@@ -837,6 +989,136 @@ def _aligned_rows(m_splits: list[int], block_m: int, device) -> tuple:
     return dest_t.to(device), torch.tensor(offs, dtype=torch.int64).to(device), m_pad
 
 
+# Training expert GEMMs: one Triton launch per grouped linear (``segment``) or one
+# cuBLAS GEMM per expert (``cublas``). Both give the same bits (exact 16-bit
+# products, the reduction accumulated in order in fp32, no split-K); they differ in
+# cost. cuBLAS costs ~20-60 us of host time per GEMM (PyTorch re-parses
+# CUBLAS_WORKSPACE_CONFIG on every call under the batch-invariant :0:0 setting), so
+# at few rows per expert a forward over many local experts is launch-bound (Nano
+# EP1: 128 experts x 2 linears x #MoE layers GEMMs); at many rows per expert
+# cuBLAS's tiles are faster on the GPU. ``auto`` takes the segment kernel below
+# _SEGMENT_MAX_ROWS rows per expert (crossover ~1000-1500 rows per expert at Nano
+# expert shapes, thundersync_work/research/callcost/moe_bench_seg*.json).
+# NEMO_RL_FP16_MOE_TRAIN_GEMM overrides it (auto | segment | cublas).
+_SEGMENT_MAX_ROWS = 1024
+# (rows per expert bound, (BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages))
+_SEGMENT_CONFIGS: tuple[tuple[int, TileConfig], ...] = (
+    (16, (16, 64, 64, 4, 3)),
+    (64, (32, 64, 64, 4, 3)),
+    (256, (64, 64, 64, 4, 3)),
+    (1 << 62, (128, 128, 64, 8, 3)),
+)
+# wgrad tiles (BLOCK_N, BLOCK_K, BLOCK_R, num_warps, num_stages) by rows per expert.
+_WGRAD_CONFIGS: tuple[tuple[int, tuple], ...] = (
+    (256, (64, 64, 32, 4, 3)),
+    (1 << 62, (128, 128, 64, 8, 3)),
+)
+
+
+def _train_gemm_kind(rows: int, experts: int) -> str:
+    mode = os.environ.get("NEMO_RL_FP16_MOE_TRAIN_GEMM", "auto")
+    if mode in ("segment", "cublas"):
+        return mode
+    return "segment" if rows <= _SEGMENT_MAX_ROWS * max(experts, 1) else "cublas"
+
+
+def _segment_config(rows: int, experts: int) -> TileConfig:
+    per = rows / max(experts, 1)
+    for bound, cfg in _SEGMENT_CONFIGS:
+        if per <= bound:
+            return cfg
+    return _SEGMENT_CONFIGS[-1][1]
+
+
+def _segment_gemm(
+    a: torch.Tensor,
+    weights: tuple[torch.Tensor, ...],
+    counts: torch.Tensor,
+    transpose: bool,
+    b_fp16: bool,
+) -> torch.Tensor:
+    """out[r] = a[r] @ (W_e^T if transpose else W_e) for the rows r of expert e (fp32).
+
+    ``a`` [M, R] 16-bit contiguous, rows grouped by expert, ``counts`` [E] int32 on
+    a's device (rows per expert, summing to M). ``b_fp16``: round the weight to fp16
+    in registers (the forward); else the weight's dtype (dgrad on bf16 weights).
+    """
+    base, w_offs = _weight_table(list(weights))
+    n, k = base.shape  # each weight [N, K]
+    m, r = a.shape
+    cols, (s_r, s_c) = (n, (1, k)) if transpose else (k, (k, 1))
+    assert r == (k if transpose else n) and a.is_contiguous()
+    e = len(weights)
+    bm, bn, bk, warps, stages = _segment_config(m, e)
+    out = torch.empty((m, cols), dtype=torch.float32, device=a.device)
+    if m == 0:
+        return out
+    grid = (triton.cdiv(m, bm) + e, triton.cdiv(cols, bn))
+    _segment_gemm_kernel[grid](
+        a,
+        base,
+        w_offs,
+        counts,
+        out,
+        cols,
+        r,
+        s_r,
+        s_c,
+        e,
+        E_POW2=triton.next_power_of_2(e),
+        B_FP16=b_fp16,
+        BLOCK_M=bm,
+        BLOCK_N=bn,
+        BLOCK_K=bk,
+        num_warps=warps,
+        num_stages=stages,
+    )
+    return out
+
+
+def _segment_wgrad(
+    g: torch.Tensor, x: torch.Tensor, counts: torch.Tensor, e: int
+) -> torch.Tensor:
+    """[E, N, K] fp32: g_e^T @ x_e per expert (``g`` [M, N], ``x`` [M, K] bf16)."""
+    m, n = g.shape
+    k = x.shape[1]
+    out = torch.empty((e, n, k), dtype=torch.float32, device=g.device)
+    per = m / max(e, 1)
+    bn, bk, br, warps, stages = next(c for bound, c in _WGRAD_CONFIGS if per <= bound)
+    _segment_wgrad_kernel[(triton.cdiv(n, bn), triton.cdiv(k, bk), e)](
+        g,
+        x,
+        counts,
+        out,
+        n,
+        k,
+        e,
+        E_POW2=triton.next_power_of_2(e),
+        BLOCK_N=bn,
+        BLOCK_K=bk,
+        BLOCK_R=br,
+        num_warps=warps,
+        num_stages=stages,
+    )
+    return out
+
+
+def _grouped_backward_reference(ctx, g, x16, weights):
+    """Per-expert backward (CPU tests): dgrad / wgrad of each expert on bf16 casts."""
+    dx = torch.empty(x16.shape, dtype=torch.float32, device=x16.device)
+    wgrads = []
+    start = 0
+    for w, m in zip(weights, ctx.m_splits):
+        g_e = g[start : start + m]
+        x_e = x16[start : start + m].to(torch.bfloat16)
+        if ctx.needs_input_grad[0]:
+            dx[start : start + m] = _mm32(g_e, w.to(torch.bfloat16))
+        wgrads.append(_mm32(g_e.t(), x_e).to(w.dtype))
+        start += m
+    dx = dx.to(ctx.x_dtype).view(ctx.x_shape) if ctx.needs_input_grad[0] else None
+    return (dx, None, *wgrads)
+
+
 class GroupedFp16Linear(torch.autograd.Function):
     """y[rows of expert e] = fp16(x) @ fp16(W_e).T in fp32 (the shared kernel).
 
@@ -849,7 +1131,13 @@ class GroupedFp16Linear(torch.autograd.Function):
         k = x.shape[-1]
         x16 = x.reshape(-1, k).to(torch.float16)
         splits = list(m_splits)
-        if x16.is_cuda:
+        counts = None
+        if x16.is_cuda and _train_gemm_kind(x16.shape[0], len(splits)) == "segment":
+            counts = torch.tensor(splits, dtype=torch.int32).to(
+                x16.device, non_blocking=True
+            )
+            out = _segment_gemm(x16.contiguous(), weights, counts, True, True)
+        elif x16.is_cuda:
             out = _expert_gemm_cublas(x16, splits, weights)
         else:
             cfg = select_config(sum(splits) / max(len(splits), 1))
@@ -859,6 +1147,7 @@ class GroupedFp16Linear(torch.autograd.Function):
             out = grouped_gemm(x_pad, list(weights), offs, cfg).index_select(0, dest)
         ctx.save_for_backward(x16, *weights)
         ctx.m_splits = splits
+        ctx.counts = counts  # device rows per expert: the segment-kernel backward
         ctx.x_dtype = x.dtype
         ctx.x_shape = x.shape
         return out
@@ -866,22 +1155,56 @@ class GroupedFp16Linear(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad):  # noqa: D102
         x16, *weights = ctx.saved_tensors
+        splits = ctx.m_splits
         g = grad.reshape(-1, weights[0].shape[0]).to(torch.bfloat16)
-        dx = torch.empty(x16.shape, dtype=torch.float32, device=x16.device)
-        wgrads = []
-        start = 0
-        for w, m in zip(weights, ctx.m_splits):
-            g_e = g[start : start + m]
-            x_e = x16[start : start + m].to(torch.bfloat16)
+        if not g.is_cuda:
+            return _grouped_backward_reference(ctx, g, x16, weights)
+        w0 = weights[0]
+        same = all(w.dtype == w0.dtype and w.shape == w0.shape for w in weights)
+        if ctx.counts is not None and same and w0.dtype == torch.bfloat16:
+            # One dgrad and one wgrad launch for all experts (same bits as below).
+            dx = None
             if ctx.needs_input_grad[0]:
-                dx[start : start + m] = _mm32(g_e, w.to(torch.bfloat16))
-            wgrads.append(_mm32(g_e.t(), x_e).to(w.dtype))
-            start += m
-        dx = dx.to(ctx.x_dtype).view(ctx.x_shape) if ctx.needs_input_grad[0] else None
-        return (dx, None, *wgrads)
+                dx = _segment_gemm(g.contiguous(), weights, ctx.counts, False, False)
+                dx = dx.to(ctx.x_dtype).view(ctx.x_shape)
+            wg32 = _segment_wgrad(
+                g.contiguous(), x16.to(torch.bfloat16), ctx.counts, len(weights)
+            )
+            return (dx, None, *wg32.to(w0.dtype).unbind(0))
+        # Per expert: the same cuBLAS GEMMs as before, on views of whole-tensor
+        # casts and into views of whole-tensor outputs (one bf16 cast of x, one
+        # bf16 cast of all wgrads), so the host issues one GEMM per expert and
+        # nothing else. Bitwise the same as casting / rounding expert by expert.
+        x_bf = x16.to(torch.bfloat16)
+        g_e, x_e = g.split(splits), x_bf.split(splits)
+        dx = None
+        if ctx.needs_input_grad[0]:
+            dx = torch.empty(x16.shape, dtype=torch.float32, device=x16.device)
+            for gi, w, di in zip(g_e, weights, dx.split(splits)):
+                if gi.shape[0]:
+                    torch.mm(gi, w.to(torch.bfloat16), out_dtype=torch.float32, out=di)
+            dx = dx.to(ctx.x_dtype).view(ctx.x_shape)
+        if not same:
+            return (
+                dx,
+                None,
+                *(
+                    _mm32(gi.t(), xi).to(w.dtype)
+                    for gi, xi, w in zip(g_e, x_e, weights)
+                ),
+            )
+        wg32 = torch.empty(
+            (len(weights), *w0.shape), dtype=torch.float32, device=g.device
+        )
+        for gi, xi, wi in zip(g_e, x_e, wg32.unbind(0)):
+            if gi.shape[0]:
+                torch.mm(gi.t(), xi, out_dtype=torch.float32, out=wi)
+            else:
+                wi.zero_()  # an expert without rows: zero gradient
+        return (dx, None, *wg32.to(w0.dtype).unbind(0))
 
 
-# fp16 copies of the training model's expert weights (cuBLAS needs both operands in
+# fp16 copies of the training model's expert weights for the cuBLAS path (cuBLAS needs both operands in
 # fp16; the Triton kernel converts in registers instead), stacked [E, N, K] per expert
 # linear for the grouped GEMM, cast just in time and kept for the most recent
 # _CACHE_LINEARS expert linears only: fc1 + fc2 of the two most recent MoE layers, so a
@@ -892,9 +1215,7 @@ class GroupedFp16Linear(torch.autograd.Function):
 # policy worker calls invalidate_weight_cache() after every optimizer step.
 # ``set_weight_cache(False)`` casts one expert at a time instead (no stacked buffer).
 _CACHE_LINEARS = 4
-_WEIGHT_CACHE: "collections.OrderedDict[tuple[int, ...], tuple[tuple[int, ...], torch.Tensor]]" = (
-    collections.OrderedDict()
-)
+_WEIGHT_CACHE: "collections.OrderedDict[tuple[int, ...], tuple[tuple[int, ...], torch.Tensor]]" = collections.OrderedDict()
 # Sticky rounding's anchor forward runs on transient theta_n weights (streamed
 # from host): those must not enter the cache (ids and pointers get reused).
 # ``fc2_input``: sticky rounding's hook on the expert fc2 input rows.
@@ -947,8 +1268,8 @@ def _stacked_fp16(weights: tuple[torch.Tensor, ...]) -> torch.Tensor:
             w16 = old
     if w16 is None:
         w16 = torch.empty(shape, dtype=torch.float16, device=weights[0].device)
-    for dst, w in zip(w16, weights):
-        dst.copy_(w.detach())
+    # One multi-tensor cast (~E/4 launches) instead of one copy per expert.
+    torch._foreach_copy_(list(w16.unbind(0)), [w.detach() for w in weights])
     _WEIGHT_CACHE[key] = (ptrs, w16)
     return w16
 
@@ -969,17 +1290,12 @@ def _expert_gemm_cublas(
     w16 = _stacked_fp16(weights) if _HOOKS["cache"] else None
     m_total, n = x16.shape[0], weights[0].shape[0]
     out = torch.empty((m_total, n), dtype=torch.float32, device=x16.device)
-    start = 0
-    for i, m in enumerate(m_splits):
-        if m:
-            w = w16[i] if w16 is not None else weights[i].detach().to(torch.float16)
-            torch.mm(
-                x16[start : start + m],
-                w.t(),
-                out_dtype=torch.float32,
-                out=out[start : start + m],
-            )
-        start += m
+    ws = w16.unbind(0) if w16 is not None else weights
+    for x_e, o_e, w in zip(x16.split(m_splits), out.split(m_splits), ws):
+        if x_e.shape[0]:
+            if w16 is None:
+                w = w.detach().to(torch.float16)
+            torch.mm(x_e, w.t(), out_dtype=torch.float32, out=o_e)
     return out
 
 
@@ -1131,6 +1447,7 @@ def inference_experts_forward(
         out=out,
     )
     return y, None
+
 
 def validate_model(model_cfg: Any) -> list[str]:
     """MoE settings the fp16 expert path covers; returns what is unsupported."""
