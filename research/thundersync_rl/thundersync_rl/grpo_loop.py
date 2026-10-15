@@ -1417,6 +1417,13 @@ async def _run_one_step(
     # canonical_a_again).
     per_param_replay = os.environ.get("THUNDERSYNC_DEBUG_ORDER_REPLAY") == "params"
     replay_params: dict[str, Any] = {}
+    dispatch_sigs: dict[str, list] = {"real": []}
+
+    def dispatch_sig(d):
+        return tuple(
+            tuple((c.padding, tuple((t.group[1], t.index) for t in c.trajectories)) for c in cs)
+            for cs in d.per_rank
+        )
 
     def grad_digests():
         return [tuple(x) for x in _run_workers(learner.policy, "grad_digest")]
@@ -1430,18 +1437,21 @@ async def _run_one_step(
         pl = make_planner(order, block_sizes)
         arrival = list(trajs)
         _random.Random(seed).shuffle(arrival)
+        sigs = dispatch_sigs.setdefault(key, [])
         for t in arrival:
             pl.add(t)
             while pl.has_work(flush=False):
                 d = pl.next_dispatch(flush=False)
+                sigs.append(dispatch_sig(d))
                 ray.get(learner.submit(_build_dispatch(d), d.closes))
         while pl.has_work():
             d = pl.next_dispatch()
+            sigs.append(dispatch_sig(d))
             ray.get(learner.submit(_build_dispatch(d), d.closes))
         out = grad_digests()
         if per_param_replay:
             replay_params[key] = _run_workers(learner.policy, "grad_param_digests")
-            if key == "canonical_a":
+            if key.startswith("canonical"):
                 _run_workers(learner.policy, "grad_param_snapshot", tag=key)
         learner.abort()
         learner.begin(loss_fn, **begin_kw)
@@ -1520,6 +1530,8 @@ async def _run_one_step(
                 (ts_cfg.granularity != "batch" and not order_replay) or rollouts_done
             ):
                 d = planner.next_dispatch(flush=rollouts_done)
+                if per_param_replay:
+                    dispatch_sigs["real"].append(dispatch_sig(d))
                 per_rank = _build_dispatch(d)
                 t0 = time.perf_counter()
                 seq = None if ordered is None else ordered.learner_seq()
@@ -1751,10 +1763,24 @@ async def _run_one_step(
         real = grad_digests()
         if per_param_replay:
             _run_workers(learner.policy, "grad_param_snapshot", tag="real")
-            for r, diff in enumerate(
-                _run_workers(learner.policy, "grad_param_compare", a="canonical_a", b="real")
-            ):
-                print(f"[order replay] step={step} rank={r} canonical_a_vs_real={diff}", flush=True)
+            for k in ("canonical_a", "canonical_b", "canonical_a_again"):
+                diffs = _run_workers(
+                    learner.policy, "grad_param_compare", a=k, b="real", drop=False
+                )
+                for r, diff in enumerate(diffs):
+                    print(f"[order replay] step={step} rank={r} {k}_vs_real={diff}", flush=True)
+                sig = dispatch_sigs.get(k)
+                first = next(
+                    (i for i, (x, y) in enumerate(zip(sig, dispatch_sigs["real"])) if x != y),
+                    None,
+                )
+                print(
+                    f"[order replay] step={step} {k} dispatches={len(sig)} "
+                    f"real={len(dispatch_sigs['real'])} first_differing={first}"
+                    + ("" if first is None else f" {k}={sig[first]} real={dispatch_sigs['real'][first]}"),
+                    flush=True,
+                )
+            _run_workers(learner.policy, "grad_param_compare", a="real", b="real")
         bad = []
         for k, v in replay_digests.items():
             same = v == real
