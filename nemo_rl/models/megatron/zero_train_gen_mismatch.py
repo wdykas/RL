@@ -581,6 +581,17 @@ class _BatchInvariantLogprob:
             logits, target, start, end, group, inference_only = args
             chunk_size = None
         if group is None or torch.distributed.get_world_size(group) == 1:
+            from nemo_rl.models.megatron.deferred_head import DeferredHeadLogits
+
+            if isinstance(logits, DeferredHeadLogits):
+                # The training head's logits, never materialized for the whole
+                # micro-batch (deferred_head.py); the same chunking as below.
+                if inference_only or not torch.is_grad_enabled():
+                    logits = logits.materialize()
+                else:
+                    return logits.target_logprobs(
+                        target, _gathered_chunk_size(logits, chunk_size)
+                    )
             if not inference_only and torch.is_grad_enabled() and logits.requires_grad:
                 return _LocalVocabLogprob.apply(logits, target, chunk_size)
             return model_utils._tp_target_logprobs(
@@ -646,11 +657,19 @@ def enable_batch_invariant_kernels(config: PolicyConfig) -> None:
         # cost: none within noise (0.40-0.42 s vs 0.42-0.43 s per fwd+bwd).
         os.environ.setdefault("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
     _use_inference_log_softmax()
+    # Training LM head (fp32 head, TP=1): logits formed chunk by chunk inside the
+    # log-prob op, never for a whole micro-batch (deferred_head.py). Forward
+    # log-probs are bitwise the same; per-rank head memory no longer grows with
+    # tokens per micro-batch.
+    from nemo_rl.models.megatron import fp16_gemm
+
+    fp16_gemm._STATE["deferred_head"] = bool(megatron_cfg.get("deferred_lm_head", True))
     print(
         "[zero_train_gen_mismatch] batch-invariant kernels enabled: "
         f"backend={megatron_cfg['batch_invariant_backend']} "
         f"collective={collective} "
         f"deterministic_training={deterministic} "
+        f"deferred_lm_head={fp16_gemm._STATE['deferred_head']} "
         f"flash_attention_version={megatron_cfg['flash_attention_version']} "
         f"CUTE_DSL_LIBS={os.environ.get('CUTE_DSL_LIBS')}",
         flush=True,

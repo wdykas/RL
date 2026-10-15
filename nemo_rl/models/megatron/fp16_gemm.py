@@ -603,6 +603,20 @@ def _make_output_layer_forward(cls: type):
             comm = COMM_TP_COPY
         else:
             comm = COMM_NONE
+        if (
+            _STATE.get("deferred_head")
+            and comm == COMM_NONE
+            and _STATE["head"] == FP32_HEAD
+            and torch.is_grad_enabled()
+            and w.requires_grad
+            and self.bias is None
+        ):
+            # Training (TP=1): the loss needs only the target log-probs, so the
+            # logits are formed chunk by chunk by the log-prob op instead of for
+            # the whole micro-batch here (deferred_head.py).
+            from nemo_rl.models.megatron.deferred_head import deferred_head_logits
+
+            return deferred_head_logits(input_, w), None
         out = fp16_linear(input_, w, comm, group, _STATE["head"], site=self)
         if self.bias is not None and not self.skip_bias_add:
             out = out + self.bias.float()

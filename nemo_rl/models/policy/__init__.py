@@ -578,6 +578,11 @@ class MegatronConfig(TypedDict):
     # row order, mamba_ssm deterministic chunk-scan backward. Batch invariance (0
     # train/generation logprob difference) does not need it.
     deterministic_training: NotRequired[bool]
+    # Batch-invariant fp16-GEMM recipe, TP=1 (default true): the training LM head's
+    # logits are formed chunk by chunk inside the log-prob op (never for a whole
+    # micro-batch; nemo_rl/models/megatron/deferred_head.py). Bitwise the same
+    # forward log-probs.
+    deferred_lm_head: NotRequired[bool]
     # Sticky MoE routing threshold in router-score units (None/absent: off).
     # Set by ThunderSync from thundersync.sticky_routing_delta
     # (nemo_rl/models/megatron/sticky_routing.py).
