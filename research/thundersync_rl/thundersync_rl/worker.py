@@ -2731,7 +2731,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
     ) -> list[tuple[int, dict[str, Any]]]:
         """Block verification with q from the engine and p from the training model.
 
-        Learner prefix-state cache (``prefix_keys``; DESIGN 14o): row i is
+        Learner prefix-state cache (``prefix_keys``; DESIGN 14p): row i is
         cached under ``prefix_keys[i]`` (None: not cached) and forwarded only
         from its largest cached chunk boundary <= prompt_lens[i] - 1 whose
         tokens match; its p logits are bitwise those of the whole-row forward

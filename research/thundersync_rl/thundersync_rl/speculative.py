@@ -183,7 +183,7 @@ class Plan:
     # its draft, or a whole-accepted draft cut before EOS / the cap).
     tail: bool = field(default=False, compare=False)
     # Learner prefix-state cache: the key the learner caches this rollout's
-    # verification state under (continuation pieces; DESIGN 14o).
+    # verification state under (continuation pieces; DESIGN 14p).
     prefix_key: Optional[str] = field(default=None, compare=False)
     # Log of the row's importance (loss) weight, 0 for exact samples of p.
     # Opt-in tools only: drop-IS (log max(1, W*/M), needs null_bv) or banded
@@ -477,7 +477,7 @@ class SpeculativeGeneration:
         # Continuations are verified every this many decoded tokens while the
         # engine keeps decoding them (``_continue_sticky``).
         self.sticky_chunk_tokens = sticky_chunk_tokens
-        # Learner prefix-state cache (DESIGN 14o): continuation pieces are
+        # Learner prefix-state cache (DESIGN 14p): continuation pieces are
         # forwarded from the row's cached state on the learner rank that holds
         # it ({"gpu_gb", "max_gb"} per learner rank; None: off).
         self.prefix_cache = (

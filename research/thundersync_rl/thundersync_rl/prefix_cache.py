@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Driver side of the learner prefix-state cache (DESIGN.md section 14o).
+"""Driver side of the learner prefix-state cache (DESIGN.md section 14p).
 
 The learner ranks hold the state (``nemo_rl/models/megatron/prefix_state_cache.py``); the
 driver decides membership and placement, so every rank of a replica (TP x PP) receives the

@@ -302,7 +302,7 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # remainder (2048 > a 1024 cap re-decoded the remainder: 1.2-1.9x plain
     # decode per kept token, DESIGN.md section 14k).
     sticky_continuation_chunk_tokens: int = 128
-    # Learner prefix-state cache (DESIGN.md section 14o; nemo_rl/models/megatron/
+    # Learner prefix-state cache (DESIGN.md section 14p; nemo_rl/models/megatron/
     # prefix_state_cache.py). Each continuation piece is verified by a forward
     # of positions [last Mamba chunk boundary before the piece, end of piece)
     # from the row's cached attention K/V and Mamba conv/SSM state, instead of
@@ -511,7 +511,7 @@ def validate_config(master_config: ThunderSyncMasterConfig) -> None:
 
 
 def validate_learner_prefix_cache(master_config: ThunderSyncMasterConfig) -> None:
-    """Settings the learner prefix-state cache is built for (DESIGN 14o)."""
+    """Settings the learner prefix-state cache is built for (DESIGN 14p)."""
     ts_cfg = master_config.thundersync
     if not ts_cfg.learner_prefix_cache:
         return

@@ -2722,7 +2722,7 @@ Notes: thundersync_work/research/agent_nano_perf.md.*
     today [D]), so EP8 gains more.
   - Also: `select_engine_config` picks the grouped-GEMM tile from the padded row count.
 
-## 14o. Learner prefix-state cache for exact piece verification (`thundersync.learner_prefix_cache`)
+## 14p. Learner prefix-state cache for exact piece verification (`thundersync.learner_prefix_cache`)
 
 *Branch ts-learner-prefix-cache (../RL-prefixcache). Notes: thundersync_work/research/agent_prefix_cache.md.
 Problem statement: thundersync_work/research/piece_verify_scaling.md.*
@@ -2784,7 +2784,35 @@ offsets), context parallelism, sticky rounding's theta_n anchor forward, verify_
 At 16 continued rows per learner rank: Nano 4.5 GB (32k) / 13 GB (128k) per rank (of which `gpu_gb` on device);
 Ultra 1.2 / 2.4 GB per GPU. KV heads are replicated, not sharded, when TP exceeds the KV head count.
 
-**Validation.** RESULTS_PLACEHOLDER
+**Validation [M]** (thundersync_work/research/prefix_cache/*.log; check script tests/functional/check_prefix_cache.py:
+continuation rounds of 128-token pieces with random rejections, the cached forward of each round's rows in one batch
+with mixed starts vs the whole rows, logits compared with torch.equal).
+- Bitwise, 0 mismatches, max |d| 0 everywhere: Nano L8 quick (15 pieces, 4 rejections, 12 hits, host eviction);
+  L8 sticky anchors, 6 rows to 4k (201 pieces, 57 rejections, 195 hits; sticky kept the anchor on 17.9% of
+  token-layers); L8 plain, rejection prob 0.5; L16 sticky; L8 TP2 (sequence parallel) sticky; L8 EP2 sticky.
+- In-loop (local Nano L8 EP2 ts_por, 1k cap, parity reward, expert-grad noise, CHECKS=1 and
+  THUNDERSYNC_PREFIX_CACHE_CHECK=1; runs_prefixcache/pcl-x-1k-c): exactness EXACT 4/4 steps (mismatch 0, engine q
+  exact), 123/123 cached piece forwards bitwise equal to the whole-row forward. At a 1k cap most continued rows need
+  one piece, whose first forward is whole (verify0 is not cached): 3 hits. A first run hung: the check's extra forward
+  was not matched by EP dummy forwards on a rank without rows (fixed 0472a8b3).
+- Piece forward time, one row, prefix P + 128-token piece, cached start = last boundary (1 GPU, median of 5):
+
+  | P | L8 full | L8 cached | L16 full | L16 cached |
+  |---|---|---|---|---|
+  | 1k | 98.5 ms | 96.3 | 200.4 | 189.3 |
+  | 2k | 100.4 | 96.7 | 206.1 | 191.1 |
+  | 4k | 101.1 | 94.7 | 206.7 | 189.2 |
+  | 8k | 108.3 | 93.9 | 217.4 | 189.2 |
+
+  At L8/L16 and <= 8k a one-row forward is dominated by per-call cost (~90 ms per 8 layers on this node, flat in
+  length: research/determinism/fwdlen.json, 85 ms at 1k, 98 ms at 8k, 122 ms at 16k for L8). The cache removes the
+  length-dependent part: cached time is flat in P, full grows 10 ms (L8) / 17 ms (L16) from 1k to 8k. Measured gain
+  at this scale: x1.0-1.2.
+- Projection [D] to full Nano (52 layers ~ 3.3 x L16) and 32k: length-dependent work of a whole-row forward
+  ~ 2.4 us/token per 8 layers (fwdlen 8k->16k) -> ~16 us/token full depth, plus attention growing with L; a 32k
+  piece forward ~0.5 s of token work vs ~4 ms for a 256-token cached segment. Per continued 32k row: 256 pieces x
+  ~0.25 s (average 16k) ~ 60 s of learner work without the cache, ~1-2 s with it. The per-call cost is shared by all
+  rows batched in one verification call and is not changed by the cache; it needs its own fix (profile first).
 
 ## 15. Open work
 
