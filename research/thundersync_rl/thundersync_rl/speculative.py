@@ -1605,6 +1605,8 @@ class SpeculativeGeneration:
         if null is not None:
             drafts, names, slots, n_empty = null
             if self.verify_in_train:
+                # The envelopes VIT assumes are the ones this step's verification uses.
+                self._update_null_calibration()
                 drafts = self._vit_split(drafts, names, slots)
                 vit_names = {names[vg.key] for vg in self._vit_groups}
                 slots = {n: v for n, v in slots.items() if n not in vit_names}
@@ -1646,11 +1648,14 @@ class SpeculativeGeneration:
     def _vit_split(self, drafts, names, slots):
         """Take the pools whose first G drafts are all finished out of verify0.
 
-        A pool qualifies when it serves exactly G rows (one prompt), its first G
-        drafts (drafting order) are non-empty finished rollouts if whole-accepted
-        (``_stopped``) with engine log q and anchors. Which pools qualify is a
-        timing/length fact; the outcome of each pool is the regular
-        ``decide_pools`` outcome either way (``vit.py``).
+        A pool is every draft of one prompt key, in drafting order (``drafts``
+        is a list of per-row variant lists; ``_verify_null`` forms the pools the
+        same way, by key over the flat order). A pool qualifies when it serves
+        exactly G rows (one prompt), its first G drafts are non-empty finished
+        rollouts if whole-accepted (``_stopped``) with engine log q and anchors,
+        and it passes the gate. Which pools qualify is a timing/length fact; the
+        outcome of each pool is the regular ``decide_pools`` outcome either way
+        (``vit.py``).
         """
         if names is None:
             raise RuntimeError("verify_in_train needs pooled ⊥-BV drafts")
@@ -1659,60 +1664,67 @@ class SpeculativeGeneration:
         pred = self.vit_predictor
         pred.end_step()  # the previous step's outcomes join the window
         spread = self.vit_spread_rows() is not None
-        keep = []
-        pis, gated = [], 0
+        pools: dict[tuple, list] = {}
         for v in drafts:
-            key = _key(v[0][0])
-            n_slots = int(slots[names[key]]) if names is not None else len(v)
-            head = v[:G]
-            ok = (
-                G > 0
-                and n_slots == G
-                and len(v) >= G
-                and all(
-                    len(d[2]) > 0
-                    and self._stopped(d)
-                    and len(d) > 8
-                    and d[6] is not None
-                    and d[8] is not None
-                    for d in head
-                )
+            for d in v:
+                pools.setdefault(_key(d[0]), []).append(d)
+
+        def ready(d):
+            return (
+                len(d[2]) > 0
+                and self._stopped(d)
+                and len(d) > 8
+                and d[6] is not None
+                and d[8] is not None
             )
-            if ok:
-                # Gate (past steps' counts only): high predicted pass probability,
-                # and a spread group's retained forwards within the budget.
-                pi = pred.group_pass([len(d[2]) for d in head])
-                tokens_rank = -(-G // max(1, int(self.vit_dp))) * max(
-                    d[0].numel() + len(d[2]) for d in head
-                )
-                fits = (not spread) or tokens_rank * self.vit_bytes_per_token <= self.vit_checkpoint_bytes
-                if pi < self.vit_min_pass_prob or not fits:
-                    ok = False
-                    gated += 1
-                else:
-                    pis.append(pi)
-            if not ok:
-                keep.append(v)
+
+        taken: set = set()
+        pis, gated, n_any_g, n_first_g = [], 0, 0, 0
+        for key, pool in pools.items():
+            n_slots = int(slots[names[key]])
+            n_any_g += int(n_slots == G and sum(map(ready, pool)) >= G)
+            if not (G > 0 and n_slots == G and len(pool) >= G and all(map(ready, pool[:G]))):
                 continue
-            n = len(v)
-            ms = [
-                float(self._null_policy.m(n - j, G - j)) if names is not None else 1.0
-                for j in range(G)
-            ]
+            n_first_g += 1
+            head = pool[:G]
+            # Gate (past steps' counts only): high predicted pass probability,
+            # and a spread group's retained forwards within the budget.
+            pi = pred.group_pass([len(d[2]) for d in head])
+            tokens_rank = -(-G // max(1, int(self.vit_dp))) * max(
+                d[0].numel() + len(d[2]) for d in head
+            )
+            fits = (not spread) or tokens_rank * self.vit_bytes_per_token <= self.vit_checkpoint_bytes
+            if pi < self.vit_min_pass_prob or not fits:
+                gated += 1
+                continue
+            pis.append(pi)
+            n = len(pool)
+            ms = [float(self._null_policy.m(n - j, G - j)) for j in range(G)]
             self._vit_groups.append(
                 vit.VitGroup(
                     key=key,
-                    drafts=list(v),
+                    drafts=list(pool),
                     ms=ms,
-                    seeds=[vit.row_seed(base, d[4]) for d in v],
+                    seeds=[vit.row_seed(base, d[4]) for d in pool],
                 )
             )
+            taken.add(key)
+        keep = [[d for d in v if _key(d[0]) not in taken] for v in drafts]
+        keep = [v for v in keep if v]
         self._vit_seed_base = base
-        self._vit_null = names is not None
+        self._vit_null = True
+        self.stats["vit/pools_g_finished"] = float(n_any_g)
+        self.stats["vit/pools_first_g_finished"] = float(n_first_g)
         self.stats["vit/gated_groups"] = float(gated)
         self.stats["vit/predicted_pass_mean"] = sum(pis) / len(pis) if pis else float("nan")
         self.stats["vit/candidate_groups"] = float(len(self._vit_groups))
         self.stats["vit/candidate_rows"] = float(G * len(self._vit_groups))
+        if n_any_g and not self._vit_groups and not gated:
+            print(
+                f"[thundersync] WARNING verify_in_train: {n_any_g} pools have >= {G} finished "
+                f"drafts but none qualified (first-{G}-finished pools: {n_first_g})",
+                flush=True,
+            )
         return keep
 
     def vit_spread_rows(self) -> Optional[int]:
@@ -2114,6 +2126,21 @@ class SpeculativeGeneration:
         if self.verify_source == "engine":
             self.stats["spec/engine_q_dropped"] = float(dropped)
 
+    def _update_null_calibration(self) -> None:
+        """This step's calibrated ⊥-BV policy (earlier steps' rows only); idempotent."""
+        calib = self.__dict__.get("_null_calib")  # absent on test stubs
+        if calib is not None:
+            # This step's v: earlier steps' rows only (fixed before any of
+            # this step's drafts is verified).
+            v = calib.estimate()
+            cv = calib.verify_cost(int(self.null_bv_policy.get("ref_len", self.max_new_tokens)))
+            if (v, cv) != (self._null_policy.logratio_var, self._null_policy.verify_cost):
+                self._null_policy = NullPolicy(
+                    **{**self.null_bv_policy, "logratio_var": v, "verify_cost": cv}
+                )
+            self.stats["spec/null_v_used"] = v
+            self.stats["spec/null_verify_cost_used"] = cv
+
     def _verify_null(
         self, flat, rows, groups: list[str], slots: dict[str, int]
     ) -> dict[int, dict[str, Any]]:
@@ -2132,18 +2159,8 @@ class SpeculativeGeneration:
         (``decide_pools``); rows after the slots fill are "unused", and those
         never forwarded cost nothing (their hidden states are freed).
         """
+        self._update_null_calibration()
         calib = self.__dict__.get("_null_calib")  # absent on test stubs
-        if calib is not None:
-            # This step's v: earlier steps' rows only (fixed before any of
-            # this step's drafts is verified).
-            v = calib.estimate()
-            cv = calib.verify_cost(int(self.null_bv_policy.get("ref_len", self.max_new_tokens)))
-            if (v, cv) != (self._null_policy.logratio_var, self._null_policy.verify_cost):
-                self._null_policy = NullPolicy(
-                    **{**self.null_bv_policy, "logratio_var": v, "verify_cost": cv}
-                )
-            self.stats["spec/null_v_used"] = v
-            self.stats["spec/null_verify_cost_used"] = cv
         t_verify, n_forwarded = time.perf_counter(), 0
         policy = self._null_policy
         queue: dict[str, list[int]] = defaultdict(list)

@@ -265,3 +265,53 @@ def test_retained_forward_reuses_output_and_restores_routes():
             vit.RetainedSlot(ids=torch.tensor([[1, 2]]), output=out, routes=[], num_tokens=2),
             lambda **kw: dec(None), dec, [], {"input_ids_cp_sharded": torch.tensor([[1, 3]])},
         )
+
+
+def _spec_stub(G=2, slots_per_key=2):
+    import itertools as it
+
+    from thundersync_rl.speculative import SpeculativeGeneration
+
+    sp = object.__new__(SpeculativeGeneration)
+    sp.__dict__.update(
+        base=None, vit_group_size=G, _verify_seeds=it.count(1), vit_predictor=vit.PassPredictor(),
+        vit_dp=1, vit_mbs=8, vit_min_pass_prob=0.5, vit_checkpoint_bytes=float("inf"),
+        vit_bytes_per_token=0.0, stats={}, _vit_groups=[], _null_policy=NullPolicy(fixed_m=None),
+        max_new_tokens=4, max_seq_len=None, draft_budget=4, eod=0,
+    )
+    return sp
+
+
+def _draft(prompt, toks, done, key):
+    return (prompt, -1, toks, done, key, [], [0.0] * len(toks), None, object(), None)
+
+
+def test_vit_split_pools_per_row_variant_lists_by_key():
+    """Drafts arrive as one variant list per draft (``draft_streaming.build``): the pools
+    are formed by prompt key in drafting order, as ``_verify_null`` forms them (vit-l2
+    found no candidates when each per-row list was taken as a pool)."""
+    sp = _spec_stub(G=2)
+    pa, pb = torch.tensor([1, 2]), torch.tensor([3, 4])
+    drafts = [
+        [_draft(pa, [5, 6, 7, 8], True, "a0")],
+        [_draft(pb, [5, 6], False, "b0")],  # unfinished: pool b does not qualify
+        [_draft(pa, [5, 6, 0], True, "a1")],
+        [_draft(pb, [5, 6, 7, 8], True, "b1")],
+        [_draft(pa, [9], False, "a2")],  # extra of pool a (not among the first G)
+    ]
+    names = {tuple(pa.tolist()): "s:0", tuple(pb.tolist()): "s:1"}
+    keep = sp._vit_split(drafts, names, {"s:0": 2, "s:1": 2})
+    assert [vg.key for vg in sp._vit_groups] == [tuple(pa.tolist())]
+    assert [d[4] for d in sp._vit_groups[0].drafts] == ["a0", "a1", "a2"]
+    assert [v[0][4] for v in keep] == ["b0", "b1"]
+    assert sp.stats["vit/candidate_groups"] == 1.0 and sp.stats["vit/pools_g_finished"] == 1.0
+
+
+def test_vit_split_gate_uses_past_counts():
+    sp = _spec_stub(G=2)
+    for _ in range(10):
+        sp.vit_predictor.observe(4, False)  # finished 4-token drafts were never whole
+    pa = torch.tensor([1, 2])
+    drafts = [[_draft(pa, [5, 6, 7, 8], True, "a0")], [_draft(pa, [1, 2, 3, 4], True, "a1")]]
+    keep = sp._vit_split(drafts, {tuple(pa.tolist()): "s:0"}, {"s:0": 2})
+    assert sp._vit_groups == [] and len(keep) == 2 and sp.stats["vit/gated_groups"] == 1.0
