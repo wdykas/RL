@@ -28,6 +28,9 @@ policy:
     name: ${policy.model_name}
     chat_template_kwargs:
       enable_thinking: true
+      # Multi-turn rows must be prefix extensions: the Nemotron template's default (True)
+      # strips earlier turns' reasoning whenever history is rendered (check_multi_turn_template).
+      truncate_history_thinking: false
   # run_ab_arm.sh sets max_total_sequence_length = data.max_input_seq_length (PROMPT_CAP) + max_new_tokens (MAXLEN)
   max_total_sequence_length: 10240
   train_micro_batch_size: 1

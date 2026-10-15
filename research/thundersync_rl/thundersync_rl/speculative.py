@@ -58,6 +58,7 @@ from thundersync_rl.multi_turn import TurnEnvironment, TurnRecord, pair_rows, re
 from thundersync_rl.null_bv import NullGroup, NullPolicy, row_envelopes
 from thundersync_rl.prefix_cache import PrefixCacheDirectory, lpt_owners
 from thundersync_rl.tail_trace import TailTrace
+from thundersync_rl.run_state import SeedStream
 from thundersync_rl.routes import (
     RouteRefs,
     anchor_mismatches,
@@ -374,6 +375,8 @@ class SpeculativeGeneration:
         anchor_horizon: Optional[int] = None,
         banded_is_band: Optional[float] = None,
         learner_prefix_cache: Optional[dict[str, float]] = None,
+        seed: int = 0,
+        seed_stream: str = "0",
     ):
         self.base = base
         self.learner_policy = learner_policy
@@ -582,8 +585,15 @@ class SpeculativeGeneration:
                 "banded_is_band needs verify_mode='block' with verify_source='engine' "
                 f"(got {verify_mode!r}/{self.verify_source!r})"
             )
-        self._seeds = itertools.count(1)
-        self._verify_seeds = itertools.count(1)
+        # Verification randomness (eta, emissions) and keyed draft seeds:
+        # hash(grpo.seed, stream, step, counter), never reused across calls,
+        # steps, lanes or a resume (the counters are checkpointed:
+        # ``seed_state`` / ``load_seed_state``).
+        self.sentinel = None  # sentinel.WeightSentinel (set by the training loop)
+        self._seeds = SeedStream(seed, f"draft/{seed_stream}", lambda: self.current_step)
+        self._verify_seeds = SeedStream(
+            seed, f"verify/{seed_stream}", lambda: self.current_step
+        )
         self.plans: dict[tuple[int, ...], list[Plan]] = defaultdict(list)
         self.stats: dict[str, float] = {}
         # Multi-iteration drafts: target step -> drafts for that step's rollouts.
@@ -862,6 +872,11 @@ class SpeculativeGeneration:
         ids = ray.get(rank0.draft_request_ids.remote())
         refs, rids = self._record_refs(ids)
         out = ray.get(rank0.collect_drafts.remote(record_refs=refs, request_ids=rids))
+        # Drafts whose request had no engine record at the cut (finished in
+        # between): their final frame was awaited, never their streamed frames.
+        stats_fn = getattr(rank0, "draft_collect_stats", None)
+        for k, v in (ray.get(stats_fn.remote()) if stats_fn is not None else {}).items():
+            self.stats[f"spec/collect_{k}"] = self.stats.get(f"spec/collect_{k}", 0.0) + v
         self.stats["driver/collect_s"] = self.stats.get("driver/collect_s", 0.0) + time.perf_counter() - t0
         return out
 
@@ -1311,6 +1326,19 @@ class SpeculativeGeneration:
             self._stash_drafting_version(keep_previous=True)
             t2 = time.perf_counter()
             refit()
+            sentinel = getattr(self, "sentinel", None)
+            if sentinel is not None and sentinel.enabled:
+                # (a) the engine holds bitwise the learner's theta_hat; (b) the
+                # stashed head q rows are rebuilt with is that same head.
+                self._staged_digest = sentinel.check(
+                    self, f"theta_hat_{self.current_step + 1}"
+                )
+                if self.verify_source == "engine":
+                    ray.get(
+                        group.run_all_workers_single_data(
+                            "sentinel_head_stash_check", version=self.current_step
+                        )
+                    )
             t3 = time.perf_counter()
             if stage_on_engine:
                 stage_refs = engine.run_all_workers_single_data("stage_engine_weights")
@@ -1347,6 +1375,44 @@ class SpeculativeGeneration:
             flush=True,
         )
 
+    def seed_state(self) -> dict[str, Any]:
+        """Seed counters to checkpoint (``run_state.SeedStream``)."""
+        return {
+            "draft": self._seeds.state_dict(),
+            "verify": self._verify_seeds.state_dict(),
+        }
+
+    def load_seed_state(self, state: dict[str, Any]) -> None:
+        self._seeds.load_state_dict(state["draft"])
+        self._verify_seeds.load_state_dict(state["verify"])
+
+    def end_step(self) -> int:
+        """Drop the plans left over by this step (verified against its policy only).
+
+        Plans are otherwise replaced at the next verification; a step without
+        drafts (before a checkpoint / validation boundary) has none, and a later
+        row with the same prompt tokens (duplicate prompts, the next epoch) must
+        never claim a plan verified against an older version. Returns the count.
+        """
+        n = sum(len(q) for q in self.plans.values())
+        self.plans.clear()
+        # ⊥-BV prompt drop: the next step's selection comes from its own pools
+        # (none when it has no drafts: its first prompts are trained).
+        self.null_selected_keys = None
+        return n
+
+    def boundary_state_problems(self) -> list[str]:
+        """What this wrapper still holds that must not cross a checkpoint boundary."""
+        out = []
+        pending = sum(len(q) for q in self.plans.values())
+        if pending:
+            out.append(f"{pending} unconsumed plans")
+        if self.cohorts:
+            out.append(f"draft cohorts for steps {sorted(self.cohorts)}")
+        if getattr(self, "_staged_version", None) is not None:
+            out.append(f"momentum weights staged for step {self._staged_version}")
+        return out
+
     def load_staged_draft_weights(self) -> None:
         """Engine: replace the live weights by the staged draft weights.
 
@@ -1371,6 +1437,12 @@ class SpeculativeGeneration:
             raise RuntimeError(
                 f"draft weights: engine checksums after load {sums} != staged "
                 f"{self._staged_checksums}"
+            )
+        sentinel = getattr(self, "sentinel", None)
+        if sentinel is not None:
+            # The host stage came back bitwise (the theta_hat digest taken at refit).
+            sentinel.check_engine_against(
+                self, getattr(self, "_staged_digest", None) or [], "theta_hat host stage reload"
             )
         self._staged_version = None
         self.stats["draft/engine_load_s"] = time.perf_counter() - t0

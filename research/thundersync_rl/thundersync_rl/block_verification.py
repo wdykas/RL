@@ -55,12 +55,110 @@ positions with eta_i <= b_i need r_i (an O(V) pass over p_i and q_i).
 
 from __future__ import annotations
 
+import contextlib
 import math
 
 import torch
 
 # Emitted token id meaning BOT ("no output"): the draft is discarded (⊥-BV).
 NULL_TOKEN = -1
+
+
+class NonFiniteVerification(RuntimeError):
+    """A non-finite value reached block verification (never silently skipped).
+
+    log q(x) = -inf for a drafted token x means the engine sampled a token its
+    logged law gives probability 0: the logged q is not the sampling law (an
+    exactness bug, not a numerical event). Without this check the acceptance
+    weights become inf - inf = NaN and every comparison with NaN is false, so
+    the draft is silently cut before the token. NaN / +inf learner log-probs
+    (NaN logits) would end in a ``multinomial`` device assert instead.
+    """
+
+
+# Per-process counters of the checks (``nonfinite_counts``): drafts checked,
+# tokens with p(x) = 0 (legitimate: rejected with probability 1), errors raised.
+_COUNTS = {"drafts_checked": 0, "p_zero_tokens": 0, "errors": 0}
+
+
+def nonfinite_counts() -> dict[str, int]:
+    return dict(_COUNTS)
+
+
+def _fail(msg: str) -> None:
+    _COUNTS["errors"] += 1
+    print(f"[verify nonfinite] {msg} counts={_COUNTS}", flush=True)
+    raise NonFiniteVerification(msg)
+
+
+def check_verification_inputs(
+    lpx: torch.Tensor,
+    lqx: torch.Tensor,
+    lse_p: torch.Tensor | None = None,
+    lse_q: torch.Tensor | None = None,
+) -> None:
+    """Raise ``NonFiniteVerification`` unless p and q of a draft are usable.
+
+    ``lpx``/``lqx``: [g] log p / log q of the drafted tokens; ``lse_*``: the
+    rows' logsumexps (NaN/inf logits show there). log p(x) = -inf is allowed
+    (p(x) = 0: rejected with probability 1, counted); everything else must be
+    finite. One device sync per draft.
+    """
+    _COUNTS["drafts_checked"] += 1
+    parts = [lpx.float(), lqx.float().to(lpx.device)]
+    if lse_p is not None:
+        parts.append(lse_p.float())
+    if lse_q is not None:
+        parts.append(lse_q.float().to(lpx.device))
+    flat = torch.cat([p.reshape(-1) for p in parts])
+    p_zero = lpx == float("-inf")
+    ok = torch.isfinite(flat)
+    ok[: lpx.numel()] |= p_zero.reshape(-1)
+    if bool(ok.all()):
+        n0 = int(p_zero.sum()) if lpx.numel() else 0
+        _COUNTS["p_zero_tokens"] += n0
+        return
+    g = lpx.numel()
+    bad_q = torch.nonzero(~torch.isfinite(lqx.float())).flatten().tolist()
+    bad_p = torch.nonzero(~(torch.isfinite(lpx.float()) | p_zero)).flatten().tolist()
+    if bad_q:
+        _fail(
+            f"engine log q of {len(bad_q)} drafted token(s) is not finite at positions "
+            f"{bad_q[:8]} of g={g} (values {[float(lqx[i]) for i in bad_q[:4]]}): the "
+            "logged q is not the law the engine sampled from"
+        )
+    if bad_p:
+        _fail(
+            f"learner log p of {len(bad_p)} drafted token(s) is NaN/+inf at positions "
+            f"{bad_p[:8]} of g={g} (values {[float(lpx[i]) for i in bad_p[:4]]})"
+        )
+    _fail(f"non-finite logsumexp of a p or q row (draft of g={g})")
+
+
+@contextlib.contextmanager
+def nonfinite_context(**ctx):
+    """Re-raise ``NonFiniteVerification`` with the row's context (row, step, versions)."""
+    try:
+        yield
+    except NonFiniteVerification as exc:
+        raise NonFiniteVerification(
+            f"{exc} [" + ", ".join(f"{k}={v}" for k, v in ctx.items()) + "]"
+        ) from exc
+
+
+def check_emission(dist: torch.Tensor, where: str) -> None:
+    """The emission law must be finite with positive mass before ``multinomial``."""
+    s = dist.sum()
+    if not bool(torch.isfinite(s)) or not bool(s > 0):
+        _fail(
+            f"emission distribution at {where} is not a valid law "
+            f"(sum={float(s)}, non-finite entries={int((~torch.isfinite(dist)).sum())})"
+        )
+
+
+def check_stop_probabilities(h: torch.Tensor, where: str) -> None:
+    if not bool(torch.isfinite(h).all()):
+        _fail(f"non-finite stop probability at {where}: {h.tolist()[:8]}")
 
 
 def acceptance_weights(log_ratio: torch.Tensor, null_m: float = 1.0) -> torch.Tensor:
@@ -224,6 +322,7 @@ def lazy_stop_index(
         idx = cand[done : done + n]
         idx_d = idx.to(b.device)
         h = stop_probability(residual_mass(idx_d), b[idx_d])
+        check_stop_probabilities(h, f"positions {idx[:4].tolist()}")
         hit = torch.nonzero((eta[idx_d] <= h).cpu()).flatten()
         done += idx.numel()
         if hit.numel():
@@ -279,6 +378,7 @@ def block_weights(
     if band is not None:
         lp = banded_target(lp, lq, draft, band)
     ar = torch.arange(g, device=lp.device)
+    check_verification_inputs(lp[ar, draft], lq[ar, draft])
     b = acceptance_weights(lp[ar, draft] - lq[ar, draft], null_m)
 
     def mass(idx, bi):
@@ -289,7 +389,9 @@ def block_weights(
         )
 
     r = null_root_residual(mass, b, null_m)(ar)
-    return stop_probabilities(r, b), b, r
+    h = stop_probabilities(r, b)
+    check_stop_probabilities(h, "block_weights")
+    return h, b, r
 
 
 def _emit_dist(lp, lq, b, tau: int, g: int, null_m: float = 1.0) -> torch.Tensor:
@@ -320,6 +422,7 @@ def block_verify(
     eta = torch.rand(g + 1, generator=generator, dtype=torch.float64, device=lp.device)
     tau = int(torch.nonzero(eta <= h).flatten().max())
     dist = _emit_dist(lp, lq, b, tau, g, null_m)
+    check_emission(dist, f"tau={tau} of g={g}")
     y = int(torch.multinomial((dist / dist.sum()).float(), 1, generator=generator))
     return tau, emitted_token(y, lp.shape[-1])
 
@@ -343,6 +446,7 @@ def block_verify_lazy(
     if band is not None:
         lp = banded_target(lp, lq, draft, band)
     ar = torch.arange(g, device=lp.device)
+    check_verification_inputs(lp[ar, draft], lq[ar, draft])
     b = acceptance_weights(lp[ar, draft] - lq[ar, draft], null_m)
 
     def mass(idx, bi):
@@ -355,6 +459,7 @@ def block_verify_lazy(
     eta = torch.rand(g + 1, generator=generator, dtype=torch.float64, device=lp.device)
     tau, _ = lazy_stop_index(b, eta, null_root_residual(mass, b, null_m))
     dist = _emit_dist(lp, lq, b, tau, g, null_m)
+    check_emission(dist, f"tau={tau} of g={g}")
     y = int(torch.multinomial((dist / dist.sum()).float(), 1, generator=generator))
     return tau, emitted_token(y, lp.shape[-1])
 

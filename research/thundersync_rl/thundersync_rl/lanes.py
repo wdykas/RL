@@ -269,6 +269,7 @@ def build_engine_lanes(
     policy_config: dict[str, Any],
     tokenizer: Any,
     num_lanes: int = 2,
+    start_step: int = 0,
 ) -> list[Lane]:
     """Lanes over the setup's engine plus ``num_lanes - 1`` engines of its shape.
 
@@ -288,7 +289,8 @@ def build_engine_lanes(
 
     learners = policy.worker_group
     ray.get(learners.run_all_workers_single_data("keep_refit_group", lane=0))
-    lanes = [Lane(0, generation, version=("theta", 0))]
+    # Every lane starts on the learner's weights: theta_0, or theta_start on a resume.
+    lanes = [Lane(0, generation, version=("theta", start_step))]
     for i in range(1, num_lanes):
         cluster = RayVirtualCluster(
             name=f"grpo_inference_lane{i}",
@@ -320,7 +322,7 @@ def build_engine_lanes(
         ray.get(learners.run_all_workers_single_data("select_refit_group", lane=i))
         # The skip-load engine starts here, on its final weight buffers.
         sync.sync_weights()
-        lanes.append(Lane(i, gen, version=("theta", 0)))
+        lanes.append(Lane(i, gen, version=("theta", start_step)))
     ray.get(learners.run_all_workers_single_data("select_refit_group", lane=0))
     return lanes
 

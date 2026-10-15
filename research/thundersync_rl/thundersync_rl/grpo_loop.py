@@ -69,9 +69,18 @@ from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.logger import Logger
 from thundersync_rl.fused_train import FusedRef
 from thundersync_rl.lanes import CohortLanes, Lane, LaneStepOps, refit_lane
-from thundersync_rl.multi_turn import TurnEnvironment
+from thundersync_rl.multi_turn import PrefixGuardGeneration, TurnEnvironment
 from thundersync_rl.null_bv import drafts_per_prompt
 from thundersync_rl.routes import RouteRefs
+from thundersync_rl.run_state import (
+    Boundaries,
+    PromptStream,
+    check_fingerprint,
+    config_fingerprint,
+    load_state,
+    save_state,
+)
+from thundersync_rl.sentinel import WeightSentinel
 from thundersync_rl.speculative import SpeculativeGeneration, cohort_draft
 from thundersync_rl.streaming import (
     Chunk,
@@ -406,6 +415,15 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # with sticky routing (continuation rounds are plain BV), sticky rounding
     # and momentum draft weights (q is whatever the engine drafted with).
     banded_is_band: Optional[float] = None
+    # Always-on engine-vs-learner weight sentinel (sentinel.py, DESIGN.md
+    # section 14q): after every refit (theta_k, theta_hat_{k+1}, the initial
+    # weights and validation refits) each engine rank's weights are digested
+    # and compared bitwise with the learner's shards of the same tensors under
+    # the engine's storage dtype; the momentum host stage is re-checked when it
+    # is loaded, the stashed LM head against the live one, and expert_bias
+    # buffers must never change. A mismatch is an error naming the tensors.
+    # O(params / rank) reads per refit, no gather.
+    weight_sentinel: bool = True
 
 
 def train_micro_batch_rows(master_config: "ThunderSyncMasterConfig") -> int:
@@ -560,6 +578,80 @@ def validate_config(master_config: ThunderSyncMasterConfig) -> None:
     validate_draft_weights(master_config)
     validate_cohort_lanes(master_config)
     validate_banded_is(master_config)
+    validate_run_control(master_config)
+
+
+def _section(master_config: Any, name: str) -> dict[str, Any]:
+    part = getattr(master_config, name, None) or {}
+    if not isinstance(part, dict):
+        part = part.model_dump() if hasattr(part, "model_dump") else dict(vars(part))
+    return part
+
+
+def validate_run_control(master_config: Any) -> None:
+    """Checkpointing, validation and epochs as the ThunderSync loop runs them (DESIGN 14q)."""
+    ts_cfg = master_config.thundersync
+    ckpt = _section(master_config, "checkpointing")
+    grpo = master_config.grpo
+    data = _section(master_config, "data")
+    problems = []
+    val_on = (grpo.val_period or 0) > 0 or grpo.val_at_start or grpo.val_at_end
+    if ckpt.get("enabled"):
+        if not ckpt.get("save_optimizer", True):
+            problems.append(
+                "checkpointing.save_optimizer must be true (exact resume needs the "
+                "optimizer state; the momentum draft is a function of it)"
+            )
+        if (ckpt.get("save_period") or 0) <= 0:
+            problems.append("checkpointing.save_period must be > 0")
+        if ts_cfg.rollout_lag:
+            problems.append(
+                "checkpointing with thundersync.rollout_lag=1 is not built yet (the "
+                "lagged rollouts in flight would have to be saved)"
+            )
+        if data.get("use_multiple_dataloader"):
+            problems.append("checkpointing with data.use_multiple_dataloader is not built yet")
+        if ckpt.get("ft_save_period"):
+            problems.append(
+                "checkpointing.ft_save_period is not built yet (use save_period; "
+                "checkpoints are quiescent step boundaries)"
+            )
+    if (ckpt.get("enabled") or val_on) and ts_cfg.cohort_lanes > 1 and not (
+        ts_cfg.stream_training_over_tails
+    ):
+        problems.append(
+            "checkpoints and validation on the non-streaming lanes loop "
+            "(stream_training_over_tails=false) are not built yet"
+        )
+    if val_on and ts_cfg.rollout_lag:
+        problems.append("validation with thundersync.rollout_lag=1 is not built yet")
+    if (grpo.max_num_epochs or 0) < 1:
+        problems.append("grpo.max_num_epochs must be >= 1")
+    if problems:
+        raise ValueError("thundersync run control: " + "; ".join(problems) + ".")
+
+
+def check_multi_turn_template(master_config: Any, tokenizer: Any) -> None:
+    """Multi-turn rows must be prefix extensions: no chat template re-rendering of history.
+
+    The Nemotron chat template's ``truncate_history_thinking`` (default True)
+    strips the reasoning of assistant turns before the last user turn whenever
+    the history is rendered. The rollout loops tokenize incrementally (each
+    observation alone, ids concatenated; ``PrefixGuardGeneration`` asserts it
+    per turn), but any path that renders the history would silently change
+    earlier turns: refuse templates that can do it unless it is disabled.
+    """
+    if (master_config.grpo.max_rollout_turns or 1) <= 1:
+        return
+    template = getattr(tokenizer, "chat_template", None) or ""
+    kwargs = (master_config.policy.get("tokenizer") or {}).get("chat_template_kwargs") or {}
+    if "truncate_history_thinking" in template and kwargs.get("truncate_history_thinking") is not False:
+        raise ValueError(
+            "multi-turn rollouts (grpo.max_rollout_turns > 1) with a chat template that "
+            "truncates history thinking by default: set policy.tokenizer."
+            "chat_template_kwargs.truncate_history_thinking=false (re-rendered history "
+            "would not be a prefix of the sampled row)"
+        )
 
 
 def validate_learner_prefix_cache(master_config: ThunderSyncMasterConfig) -> None:
@@ -839,6 +931,16 @@ def validate_draft_weights(master_config: ThunderSyncMasterConfig) -> None:
         )
     if opt_cfg.get("optimizer", "adam") != "adam":
         problems.append("policy.megatron_cfg.optimizer.optimizer must be 'adam'")
+    if megatron_cfg.get("moe_router_bias_update_rate") and megatron_cfg.get(
+        "moe_router_enable_expert_bias", True
+    ):
+        # Independent of the streaming-wide rejection in validate_config: the
+        # momentum stage stages parameters only, not the expert_bias buffer.
+        problems.append(
+            "MoE expert-bias updates (moe_router_bias_update_rate > 0) are not "
+            "supported: the momentum stage does not stage the expert_bias buffer "
+            "(not built yet)"
+        )
     if problems:
         raise ValueError("thundersync.draft_weights=momentum: " + "; ".join(problems) + ".")
 
@@ -1322,6 +1424,8 @@ def train_gen_mismatch(trajectories, learner, tokenizer, master_config) -> dict:
     mask[:, 0] = False  # no prediction for the first token
     diff = (train_lp - data["generation_logprobs"])[mask]
     return {
+        # Bitwise digest of the learner's log-probs of the trained tokens.
+        "mismatch/train_lp_crc": zlib.crc32(train_lp[mask].float().numpy().tobytes()),
         "mismatch/max_abs_logprob_diff": float(diff.abs().max()),
         "mismatch/mean_abs_logprob_diff": float(diff.abs().mean()),
         "mismatch/exact_token_frac": float((diff == 0).float().mean()),
@@ -1373,6 +1477,53 @@ async def _generate_rollouts(
 
 async def _ready(x):
     return x
+
+
+class KeyedFreshGeneration:
+    """Debug (``THUNDERSYNC_DEBUG_KEYED_FRESH=1``, speculation off): reproducible rollouts.
+
+    Every turn request of row ``row`` at step ``step`` carries
+    ``noise_seed = hash(grpo.seed, "fresh", step, row, turn)``; the engine's
+    keyed sampler (``install_keyed_sampler``, full vocabulary) then draws each
+    token by Gumbel-max with noise keyed by (seed, position): an exact sample of
+    the engine's distribution that does not depend on which requests share a
+    batch. With batch-invariant kernels and deterministic training, two runs
+    (or a run and its resume) then produce bitwise the same rollouts, which the
+    kill-and-resume exactness test needs (the engine's own sampler draws from
+    one generator over the whole batch: not reproducible run to run).
+    """
+
+    def __init__(self, inner: Any, base_seed: int, step: int, row: int) -> None:
+        self._inner, self._key = inner, (int(base_seed), "fresh", int(step), int(row))
+        self._turn = 0
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    async def generate_async(self, data, greedy: bool = False, **kwargs):
+        from thundersync_rl.run_state import derive_seed
+
+        data["noise_seed"] = torch.tensor([derive_seed(*self._key, self._turn)])
+        self._turn += 1
+        async for out in self._inner.generate_async(data, greedy=greedy, **kwargs):
+            yield out
+
+
+def keyed_fresh_enabled(master_config: Any) -> bool:
+    if not os.environ.get("THUNDERSYNC_DEBUG_KEYED_FRESH"):
+        return False
+    if master_config.thundersync.speculate:
+        raise ValueError("THUNDERSYNC_DEBUG_KEYED_FRESH needs thundersync.speculate=false")
+    return True
+
+
+def install_keyed_fresh(generation: Any) -> None:
+    """Install the keyed sampler on every engine rank (full vocabulary, as the logged law)."""
+    ray.get(
+        generation._policy.worker_group.run_all_workers_single_data(
+            "install_keyed_sampler", vocab_limit=1 << 30, head_k=1
+        )
+    )
 
 
 async def _run_one_step(
@@ -1433,6 +1584,13 @@ async def _run_one_step(
     ``_next_rollouts``).
     """
     G = master_config.grpo.num_generations_per_prompt
+    keyed_fresh = keyed_fresh_enabled(master_config)
+    if keyed_fresh and group_order is None:
+        # Reproducible runs also need a reproducible gradient order: dispatch
+        # the groups in index order (StreamPlanner.set_order), not by arrival.
+        group_order = list(range(batch.size))
+        bg = max(1, int(ts_cfg.canonical_block_groups))
+        group_blocks = [min(bg, len(group_order) - j) for j in range(0, len(group_order), bg)]
     # Streaming over the tails: training dispatches are ordered learner calls
     # (SpeculativeGeneration.learner_seq), interleaved with verification.
     ordered = ordered_learner
@@ -1593,16 +1751,26 @@ async def _run_one_step(
             # environment is not stepped again.
             replayed[0] += 1
             return i, *drafted
+        # Multi-turn: every turn's context must extend the previous turn's
+        # tokens (row-is-a-prefix; always on, an error otherwise).
+        multi = (master_config.grpo.max_rollout_turns or 1) > 1
+        gen = policy_generation
+        if keyed_fresh:
+            gen = KeyedFreshGeneration(gen, master_config.grpo.seed, step, i)
+        if multi:
+            gen = PrefixGuardGeneration(gen, i)
         state, metrics = await run_sample_multi_turn_rollout(
             sample_idx=i,
             initial_sample_state=_initial_sample_state(repeated, i),
-            policy_generation=policy_generation,
+            policy_generation=gen,
             tokenizer=tokenizer,
             task_to_env=task_to_env,
             max_seq_len=master_config.policy["max_total_sequence_length"],
             max_rollout_turns=master_config.grpo.max_rollout_turns,
             greedy=False,
         )
+        if multi:
+            gen.final_check(state["message_log"])
         return i, state, metrics, None
 
     async def learner_loop():
@@ -1931,6 +2099,9 @@ async def _run_one_step(
     out = {
         "reward": float(np.mean(rewards)),
         "rollout_entropy": nll / max(n_tok, 1),
+        # Bitwise digest of the trained rows (tokens and their stored
+        # log-probs), row order fixed by row index.
+        "digest/rollouts": _rollout_crc(all_trajectories),
         "grad_norm": float(torch.as_tensor(results["grad_norm"]).float().mean()),
         "mean_gen_tokens": float(
             np.mean([m["assistant_tokens"] for m in sample_metrics])
@@ -2000,6 +2171,17 @@ async def _run_one_step(
     return out
 
 
+def _rollout_crc(trajectories) -> int:
+    crc = 0
+    for t in sorted(trajectories, key=lambda t: t.index):
+        for m in t.payload["message_log"]:
+            crc = zlib.crc32(m["token_ids"].to(torch.int64).numpy().tobytes(), crc)
+            lp = m.get("generation_logprobs")
+            if lp is not None:
+                crc = zlib.crc32(torch.as_tensor(lp).float().numpy().tobytes(), crc)
+    return crc
+
+
 def next_draft_prompts(
     next_batch: BatchedDataDict, ts_cfg: ThunderSyncConfig, G: int
 ) -> tuple[list[torch.Tensor], Optional[dict[tuple[int, ...], int]]]:
@@ -2037,8 +2219,13 @@ def make_speculative_generation(
     policy: Policy,
     tokenizer,
     master_config: ThunderSyncMasterConfig,
+    stream: int = 0,
 ) -> SpeculativeGeneration:
-    """The speculative wrapper of one engine (one per lane with cohort lanes)."""
+    """The speculative wrapper of one engine (one per lane with cohort lanes).
+
+    ``stream``: seed stream of this wrapper (the lane index): verification
+    randomness is hash(grpo.seed, stream, step, counter) (``run_state``).
+    """
     ts_cfg = master_config.thundersync
     return SpeculativeGeneration(
         generation,
@@ -2085,6 +2272,8 @@ def make_speculative_generation(
             if ts_cfg.learner_prefix_cache
             else None
         ),
+        seed=int(master_config.grpo.seed),
+        seed_stream=str(stream),
     )
 
 
@@ -2099,11 +2288,24 @@ def thundersync_grpo_train(
     logger: Optional[Logger] = None,
     on_step: Optional[Callable[[list[dict[str, Any]]], None]] = None,
     lanes: Optional[list[Lane]] = None,
+    checkpointer: Optional[Any] = None,
+    grpo_save_state: Optional[Any] = None,
+    val_dataloader: Optional[Any] = None,
+    val_task_to_env: Optional[dict[str, EnvironmentInterface]] = None,
+    resume_path: Optional[str] = None,
 ) -> list[dict[str, Any]]:
     """``on_step(history)`` runs after every completed step (e.g. to persist the
     per-step history, so a run cut short still has every finished step's metrics).
     ``lanes``: the engine lanes (``lanes.build_engine_lanes``) when
-    ``thundersync.cohort_lanes`` is 2; ``policy_generation`` is then lane 0."""
+    ``thundersync.cohort_lanes`` is 2; ``policy_generation`` is then lane 0.
+
+    Run control (DESIGN.md section 14q, ``run_state.py``): batches come from
+    ``grpo.max_num_epochs`` epochs of ``dataloader`` until ``grpo.max_num_steps``;
+    checkpoints (``checkpointer``, NeMo-RL's, with ``checkpointing.enabled``)
+    and validation (``val_period`` / ``val_at_start`` / ``val_at_end``, plain
+    routing) run at quiescent step boundaries; ``resume_path``: the checkpoint
+    this run continues from (``run_state.resolve_resume``; setup() already
+    loaded its weights and optimizer)."""
     validate_config(master_config)
     ts_cfg = master_config.thundersync
     adv_fn = make_group_advantage_fn(master_config)
@@ -2113,17 +2315,40 @@ def thundersync_grpo_train(
             f"thundersync.cohort_lanes={ts_cfg.cohort_lanes} but "
             f"{'no' if lanes is None else len(lanes)} engine lanes were built"
         )
+    ckpt_cfg = _section(master_config, "checkpointing")
+    ckpt_on = checkpointer is not None and bool(ckpt_cfg.get("enabled"))
+    resume = load_state(resume_path) if resume_path is not None else None
+    if resume is not None:
+        if not ckpt_on:
+            raise RuntimeError("resume_path given but checkpointing is not enabled")
+        check_fingerprint(resume["fingerprint"], config_fingerprint(master_config))
     if lanes is not None and not ts_cfg.stream_training_over_tails:
+        if resume is not None:
+            raise RuntimeError("resume on the non-streaming lanes loop is not built yet")
         return _train_on_lanes(
             policy, lanes, learner, adv_fn, dataloader, tokenizer, loss_fn,
             task_to_env, master_config, logger, on_step,
         )
     max_steps = master_config.grpo.max_num_steps
+    grpo_cfg = master_config.grpo
+    bounds = Boundaries(
+        max_steps=max_steps,
+        save_period=int(ckpt_cfg.get("save_period") or 0) if ckpt_on else 0,
+        val_period=int(grpo_cfg.val_period or 0) if val_dataloader is not None else 0,
+        val_start_at=int(getattr(grpo_cfg, "val_start_at", 0) or 0),
+    )
+    timeout = None
+    if ckpt_on and ckpt_cfg.get("checkpoint_must_save_by"):
+        from nemo_rl.utils.timer import TimeoutChecker
+
+        timeout = TimeoutChecker(timeout=ckpt_cfg["checkpoint_must_save_by"], fit_last_save_time=True)
+        timeout.start_iterations()
     history = []
     stale = False  # setup() already performed the initial refit
-    step = 0
+    step = int(resume["next_step"]) if resume is not None else 0
     spec = None
     sched = None
+    sentinel = WeightSentinel(policy, enabled=ts_cfg.weight_sentinel)
     if lanes is not None:
         # Cohort lanes on the streaming loop (DESIGN.md section 14j): one
         # SpeculativeGeneration per lane; each step's cohort runs on lane
@@ -2132,7 +2357,7 @@ def thundersync_grpo_train(
         for lane in lanes:
             lane.generation.prepare_for_generation()
             lane.spec = make_speculative_generation(
-                lane.generation, policy, tokenizer, master_config
+                lane.generation, policy, tokenizer, master_config, stream=lane.index
             )
         sched = CohortLanes(lanes)
         spec = lanes[0].spec
@@ -2141,6 +2366,30 @@ def thundersync_grpo_train(
         spec = make_speculative_generation(
             policy_generation, policy, tokenizer, master_config
         )
+    specs = [lane.spec for lane in lanes] if lanes is not None else ([spec] if spec else [])
+    for sp in specs:
+        sp.sentinel = sentinel
+    if resume is not None:
+        seeds = resume.get("seeds") or {}
+        for i, sp in enumerate(specs):
+            if str(i) in seeds:
+                sp.load_seed_state(seeds[str(i)])
+        if lanes is not None:
+            for lane in lanes:
+                # Every lane holds theta_start now (setup's refit / the lane build).
+                lane.version, lane.cohort = ("theta", step), None
+        print(
+            f"[thundersync] resumed from {resume_path} at step {step} "
+            f"(epoch {resume['data']['epoch']})",
+            flush=True,
+        )
+    if keyed_fresh_enabled(master_config):
+        for gen in ([lane.generation for lane in lanes] if lanes is not None else [policy_generation]):
+            install_keyed_fresh(gen)
+    # The engines' initial weights (setup's refit, lane builds, or a resume)
+    # must already be the learner's: checked before step 0 like every refit.
+    for gen in ([lane.generation for lane in lanes] if lanes is not None else [policy_generation]):
+        sentinel.check(gen, f"initial weights (step {step})")
     check_weights = bool(os.environ.get("THUNDERSYNC_MISMATCH_CHECK"))
 
     def lane_fp(lane):
@@ -2164,7 +2413,8 @@ def thundersync_grpo_train(
             master_config.policy["max_total_sequence_length"],
             master_config.grpo.max_rollout_turns,
         )
-    if spec is not None and os.environ.get("THUNDERSYNC_SPEC_SELFTEST"):
+    if spec is not None and os.environ.get("THUNDERSYNC_SPEC_SELFTEST") and resume is None:
+        # Debug only; never on a resume (it would consume the loaded data position).
         first = next(iter(dataloader))
         prompts = [
             torch.cat([m["token_ids"] for m in first["message_log"][i]])
@@ -2173,16 +2423,124 @@ def thundersync_grpo_train(
         spec.draft_budget, budget = 256, spec.draft_budget
         print("[spec selftest]", asyncio.run(spec.self_test(prompts)), flush=True)
         spec.draft_budget = budget
-    batches = iter(dataloader)
-    if ts_cfg.null_bv_prompt_drop and ts_cfg.null_bv_spare_prompts:
-        # Prompt drop: every step's batch carries the spares (the trained
-        # prompts stay grpo.num_prompts_per_step).
-        batches = rebatch(
-            batches, master_config.grpo.num_prompts_per_step + ts_cfg.null_bv_spare_prompts
-        )
-    upcoming = collections.deque(
-        b for b in itertools.islice(batches, max(1, ts_cfg.draft_lookahead) + 1)
+    # Every epoch of the data (grpo.max_num_epochs), each batch tagged with the
+    # stream state that yields it (the checkpoint's data position). Prompt drop:
+    # every step's batch carries the spares (trained prompts stay
+    # grpo.num_prompts_per_step).
+    stream = PromptStream(
+        dataloader,
+        max_epochs=int(grpo_cfg.max_num_epochs or 1),
+        rebatch_size=(
+            master_config.grpo.num_prompts_per_step + ts_cfg.null_bv_spare_prompts
+            if ts_cfg.null_bv_prompt_drop and ts_cfg.null_bv_spare_prompts
+            else None
+        ),
+        state=resume["data"] if resume is not None else None,
     )
+    upcoming = collections.deque(
+        itertools.islice(stream, max(1, ts_cfg.draft_lookahead) + 1)
+    )
+
+    def run_validation(at_step: int) -> dict[str, Any]:
+        """Validation of theta_{at_step} at a quiescent boundary, plain routing.
+
+        The engine holds no drafting weights or plans here (the step before a
+        boundary drafted nothing); eval requests go to the raw engine (never the
+        speculative wrapper), carry no anchors, and the engine applies anchors
+        only to requests that carry them, so routing is plain top-k.
+        """
+        nonlocal stale
+        from nemo_rl.algorithms.grpo import validate
+
+        problems = [p for sp in specs for p in sp.boundary_state_problems()]
+        if problems:
+            raise RuntimeError(f"validation at step {at_step}: engine not quiescent: {problems}")
+        if sched is not None:
+            gen = sched.cohort_lane(at_step).generation
+            lane = sched.cohort_lane(at_step)
+            sched.refit(lane, ("theta", at_step), lambda: refit_lane(policy, lane))
+            lane.generation.prepare_for_generation()
+        else:
+            gen = policy_generation
+            refit_policy_generation(policy, gen, False)
+            stale = False
+        sentinel.check(gen, f"validation refit (theta_{at_step})")
+        t = time.perf_counter()
+        val_metrics, val_timings = validate(
+            gen, val_dataloader, tokenizer, val_task_to_env, step=at_step,
+            master_config=master_config, logger=logger,
+        )
+        gen.finish_generation()
+        val_metrics = dict(val_metrics)
+        val_metrics["time_s"] = time.perf_counter() - t
+        print(f"[thundersync validation step {at_step}] {val_metrics}", flush=True)
+        if logger is not None:
+            logger.log_metrics(val_metrics, at_step, prefix="validation")
+            logger.log_metrics(val_timings, at_step, prefix="timing/validation")
+        return val_metrics
+
+    def save_boundary(next_step: int, val_metrics, final: bool) -> str:
+        """Checkpoint at the quiescent boundary before step ``next_step``."""
+        problems = [p for sp in specs for p in sp.boundary_state_problems()]
+        if sched is not None:
+            problems += [f"lane {ln.index} pinned to cohort {ln.cohort}" for ln in lanes if ln.cohort is not None]
+        if problems:
+            raise RuntimeError(f"checkpoint before step {next_step}: boundary not quiescent: {problems}")
+        t = time.perf_counter()
+        data_state = upcoming[0].state if upcoming else stream.state()
+        if grpo_save_state is not None:
+            grpo_save_state.total_steps = next_step
+            grpo_save_state.current_step = next_step
+            grpo_save_state.current_epoch = int(data_state["epoch"])
+            grpo_save_state.consumed_samples = next_step * int(master_config.grpo.num_prompts_per_step)
+            if val_metrics and "accuracy" in val_metrics:
+                grpo_save_state.val_reward = val_metrics["accuracy"]
+            metric = ckpt_cfg.get("metric_name")
+            if metric:
+                prefix, name = metric.split(":", 1)
+                src = val_metrics if prefix == "val" else (history[-1] if history else {})
+                if src and name in src:
+                    setattr(grpo_save_state, metric, src[name])
+        info = vars(grpo_save_state) if grpo_save_state is not None else {"total_steps": next_step}
+        checkpointer.finalize_pending()
+        path = checkpointer.init_tmp_checkpoint(next_step, info, master_config)
+        policy.save_checkpoint(
+            weights_path=os.path.join(path, "policy", "weights"),
+            optimizer_path=os.path.join(path, "policy", "optimizer"),
+            tokenizer_path=os.path.join(path, "policy", "tokenizer"),
+            is_final_checkpoint=final,
+        )
+        if data_state.get("dl") is not None:
+            # NeMo-RL's own resume reads it too (setup's load_dataloader_state).
+            torch.save(data_state["dl"], os.path.join(path, "train_dataloader.pt"))
+        state = {
+            "next_step": next_step,
+            "data": data_state,
+            "seeds": {str(i): sp.seed_state() for i, sp in enumerate(specs)},
+            "lanes": (
+                [{"index": ln.index, "version": ln.version} for ln in lanes]
+                if lanes is not None
+                else None
+            ),
+            "fingerprint": config_fingerprint(master_config),
+        }
+        if os.environ.get("THUNDERSYNC_RESUME_DIGEST"):
+            state["digest"] = resume_digest(policy, upcoming, stream, specs)
+            print(f"[resume digest] save next_step={next_step} {state['digest']}", flush=True)
+        save_state(path, state)
+        checkpointer.begin_finalization(path, wait_fn=policy.finalize_async_save)
+        secs = time.perf_counter() - t
+        print(f"[thundersync] checkpoint {path} (next step {next_step}) in {secs:.1f} s", flush=True)
+        return path
+
+    if resume is not None and os.environ.get("THUNDERSYNC_RESUME_DIGEST"):
+        d = resume_digest(policy, upcoming, stream, specs)
+        print(f"[resume digest] load next_step={step} {d}", flush=True)
+        saved = resume.get("digest")
+        if saved is not None and saved != d:
+            raise RuntimeError(f"resume digest differs: saved {saved} loaded {d}")
+    if step == 0 and grpo_cfg.val_at_start and val_dataloader is not None:
+        run_validation(0)
     drafts = None
     cohort_mode = (
         spec is not None
@@ -2199,13 +2557,16 @@ def thundersync_grpo_train(
         ]
 
     while upcoming:
-        batch = upcoming.popleft()
-        nb = next(batches, None)
-        if nb is not None:
-            upcoming.append(nb)
-        next_batch = upcoming[0] if upcoming else None
         if step >= max_steps:
             break
+        batch = upcoming.popleft().batch
+        nb = next(stream, None)
+        if nb is not None:
+            upcoming.append(nb)
+        next_batch = upcoming[0].batch if upcoming else None
+        # Drafts made in this step may target steps < draft_limit only: none
+        # crosses a checkpoint / validation boundary (run_state.Boundaries).
+        draft_limit = bounds.draft_limit(step)
         t0 = time.perf_counter()
         t_verify = 0.0
         t_first = 0.0
@@ -2216,7 +2577,7 @@ def thundersync_grpo_train(
             spec, policy_generation = lane_x.spec, lane_x.generation
             for lane in lanes:
                 lane.spec.current_step = step
-            if next_batch is not None and step + 1 < max_steps:
+            if next_batch is not None and step + 1 < draft_limit:
                 # The drafting lane takes cohort step+1's drafter (theta_step, or
                 # theta_hat_{step+1}: learner load, refit of this lane only,
                 # learner restore) and starts drafting before this step's
@@ -2231,6 +2592,7 @@ def thundersync_grpo_train(
                         )
                     else:
                         refit_lane(policy, y)
+                        sentinel.check(y.generation, f"drafter theta_{step} (lane {y.index})")
 
                 sched.refit(lane_y, version, put_drafter)
                 sched.pin(lane_y, step + 1)
@@ -2282,7 +2644,7 @@ def thundersync_grpo_train(
             and sched is None  # lanes stage the drafter on the drafting lane
             and spec.draft_weights != "current"
             and next_batch is not None
-            and step + 1 < max_steps
+            and step + 1 < draft_limit
         )
         # Lanes: rows without a plan (never drafted, or dropped) decode at
         # theta_step on the cohort lane after its tails; decided before any
@@ -2319,6 +2681,7 @@ def thundersync_grpo_train(
                     sched.unpin(lane_x, step)
                 if lane_fresh:
                     sched.refit(lane_x, ("theta", step), lambda: refit_lane(policy, lane_x))
+                    sentinel.check(lane_x.generation, f"theta_{step} (lane {lane_x.index})")
                 else:
                     lane_x.generation.prepare_for_generation()
                 refit_s.append(time.perf_counter() - t_r)
@@ -2335,6 +2698,7 @@ def thundersync_grpo_train(
             t_r = time.perf_counter()
             if (stale or staged) and not draft_now:
                 refit_policy_generation(policy, policy_generation, False)
+                sentinel.check(policy_generation, f"theta_{step}")
             else:
                 policy_generation.prepare_for_generation()
             refit_s.append(time.perf_counter() - t_r)
@@ -2430,11 +2794,11 @@ def thundersync_grpo_train(
         if cohort_mode:
             ahead = list(upcoming)[: ts_cfg.draft_lookahead]
             targets = new_cohort_targets(
-                step, len(ahead), max_steps, existing=spec.cohorts.keys()
+                step, len(ahead), draft_limit, existing=spec.cohorts.keys()
             )
-            new = {t: _prompts(ahead[t - step - 1]) for t in targets}
+            new = {t: _prompts(ahead[t - step - 1].batch) for t in targets}
             drafter = lambda new=new, step=step: spec.draft_cohorts(step, new)  # noqa: E731
-        elif spec is not None and next_batch is not None and step + 1 < max_steps:
+        elif spec is not None and next_batch is not None and step + 1 < draft_limit:
             next_prompts, null_slots = next_draft_prompts(next_batch, ts_cfg, G)
             drafter = (  # noqa: E731
                 (
@@ -2553,12 +2917,63 @@ def thundersync_grpo_train(
             for r, st in enumerate(per_rank):
                 print(f"[engine prof] step={step} rank={r} {st}", flush=True)
             metrics.update(per_rank[0] or {})
+        # Plans left by this step were verified against its policy only.
+        metrics["spec/plans_dropped"] = float(sum(sp.end_step() for sp in specs))
+        if os.environ.get("THUNDERSYNC_STEP_DIGEST"):
+            # Debug (resume tests): bitwise digests of the weights after this
+            # step's update (per rank, folded) and of this step's rollouts.
+            ranks = _run_workers(policy, "resume_state_digest")
+            metrics["digest/params"] = "|".join(r["params"] for r in ranks)
+            metrics["digest/optimizer"] = "|".join(str(r.get("optimizer")) for r in ranks)
+        metrics.update(sentinel.pop_stats())
+        metrics["step"] = step
+        metrics["data/epoch"] = float(stream.epoch if not upcoming else upcoming[0].state["epoch"])
         history.append(metrics)
         _log_step(step, metrics, logger)
         if on_step is not None:
             on_step(history)
         step += 1
+        if timeout is not None:
+            timeout.mark_iteration()
+            if not bounds.is_boundary(step - 1) and timeout.check_save():
+                # The next step drafts nothing past itself; save after it.
+                bounds.requested.add(step + 1)
+        last = step >= max_steps or not upcoming
+        val_metrics = None
+        if val_dataloader is not None and (
+            bounds.validates_after(step - 1) or (last and grpo_cfg.val_at_end)
+        ):
+            val_metrics = run_validation(step)
+        if ckpt_on and (bounds.saves_after(step - 1) or last):
+            save_boundary(step, val_metrics, final=last)
+    if checkpointer is not None:
+        checkpointer.shutdown()
     return history
+
+
+def resume_digest(policy: Policy, upcoming, stream, specs) -> dict[str, Any]:
+    """Debug (THUNDERSYNC_RESUME_DIGEST): the boundary state, bitwise, for resume tests.
+
+    Learner parameter, optimizer-state and momentum-draft digests (per rank,
+    no gather), the next batch's prompt tokens, the data position and the seed
+    counters. Equal at a save and at the resume that loads it.
+    """
+    per_rank = _run_workers(policy, "resume_state_digest")
+    nxt = upcoming[0].batch if upcoming else None
+    prompt_crc = None
+    if nxt is not None:
+        prompt_crc = zlib.crc32(
+            b"".join(
+                torch.cat([m["token_ids"] for m in nxt["message_log"][i]]).numpy().tobytes()
+                for i in range(nxt.size)
+            )
+        )
+    return {
+        "ranks": per_rank,
+        "next_prompts_crc": prompt_crc,
+        "epoch": upcoming[0].state["epoch"] if upcoming else stream.epoch,
+        "seeds": [sp.seed_state() for sp in specs],
+    }
 
 
 def _run_streaming_tails(spec, on: bool):
@@ -2618,13 +3033,20 @@ def _train_on_lanes(
     G = master_config.grpo.num_generations_per_prompt
     max_steps = master_config.grpo.max_num_steps
     momentum = ts_cfg.draft_weights != "current"
+    sentinel = WeightSentinel(policy, enabled=ts_cfg.weight_sentinel)
     for lane in lanes:
         lane.generation.prepare_for_generation()
         lane.spec = make_speculative_generation(
-            lane.generation, policy, tokenizer, master_config
+            lane.generation, policy, tokenizer, master_config, stream=lane.index
         )
+        lane.spec.sentinel = sentinel
+        sentinel.check(lane.generation, f"initial weights (lane {lane.index})")
     sched = CohortLanes(lanes)
     check_weights = bool(os.environ.get("THUNDERSYNC_MISMATCH_CHECK"))
+
+    def checked_refit(lane):
+        refit_lane(policy, lane)
+        sentinel.check(lane.generation, f"refit lane {lane.index}")
 
     def lane_fingerprint(lane):
         # Debug: the weights the lane's engine ranks hold, read from the engine.
@@ -2636,7 +3058,7 @@ def _train_on_lanes(
             )
         )
 
-    batches = iter(dataloader)
+    batches = (t.batch for t in PromptStream(dataloader, int(master_config.grpo.max_num_epochs or 1)))
     batch, next_batch = next(batches, None), next(batches, None)
     drafts = None
     history = []
@@ -2706,7 +3128,7 @@ def _train_on_lanes(
         ops = LaneStepOps(
             drafter_version=lambda t: ("theta_hat", t) if momentum else ("theta", t - 1),
             put_drafter=put_drafter,
-            refit_lane=lambda lane: timed("time/refit", lambda: refit_lane(policy, lane)),
+            refit_lane=lambda lane: timed("time/refit", lambda: checked_refit(lane)),
             start_drafts=start_drafts,
             complete_cohort=complete_cohort,
             needs_current=needs_current,
@@ -2717,6 +3139,8 @@ def _train_on_lanes(
         metrics, drafts = sched.step(step, drafts, draft_next, ops)
         # This step's training has replayed every anchor targeted at it.
         x.spec.release_routes(step)
+        metrics["spec/plans_dropped"] = float(sum(lane.spec.end_step() for lane in lanes))
+        metrics.update(sentinel.pop_stats())
         metrics["time/verify"] = times["time/verify"]
         metrics["time/refit"] = times["time/refit"]
         for lane in (x, y):
