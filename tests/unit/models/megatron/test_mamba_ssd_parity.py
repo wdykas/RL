@@ -218,10 +218,22 @@ def test_conv_weight_grads_are_reproducible(activation, dtype):
 
 
 def test_chunk_scan_training_grads_are_reproducible():
-    """With the patch installed, every SSD input gradient (A, dt_bias included) repeats bitwise."""
+    """With deterministic training on, every SSD input gradient (A, dt_bias included) repeats bitwise."""
+    from mamba_ssm.utils.determinism import set_deterministic_mode
+
     from nemo_rl.models.megatron import mamba_ssd_parity
 
-    mamba_ssd_parity.install()
+    # Opt-in (policy.megatron_cfg.deterministic_training): mamba_ssm's chunk-scan
+    # backward reduces A_log / dt_bias partials with atomics unless deterministic.
+    mamba_ssd_parity.install(deterministic=True)
+    try:
+        _check_chunk_scan_grads_repeat(mamba_ssd_parity)
+    finally:
+        set_deterministic_mode(False)
+        mamba_ssd_parity._DETERMINISTIC[0] = False
+
+
+def _check_chunk_scan_grads_repeat(mamba_ssd_parity):
     torch.manual_seed(0)
     b, length, h, p, g, n = 4, 1024, 16, 64, 2, 64
     bf = dict(device="cuda", dtype=torch.bfloat16)

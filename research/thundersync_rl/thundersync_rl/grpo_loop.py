@@ -302,6 +302,12 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # remainder (2048 > a 1024 cap re-decoded the remainder: 1.2-1.9x plain
     # decode per kept token, DESIGN.md section 14k).
     sticky_continuation_chunk_tokens: int = 128
+    # Upper bound on tokens per training micro-batch (rows x
+    # policy.max_total_sequence_length): rows per micro-batch =
+    # min(policy.train_micro_batch_size, this // max_total_sequence_length), >= 1.
+    # Bounds activation memory per learner rank by tokens, not rows (an 8 x 10k
+    # micro-batch OOMed Nano L8). None: rows only.
+    train_micro_batch_tokens: Optional[int] = 32768
     # Continuation piece size grows with the row's generated position:
     # max(chunk_tokens, growth * position) (SpeculativeGeneration._piece_tokens).
     # Each piece costs one forward of the whole row on the learner, so fixed
@@ -400,6 +406,22 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # with sticky routing (continuation rounds are plain BV), sticky rounding
     # and momentum draft weights (q is whatever the engine drafted with).
     banded_is_band: Optional[float] = None
+
+
+def train_micro_batch_rows(master_config: "ThunderSyncMasterConfig") -> int:
+    """Rows per training micro-batch: policy.train_micro_batch_size, bounded by tokens.
+
+    ``thundersync.train_micro_batch_tokens`` caps rows x the padded row length
+    (policy.max_total_sequence_length), so a micro-batch's activations (and the
+    LM head's chunked buffers) are bounded by tokens whatever the rollout cap.
+    A function of the config only: every rank and the planner agree, and the
+    micro-batch boundaries do not depend on timing or batch contents.
+    """
+    rows = int(master_config.policy["train_micro_batch_size"])
+    cap = master_config.thundersync.train_micro_batch_tokens
+    if cap:
+        rows = min(rows, max(1, int(cap) // int(master_config.policy["max_total_sequence_length"])))
+    return rows
 
 
 def resolve_min_pipeline_microbatches(ts_cfg: ThunderSyncConfig, pp: int) -> int:
@@ -1407,7 +1429,7 @@ async def _run_one_step(
     ordered = ordered_learner
     repeated = batch.repeat_interleave(G)
     n = repeated.size
-    mbs = master_config.policy["train_micro_batch_size"]
+    mbs = train_micro_batch_rows(master_config)
 
     # Only trajectory granularity streams open groups; group and batch
     # granularity are the same planner with no open-group buckets.
@@ -1925,6 +1947,9 @@ async def _run_one_step(
         "learner/dispatches": num_dispatches,
         "learner/pipeline_calls": pipeline_calls,
         "learner/peak_open_buffers": results["stream_peak_open_buffers"],
+        # Rank 0's peak allocated / reserved memory over the step's dispatches.
+        "learner/mem_peak_gb": results.get("learner_mem_peak_gb", float("nan")),
+        "learner/mem_reserved_gb": results.get("learner_mem_reserved_gb", float("nan")),
         "timeline/arrivals": arrivals,
         "timeline/dispatches": dispatches,
         "timeline/step_end": t_end - t_start,

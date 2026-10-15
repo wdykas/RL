@@ -714,7 +714,22 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         # Retained verification graphs never outlive the weights they were
         # taken at; any left (their rollout trained the regular way) go now.
         unclaimed = self._fused_graphs.clear()
+        # Memory of this step's dispatches (per rank), then return the allocator's
+        # cached free blocks: the optimizer step's collectives (grad norm, DP
+        # reduce) allocate NCCL buffers outside PyTorch, and blocks cached by the
+        # step's largest micro-batch otherwise leave them no room (np-dh-8k:
+        # "Cuda failure 2 'out of memory'" in the grad-norm all-reduce). Once
+        # per step; the next dispatch re-reserves what it needs.
+        mem = {
+            "learner_mem_peak_gb": torch.cuda.max_memory_allocated() / 2**30,
+            "learner_mem_reserved_gb": torch.cuda.memory_reserved() / 2**30,
+        }
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        if os.environ.get("THUNDERSYNC_MEM_LOG"):
+            print(f"[thundersync mem] rank={self.rank} step dispatches: {mem}", flush=True)
         results = self.finish_train_step()
+        results.update(mem)
         results["stream_peak_open_buffers"] = peak
         results["stream_learner_busy_s"] = self._stream_busy_s
         results["stream_fused_unclaimed"] = unclaimed
