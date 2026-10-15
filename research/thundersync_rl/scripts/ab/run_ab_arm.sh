@@ -23,6 +23,11 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ARM=${ARM:?ARM} MODEL=${MODEL:?MODEL}
 TP=${TP:-1} PP=${PP:-1} EP=${EP:-1} STEPS=${STEPS:-6} PROMPTS=${PROMPTS:-64} G=${G:-8}
 MAXLEN=${MAXLEN:-8192} RUNS=${RUNS:-runs_ab} CHECKS=${CHECKS:-1}
+# Lengths, identical on every arm: MAXLEN = generation cap (max_new_tokens); PROMPT_CAP = prompt cap
+# (data.max_input_seq_length; longer prompts are masked out by the data processor, loss_multiplier 0);
+# policy.max_total_sequence_length = PROMPT_CAP + MAXLEN, so no kept prompt overflows the sequence budget
+# (DAPO prompts reach ~1.25k tokens: a 1k total cap overflowed).
+PROMPT_CAP=${PROMPT_CAP:-2048}
 TAG=${TAG:-$ARM-$(basename "$MODEL")-tp$TP-pp$PP-ep$EP-L$MAXLEN}
 export RL_ROOT_OVERRIDE=${RL_ROOT_OVERRIDE:-$(cd "$HERE/../../../.." && pwd)}
 source $W/env_sbatch.sh bi
@@ -77,12 +82,13 @@ mkdir -p "$OUT"
 rm -f "$OUT/history.json"
 echo "$ARM" > "$OUT/arm"
 echo "$GPUS" > "$OUT/gpus"  # GPUs the arm holds (summarizer: GPU-seconds per step)
-echo "[ab] ARM=$ARM TP=$TP PP=$PP EP=$EP GPS=$GPS GPUS=$GPUS COLOCATED=$COLOCATED STEPS=$STEPS PROMPTS=$PROMPTS G=$G MAXLEN=$MAXLEN MODEL=$MODEL" \
+echo "[ab] ARM=$ARM TP=$TP PP=$PP EP=$EP GPS=$GPS GPUS=$GPUS COLOCATED=$COLOCATED STEPS=$STEPS PROMPTS=$PROMPTS G=$G MAXLEN=$MAXLEN PROMPT_CAP=$PROMPT_CAP MODEL=$MODEL" \
   "RL_ROOT=$RL_ROOT @ $(git -C "$RL_ROOT" rev-parse --short HEAD) -> $OUT"
 timeout ${RUN_TIMEOUT:-14400} python $ENTRY --config $CFG --history-json "$OUT/history.json" \
   logger.log_dir="$OUT/logs" policy.model_name=$MODEL grpo.max_num_steps=$STEPS \
   grpo.num_prompts_per_step=$PROMPTS grpo.num_generations_per_prompt=$G \
-  policy.train_global_batch_size=$((PROMPTS * G)) policy.max_total_sequence_length=$MAXLEN \
+  policy.train_global_batch_size=$((PROMPTS * G)) policy.max_total_sequence_length=$((PROMPT_CAP + MAXLEN)) \
+  data.max_input_seq_length=$PROMPT_CAP policy.generation.max_new_tokens=$MAXLEN \
   "${RES[@]}" "${PAR[@]}" "${USER_ARGS[@]}" > "$OUT/run.log" 2>&1
 rc=$?
 echo "[ab] run exit=$rc"

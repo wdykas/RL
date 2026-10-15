@@ -28,7 +28,8 @@ policy:
     name: ${policy.model_name}
     chat_template_kwargs:
       enable_thinking: true
-  max_total_sequence_length: 8192  # first A/B pass; 16384 / 32768 via submit_ab.sh MAXLEN
+  # run_ab_arm.sh sets max_total_sequence_length = data.max_input_seq_length (PROMPT_CAP) + max_new_tokens (MAXLEN)
+  max_total_sequence_length: 10240
   train_micro_batch_size: 1
   logprob_batch_size: 1
   make_sequence_length_divisible_by: 128
@@ -59,7 +60,7 @@ policy:
       CUBLASLT_WORKSPACE_SIZE: "0"
       CUBLAS_WORKSPACE_CONFIG: ":0:0"
   generation:
-    max_new_tokens: ${policy.max_total_sequence_length}
+    max_new_tokens: 8192  # generation cap (run_ab_arm.sh MAXLEN; 16384 / 32768 for the long-cap pass)
     mcore_generation_config:
       transformer_impl: inference_optimized
       logprobs_mode: raw_logprobs
