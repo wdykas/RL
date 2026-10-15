@@ -1246,9 +1246,14 @@ class ThunderSyncMegatronPolicyWorker(verify_yield.YieldWorkerMixin, MegatronPol
             self._tprof_done = True
             from torch.profiler import ProfilerActivity, profile
 
-            with profile(
-                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]
-            ) as tp:
+            tp = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA])
+            # The profiler's trace metadata lists every process group's backend
+            # config; groups created with backend options unset (Megatron's
+            # gloo / sub-groups) make torch raise "value was None" there
+            # (dr-x-lanes). Only the key_averages table is printed here, no
+            # trace is exported, so skip that metadata.
+            tp._get_distributed_info = lambda: None
+            with tp:
                 self.train_microbatches(
                     datas, stream_bucket=bucket, micro_batch_sizes=mbs_per_item
                 )
