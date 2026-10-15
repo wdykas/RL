@@ -276,6 +276,38 @@ def test_canonical_blocks_dispatch_whole_blocks_independent_of_arrival():
         pl.set_order(order, [2, 2])
 
 
+def test_token_bounded_canonical_blocks_independent_of_arrival():
+    from thundersync_rl.streaming import Trajectory
+
+    groups = [(0, p) for p in range(5)]
+    # Group p: 2 rows of 10 (p + 1) tokens -> 20, 40, 60, 80, 100 tokens.
+    rows = [
+        Trajectory(group=(0, p), index=2 * p + j, reward=float(j), payload=None, num_tokens=10 * (p + 1))
+        for p in range(5)
+        for j in range(2)
+    ]
+    order = [(0, 3), (0, 0), (0, 4), (0, 1), (0, 2)]
+    sigs = []
+    for arrival in (rows, rows[::-1], rows[3:] + rows[:3]):
+        pl = _planner(groups)
+        pl.set_order(order, [3, 2], block_tokens=50)  # two classes (segments)
+        got = []
+        for t in arrival:
+            pl.add(t)
+            while pl.has_work(flush=False):
+                got.extend(_dispatch_signature(pl))
+        got.extend(_dispatch_signature(pl))
+        assert pl.all_done()
+        sigs.append(got)
+    assert sigs[0] == sigs[1] == sigs[2]
+    blocks = [sorted({x[0] for cs in d for r in cs for x in r}) for d in sigs[0]]
+    # 80 >= 50 | 20 + 100 >= 50 | segment end: 40 + 60.
+    assert blocks == [[(0, 3)], [(0, 0), (0, 4)], [(0, 1), (0, 2)]]
+    pl = _planner(groups)
+    with pytest.raises(ValueError, match="positive"):
+        pl.set_order(order, [3, 2], block_tokens=0)
+
+
 def test_horizon_plan_waits_for_theta_k_after_its_rounds():
     """Anchor horizon: a tail plan that leaves the rounds incomplete (handed to the
     refit engine) must not wait for completion forever; it waits for theta_k."""
