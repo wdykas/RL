@@ -686,7 +686,7 @@ class SpeculativeGeneration:
         rank0 = self.base._policy.worker_group.workers[0]
         budget = min(self.draft_budget, self.max_new_tokens)
         if self.sticky_delta is not None:
-            # Drafts are not aborted at the deadline (``_collect_running``):
+            # Drafts are not aborted at the deadline (``_handout_running``):
             # their streams go on toward the cap as continuations.
             budget = self.max_new_tokens
         step = self.current_step
@@ -710,9 +710,15 @@ class SpeculativeGeneration:
             )
         )
 
-        def collect():
+        def collect(defer: bool = False):
+            """The drafts at this deadline.
+
+            ``defer`` (sticky routing): take the cut (each draft's length)
+            now and return a callable that hands the drafts out (routes,
+            hidden rows) later, e.g. while another lane refits: the cut is
+            then a single snapshot call.
+            """
             plens = [p.numel() for p in prompts]
-            streams: list[Any] = [None] * len(prompts)
             if self.sticky_delta is not None:
                 t_cut = time.perf_counter()
                 if self.draft_until_complete:
@@ -721,17 +727,25 @@ class SpeculativeGeneration:
                         time.sleep(0.05)
                 self.stats["tail/next_draft_complete_wait_s"] = time.perf_counter() - t_cut
                 self.stats["tail/next_draft_window_s"] = time.perf_counter() - t_start
-                res, hid, anchors, streams = self._collect_running(
-                    rank0, hkeys, plens, budget, target=step + 1
+                t0 = time.perf_counter()
+                peeked = [_drafted(x) for x in self._peek_streams(rank0, list(range(len(prompts))))]
+                self.stats["cut/peek_s"] = time.perf_counter() - t0
+                handout = lambda: self._handout_running(  # noqa: E731
+                    peeked, hkeys, plens, budget, target=step + 1
                 )
+                return (lambda: build(*handout())) if defer else build(*handout())
+            res = [_drafted(x) for x in self._collect_drafts(rank0)]
+            res, hid, anchors = self._pop_logs(hkeys, plens, res, target=step + 1)
+            return build(res, hid, anchors, [None] * len(prompts))
+
+        def build(res, hid, anchors, streams):
+            plens = [p.numel() for p in prompts]
+            if self.sticky_delta is not None:
                 self.stats["tail/next_drafted_tokens"] = float(sum(len(x[0]) for x in res))
                 if os.environ.get("THUNDERSYNC_DEBUG_DRAFT_LENS"):
                     # Debug: drafted length per draft, in drafting (= admission) order.
                     print(f"[draft lens] target={step + 1} {[len(x[0]) for x in res]}", flush=True)
                 self.stats["tail/next_drafts"] = float(len(res))
-            else:
-                res = [_drafted(x) for x in self._collect_drafts(rank0)]
-                res, hid, anchors = self._pop_logs(hkeys, plens, res, target=step + 1)
             return [
                 [
                     (
@@ -756,6 +770,7 @@ class SpeculativeGeneration:
                 for i, (toks, done, lps) in enumerate(res)
             ]
 
+        collect.deferrable = self.sticky_delta is not None
         return collect
 
     def _check_draft_capacity(self, rank0, n: int) -> None:
@@ -810,8 +825,8 @@ class SpeculativeGeneration:
         others = self.base._policy.worker_group.workers[1:]
         return [w.draft_records.remote(request_ids=rids) for w in others], rids
 
-    def _collect_running(self, rank0, hkeys, prompt_lens, budget: int, target: int):
-        """Sticky routing: the deadline snapshot of the drafts, streams left running.
+    def _handout_running(self, res, hkeys, prompt_lens, budget: int, target: int):
+        """Sticky routing: hand out the drafts cut at ``res`` (``_peek_streams``), streams left running.
 
         Each draft is cut to its logged routes and hidden rows; its stream
         (``_continue_sticky``) keeps decoding at theta_{k-1}, which the
@@ -820,8 +835,6 @@ class SpeculativeGeneration:
         (drafts, hidden, anchors, stream handles).
         """
         n = len(prompt_lens)
-        t0 = time.perf_counter()
-        res = [_drafted(x) for x in self._peek_streams(rank0, list(range(n)))]
         t1 = time.perf_counter()
         routes = self._pop_routes(
             hkeys, prompt_lens, [budget] * n, target=target, close=False
@@ -834,7 +847,6 @@ class SpeculativeGeneration:
         hid = self._take_hidden(hkeys, [0] * n, [len(x[0]) for x in cut])
         t3 = time.perf_counter()
         # Where the deadline cut goes (driver wall seconds).
-        self.stats["cut/peek_s"] = t1 - t0
         self.stats["cut/routes_s"] = t2 - t1
         self.stats["cut/hidden_s"] = t3 - t2
         res = [self._truncate(x, h) for x, h in zip(cut, hid)]
@@ -2676,7 +2688,7 @@ class SpeculativeGeneration:
         rank0 = self.base._policy.worker_group.workers[0]
         rows = [torch.cat([p, torch.tensor(t, dtype=torch.long)]) for p, t, _, _ in items]
         hkeys = self._hidden_keys([f"{name}:{j}" for j in range(len(items))])
-        # Next to the drafts' streams, which keep running (``_collect_running``).
+        # Next to the drafts' streams, which keep running (``_handout_running``).
         idx = ray.get(
             rank0.add_drafts.remote(
                 [r.tolist() for r in rows], [1] * len(rows), self.stream_interval,
