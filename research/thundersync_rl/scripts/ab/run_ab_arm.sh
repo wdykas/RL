@@ -112,6 +112,18 @@ fi
 # top-30 CPU-time table (that one dispatch is slower).
 [ "${LEARNER_PROF:-0}" = 1 ] && PAR+=("++policy.megatron_cfg.env_vars.THUNDERSYNC_LEARNER_PROF='1'")
 [ -n "${LEARNER_TORCHPROF:-}" ] && PAR+=("++policy.megatron_cfg.env_vars.THUNDERSYNC_LEARNER_TORCHPROF='$LEARNER_TORCHPROF'")
+# Opt-in engine step timing (engine_prof.py): ENGINE_PROF=1 logs engine/decode_ms_rows* and engine/cycle_ms_rows* per
+# step (the driver reads them, so it gets the variable too). DECODE_FUSED=0: the decode fusions of ts-decode-speed
+# off (op-by-op paths, same bits) in every worker, the A/B control.
+if [ "${ENGINE_PROF:-0}" = 1 ]; then
+  export THUNDERSYNC_ENGINE_PROF=1
+  PAR+=("++policy.megatron_cfg.env_vars.THUNDERSYNC_ENGINE_PROF='1'")
+fi
+if [ "${DECODE_FUSED:-1}" = 0 ]; then
+  export THUNDERSYNC_BI_DECODE_FUSED=0 THUNDERSYNC_FUSED_DECODE_OPS=0
+  PAR+=("++policy.megatron_cfg.env_vars.THUNDERSYNC_BI_DECODE_FUSED='0'"
+        "++policy.megatron_cfg.env_vars.THUNDERSYNC_FUSED_DECODE_OPS='0'")
+fi
 # Engine EP != learner EP (e.g. EP4 lanes under an EP8 learner) needs the EP-invariant MoE combine
 # (exact limb sums; DESIGN 14u): without it plainly sampled rows differ (np-v2-lanes-ep, epinv-lanes-ep-off).
 # EPINV=1 forces it on at equal EP, EPINV=0 off (the validators then refuse an EP mismatch).
