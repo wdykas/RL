@@ -86,6 +86,94 @@ def tensor_digest(t: torch.Tensor, dtype: Optional[torch.dtype] = None) -> Diges
     return dtype_name(out_dtype), n, int(s1) & _MASK64, int(s2) & _MASK64
 
 
+def _bits64(x: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """``x`` (flat) cast to ``out_dtype``, its bit patterns widened to int64."""
+    if x.dtype != out_dtype:
+        x = x.to(out_dtype)
+    if x.dtype == torch.bool:
+        x = x.to(torch.int8)
+    return x.contiguous().view(_BITS_DTYPE[x.element_size()]).to(torch.int64)
+
+
+@torch.no_grad()
+def digest_many(
+    items: Iterable[tuple[str, torch.Tensor, Optional[torch.dtype]]],
+    pack_elems: int = 1 << 22,
+) -> dict[str, Digest]:
+    """``{key: tensor_digest(t, dtype)}`` for every ``(key, t, dtype)``, bitwise equal.
+
+    ``tensor_digest`` synchronizes the host once per tensor and launches ~10
+    kernels per tensor; a full-Nano rank has ~6k tensors, so one sentinel check
+    took ~2 s on the refit's critical path (``sentinel/time_s``, ab2 runs).
+    Here tensors smaller than ``pack_elems`` are packed (same device) into
+    buffers of at most ``pack_elems`` elements and digested together with
+    integer segment sums (``index_add_`` on int64: exact and order-free, the
+    same sums mod 2**64), larger ones chunk by chunk as before, and the host
+    reads every sum with one transfer per device. O(params / rank) work, no
+    gather, one sync.
+    """
+    out_meta: dict[str, tuple[str, int]] = {}
+    sums: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+    packs: dict[torch.device, list[tuple[str, torch.Tensor]]] = {}
+    pos_cache: dict[torch.device, torch.Tensor] = {}
+
+    def positions(device: torch.device, n: int) -> torch.Tensor:
+        base = pos_cache.get(device)
+        if base is None or base.numel() < n:
+            base = torch.arange(max(n, 1), device=device, dtype=torch.int64)
+            pos_cache[device] = base
+        return base[:n]
+
+    for key, t, dtype in items:
+        flat = t.detach().reshape(-1)
+        out_dtype = dtype if dtype is not None else flat.dtype
+        n = flat.numel()
+        out_meta[key] = (dtype_name(out_dtype), n)
+        if n < pack_elems:
+            packs.setdefault(flat.device, []).append((key, _bits64(flat, out_dtype)))
+            continue
+        s1 = torch.zeros((), dtype=torch.int64, device=flat.device)
+        s2 = torch.zeros((), dtype=torch.int64, device=flat.device)
+        for a in range(0, n, DIGEST_CHUNK):
+            b = min(n, a + DIGEST_CHUNK)
+            bits = _bits64(flat[a:b], out_dtype)
+            w = (positions(flat.device, b - a) + a) % _POS_MOD + 1
+            s1 += bits.sum()
+            s2 += (bits * w).sum()
+        sums[key] = (s1, s2)
+
+    for device, group in packs.items():
+        start = 0
+        while start < len(group):
+            stop, total = start, 0
+            while stop < len(group) and (stop == start or total + group[stop][1].numel() <= pack_elems):
+                total += group[stop][1].numel()
+                stop += 1
+            part = group[start:stop]
+            lens = torch.tensor([b.numel() for _, b in part], device=device, dtype=torch.int64)
+            seg = torch.repeat_interleave(torch.arange(len(part), device=device), lens)
+            offsets = torch.cumsum(lens, 0) - lens
+            bits = torch.cat([b for _, b in part]) if len(part) > 1 else part[0][1]
+            w = (positions(device, total) - offsets[seg]) % _POS_MOD + 1
+            s1 = torch.zeros(len(part), dtype=torch.int64, device=device).index_add_(0, seg, bits)
+            s2 = torch.zeros(len(part), dtype=torch.int64, device=device).index_add_(0, seg, bits * w)
+            for j, (key, _) in enumerate(part):
+                sums[key] = (s1[j], s2[j])
+            start = stop
+
+    keys = list(sums)
+    by_device: dict[torch.device, list[str]] = {}
+    for k in keys:
+        by_device.setdefault(sums[k][0].device, []).append(k)
+    out: dict[str, Digest] = {}
+    for device, ks in by_device.items():
+        vals = torch.stack([torch.stack(sums[k]) for k in ks]).cpu().tolist()  # one sync
+        for k, (a, b) in zip(ks, vals):
+            name, n = out_meta[k]
+            out[k] = (name, n, int(a) & _MASK64, int(b) & _MASK64)
+    return {k: out[k] for k in out_meta}
+
+
 _LAYER = re.compile(r"(^|\.)layers\.(\d+)(?=\.|$)")
 _LOCAL_EXPERT = re.compile(r"(\.experts\.local_experts\.)(\d+)(\.)")
 _GROUPED_EXPERT = re.compile(r"(\.experts\.linear_fc\d\.(?:weight|bias))(\d+)$")
@@ -209,18 +297,19 @@ def digest_named(
     the tensor ``<name>`` cast to that dtype, under the alias key.
     """
     named = list(named)
-    out = {}
+    items = []
     for name, t in named:
         want = None if dtypes is None or name not in dtypes else name_dtype(dtypes[name])
-        out[name] = tensor_digest(t, want)
+        items.append((name, t, want))
     if dtypes:
         by_name = dict(named)
         for key, dt in dtypes.items():
             if ALIAS in key:
                 src = by_name.get(key.split(ALIAS, 1)[0])
                 if src is not None:
-                    out[key] = tensor_digest(src, name_dtype(dt))
-    return out
+                    items.append((key, src, name_dtype(dt)))
+    # Same digests as tensor_digest per tensor, one host sync (digest_many).
+    return digest_many(items)
 
 
 @torch.no_grad()

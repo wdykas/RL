@@ -2077,12 +2077,26 @@ class SpeculativeGeneration:
         return by_row
 
     def _count_balance(self, lengths: list[int], owners: list[int], ranks: int) -> None:
-        """``spec/verify_load_max_over_mean``: busiest rank's tokens over the mean."""
+        """``spec/verify_load_max_over_mean``: busiest rank's tokens over the mean.
+
+        Over the step's verification calls (each call waits for its busiest
+        rank): ranks * sum(busiest) / sum(total). It used to be overwritten by
+        every call, so the step reported its last call -- typically one small
+        piece on one rank, i.e. exactly ``ranks`` (8.0 in every full-Nano ab /
+        x2 history) -- which hid verify0's balance.
+        ``spec/verify_load_first_max_over_mean``: the step's first call (verify0).
+        """
         load = [0] * ranks
         for n, r in zip(lengths, owners):
             load[r] += n
         if sum(load):
-            self.stats["spec/verify_load_max_over_mean"] = max(load) * ranks / sum(load)
+            s = self.stats
+            s["spec/verify_load_busiest_tokens"] = s.get("spec/verify_load_busiest_tokens", 0.0) + max(load)
+            s["spec/verify_load_tokens"] = s.get("spec/verify_load_tokens", 0.0) + sum(load)
+            s["spec/verify_load_max_over_mean"] = (
+                ranks * s["spec/verify_load_busiest_tokens"] / s["spec/verify_load_tokens"]
+            )
+            s.setdefault("spec/verify_load_first_max_over_mean", max(load) * ranks / sum(load))
 
     def _finish_verify(self, drafts, flat, by_row, dropped) -> None:
         """Plans and acceptance statistics from verification results."""

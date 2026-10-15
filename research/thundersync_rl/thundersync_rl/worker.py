@@ -533,8 +533,8 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             canonical_named_tensors,
             check_expert_weight_cache,
             compute_tensors,
+            digest_many,
             digest_named,
-            tensor_digest,
         )
 
         ep = ps.get_expert_model_parallel_rank() if ps.model_parallel_is_initialized() else 0
@@ -551,8 +551,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         }
         if not learner:
             comp = list(compute_tensors(model, ep_rank=ep))
-            for key, t, _ in comp:
-                out[key] = tensor_digest(t)
+            out.update(digest_many((key, t, None) for key, t, _ in comp))
             cov["compute_buffers"] = len(comp)
             cov["compute_buffers_aliased"] = sum(1 for *_, a in comp if a)
         if learner:

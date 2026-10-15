@@ -2449,10 +2449,14 @@ async def _run_one_step(
             all_trajectories.append(traj)
             planner.add(traj)
             wake.set()
-            if planner.has_work(flush=False):
+            if stale_rollouts is None and planner.has_work(flush=False):
                 # Completed rollouts (served from complete plans) resolve
                 # without suspending this loop: yield so the learner loop
                 # sends the dispatch now, not after the last row is served.
+                # Not with stale_rollouts (rollout_lag=1): every row is already
+                # in hand, and yielding here sent the first group alone (an
+                # 8-row dispatch costing a whole 8-micro-batch-per-rank call
+                # under EP at full Nano, 10.6-14.2 s/step in async1-*-ab2).
                 await asyncio.sleep(0)
         if order_replay:
             # Same trajectories, two other arrival orders under the canonical
