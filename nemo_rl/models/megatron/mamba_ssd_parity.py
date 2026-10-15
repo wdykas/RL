@@ -310,6 +310,13 @@ def _ssm_training(self, zxBCdt, packed_seq_params=None):
 def install() -> None:
     """Train batch-invariant Mamba on the engine's pinned SSD kernels (idempotent)."""
     pin_engine_kernels()
+    # mamba_ssm's chunk-scan backward otherwise adds the A_log / dt_bias
+    # gradient partials with atomics (bitwise different between identical
+    # steps); its deterministic mode reduces them in a fixed order (measured
+    # at the cost of noise on Nano-L8 per-layer shapes).
+    from mamba_ssm.utils.determinism import set_deterministic_mode
+
+    set_deterministic_mode(True)
     if _INSTALLED:
         return
     from megatron.core.ssm.mamba_mixer import MambaMixer

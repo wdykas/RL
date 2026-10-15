@@ -215,3 +215,36 @@ def test_conv_weight_grads_are_reproducible(activation, dtype):
     for _ in range(3):
         again = run(lambda x, w, b: _ConvFixedOrderGradFn.apply(x, w, b, activation))
         assert all(torch.equal(a, g) for a, g in zip(again, got))
+
+
+def test_chunk_scan_training_grads_are_reproducible():
+    """With the patch installed, every SSD input gradient (A, dt_bias included) repeats bitwise."""
+    from nemo_rl.models.megatron import mamba_ssd_parity
+
+    mamba_ssd_parity.install()
+    torch.manual_seed(0)
+    b, length, h, p, g, n = 4, 1024, 16, 64, 2, 64
+    bf = dict(device="cuda", dtype=torch.bfloat16)
+    inputs = (
+        torch.randn(b, length, h, p, **bf),
+        torch.rand(b, length, h, **bf),
+        -torch.rand(h, device="cuda"),
+        torch.randn(b, length, g, n, **bf),
+        torch.randn(b, length, g, n, **bf),
+        torch.randn(h, device="cuda"),
+        torch.randn(b, length, h, p, **bf),
+        torch.randn(h, device="cuda"),
+    )
+    dy = torch.randn(b, length, h, p, **bf)
+
+    def grads():
+        x, dt, A, B, C, D, z, dt_bias = (t.clone().requires_grad_() for t in inputs)
+        y = mamba_ssd_parity.mamba_chunk_scan_combined_train(
+            x, dt, A, B, C, 128, D=D, z=z, dt_bias=dt_bias, dt_softplus=True
+        )
+        y.backward(dy)
+        return [t.grad for t in (x, dt, A, B, C, D, z, dt_bias)]
+
+    first = grads()
+    for _ in range(4):
+        assert all(torch.equal(a, b) for a, b in zip(grads(), first))
