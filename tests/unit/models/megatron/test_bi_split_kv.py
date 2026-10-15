@@ -21,15 +21,14 @@ from nemo_rl.models.megatron import bi_split_kv
 CFG = {"enabled": True, "seqlen_k_per_split": 1024, "num_splits": 128}
 
 
-def _fa4_stub(q, k, v, num_splits=1, seqlen_k_per_split=None, combine_max_splits=None, **kw):
-    return dict(num_splits=num_splits, seqlen_k_per_split=seqlen_k_per_split,
-                combine_max_splits=combine_max_splits, **kw)
+def _fa4_stub(q, k, v, num_splits=1, seqlen_k_per_split=None, **kw):
+    return dict(num_splits=num_splits, seqlen_k_per_split=seqlen_k_per_split, **kw)
 
 
 def test_bi_call_becomes_anchored():
     f = bi_split_kv.wrap(_fa4_stub, CFG)
     out = f(1, 2, 3, num_splits=1, causal=True)
-    assert out == dict(num_splits=128, seqlen_k_per_split=1024, combine_max_splits=128, causal=True)
+    assert out == dict(num_splits=128, seqlen_k_per_split=1024, causal=True)
 
 
 def test_non_bi_and_explicit_calls_untouched():
@@ -56,17 +55,12 @@ def test_requires_anchored_fa4():
     [
         {"seqlen_k_per_split": 1000, "num_splits": 8},
         {"seqlen_k_per_split": 1024, "num_splits": 1},
-        {"seqlen_k_per_split": 1024, "num_splits": 64, "combine_max_splits": 32},
         {"seqlen_k_per_split": 1024, "num_splits": 300},
     ],
 )
 def test_validation(cfg):
     with pytest.raises(ValueError):
         bi_split_kv._resolve(cfg)
-
-
-def test_combine_default_is_num_splits():
-    assert bi_split_kv._resolve({"seqlen_k_per_split": 128, "num_splits": 16})["combine_max_splits"] == 16
 
 
 def test_install_requires_bi_mode():

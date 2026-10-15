@@ -625,8 +625,6 @@ class BISplitKVConfig(TypedDict):
     # Fixed number of splits launched by every call (>= ceil(max context / S), >= 2):
     # fixed CUDA-graph grids; empty splits contribute an exact zero.
     num_splits: int
-    # Pinned split capacity of the combine kernel (>= num_splits, <= 256); default num_splits.
-    combine_max_splits: NotRequired[int | None]
 
 
 class TokenizerConfig(TypedDict):

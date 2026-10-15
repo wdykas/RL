@@ -23,16 +23,17 @@ few-row long-context decode runs at ~60-115 GB/s (295 us/layer at 32k, 1.16 ms a
   depends only on its own keys -- not on the batch, the query count, the tiling or the split count.
 - ``num_splits=NS``: fixed for every call, so CUDA-graph grids are fixed; empty splits write
   lse=-inf, which the combine turns into an exact zero.
-- ``combine_max_splits=P``: pinned combine split capacity (its LSE reduction order depends on it).
+- the combine's per-row reduction order does not depend on the launched split count (each thread
+  sums a fixed stride of splits; extra splits add exact zeros), so no further pinning is needed.
 
 Learner forward (TE ``flash_attn_varlen_func_v4``) and engine prefill/decode (Megatron
 ``flash_attn4_varlen_func``) then compute bitwise-identical rows (verified on GB200 for
 decode B=1..64, 1-3 tokens/request, paged/permuted cache, up to 32k; thundersync_work
 research/agent_bi_splitkv.md). The backward is FA4's stock backward from (out, lse).
 
-Requires an FA4 build whose ``flash_attn_varlen_func`` takes ``seqlen_k_per_split`` and
-``combine_max_splits`` (upstream flash-attention branch cute-anchored-split-kv, or the b19 overlay
-patched by thundersync_work/research/bi_splitkv/patch_fa4_b19.py).
+Requires an FA4 build whose ``flash_attn_varlen_func`` takes ``seqlen_k_per_split`` with absolute
+split boundaries: upstream flash-attention main (causal; local windows need PR #3000), or the b19
+overlay patched by thundersync_work/research/bi_splitkv/patch_fa4_b19.py.
 
 Per-rank cost: fp32 partials NS x rows x heads x head_dim x 4 B per attention call (learner: rows =
 packed micro-batch tokens; bound it with NS and the micro-batch size), extra partial write/read
@@ -51,12 +52,11 @@ _STATE: dict[str, Any] = {"cfg": None, "patched": []}
 def _resolve(cfg: dict) -> dict:
     s = int(cfg["seqlen_k_per_split"])
     ns = int(cfg["num_splits"])
-    p = cfg.get("combine_max_splits") or ns
     if s <= 0 or s % 128:
         raise ValueError(f"bi_split_kv.seqlen_k_per_split={s} must be a positive multiple of 128")
-    if ns < 2 or not (ns <= p <= 256):
-        raise ValueError(f"bi_split_kv: need 2 <= num_splits={ns} <= combine_max_splits={p} <= 256")
-    return {"seqlen_k_per_split": s, "num_splits": ns, "combine_max_splits": int(p)}
+    if not 2 <= ns <= 256:
+        raise ValueError(f"bi_split_kv: need 2 <= num_splits={ns} <= 256")
+    return {"seqlen_k_per_split": s, "num_splits": ns}
 
 
 def wrap(fn: Callable, cfg: dict) -> Callable:
@@ -64,11 +64,10 @@ def wrap(fn: Callable, cfg: dict) -> Callable:
     if getattr(fn, "_ts_bi_split_kv", False):
         return fn
     params = inspect.signature(fn).parameters
-    if "seqlen_k_per_split" not in params or "combine_max_splits" not in params:
+    if "seqlen_k_per_split" not in params:
         raise RuntimeError(
-            "bi_split_kv: this flash_attn.cute build lacks seqlen_k_per_split/combine_max_splits "
-            "(build the overlay with research/bi_splitkv/patch_fa4_b19.py or use upstream "
-            "cute-anchored-split-kv)"
+            "bi_split_kv: this flash_attn.cute build lacks seqlen_k_per_split (build the overlay "
+            "with research/bi_splitkv/patch_fa4_b19.py or use upstream flash-attention main)"
         )
     c = _resolve(cfg)
 
