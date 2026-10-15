@@ -2396,6 +2396,12 @@ async def _run_one_step(
                 # train on nonzero advantages (determinism checks need them).
                 toks = torch.cat([m["token_ids"] for m in state["message_log"]])
                 reward = float(zlib.crc32(toks.to(torch.int64).numpy().tobytes()) & 1)
+            zero_every = int(os.environ.get("THUNDERSYNC_DEBUG_ZERO_ADV_GROUPS", "0") or 0)
+            if zero_every > 0 and (i // G) % zero_every == 0:
+                # Debug: every zero_every-th group gets a constant reward (all-zero
+                # advantage), so zero-advantage skipping (DESIGN 14x) is exercised
+                # under the parity reward (which almost never ties a group).
+                reward = 0.0
             rewards[i] = reward
             sample_metrics[i] = metrics
             loss_mult = float(repeated["loss_multiplier"][i])
