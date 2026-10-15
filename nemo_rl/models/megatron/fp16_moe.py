@@ -100,15 +100,14 @@ if HAVE_TRITON:
         BLOCK_K: tl.constexpr,
     ):
         # Same per-row math as _grouped_gemm_kernel (exact fp16 products, K accumulated
-        # in order in fp32), with both operands fed through TMA descriptors.
-        pid_m = tl.program_id(0)
+        # in order in fp32), with both operands fed through TMA descriptors. Persistent
+        # over the live row tiles: program p computes M tiles p, p + P, ... below
+        # offs[E - 1] (read on device, so the launch shape is static and the work is
+        # proportional to the live rows, whatever the buffer's padded size).
         pid_n = tl.program_id(1)
-        start = pid_m * BLOCK_M
         idx = tl.arange(0, E_POW2)
         ends = tl.load(offs_ptr + idx, mask=idx < E, other=2147483647).to(tl.int64)
-        expert = tl.sum((ends <= start).to(tl.int32), axis=0)
-        if expert >= E:
-            return
+        live_tiles = tl.load(offs_ptr + E - 1).to(tl.int32) // BLOCK_M
         xd = tl.make_tensor_descriptor(
             x_ptr, shape=[M, K], strides=[K, 1], block_shape=[BLOCK_M, BLOCK_K]
         )
@@ -118,11 +117,19 @@ if HAVE_TRITON:
         od = tl.make_tensor_descriptor(
             out_ptr, shape=[M, N], strides=[N, 1], block_shape=[BLOCK_M, BLOCK_N]
         )
-        w_row = expert * N + pid_n * BLOCK_N
-        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-        for k0 in range(0, K, BLOCK_K):
-            acc = tl.dot(xd.load([start, k0]), wd.load([w_row, k0]).T, acc)
-        od.store([start, pid_n * BLOCK_N], acc)
+        # num_stages=1: the K loop inside is pipelined; pipelining this loop as well would
+        # keep the next tile's loads in shared memory during the epilogue (over the limit
+        # for the 128 x 256 prefill tile).
+        for pid_m in tl.range(
+            tl.program_id(0), live_tiles, tl.num_programs(0), num_stages=1
+        ):
+            start = pid_m * BLOCK_M
+            expert = tl.sum((ends <= start).to(tl.int32), axis=0)
+            w_row = expert * N + pid_n * BLOCK_N
+            acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            for k0 in range(0, K, BLOCK_K):
+                acc = tl.dot(xd.load([start, k0]), wd.load([w_row, k0]).T, acc)
+            od.store([start, pid_n * BLOCK_N], acc)
 
     @triton.jit
     def _grouped_gemm_kernel(
@@ -179,23 +186,29 @@ if HAVE_TRITON:
         p_ptr,  # [rows] fp32
         out_ptr,  # [rows, F] fp32 or fp16
         F,
+        rows,  # rows of the buffer
         valid_ptr,  # scalar int32/int64: rows from here on are skipped (HAS_VALID)
+        p_scale,  # fp32 factor on the probability (HAS_SCALE)
         BLOCK: tl.constexpr,
         HAS_VALID: tl.constexpr,
+        HAS_SCALE: tl.constexpr,
     ):
-        row = tl.program_id(0).to(tl.int64)
         if HAS_VALID:
-            if row >= tl.load(valid_ptr).to(tl.int64):
-                return
+            end = tl.load(valid_ptr).to(tl.int64)
+        else:  # one row per program (grid = rows)
+            end = tl.program_id(0).to(tl.int64) * 0 + rows
         cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
         mask = cols < F
-        gate = tl.load(h_ptr + row * 2 * F + cols, mask=mask, other=0.0)
-        up = tl.load(h_ptr + row * 2 * F + F + cols, mask=mask, other=0.0)
-        p = tl.load(p_ptr + row)
-        value = (gate / (1.0 + tl.exp(-gate))) * up * p
-        tl.store(
-            out_ptr + row * F + cols, value.to(out_ptr.dtype.element_ty), mask=mask
-        )
+        for row in tl.range(tl.program_id(0).to(tl.int64), end, tl.num_programs(0)):
+            gate = tl.load(h_ptr + row * 2 * F + cols, mask=mask, other=0.0)
+            up = tl.load(h_ptr + row * 2 * F + F + cols, mask=mask, other=0.0)
+            p = tl.load(p_ptr + row)
+            if HAS_SCALE:
+                p = p * p_scale
+            value = (gate / (1.0 + tl.exp(-gate))) * up * p
+            tl.store(
+                out_ptr + row * F + cols, value.to(out_ptr.dtype.element_ty), mask=mask
+            )
 
     @triton.jit
     def _relu2_probs_kernel(
@@ -203,22 +216,26 @@ if HAVE_TRITON:
         p_ptr,  # [rows] fp32
         out_ptr,  # [rows, F] fp32 or fp16
         F,
-        valid_ptr,  # scalar int32/int64: rows from here on are skipped (HAS_VALID)
+        valid_ptr,  # scalar int32/int64: rows from here on are skipped
+        p_scale,  # fp32 factor on the probability (HAS_SCALE)
         BLOCK: tl.constexpr,
-        HAS_VALID: tl.constexpr,
+        HAS_SCALE: tl.constexpr,
     ):
         # _relu2_eager's ops in its order: relu, (r * r), * p in fp32, then one cast.
-        row = tl.program_id(0).to(tl.int64)
-        if HAS_VALID:
-            if row >= tl.load(valid_ptr).to(tl.int64):
-                return
+        # Persistent over the rows below valid_ptr's value.
+        end = tl.load(valid_ptr).to(tl.int64)
         cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
         mask = cols < F
-        h = tl.load(h_ptr + row * F + cols, mask=mask, other=0.0)
-        p = tl.load(p_ptr + row)
-        r = tl.maximum(h, 0.0)
-        value = (r * r) * p
-        tl.store(out_ptr + row * F + cols, value.to(out_ptr.dtype.element_ty), mask=mask)
+        for row in tl.range(tl.program_id(0).to(tl.int64), end, tl.num_programs(0)):
+            h = tl.load(h_ptr + row * F + cols, mask=mask, other=0.0)
+            p = tl.load(p_ptr + row)
+            if HAS_SCALE:
+                p = p * p_scale
+            r = tl.maximum(h, 0.0)
+            value = (r * r) * p
+            tl.store(
+                out_ptr + row * F + cols, value.to(out_ptr.dtype.element_ty), mask=mask
+            )
 
     @triton.jit
     def _unpermute_fp64_kernel(
@@ -227,30 +244,72 @@ if HAVE_TRITON:
         valid_tokens_ptr,  # scalar int32
         output_ptr,  # [num_tokens, H] fp32
         hidden_dim,
+        y_scale,  # fp32 factor on every expert row (HAS_SCALE)
         num_local_experts: tl.constexpr,
         BLOCK_H: tl.constexpr,
+        HAS_SCALE: tl.constexpr,
     ):
-        tok = tl.program_id(0)
-        block_h = tl.program_id(1)
-        valid_tokens = tl.load(valid_tokens_ptr)
-        offsets = block_h * BLOCK_H + tl.arange(0, BLOCK_H)
+        # Persistent over the valid tokens; rows from valid_tokens on are not written.
+        valid_tokens = tl.load(valid_tokens_ptr).to(tl.int64)
+        offsets = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
         mask_h = offsets < hidden_dim
-        acc = tl.zeros([BLOCK_H], dtype=tl.float64)
-        if tok < valid_tokens:
-            tok_i64 = tok.to(tl.int64)
+        for tok in tl.range(tl.program_id(0).to(tl.int64), valid_tokens, tl.num_programs(0)):
+            acc = tl.zeros([BLOCK_H], dtype=tl.float64)
             for lid in tl.range(0, num_local_experts):
-                pos = tl.load(inverse_map_ptr + tok_i64 * num_local_experts + lid)
+                pos = tl.load(inverse_map_ptr + tok * num_local_experts + lid)
                 if pos >= 0:
                     vals = tl.load(
                         expert_out_ptr + pos.to(tl.int64) * hidden_dim + offsets,
                         mask=mask_h,
                     )
+                    if HAS_SCALE:
+                        vals = vals * y_scale
                     acc += vals.to(tl.float64)
             tl.store(
-                output_ptr + tok_i64 * hidden_dim + offsets,
+                output_ptr + tok * hidden_dim + offsets,
                 acc.to(tl.float32),
                 mask=mask_h,
             )
+
+    @triton.jit
+    def _permute_live_kernel(
+        hidden_ptr,  # [max_tokens, H] 16-bit token rows
+        probs_ptr,  # [max_tokens, TOPK] fp32
+        routing_ptr,  # [max_tokens, TOPK] int64 global expert ids (-1: none)
+        out_hidden_ptr,  # [rows, H] permuted token rows
+        out_probs_ptr,  # [rows] fp32 permuted probabilities
+        inverse_map_ptr,  # [max_tokens, E] int32 permuted row of (token, local expert) or -1
+        counters_ptr,  # [E] int32 exclusive segment offsets, advanced atomically
+        valid_tokens_ptr,  # scalar int32
+        hidden_dim,
+        local_expert_start,
+        TOPK: tl.constexpr,
+        E: tl.constexpr,
+        E_POW2: tl.constexpr,
+        BLOCK_H: tl.constexpr,
+    ):
+        # Persistent over the valid tokens: each token's local (token, expert) pairs get
+        # a row of their expert's segment; its inverse-map row is written whole (-1
+        # where the token does not route), so the map needs no separate fill.
+        valid_tokens = tl.load(valid_tokens_ptr).to(tl.int64)
+        lids = tl.arange(0, E_POW2)
+        for tok in tl.range(tl.program_id(0).to(tl.int64), valid_tokens, tl.num_programs(0)):
+            inv = tl.full([E_POW2], -1, tl.int32)
+            for k in tl.static_range(TOPK):
+                lid = (tl.load(routing_ptr + tok * TOPK + k) - local_expert_start).to(tl.int32)
+                if (lid >= 0) & (lid < E):
+                    pos = tl.atomic_add(counters_ptr + lid, 1)
+                    for h in tl.range(0, hidden_dim, BLOCK_H):
+                        o = h + tl.arange(0, BLOCK_H)
+                        m = o < hidden_dim
+                        tl.store(
+                            out_hidden_ptr + pos.to(tl.int64) * hidden_dim + o,
+                            tl.load(hidden_ptr + tok * hidden_dim + o, mask=m),
+                            mask=m,
+                        )
+                    tl.store(out_probs_ptr + pos, tl.load(probs_ptr + tok * TOPK + k))
+                    inv = tl.where(lids == lid, pos, inv)
+            tl.store(inverse_map_ptr + tok * E + lids, inv, mask=lids < E)
 
 
 def _weight_table(weights: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
@@ -334,17 +393,60 @@ def select_engine_config(rows_per_expert: float) -> TileConfig:
     return _ENGINE_CONFIGS[-1][1]
 
 
+# Engine MoE kernels run persistent grids: a program loops over its share of the live
+# work (rows / tokens below a device-side count), so the launch shape is static (CUDA
+# graph safe) and the work is proportional to the live rows. The grid is the smallest
+# of the buffer's padded work, a host hint of the live work (the CUDA-graph bucket
+# bounds it: bucket tokens x EP x top-k) and _PROGRAMS_PER_SM programs per SM. The
+# grid never changes a row's arithmetic, only which program computes it.
+_PROGRAMS_PER_SM = 8
+_NUM_SMS: dict[int, int] = {}
+
+
+def _persistent_programs(
+    work: int, hint: Optional[int], device: torch.device, per_program: int = 1
+) -> int:
+    """Grid size over ``work`` items: min(work, hint, cap), at least 1.
+
+    ``per_program``: launched programs per work item along other grid axes (the
+    cap counts all of them).
+    """
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    if idx not in _NUM_SMS:
+        _NUM_SMS[idx] = torch.cuda.get_device_properties(idx).multi_processor_count
+    cap = max(1, _PROGRAMS_PER_SM * _NUM_SMS[idx] // per_program)
+    n = min(work, cap) if hint is None else min(work, hint, cap)
+    return max(1, n)
+
+
+def live_rows_bound(tokens: int, topk: int, num_local_experts: int, block_m: int) -> int:
+    """Upper bound of the permuted rows (``offsets[-1]``) for ``tokens`` gathered tokens.
+
+    Each token routes to at most min(topk, local experts) local experts, and each
+    non-empty expert segment is padded by fewer than ``block_m`` rows.
+    """
+    pairs = tokens * min(topk, num_local_experts)
+    return pairs + min(num_local_experts, pairs) * (block_m - 1)
+
+
 _ALLOCATOR_SET = False
 
 
 def grouped_gemm_fp16w(
-    x16: torch.Tensor, w16: torch.Tensor, offsets: torch.Tensor, config: TileConfig
+    x16: torch.Tensor,
+    w16: torch.Tensor,
+    offsets: torch.Tensor,
+    config: TileConfig,
+    rows_hint: Optional[int] = None,
 ) -> torch.Tensor:
     """Batch-invariant grouped GEMM on fp16 expert weights: x16 [M_pad, K] @ W_e.T -> fp32.
 
     ``w16``: [E, N, K] fp16 contiguous. ``offsets``: [E] inclusive row offsets, each a
-    multiple of ``config``'s BLOCK_M. Bitwise equal to ``grouped_gemm`` and to cuBLAS
-    without split-K; TMA-fed, CUDA-graph safe.
+    multiple of ``config``'s BLOCK_M; rows from ``offsets[-1]`` on are not computed
+    (left uninitialized). Bitwise equal to ``grouped_gemm`` and to cuBLAS without
+    split-K; TMA-fed, CUDA-graph safe. ``rows_hint`` (host int, expected upper bound
+    of ``offsets[-1]``) only sizes the persistent grid; any live row count is
+    computed correctly whatever the hint.
     """
     global _ALLOCATOR_SET
     if not _ALLOCATOR_SET:  # on-device TMA descriptors need scratch memory
@@ -360,7 +462,14 @@ def grouped_gemm_fp16w(
     assert m_pad % bm == 0 and x16.dtype == torch.float16 and x16.is_contiguous()
     assert w16.dtype == torch.float16 and w16.is_contiguous()
     out = torch.empty((m_pad, n), dtype=torch.float32, device=x16.device)
-    _grouped_gemm_fp16w_kernel[(m_pad // bm, triton.cdiv(n, bn))](
+    n_tiles = triton.cdiv(n, bn)
+    m_programs = _persistent_programs(
+        m_pad // bm,
+        None if rows_hint is None else triton.cdiv(rows_hint, bm),
+        x16.device,
+        per_program=n_tiles,
+    )
+    _grouped_gemm_fp16w_kernel[(m_programs, n_tiles)](
         x16,
         w16,
         offsets,
@@ -430,27 +539,42 @@ def _swiglu_eager(h: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
 
 
 def swiglu_probs_fwd(
-    h: torch.Tensor, probs: torch.Tensor, out_dtype=torch.float32, valid_rows=None
+    h: torch.Tensor,
+    probs: torch.Tensor,
+    out_dtype=torch.float32,
+    valid_rows=None,
+    rows_hint: Optional[int] = None,
+    prob_scale: Optional[float] = None,
 ):
     """SiLU(gate) * up * prob in fp32 (one Triton kernel on CUDA), cast to out_dtype.
 
     ``valid_rows`` (engine, device scalar): rows from it on are not computed
-    (left uninitialized); see ``relu2_probs_fwd``.
+    (left uninitialized); ``rows_hint`` / ``prob_scale``: see ``relu2_probs_fwd``.
     """
     if not h.is_cuda:
-        return _swiglu_eager(h, probs).to(out_dtype)
+        p = probs if prob_scale is None else probs.float() * prob_scale
+        return _swiglu_eager(h, p).to(out_dtype)
     rows, two_f = h.shape
     f = two_f // 2
     out = torch.empty((rows, f), dtype=out_dtype, device=h.device)
     block = min(triton.next_power_of_2(f), 1024)
-    _swiglu_probs_kernel[(rows, triton.cdiv(f, block))](
+    col_blocks = triton.cdiv(f, block)
+    programs = (
+        rows
+        if valid_rows is None
+        else _persistent_programs(rows, rows_hint, h.device, col_blocks)
+    )
+    _swiglu_probs_kernel[(programs, col_blocks)](
         h.contiguous(),
         probs.float().contiguous(),
         out,
         f,
+        rows,
         out if valid_rows is None else valid_rows,
+        1.0 if prob_scale is None else prob_scale,
         BLOCK=block,
         HAS_VALID=valid_rows is not None,
+        HAS_SCALE=prob_scale is not None,
     )
     return out
 
@@ -485,33 +609,43 @@ def _relu2_eager(h: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
 
 
 def relu2_probs_fwd(
-    h: torch.Tensor, probs: torch.Tensor, out_dtype=torch.float32, valid_rows=None
+    h: torch.Tensor,
+    probs: torch.Tensor,
+    out_dtype=torch.float32,
+    valid_rows=None,
+    rows_hint: Optional[int] = None,
+    prob_scale: Optional[float] = None,
 ):
     """ReLU(h)^2 * prob in fp32 (non-gated squared-ReLU experts, Nemotron-H), cast to out_dtype.
 
     A row's value depends only on that row (batch invariant). Training runs the
     eager ops. ``valid_rows`` (the engine, a device scalar: the permuted rows'
     end, ``offsets[-1]``): one Triton kernel with the eager ops' order and
-    rounding (bitwise the same values) that skips rows from ``valid_rows`` on.
-    Under expert parallelism the engine's CUDA-graph buffers hold the worst-case
-    row count (every EP rank's tokens x top-k), so the eager ops spent ~2.2 ms
-    per MoE layer and decode step on padding at Nemotron-3-Nano shapes; those
-    rows are never read (the grouped GEMM stops at ``offsets[-1]``, unpermute
-    reads mapped rows only), so they are left uninitialized.
+    rounding (bitwise the same values) over the rows below ``valid_rows`` only,
+    on a persistent grid sized by ``rows_hint`` (host bound of the live rows; a
+    smaller hint loops more, it never skips rows). The engine's CUDA-graph buffers
+    hold the worst-case row count under expert parallelism (every EP rank's
+    tokens x top-k); rows past ``valid_rows`` are never read (the grouped GEMM
+    stops at ``offsets[-1]``, unpermute reads mapped rows), so they are left
+    uninitialized. ``prob_scale``: the probability is first multiplied by it in
+    fp32 (the down-projection prescale), as ``probs * prob_scale`` would.
     """
     if valid_rows is None or not h.is_cuda:
-        return _relu2_eager(h, probs).to(out_dtype)
+        p = probs if prob_scale is None else probs.float() * prob_scale
+        return _relu2_eager(h, p).to(out_dtype)
     rows, f = h.shape
     out = torch.empty((rows, f), dtype=out_dtype, device=h.device)
     block = min(triton.next_power_of_2(f), 1024)
-    _relu2_probs_kernel[(rows, triton.cdiv(f, block))](
+    col_blocks = triton.cdiv(f, block)
+    _relu2_probs_kernel[(_persistent_programs(rows, rows_hint, h.device, col_blocks), col_blocks)](
         h.contiguous(),
         probs.reshape(-1).float().contiguous(),
         out,
         f,
         valid_rows,
+        1.0 if prob_scale is None else prob_scale,
         BLOCK=block,
-        HAS_VALID=True,
+        HAS_SCALE=prob_scale is not None,
     )
     return out
 
@@ -553,18 +687,34 @@ def expert_activation(config: Any) -> str:
     )
 
 
-def _act_probs(module: Any, h, probs, out_dtype=None, valid_rows=None):
+def _act_probs(
+    module: Any,
+    h,
+    probs,
+    out_dtype=None,
+    valid_rows=None,
+    rows_hint: Optional[int] = None,
+    prob_scale: Optional[float] = None,
+):
     """The expert activation times the routing probability (fp32 math).
 
     ``valid_rows``: the engine's permuted-row end (device scalar); rows past it
-    are padding and are not computed.
+    are padding and are not computed. ``rows_hint`` / ``prob_scale``: see
+    ``relu2_probs_fwd``.
     """
     cfg = getattr(module, "config", None)
     kind = "swiglu" if cfg is None else expert_activation(cfg)
     if out_dtype is None:  # training: autograd
         return swiglu_probs(h, probs) if kind == "swiglu" else relu2_probs(h, probs)
     fwd = swiglu_probs_fwd if kind == "swiglu" else relu2_probs_fwd
-    return fwd(h, probs, out_dtype, valid_rows=valid_rows)
+    return fwd(
+        h,
+        probs,
+        out_dtype,
+        valid_rows=valid_rows,
+        rows_hint=rows_hint,
+        prob_scale=prob_scale,
+    )
 
 
 def unpermute_fp64(
@@ -572,8 +722,15 @@ def unpermute_fp64(
     inverse_map: torch.Tensor,
     valid_tokens: torch.Tensor,
     out: Optional[torch.Tensor] = None,
+    tokens_hint: Optional[int] = None,
+    y_scale: Optional[float] = None,
 ) -> torch.Tensor:
-    """Per-token sum of local-expert rows in fp64, ascending local expert, fp32 out."""
+    """Per-token sum of local-expert rows in fp64, ascending local expert, fp32 out.
+
+    Rows from ``valid_tokens`` on are not written. ``tokens_hint`` (host bound of
+    ``valid_tokens``) only sizes the persistent grid. ``y_scale``: every expert
+    row is first multiplied by it in fp32, as ``expert_output * y_scale`` would.
+    """
     _, hidden_dim = expert_output.shape
     num_tokens, num_local_experts = inverse_map.shape
     if out is None:
@@ -581,18 +738,86 @@ def unpermute_fp64(
             num_tokens, hidden_dim, dtype=torch.float32, device=expert_output.device
         )
     block_h = min(triton.next_power_of_2(hidden_dim), 1024)
-    grid = (num_tokens, triton.cdiv(hidden_dim, block_h))
+    h_blocks = triton.cdiv(hidden_dim, block_h)
+    grid = (
+        _persistent_programs(num_tokens, tokens_hint, expert_output.device, h_blocks),
+        h_blocks,
+    )
     _unpermute_fp64_kernel[grid](
         expert_output,
         inverse_map,
         valid_tokens,
         out,
         hidden_dim,
+        1.0 if y_scale is None else y_scale,
         num_local_experts,
         BLOCK_H=block_h,
+        HAS_SCALE=y_scale is not None,
     )
     return out
 
+
+def permute_live(
+    x16: torch.Tensor,
+    probs: torch.Tensor,
+    routing_map: torch.Tensor,
+    local_expert_start: int,
+    num_local_experts: int,
+    valid_tokens: torch.Tensor,
+    block_m: int,
+    tokens_hint: Optional[int] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Group the valid tokens' local (token, expert) pairs by expert (CUDA-graph safe).
+
+    MCore's ``permute_tokens(..., alignment=block_m, row_alignment=block_m,
+    return_batch_invariant_inverse_map=True)`` contract, with the work bounded by
+    the valid tokens instead of the buffer: the same counts and BLOCK_M-aligned
+    segment offsets (MCore's kernels), the same output buffer shapes, and one
+    persistent kernel that copies the rows and writes the inverse-map rows of the
+    valid tokens only (rows of tokens >= ``valid_tokens`` are never read). A
+    pair's row within its expert segment is claimed atomically, as in MCore: the
+    order inside a segment is arbitrary and the outputs do not depend on it (the
+    grouped GEMM is row-independent and unpermute sums through the inverse map
+    in expert order).
+
+    Returns (permuted rows [R, H], permuted probs [R] fp32, inclusive offsets [E]
+    int32, inverse map [max_tokens, E] int32).
+    """
+    from megatron.core.inference.moe.permute import (
+        compute_expert_offsets,
+        compute_local_tokens_per_expert,
+    )
+
+    max_tokens, hidden_dim = x16.shape
+    topk = probs.shape[1]
+    counts = compute_local_tokens_per_expert(
+        routing_map, local_expert_start, num_local_experts, valid_tokens, persistent=True
+    )
+    exclusive, inclusive = compute_expert_offsets(counts, alignment=block_m)
+    rows = max_tokens * min(topk, num_local_experts) + block_m * num_local_experts
+    rows = triton.cdiv(rows, block_m) * block_m
+    xp = torch.empty((rows, hidden_dim), dtype=x16.dtype, device=x16.device)
+    pp = torch.empty(rows, dtype=probs.dtype, device=x16.device)
+    inverse_map = torch.empty(
+        (max_tokens, num_local_experts), dtype=torch.int32, device=x16.device
+    )
+    _permute_live_kernel[(_persistent_programs(max_tokens, tokens_hint, x16.device),)](
+        x16,
+        probs,
+        routing_map,
+        xp,
+        pp,
+        inverse_map,
+        exclusive,
+        valid_tokens,
+        hidden_dim,
+        local_expert_start,
+        TOPK=topk,
+        E=num_local_experts,
+        E_POW2=triton.next_power_of_2(num_local_experts),
+        BLOCK_H=min(triton.next_power_of_2(hidden_dim), 1024),
+    )
+    return xp, pp, inclusive, inverse_map
 
 # ---------------------------------------------------------------------------
 # Training: autograd grouped linear over host-side expert splits.
@@ -805,11 +1030,75 @@ def training_experts_forward(
     return y, None
 
 
+def engine_experts(
+    x16: torch.Tensor,
+    probs: torch.Tensor,
+    routing_map: torch.Tensor,
+    valid_tokens: torch.Tensor,
+    fc1_weight: torch.Tensor,
+    fc2_weight: torch.Tensor,
+    local_expert_start: int,
+    ep_size: int,
+    activation: str,
+    tokens_hint: Optional[int] = None,
+    down_scale: int = 0,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """The engine's routed-expert output of the gathered tokens (CUDA-graph safe).
+
+    ``x16`` [T, K] fp16 / ``probs`` [T, topk] fp32 / ``routing_map`` [T, topk]:
+    the gathered tokens, of which the first ``valid_tokens`` (device scalar) are
+    live. ``fc1_weight`` / ``fc2_weight``: this rank's [E, N, K] fp16 experts.
+    Returns [T, H] fp32 (rows >= ``valid_tokens`` unwritten): per token, the sum of
+    its local experts' prob-weighted outputs in fp64, ascending expert, rounded to
+    fp32. ``tokens_hint`` (host): expected upper bound of ``valid_tokens``, the
+    CUDA-graph bucket's tokens x EP (None: the buffer's T). It picks the tile and
+    sizes the persistent grids; no row's bits depend on it (any tile gives the same
+    bits, and every kernel loops to its device-side live count).
+    """
+    num_local_experts = fc1_weight.shape[0]
+    topk = routing_map.shape[1]
+    hint = x16.shape[0] if tokens_hint is None else min(tokens_hint, x16.shape[0])
+    # Expected rows per local expert: the live tokens x top-k spread over every expert.
+    cfg = select_engine_config(hint * topk / (num_local_experts * ep_size))
+    rows_hint = live_rows_bound(hint, topk, num_local_experts, cfg[0])
+    xp, pp, offs, inverse_map = permute_live(
+        x16,
+        probs,
+        routing_map,
+        local_expert_start,
+        num_local_experts,
+        valid_tokens,
+        cfg[0],
+        hint,
+    )
+    # down_scale s: the prescale as training_experts_forward applies it (probs x 2^-s
+    # before the activation, y x 2^s after fc2), inside the kernels, on live rows only.
+    h = grouped_gemm_fp16w(xp, fc1_weight, offs, cfg, rows_hint)
+    act = relu2_probs_fwd if activation == "relu2" else swiglu_probs_fwd
+    a = act(
+        h,
+        pp,
+        torch.float16,
+        valid_rows=offs[-1:],
+        rows_hint=rows_hint,
+        prob_scale=2.0**-down_scale if down_scale else None,
+    )
+    y = grouped_gemm_fp16w(a, fc2_weight, offs, cfg, rows_hint)
+    return unpermute_fp64(
+        y,
+        inverse_map,
+        valid_tokens,
+        out,
+        tokens_hint=hint,
+        y_scale=2.0**down_scale if down_scale else None,
+    )
+
+
 def inference_experts_forward(
     module: Any, hidden_states, permuted_probs, routing_map
 ) -> tuple:
     """InferenceGroupedMLP forward in the engine (CUDA-graph safe)."""
-    from megatron.core.inference.moe.permute import permute_tokens
     from megatron.core.transformer.moe.token_dispatcher_inference import (
         InferenceAllGatherDispatcherBase,
         NVLSAllGatherVDispatcher,
@@ -821,39 +1110,27 @@ def inference_experts_forward(
         if hidden_states.dtype == torch.bfloat16
         else (hidden_states.to(torch.float16))
     )
-    valid_tokens = InferenceAllGatherDispatcherBase._valid_tokens()
-    local_expert_start = module.ep_group.rank() * module.num_local_experts
-    # Expected rows per local expert: tokens x top-k spread over every expert.
-    topk = routing_map.shape[1]
-    rows_per_expert = (
-        x16.shape[0] * topk / (module.num_local_experts * module.ep_group.size())
-    )
-    cfg = select_engine_config(rows_per_expert)
-    xp, pp, _pmap, offs, inverse_map = permute_tokens(
-        x16,
-        permuted_probs,
-        routing_map,
-        local_expert_start,
-        module.num_local_experts,
-        valid_tokens,
-        alignment=cfg[0],
-        return_batch_invariant_inverse_map=True,
-        row_alignment=cfg[0],
-    )
-    s = _down_scale()
-    if s:  # same prescale as training_experts_forward
-        pp = pp * (2.0**-s)
-    h = grouped_gemm_fp16w(xp, module._fc1_weight, offs, cfg)
-    # Rows past offs[-1] are CUDA-graph padding: never read by the fc2 GEMM.
-    a = _act_probs(module, h, pp, torch.float16, valid_rows=offs[-1:])
-    y = grouped_gemm_fp16w(a, module._fc2_weight, offs, cfg)
-    if s:
-        y = y * (2.0**s)
+    cfg = getattr(module, "config", None)
     out = None
     if module._nvls_dispatcher:
         out = NVLSAllGatherVDispatcher._get_rsv_tensor()
-    return unpermute_fp64(y, inverse_map, valid_tokens, out), None
-
+    y = engine_experts(
+        x16,
+        permuted_probs,
+        routing_map,
+        InferenceAllGatherDispatcherBase._valid_tokens(),
+        module._fc1_weight,
+        module._fc2_weight,
+        module.ep_group.rank() * module.num_local_experts,
+        module.ep_group.size(),
+        "swiglu" if cfg is None else expert_activation(cfg),
+        # The dispatcher's host estimate of the gathered tokens: this rank's
+        # CUDA-graph bucket (or eager token count) x EP.
+        tokens_hint=InferenceAllGatherDispatcherBase._get_host_valid_tokens_estimate(),
+        down_scale=_down_scale(),
+        out=out,
+    )
+    return y, None
 
 def validate_model(model_cfg: Any) -> list[str]:
     """MoE settings the fp16 expert path covers; returns what is unsupported."""
