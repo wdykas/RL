@@ -1331,7 +1331,7 @@ class SpeculativeGeneration:
                 # (a) the engine holds bitwise the learner's theta_hat; (b) the
                 # stashed head q rows are rebuilt with is that same head.
                 self._staged_digest = sentinel.check(
-                    self, f"theta_hat_{self.current_step + 1}"
+                    self, f"theta_hat_{self.current_step + 1}", caches=False
                 )
                 if self.verify_source == "engine":
                     ray.get(

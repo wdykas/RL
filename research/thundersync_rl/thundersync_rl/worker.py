@@ -473,30 +473,52 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
 
     @torch.no_grad()
     def sentinel_weight_digest(
-        self, dtypes: Optional[dict[str, str]] = None, learner: bool = False
-    ) -> tuple[int, dict]:
-        """(tensor-parallel rank, {canonical name: digest}) of this rank's weights now.
+        self,
+        dtypes: Optional[dict[str, str]] = None,
+        learner: bool = False,
+        caches: bool = False,
+    ) -> tuple[int, dict, dict]:
+        """(tensor-parallel rank, {canonical name: digest}, coverage) of this rank now.
 
-        Engine and learner ranks both run it (``sentinel.WeightSentinel``);
-        ``dtypes``: the engine's storage dtype per tensor, which the learner
-        casts to before digesting (bf16 -> fp16 GEMM weights). Parameters and
-        MoE ``expert_bias`` buffers, this rank's shards only.
-
-        ``learner=True``: the ``expert_bias`` buffers must equal their first
-        digest on this rank (bias updates are rejected: a changed bias would
-        not reach the momentum stage, DESIGN.md section 14s).
+        Engine and learner ranks both run it (``sentinel.WeightSentinel``).
+        Engine: the generation model's parameters (fp16-held GEMM / router / head
+        weights in their fp16 storage), ``expert_bias`` buffers, and the tensors
+        the expert kernels actually read (concatenated / fp16 expert buffers,
+        ``<param>#buf``). Learner (``learner=True``): the same names, each cast
+        to the engine's storage dtype (``dtypes``), compute aliases digested from
+        their source parameter; ``expert_bias`` must equal its first digest on
+        this rank; ``caches``: also check the fp16 expert-weight cache against
+        the parameters (only while the learner holds its training weights).
         """
         from megatron.core import parallel_state as ps
 
         from thundersync_rl.sentinel import (
             WeightSentinelError,
             canonical_named_tensors,
+            check_expert_weight_cache,
+            compute_tensors,
             digest_named,
+            tensor_digest,
         )
 
         ep = ps.get_expert_model_parallel_rank() if ps.model_parallel_is_initialized() else 0
         tp = ps.get_tensor_model_parallel_rank() if ps.model_parallel_is_initialized() else 0
-        out = digest_named(canonical_named_tensors(self.model, ep_rank=ep), dtypes)
+        model = self.model
+        if not learner and getattr(self, "_gen_model", None) is not None:
+            model = self._gen_model()  # the engine's (inference-layout) model
+        named = list(canonical_named_tensors(model, ep_rank=ep))
+        out = digest_named(named, dtypes)
+        cov = {
+            "params": sum(1 for n, _ in named if not n.endswith("expert_bias")),
+            "fp16_params": sum(1 for _, t in named if t.dtype == torch.float16),
+            "expert_bias": sum(1 for n, _ in named if n.endswith("expert_bias")),
+        }
+        if not learner:
+            comp = list(compute_tensors(model, ep_rank=ep))
+            for key, t, _ in comp:
+                out[key] = tensor_digest(t)
+            cov["compute_buffers"] = len(comp)
+            cov["compute_buffers_aliased"] = sum(1 for *_, a in comp if a)
         if learner:
             bias = {k: v for k, v in out.items() if k.endswith("expert_bias")}
             ref = self.__dict__.setdefault("_sentinel_expert_bias", dict(bias))
@@ -506,7 +528,9 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                     f"weight sentinel: learner rank {self.rank} expert_bias changed "
                     f"during training: {moved[:10]} (bias updates are not supported)"
                 )
-        return tp, out
+            if caches:
+                cov["learner_fp16_expert_cache"] = check_expert_weight_cache(self.model)
+        return tp, out, cov
 
     @torch.no_grad()
     def sentinel_head_stash_check(self, version: int) -> bool:

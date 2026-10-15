@@ -136,7 +136,7 @@ def test_weight_sentinel_driver_check_and_reference(monkeypatch):
     m = _Model(0, 1, 2, 0)
     s = WeightSentinel(policy=None)
     monkeypatch.setattr(s, "engine_digest", lambda gen: [_side(gen)])
-    monkeypatch.setattr(s, "learner_digest", lambda dtypes: [_side(m, dtypes=dtypes)])
+    monkeypatch.setattr(s, "learner_digest", lambda dtypes, **kw: [_side(m, dtypes=dtypes)])
     ref = s.check(m, "theta_hat_1")
     s.check_engine_against(m, ref, "reload")
     stats = s.pop_stats()
@@ -156,12 +156,122 @@ def test_worker_digest_flags_expert_bias_change(monkeypatch):
     monkeypatch.setattr(ps, "model_parallel_is_initialized", lambda: False)
     w = object.__new__(ThunderSyncMegatronPolicyWorker.__ray_metadata__.modified_class)
     w.model, w.rank = _Model(0, 1, 2, 0), 0
-    tp, d = w.sentinel_weight_digest(learner=True)
-    assert tp == 0 and any(k.endswith("expert_bias") for k in d)
+    tp, d, cov = w.sentinel_weight_digest(learner=True)
+    assert tp == 0 and any(k.endswith("expert_bias") for k in d) and cov["expert_bias"] == 1
     w.sentinel_weight_digest(learner=True)  # unchanged: fine
     w.model.module.decoder.layers[0].mlp.router.expert_bias += 1
     with pytest.raises(WeightSentinelError, match="expert_bias changed"):
         w.sentinel_weight_digest(learner=True)
+
+
+class _Experts(torch.nn.Module):
+    """A grouped-MLP experts module holding fp16 [E, N, K] buffers (fp16_moe layout)."""
+
+    def __init__(self, n=3, alias=True, dtype=torch.bfloat16):
+        super().__init__()
+        self.num_local_experts = n
+        for lin in ("linear_fc1", "linear_fc2"):
+            m = torch.nn.Module()
+            m.num_gemms = n
+            for i in range(n):
+                m.register_parameter(f"weight{i}", torch.nn.Parameter(torch.randn(4, 2).to(dtype)))
+            setattr(self, lin, m)
+        if alias:
+            from nemo_rl.models.megatron.fp16_moe import _ensure_fp16_expert_weights
+
+            _ensure_fp16_expert_weights(self)
+
+
+def _expert_model(**kw):
+    m = torch.nn.Module()
+    m.decoder = torch.nn.Module()
+    m.decoder.layers = torch.nn.ModuleList([torch.nn.Module()])
+    m.decoder.layers[0].layer_number = 1
+    m.decoder.layers[0].mlp = torch.nn.Module()
+    m.decoder.layers[0].mlp.experts = _Experts(**kw)
+    return m
+
+
+def _engine_side(model):
+    from thundersync_rl.sentinel import compute_tensors
+
+    tp, d = _side(model)
+    for key, t, _ in compute_tensors(model):
+        d[key] = tensor_digest(t)
+    return tp, d
+
+
+def test_sentinel_checks_the_fp16_expert_buffers_the_kernels_read():
+    torch.manual_seed(0)
+    learner = _expert_model(alias=False)
+    engine = _expert_model(alias=False)
+    engine.load_state_dict(learner.state_dict())
+    from nemo_rl.models.megatron.fp16_moe import _ensure_fp16_expert_weights
+
+    _ensure_fp16_expert_weights(engine.decoder.layers[0].mlp.experts)
+    e = [_engine_side(engine)]
+    keys = [k for k in e[0][1] if k.endswith("#buf")]
+    assert len(keys) == 6 and "decoder.layers.0.mlp.experts.linear_fc2.weight2#buf" in keys
+    cov = compare(e, [_side(learner, dtypes=engine_dtypes(e))], "fp16 experts")
+    assert cov["sentinel/tensors"] == 12  # 6 params + 6 compute buffers
+    # The old raw-byte refit: bf16 bits written into the fp16 buffer. No error at
+    # write time, wrong values; the sentinel names the buffer (and its parameter view).
+    buf = engine.decoder.layers[0].mlp.experts._fc1_weight
+    raw = learner.decoder.layers[0].mlp.experts.linear_fc1.weight1.detach()
+    buf[1].view(torch.int16).copy_(raw.view(torch.int16))
+    with pytest.raises(WeightSentinelError, match=r"linear_fc1\.weight1#buf"):
+        compare([_engine_side(engine)], [_side(learner, dtypes=engine_dtypes(e))], "raw bytes")
+
+
+def test_sentinel_catches_a_buffer_that_no_longer_aliases_its_parameter():
+    torch.manual_seed(1)
+    learner = _expert_model(alias=False)
+    engine = _expert_model(alias=False)
+    engine.load_state_dict(learner.state_dict())
+    exp = engine.decoder.layers[0].mlp.experts
+    from nemo_rl.models.megatron.fp16_moe import _ensure_fp16_expert_weights
+
+    _ensure_fp16_expert_weights(exp)
+    exp.linear_fc2.weight0.data = exp.linear_fc2.weight0.data.clone()  # view re-pointed
+    with torch.no_grad():
+        exp.linear_fc2.weight0.add_(1)  # a refit lands in the parameter only
+        learner.decoder.layers[0].mlp.experts.linear_fc2.weight0.add_(1)
+    e = [_engine_side(engine)]
+    from thundersync_rl.sentinel import compute_tensors
+
+    assert sum(1 for *_, a in compute_tensors(engine) if not a) == 1
+    with pytest.raises(WeightSentinelError, match=r"linear_fc2\.weight0#buf"):
+        compare(e, [_side(learner, dtypes=engine_dtypes(e))], "stale buffer")
+
+
+def test_learner_fp16_expert_cache_check(monkeypatch):
+    from nemo_rl.models.megatron import fp16_moe
+    from thundersync_rl.sentinel import check_expert_weight_cache
+
+    m = _expert_model(alias=False)
+    lin = m.decoder.layers[0].mlp.experts.linear_fc1
+    monkeypatch.setattr(fp16_moe, "_HOOKS", {**fp16_moe._HOOKS, "cache": True})
+    fp16_moe._WEIGHT_CACHE.clear()
+    fp16_moe._stacked_fp16(tuple(fp16_moe._expert_weights(lin)))
+    assert check_expert_weight_cache(m) == 3
+    with torch.no_grad():
+        lin.weight2.add_(1)  # in place, same pointer, no invalidate_weight_cache()
+    with pytest.raises(WeightSentinelError, match="stale cache"):
+        check_expert_weight_cache(m)
+    fp16_moe.invalidate_weight_cache()
+    assert check_expert_weight_cache(m) == 0
+
+
+def test_coverage_report_lists_checked_and_unchecked():
+    from thundersync_rl.sentinel import coverage_report
+
+    text = coverage_report(
+        "initial", {"sentinel/tensors": 10, "sentinel/elems": 100, "sentinel/expert_bias": 2,
+                    "sentinel/compute_buffers": 4},
+        {"compute_buffers": 4, "compute_buffers_aliased": 4, "fp16_params": 3},
+        {"learner_fp16_expert_cache": 5}, ["e.x"], [],
+    )
+    assert "4 expert compute buffers" in text and "not checked" in text and "hi/lo" in text
 
 
 # ---------------------------------------------------------------------------

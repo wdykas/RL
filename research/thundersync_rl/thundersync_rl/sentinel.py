@@ -97,6 +97,53 @@ def _strip(name: str) -> str:
     return name.replace(".module.", ".")
 
 
+def _chunks(model: Any) -> list:
+    return list(model) if isinstance(model, (list, tuple)) else [model]
+
+
+def _canon_fn(chunk: Any, ep_rank: int):
+    """name -> canonical name for the parameters of one model chunk."""
+    modules = dict(chunk.named_modules())
+    layer_map: dict[str, int] = {}
+    experts_local: dict[str, int] = {}
+    for name, mod in modules.items():
+        m = _LAYER.search(name)
+        if m is not None and m.end() == len(name):
+            ln = getattr(mod, "layer_number", None)
+            if isinstance(ln, int):
+                layer_map[name] = ln - 1  # Megatron layer numbers are global, 1-based
+        if name.endswith("experts"):
+            nl = getattr(mod, "num_local_experts", None)
+            if isinstance(nl, int):
+                experts_local[name] = nl
+
+    def canon(name: str) -> str:
+        # Global expert index (needs the module path before renaming layers).
+        for pat in (_LOCAL_EXPERT, _GROUPED_EXPERT):
+            m = pat.search(name)
+            if m is None:
+                continue
+            owner = name[: name.index(".experts.") + len(".experts")]
+            nl = experts_local.get(owner)
+            if nl is not None:
+                j = ep_rank * nl + int(m.group(2))
+                if pat is _LOCAL_EXPERT:
+                    name = name[: m.start(2)] + str(j) + name[m.end(2):]
+                else:
+                    name = name[: m.start(2)] + str(j)
+        # Global layer index: longest matching module prefix first.
+        out, pos = [], 0
+        for m in _LAYER.finditer(name):
+            mod_name = name[: m.end()]
+            if mod_name in layer_map:
+                out.append(name[pos : m.start(2)] + str(layer_map[mod_name]))
+                pos = m.end(2)
+        out.append(name[pos:])
+        return _strip("".join(out))
+
+    return canon
+
+
 def canonical_named_tensors(
     model: Any, ep_rank: int = 0, include_buffers: bool = True
 ) -> Iterator[tuple[str, torch.Tensor]]:
@@ -104,47 +151,9 @@ def canonical_named_tensors(
 
     Shared tensors (tied embeddings) are listed once, under their first name.
     """
-    chunks = model if isinstance(model, (list, tuple)) else [model]
     seen: set[tuple[int, int, torch.dtype]] = set()
-    for chunk in chunks:
-        modules = dict(chunk.named_modules())
-        layer_map: dict[str, int] = {}
-        experts_local: dict[str, int] = {}
-        for name, mod in modules.items():
-            m = _LAYER.search(name)
-            if m is not None and m.end() == len(name):
-                ln = getattr(mod, "layer_number", None)
-                if isinstance(ln, int):
-                    layer_map[name] = ln - 1  # Megatron layer numbers are global, 1-based
-            if name.endswith("experts"):
-                nl = getattr(mod, "num_local_experts", None)
-                if isinstance(nl, int):
-                    experts_local[name] = nl
-
-        def canon(name: str) -> str:
-            # Global expert index (needs the module path before renaming layers).
-            for pat in (_LOCAL_EXPERT, _GROUPED_EXPERT):
-                m = pat.search(name)
-                if m is None:
-                    continue
-                owner = name[: name.index(".experts.") + len(".experts")]
-                nl = experts_local.get(owner)
-                if nl is not None:
-                    j = ep_rank * nl + int(m.group(2))
-                    if pat is _LOCAL_EXPERT:
-                        name = name[: m.start(2)] + str(j) + name[m.end(2):]
-                    else:
-                        name = name[: m.start(2)] + str(j)
-            # Global layer index: longest matching module prefix first.
-            out, pos = [], 0
-            for m in _LAYER.finditer(name):
-                mod_name = name[: m.end()]
-                if mod_name in layer_map:
-                    out.append(name[pos : m.start(2)] + str(layer_map[mod_name]))
-                    pos = m.end(2)
-            out.append(name[pos:])
-            return _strip("".join(out))
-
+    for chunk in _chunks(model):
+        canon = _canon_fn(chunk, ep_rank)
         items: list[tuple[str, torch.Tensor]] = list(chunk.named_parameters())
         if include_buffers:
             items += [(n, b) for n, b in chunk.named_buffers() if n.endswith("expert_bias")]
@@ -156,16 +165,96 @@ def canonical_named_tensors(
             yield canon(name), t
 
 
+# Compute tensors are digested under "<canonical source parameter>#<kind>"; the
+# learner digests the source parameter cast to the engine tensor's dtype under the
+# same key, so they compare like parameters.
+ALIAS = "#"
+
+
+def compute_tensors(model: Any, ep_rank: int = 0) -> Iterator[tuple[str, torch.Tensor, bool]]:
+    """The tensors the engine computes with besides its parameters.
+
+    Yields (``<source param>#buf``, tensor, aliased) for every expert of every
+    grouped-MLP module holding concatenated expert weights (``_fc1_weight`` /
+    ``_fc2_weight`` [E, N, K]: MCore's inference concatenation, or the fp16
+    expert buffers of ``fp16_moe._ensure_fp16_expert_weights``), the storage the
+    expert kernels read. ``aliased``: the parameter's data is a view of that
+    slice (refit writes land there); a non-aliased buffer is a separate copy
+    that must still equal the parameter.
+    """
+    for chunk in _chunks(model):
+        canon = _canon_fn(chunk, ep_rank)
+        for mname, mod in chunk.named_modules():
+            for lin_name, buf_name in (("linear_fc1", "_fc1_weight"), ("linear_fc2", "_fc2_weight")):
+                buf = getattr(mod, buf_name, None)
+                lin = getattr(mod, lin_name, None)
+                if not isinstance(buf, torch.Tensor) or lin is None or buf.dim() < 2:
+                    continue
+                for i in range(buf.shape[0]):
+                    p = getattr(lin, f"weight{i}", None)
+                    if not isinstance(p, torch.Tensor) or tuple(p.shape) != tuple(buf.shape[1:]):
+                        continue
+                    src = canon(f"{mname}.{lin_name}.weight{i}" if mname else f"{lin_name}.weight{i}")
+                    aliased = p.data_ptr() == buf[i].data_ptr() and p.dtype == buf.dtype
+                    yield f"{src}{ALIAS}buf", buf[i], aliased
+
+
 def digest_named(
     named: Iterable[tuple[str, torch.Tensor]],
     dtypes: Optional[dict[str, str]] = None,
 ) -> dict[str, Digest]:
-    """Digest every tensor; ``dtypes[name]``: cast to the other side's storage dtype."""
+    """Digest every tensor; ``dtypes[name]``: cast to the other side's storage dtype.
+
+    ``dtypes`` keys ``<name>#<kind>`` (engine compute tensors) are digested from
+    the tensor ``<name>`` cast to that dtype, under the alias key.
+    """
+    named = list(named)
     out = {}
     for name, t in named:
         want = None if dtypes is None or name not in dtypes else name_dtype(dtypes[name])
         out[name] = tensor_digest(t, want)
+    if dtypes:
+        by_name = dict(named)
+        for key, dt in dtypes.items():
+            if ALIAS in key:
+                src = by_name.get(key.split(ALIAS, 1)[0])
+                if src is not None:
+                    out[key] = tensor_digest(src, name_dtype(dt))
     return out
+
+
+@torch.no_grad()
+def check_expert_weight_cache(model: Any) -> int:
+    """Learner: every cached stacked fp16 expert weight equals its parameters cast now.
+
+    ``fp16_moe``'s cache is keyed by parameter identity and data pointer, not
+    by value: an in-place weight change that skipped ``invalidate_weight_cache``
+    would leave stale fp16 experts in the verification / training forwards.
+    Returns the number of expert slices checked; raises ``WeightSentinelError``.
+    """
+    try:
+        from nemo_rl.models.megatron import fp16_moe
+    except ImportError:
+        return 0
+    params = {}
+    for chunk in _chunks(model):
+        for name, p in chunk.named_parameters():
+            params[id(p)] = (name, p)
+    n, bad = 0, []
+    for key, (ptrs, w16) in list(fp16_moe._WEIGHT_CACHE.items()):
+        hits = [params.get(pid) for pid in key]
+        if any(h is None for h in hits) or tuple(h[1].data_ptr() for h in hits) != ptrs:
+            continue  # not this model's, or a miss on next use (rebuilt): never read stale
+        for i, (name, p) in enumerate(hits):
+            n += 1
+            if not torch.equal(w16[i], p.detach().to(torch.float16)):
+                bad.append(name)
+    if bad:
+        raise WeightSentinelError(
+            f"weight sentinel: {len(bad)} cached fp16 expert weights differ from their "
+            f"parameters (stale cache): {bad[:10]}"
+        )
+    return n
 
 
 def merge_side(
@@ -219,6 +308,44 @@ def compare(
     }
 
 
+def _sum_cov(covs) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for c in covs:
+        for k, v in (c or {}).items():
+            out[k] = out.get(k, 0) + int(v)
+    return out
+
+
+NOT_CHECKED = (
+    "per-call casts that are not stored (bf16 params cast to fp16 inside each GEMM when the "
+    "engine does not hold fp16 weights, e.g. refit_transport mcore/m2n: a deterministic "
+    "function of the checked parameter)",
+    "the hi/lo split of the fp32 LM head (it splits activations; the head weight itself is checked)",
+    "KV cache, Mamba conv/SSM state and CUDA-graph static activation buffers (activations, not weights)",
+    "the learner fp16 expert cache while theta_hat is loaded (it keeps theta_k's casts by design)",
+)
+
+
+def coverage_report(label, cov, e_cov, l_cov, e_only, l_only) -> str:
+    """What the sentinel compares and what it does not (printed at the first check)."""
+    lines = [
+        f"[sentinel] coverage at {label}:",
+        f"[sentinel]   checked: {int(cov['sentinel/tensors'])} engine/learner tensor pairs "
+        f"({int(cov['sentinel/elems'])} elements, all ranks), of which "
+        f"{int(cov.get('sentinel/compute_buffers', 0))} expert compute buffers (#buf, the storage "
+        f"the expert kernels read; {e_cov.get('compute_buffers_aliased', 0)}/"
+        f"{e_cov.get('compute_buffers', 0)} rank-slices alias their parameter) and "
+        f"{int(cov['sentinel/expert_bias'])} expert_bias buffers; engine parameters held in fp16 "
+        f"(GEMM / router / head weights, compared after the learner's fp16 cast): "
+        f"{e_cov.get('fp16_params', 0)} rank-tensors; learner fp16 expert cache slices checked "
+        f"against the parameters: {l_cov.get('learner_fp16_expert_cache', 0)}",
+        f"[sentinel]   engine-only (not compared) {len(e_only)}: {e_only[:12]}",
+        f"[sentinel]   learner-only (not compared) {len(l_only)}: {l_only[:12]}",
+    ]
+    lines += [f"[sentinel]   not checked: {x}" for x in NOT_CHECKED]
+    return "\n".join(lines)
+
+
 def unmatched(
     engine: list[tuple[int, dict[str, Digest]]],
     learner: list[tuple[int, dict[str, Digest]]],
@@ -266,7 +393,8 @@ class WeightSentinel:
         gen = g if g is not None else generation
         return gen._policy.worker_group
 
-    def engine_digest(self, generation: Any) -> list[tuple[int, dict[str, Digest]]]:
+    def engine_digest(self, generation: Any) -> list:
+        """[(tp rank, digests, coverage)] of every engine rank of ``generation``."""
         import ray
 
         return ray.get(
@@ -275,35 +403,43 @@ class WeightSentinel:
             )
         )
 
-    def learner_digest(self, dtypes: dict[str, str]) -> list[tuple[int, dict[str, Digest]]]:
+    def learner_digest(self, dtypes: dict[str, str], caches: bool = False) -> list:
         import ray
 
         return ray.get(
             self.policy.worker_group.run_all_workers_single_data(
-                "sentinel_weight_digest", dtypes=dtypes, learner=True
+                "sentinel_weight_digest", dtypes=dtypes, learner=True, caches=caches
             )
         )
 
-    def check(self, generation: Any, label: str) -> list[tuple[int, dict[str, Digest]]]:
-        """Compare ``generation``'s engine with the learner's live weights now."""
+    def check(
+        self, generation: Any, label: str, caches: bool = True
+    ) -> list[tuple[int, dict[str, Digest]]]:
+        """Compare ``generation``'s engine with the learner's live weights now.
+
+        ``caches``: also check the learner's fp16 expert-weight cache (False while
+        the learner holds draft weights: the cache keeps theta_k's casts then).
+        """
         if not self.enabled:
             return []
         import time
 
         t0 = time.perf_counter()
-        eng = self.engine_digest(generation)
-        lrn = self.learner_digest(engine_dtypes(eng))
+        eng_full = self.engine_digest(generation)
+        eng = [(tp, d) for tp, d, *_ in eng_full]
+        lrn_full = self.learner_digest(engine_dtypes(eng), caches=caches)
+        lrn = [(tp, d) for tp, d, *_ in lrn_full]
         cov = compare(eng, lrn, label)
+        e_cov = _sum_cov(x[2] if len(x) > 2 else {} for x in eng_full)
+        l_cov = _sum_cov(x[2] if len(x) > 2 else {} for x in lrn_full)
+        cov["sentinel/compute_buffers"] = float(
+            sum(1 for n, _ in set(merge_side(eng, "engine")) if ALIAS in n)
+        )
+        cov["sentinel/learner_cache_slices"] = float(l_cov.get("learner_fp16_expert_cache", 0))
         if not self._reported_coverage:
             self._reported_coverage = True
             e_only, l_only = unmatched(eng, lrn)
-            print(
-                f"[sentinel] {label}: {int(cov['sentinel/tensors'])} tensors compared "
-                f"({int(cov['sentinel/elems'])} elements, {int(cov['sentinel/expert_bias'])} "
-                f"expert_bias); engine-only {len(e_only)} {e_only[:8]}; learner-only "
-                f"{len(l_only)} {l_only[:8]}",
-                flush=True,
-            )
+            print(coverage_report(label, cov, e_cov, l_cov, e_only, l_only), flush=True)
         self._account(cov, time.perf_counter() - t0)
         return eng
 
@@ -316,7 +452,8 @@ class WeightSentinel:
         import time
 
         t0 = time.perf_counter()
-        cov = compare(self.engine_digest(generation), reference, label)
+        eng = [(tp, d) for tp, d, *_ in self.engine_digest(generation)]
+        cov = compare(eng, reference, label)
         self._account(cov, time.perf_counter() - t0)
 
     def _account(self, cov: dict[str, float], secs: float) -> None:

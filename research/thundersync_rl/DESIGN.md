@@ -2994,7 +2994,14 @@ validation. Boundaries are `save_period` multiples, `val_period` multiples (from
 last step, and a timeout save (`checkpoint_must_save_by`) requested one step ahead. Leftover plans are
 dropped at every step end (`SpeculativeGeneration.end_step`): a later row with the same prompt tokens
 (duplicates, next epoch) must never claim a plan verified against an older version; ⊥-BV prompt selection
-is reset with them.
+is reset with them. Scope of that hazard: plans are keyed by prompt tokens and are otherwise cleared
+only when the next verification starts (`_finish_verify`, `_finish_verify_null`, `_verify_chunked`), so
+a stale plan can be claimed only by a row of a step that runs no verification before its rollouts, with
+the same prompt tokens. Before boundaries every step >= 1 verified first (drafts always exist; lanes
+clear the cohort lane's wrapper at its `begin_sticky`; lookahead > 1 gives every step a cohort), so
+the frozen snapshot RL-nano-perf-scale 5b3530de is not affected. With boundaries (no drafts for the
+step after) it would be an exactness bug: DAPO-Math-17k has 1,791,700 rows but 17,398 distinct prompts
+(up to 400 copies), so a 64-prompt batch shares a prompt with the previous one with probability ~0.2.
 
 **What a checkpoint holds** (exact continuation):
 - weights + optimizer + LR scheduler: NeMo-RL `policy.save_checkpoint`, Megatron distributed checkpoint
@@ -3038,9 +3045,21 @@ layout-independent (wrappers stripped, global layer numbers, global expert indic
 experts + local index), so engine and learner EP/PP may differ. Replicas within a side must agree;
 across sides every common tensor must agree bitwise, else `WeightSentinelError` names the tensors. Also:
 the momentum host stage reloaded = the θ̂ digest; the stashed LM head = the live θ̂ head (the head the
-engine drafted with); `expert_bias` buffers included and must never change on the learner. Coverage is
-printed once (common / engine-only / learner-only tensors) and logged per step (`sentinel/*`); zero
-common tensors is an error (vacuous). Per rank: O(params/rank) reads, no gather, a dict of
+engine drafted with); `expert_bias` buffers included and must never change on the learner.
+Compute tensors, not only parameters: the engine digests the storage its kernels read — the
+concatenated / fp16 expert buffers `_fc1_weight` / `_fc2_weight` [E, N, K] per expert as
+`<param>#buf` (compared with the learner's parameter cast to the buffer dtype; a buffer that stopped
+aliasing its parameter, or a raw-byte refit that wrote bf16 bits into fp16 storage, is caught by
+name) — and its fp16-held GEMM / router / LM-head weights in their fp16 storage. On the learner, the
+fp16 expert-weight cache (`fp16_moe._WEIGHT_CACHE`, keyed by identity + pointer, not value) is checked
+against the parameters at every θ check (not while θ̂ is loaded: it keeps θ_k's casts by design).
+Not checked (printed with the coverage): per-call casts that are never stored (bf16 parameters cast
+inside each GEMM when the engine does not hold fp16 weights, e.g. `refit_transport` mcore/m2n — a
+deterministic function of a checked tensor), the hi/lo split of the fp32 head (activation side; no
+cached weight copy exists on this tree), KV / Mamba state and CUDA-graph activation buffers. The
+coverage list (pairs, compute buffers and how many alias their parameter, fp16-held parameters,
+learner cache slices, engine-only / learner-only names) is printed at the first check and counters
+are logged per step (`sentinel/*`); zero common tensors is an error (vacuous). Per rank: O(params/rank) reads, no gather, a dict of
 (name -> 4 ints) to the driver per refit. Untested on GPU yet (queued).
 
 **Non-finite verification** (`block_verification.check_verification_inputs`, all verify paths): a
