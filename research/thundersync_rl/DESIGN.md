@@ -3923,6 +3923,257 @@ test_streaming_pipeline); tests/unit/models/megatron 706 pass / 9 fail + 7 error
 p-lanes / p-async1. Full Nano: thundersync_work/sbatch/go_integ3.sh (`x`, `sr`, `mamba0`) on the frozen
 ../RL-integ3-scale (fork branch ts-integ3-scale). Results: agent_integ3.md and ledger I3.
 
+## 14ac. Engine-side verification (`thundersync.verify_on: engine`, opt-in placement; ported from ts-engine-verify, where it was 14q)
+
+*Opt-in placement option, selectable per run; the learner path (`verify_on: learner`) is unchanged
+and stays the default. Branch ts-engine-verify (../RL-engverify, on ts-lanes-stream 767917df);
+notes and measurements: `thundersync_work/research/agent_engine_verify.md`.*
+
+**Why.** With lanes the step is learner-serial: verify0 (a learner forward of every draft at θ_k)
+runs before the first training dispatch, and continuation pieces are learner forwards interleaved
+with training. Measured (lanes2r-p-tspor-l2 step 2, Nano L8 1k, parity reward): drafts covered every
+token with full acceptance, yet the step took 7.96 s = verify0 1.92 s + training 4.9 s (4 dispatches)
++ ~1 s cut/refit/finish; async-1 4.47 s. Pieces cost a further 0.28x of training time with lanes
+(0.58x one engine, 0.6–2.0x at 4k; blocker audit). Verification needs θ_k, which exists only after
+step k-1 trains, so it is between trainings; it can stop costing learner time.
+
+**Premise.** Under batch invariance the engine's forward is the training forward bitwise (the in-loop
+mismatch check: engine log-probs == learner log-probs, max diff 0); prefill == decode (num_splits=1 or
+anchored split-KV attention, BI Mamba). So an engine holding θ_k computes the same p as the learner
+by prefilling the drafted row. Checked in-loop by `THUNDERSYNC_ENGINE_PREFILL_CHECK=1` (one engine,
+sticky, after the θ_k refit: the engine prefills recorded complete plans with their anchors and its
+log p of every token must equal the plan's learner log-probs bitwise) and, on the engine path itself,
+`THUNDERSYNC_ENGINE_VERIFY_CHECK=1` (the learner also verifies every engine-verified row; per-token p
+compared bitwise). Results: agent_engine_verify.md / below.
+
+**Mechanism (engine_verify.py, worker `_install_verify_capture` / `engine_verify_decide`).**
+1. *Request.* Each row (prompt + draft, or prompt + prefix + piece) is an engine request generating one
+   discarded token, tagged with a verification key and the draft's prompt length; with sticky routing
+   it carries the draft's anchors through the engine anchor-apply buffer (14i's `EngineAnchors`, now
+   installed with `engine_verify` too), so the prefill computes F(θ_k; A).
+2. *Capture.* A wrapper on `context.last_token_logits` copies every forward's [padded tokens, d]
+   head inputs into a static buffer before the last-token selection (captured into the CUDA graphs);
+   after each forward, rows of tagged requests at positions plen-1 .. n-1 are kept per key
+   (`CaptureStore`). No full-vocab logits are materialized by the engine.
+3. *Decision on the engine rank that holds the rows.* p rows = the engine's live LM head
+   (`fp16_gemm.head_matmul`, the model's head GEMM) on chunks of 512 captured rows
+   (`HeadLogprobRows`); q rows = the drafting version's head stash on the drafter's head inputs; the rule
+   is `verify_engine_q` / `verify_engine_q_grid` (plain BV, banded IS, ⊥-BV grid) exactly as on the
+   learner. Every row has its own random stream `row_seed(call seed, key)`. Only (accepted, next, log p
+   of kept tokens, ⊥-grid) go to the driver.
+4. *q-side hidden states without per-token logging (`hidden_transport: recompute`, lanes).* Drafts log
+   no hidden states (was d x 4 B = 10.75 KB per drafted token at Nano's fp32 head, 5–9% ever read; at 32k
+   an estimated 133–266 GB per node per cohort in the object store). When a row's lazy scan needs q rows
+   (a rejection, a ⊥ outcome), the decision raises `NeedQ`; after phase 1 of every row, the rows that
+   need q are prefilled once more on the lane that drafted them (it still holds D_k while the cohort's
+   tails run) and their head inputs come back; those rows are decided again with the same random stream
+   (`verify_rows_two_pass`). One engine keeps the object-store transport (D_k is gone after its refit).
+5. *Head stash.* The drafting lane stashes its own head when refit (version = drafting step) and sends it
+   to the other lane (object store, rank i -> rank i), which verifies that cohort next step.
+6. *Length cap.* A row needs room for the one sampled token: drafts longer than cap - 1 - prompt are
+   verified as that prefix (a cut at a fixed position, not at a token value: exact).
+
+**Placement.** Lanes (sticky routing): at step k the drafting lane is refit to θ_k anyway (current draft
+weights: θ_k is cohort k+1's drafter), so it verifies cohort k (verify0 and every continuation piece)
+while drafting cohort k+1 on the same engine; q recomputes run on the cohort lane (D_k). The learner
+only trains. Not built with momentum draft weights (the verifying lane would need θ_k and θ̂_{k+1} at
+once) or with one engine under sticky routing (one engine holds D_k for the tails until they end and
+θ_k only after). One engine without sticky routing: refit θ_k, then verify on itself (q via logged
+rows). TP>1 decisions are not built (the vocab all-gather would run on the engine's TP group outside its
+own step order; the prefill check uses per-shard head GEMMs on TP rank 0 instead, which is also the
+planned TP>1 decision path).
+
+**Pipelining in canonical blocks.** The step's groups are cut into verification blocks of
+`engine_verify_block_groups` (default `canonical_block_groups`) in group index order; each block is
+verified (⊥-BV pools live in one block), its plans published (rollouts wait per prompt until their block
+is decided, `prepare_verify_blocks`), its pending plans join the continuation rounds (which accept new
+plans while running), and its ready groups are appended to the training order
+(`StreamPlanner.begin_order` / `extend_order`), so the learner trains block b while the engine verifies
+block b+1. After the last block the tail groups, then the fresh groups, are appended (blocks of
+`canonical_block_groups`, or token-bounded segments with `canonical_block_tokens`). The order is
+[ready(V_0)] [ready(V_1)] … [tails] [fresh]: a function of the verification results only, so the
+accumulated gradient stays bitwise reproducible across arrival orders.
+
+**Exactness.** Unchanged argument: each row is block-verified against the fixed target
+p = F(θ_k; A) with q its logged law; only where p is computed and when changes. p is bitwise the
+learner's by the premise (checked in-loop); decisions use fresh per-row randomness; the cut for the
+length cap is positional. The standard checks (mismatch check of every trained row against a learner
+forward, engine-q check, route check) apply unchanged: a plan's kept-token log-probs now come from the
+engine, so the mismatch check validates the premise end to end on every trained token.
+
+**Per-rank costs (verifying engine rank).** d = hidden, V = vocabulary, b_h = head-input bytes (4 under
+the fp32 hi/lo head, 2 under the fp16 head), T = max_tokens per engine step.
+| item | formula | Nano L8 / full Nano (d 2688, V 131072, TP1) | 1T-class (d 10240, V 131072, TP8, 32k rows) |
+|---|---|---|---|
+| capture buffer | (T + 1024) d b_h | 187 MB (T 16384) | 713 MB |
+| captured rows in flight | (g+1) d b_h per row | 11 MB per 1k row; 352 MB per 32k row | 1.34 GB per 32k row (rows per rank = block rows / engine DP) |
+| head stash (drafting version) | V/TP d 2 B | 0.70 GB | 0.34 GB |
+| head temporaries | ~3 x 512 x V/TP x 4 B | 0.8 GB | 0.1 GB |
+| anchor pool (sticky) | n x L_moe x K x 2 B per row | 0.28 KB/token (23 MoE x top-6) | per model |
+| q hidden logging (recompute) | 0 per drafted token (was d x b_h) | 0 (was 10.75 KB/token) | 0 (was 41 KB/token) |
+FLOPs: the verify prefill is the forward the learner ran (2 x active params x tokens + attention), moved
+to the engine lane, where it runs in the engine's continuous batches next to decode steps (prefill is
+compute-bound, decode memory-bound). q recomputes add a prefill of only the rows whose scan needs q, on
+the drafting lane. Transport: per row its token ids (8 B/token) and log q (4 B/token) to the rank that
+holds it (keys queried first, so a rank receives only its rows); back to the driver the kept tokens'
+log p (4 B/token); p rows never leave the engine; one head shard per step lane to lane; q recompute
+(g+1) x d x b_h per needing row, lane to lane.
+**Engine lane cost [M, measured by the state-handoff agent: thundersync_work/research/state_handoff/
+bench_{L8,full}.json, `state_handoff_probe.py --side bench`, one GB200, BI engine as the workers build it,
+one prefill request of n tokens].** Prefill alone: Nano L8 25 ms flat up to 8k tokens, 38.5 ms at 16k,
+71 ms at 32k; full Nemotron-3-Nano 125 ms flat up to 4k (an eager prefill step's floor: CUDA graphs cover
+only steps <= cuda_graph_max_tokens = 512), 137 / 228 / 443 ms at 8k / 16k / 32k, i.e. ~74k tok/s/GPU
+(marginal ~13 us/token) once a step holds >= 16k tokens. Joining a decode batch (B = 32) is not free:
+the step with the prefill costs the decode step plus about the prefill's whole alone time (full Nano:
+decode 15 ms, join 171 ms at 1k tokens, 241 ms at 16k; L8: 3.8 ms -> 34 ms at 1k), so decode and prefill
+serialize in the current engine. Consequences [D]: verification must submit a block's rows together so
+each prefill step is full (>= 16k tokens), the cost on the theta lane is ~verify tokens / 74k s per GPU
+(full Nano EP8 lane, 768 rows: 1k caps ~1.6M tokens -> ~2.9 s per step; 8k caps ~6.9M -> ~12 s), and it is
+paid by that lane's drafting. Engine verification therefore moves the verify forward from the learner to
+the theta lane; it pays when that lane has slack (short caps, lanes idle after drafts end) and not on a
+fleet balanced for async-1 at long caps, where verify-in-train (no extra forward) or a dedicated verifier
+pool are the alternatives. Levers measured nowhere yet: CUDA-graphed large prefill steps (removes the
+125 ms floor), the prompt prefilled once per group (~1/2 of tokens at 1k caps, ~1/9 at 8k), chunked
+prefill sized to the decode step's spare compute.
+
+**Prefill cost by step shape and graphs [M, this branch's `thundersync_work/research/engine_verify/
+prefill_bench.py`, one GB200, k rows x n tokens prefilled in one engine step, BI engine; pb_{L8,full}_{eager,
+graph}.json].** Eager steps (production: graphs only <= 512 tokens) have a per-step floor (L8 27 ms, full Nano
+120 ms) that rows batched into one step amortize: full Nano 1x1k 120 ms (8.5k tok/s), 8x1k 140 ms, 16x1k
+227 ms (72k tok/s; compute-bound from ~8k tokens per step). Graphed prefill steps
+(`mcore_generation_config.cuda_graph_all_prefills=true`, now forwarded to MCore) remove the floor:
+full Nano 1x1k 35 ms, 1x2k 49 ms, 1x4k 74 ms, same ~71k tok/s for full steps; joining a 64-row decode batch
+(17.8 ms step) costs +32 ms for a 1k piece instead of +148 ms eager (L8: +5.5 ms instead of +32 ms); decode
+steps are unchanged (L8 3.96 vs 4.3 ms). Exponential graph sizes pad mid-size mixed steps (full Nano 8x1k
+joined: 202 ms graphed vs 154 ms eager), so the piece path wants graphs and the block path wants full steps.
+Verification submits a whole block (16k+ tokens per step) and each continuation round's pieces together.
+
+**End to end [M, local 3 GPUs: learner 1 GPU + two 1-GPU lanes, Nano L8 1k, parity reward, current drafts,
+⊥-BV + sticky, max_requests 256, runs_engverify/evl-*].** Exactness with every check on (CHECKS=1 +
+THUNDERSYNC_ENGINE_VERIFY_CHECK): ev-local-l2 (eager) and evl-x-g (graphed prefill, 2 pieces in flight,
+batched head pass): EXACT, mismatch 0 every step; engine p == learner p bitwise on every compared token
+(e.g. 36864/36864 per block, max |dlogp| 0); q rows rebuilt by the drafting lane's re-prefill == the engine's
+logged log q bitwise (36864/36864). Step time (iteration, steps 1–5): learner verification 13.65 s
+(verify0 3.0–3.2 s serial on the 1-GPU learner) -> engine verification 12.35 s (eager) -> 11.77 s (graphed
+prefill, batched head pass). The learner trains for ~9 s of it; the remaining gap is the first block's
+verification (1.0–1.8 s) and the decision phase, which ran 4.4–5.5 s per step while the lane also drafted
+(1.0 s on the last step, no drafting): decisions share the GPU, the stream and the Python interpreter with the
+drafting engine (side CUDA stream since 6eccfb04).
+
+**Cluster runs (4 GPUs: learner 2 GPUs + two 1-GPU lanes; async-1 2+2; Nano L8 1k, parity reward, 8 steps,
+runs_1node/ev-*, code 98ac4ba0 = before the side stream / batched head / graphs) [M].** Premise:
+`[engine prefill check]` bitwise on one engine at EP1, EP2 and TP2 (TP2 via per-shard head GEMMs on TP rank 0;
+16 rows x 1024 tokens per check, 2 checks per run, max |dlogp| 0) — ev-pc-one-{ep1,ep2,tp2}, all EXACT.
+Lanes exactness: ev-ex-l2-rc (recompute) and ev-ex-l2-os (object store) EXACT, 21/22 engine-vs-learner p
+comparisons all bitwise. Step time (iteration mean, steps 1–7): async-1 5.12 s, lanes learner-verify momentum
+7.73 s, current 8.55 s, engine verify 9.24 s (block groups 2: 10.37 s). Slower at that code: with the lane
+drafting, the decision phase took 5.4 s per step (1.3 s on the last step, no drafting), so verification of
+all blocks (~7 s) outlasted training (4.5 s) and dispatches waited for blocks. After the side stream (local
+runs above) the decision phase is 2.0–2.5 s and all blocks are verified in 3.2–3.8 s; rerun queued (ev2-*).
+
+**Cluster rerun after the fixes (ev2-*, ab55128b; same 4-GPU layout, engine graphs on every arm) [M].**
+ev2-ex-l2 EXACT. Iteration steps 1–7: async-1 4.97–5.05 (mean 5.06); learner verify current 8.34, momentum
+8.09; engine verify 7.87 (7.39 median), block groups 2: 8.14. Engine-verify steps alternate fast / slow:
+7.39 / 9.53 / 6.75 / 9.64 / 6.67 / 9.10 / 5.97 (b2: 6.14–6.39 fast, 10.2–10.5 slow). Fast steps are 0.74–0.83
+of async-1 (verification all done in 2.7–3.0 s inside 4.4–4.9 s of training, first block 0.3–1.0 s). The slow
+ones are the window feedback loop: on the fast step the next cohort's drafting window is ~6.2 s, every row of
+this parity-reward L8 run runs to the 1024 cap, and the drafts end ~40 tokens short (123–125k of 131k drafted
+tokens, full_accept 0.00), so every row needs a continuation (5–8k continuation tokens, 4–5 rounds of 0.6 s
+p50 latency) and the step takes ~9.5 s, which leaves a ~9.2 s window, so the next cohort completes
+(full_accept 1.0) and that step is fast. Fix built: `thundersync.draft_cut_slack_s` (the sticky cut waits
+up to that many seconds after training for the drafts to finish; it is at that fixed time or earlier only when
+nothing would be cut, so exactness is that of a plain deadline). Runs queued: ev3-* (slack 0.5 / 1.0 s,
+engine verify and both learner controls with the same slack).
+
+**ev3 results (f9d79bdf, same 4-GPU layout, slack 0.5 / 1.0 s) [M].** Slack removes the alternation: engine verify
+7.90 / 7.97 s (steps 2-7), learner-verify control 8.67, momentum control 8.09, async-1 5.00; ev3-ex-l2-s05 EXACT.
+
+**Critical path and pipelining (10-15) [M: ev3 timelines; notes: agent_engine_verify.md "Limits report"].** Against
+async-1 the engine-verify step spends +2.9 s: pre-loop 0.9 (head handoff wait + a needless refit, fixed in 486a4225),
+pipeline fill 1.1 (the learner waits for block 0's prefill and decisions), dispatch split 0.46 (more, smaller learner
+calls) and verification-bound gaps 0.42. Engine verification frees verify0 (1.6 s of the control's learner time at L8)
+but fill + gaps + split add about as much back, so at L8 the gain over the control comes from continuation pieces
+leaving the learner, not from verify0. Fill and gaps are set by per-block latency, which is serial: prefill, then
+decisions (~5 ms/row in the loop: per-row host syncs on a GPU and interpreter shared with drafting), then a second
+⊥-BV wave when needed, ~5 Ray round trips per call. A block's prefill (~88k tokens at L8 1k) is compute, not the
+per-step floor; the floor matters for pieces, q recomputes and restarts. Three changes (3c013e3e):
+1. *Prefetch* (`engine_verify_prefetch`, opt-in): the next block's first verification wave is a function of the
+   counts only (`_null_first_wave`; the whole block without ⊥-BV), so it is sent to the engine while the current block
+   is decided; its prefill overlaps the decisions. The call is the one the block makes anyway (rows, cap cuts,
+   anchors); the decision draws its seed when it runs. Unused prefetches are dropped. Timing only: exactness unchanged.
+   Per verifying rank: captured rows of two blocks in flight, (g+1) d b_h bytes per row (Nano 1k ~11 MB/row; at 32k
+   rows 352 MB/row, so long-cap blocks must be sized by tokens, `canonical_block_tokens`).
+2. *Batched whole-draft decisions* (`decide_whole_rows`, on in the engine path; `THUNDERSYNC_EV_DECIDE=rowwise` off):
+   the lazy scan's first test is eta_g <= b_g; rows that pass it at every envelope (most rows) need no q row and emit
+   the bonus token from p_g. They are decided together: each row draws from its own stream exactly as the scan does
+   (eta, then u or the multinomial), weights with the same ops, the bonus rows through one head GEMM (row-invariant
+   under batch invariance), two host syncs per call. Bitwise the per-row decision (unit tests on CPU and GB200;
+   in-loop `THUNDERSYNC_EV_DECIDE_CHECK=1`). Other rows take the per-row path, which restarts their stream.
+3. *First block size* (`engine_verify_first_block_groups`): blocks stay a function of the group index, so the
+   training order stays a function of the verification results.
+At full Nano 2k the ceiling is verify0's share of learner time (11-15 s of ~195 s, 6-8%); fill and split are ~fixed,
+and the theta lane must absorb ~1.8M prefill tokens/step (~3 s on an 8-GPU lane at 74k tok/s/GPU) [D].
+Runs: ev5-* (agent note). Not addressed: dispatch split (per-call learner cost), tails cut short by the draft cut,
+slack cost.
+
+Not built yet: chunked prefill of verify rows (needs Mamba-chunk-aligned splits; today a row prefills in
+one engine step, so a 32k row is one 32k-token step), sharing the prompt prefill across a group (prefix
+caching is forbidden with sticky routing today; the prompt is ~half the row tokens at 1k caps), feeding
+the verify prefill's KV/Mamba state to the continuation (lanes: the continuation runs on the other lane
+at D_k, so this applies to one engine without sticky routing only).
+
+**Step-1 crash of every engine-verify arm at 486a4225 / 3c013e3e (ev4-\*, ev5-\*) and the fix (7a85a86d) [M/T].**
+Symptom: step 0 trains (no drafts), step 1 dies with one "draft verification failed" per waiting sample and the learner's
+"canonical order incomplete after the last rollout (0 of 16 groups)"; the verification error itself was never printed
+(the rollouts raised `from` it; the learner's error surfaced first and `verify_task` was never awaited).
+- Cause: 486a4225 made the lane LM-head handoff non-blocking. Lane y's `stash_head(step)` (sent through
+  `run_all_workers_single_data`, i.e. with `ray.put` object-ref kwargs) was followed by `head_stash_cpu(step)` (inline int
+  argument) without a `ray.get` between them, relying on "calls to one actor run in submission order". The engine workers
+  are asyncio actors (`MegatronPolicyWorker` has `async def` methods), and Ray runs an asyncio actor's calls in the order
+  their arguments resolve, not the order they were sent. The export ran first and returned None.
+  `import_head_stash(.., None, ..)` then silently installed nothing on lane x. At step 1, lane x is the verifier and has no
+  LM-head stash of the drafting version 0, so `engine_verify_decide` raises "no LM-head stash of drafting version".
+  CPU repro with the same call shape: the export overtook the stash in 45 of 50 trials.
+- Fix: the order is a Ray data dependency. `head_stash_cpu(step, after=<stash ref>)`;
+  `import_head_stash(step, <export ref>, keep, after=<last step's import ref into this lane>)`. The driver still blocks on
+  nothing at the step top; the first decision waits on the stash and the previous import (`EngineVerifier.wait_refs`).
+  A missing head on a rank that holds one now raises in the export / import instead of returning None / 0.
+  Regression test: `test_ev_lane_heads_orders_by_data_not_submission` (real Ray asyncio actors, 12 steps). It fails on the
+  3c013e3e code and passes on the fix.
+- Surfacing: `SpeculativeGeneration._log_verify_error` prints the full traceback once (the block/chunked verification
+  error handlers and `_one` call it), and the learner's "canonical order incomplete" error names and chains the verify
+  task's exception.
+- Per rank: unchanged (one V/TP x d head shard per kept version; one object-store transfer per step); the dependency adds
+  no transfer.
+
+**Port to ts-integ3 (branch ts-engine-verify-i3, off 2de3f17e) [code/T].** The old branch (on lanes-stream 767917df) was
+ported as one deliberate squash of its final state (incl. the fix), not merged; every conflict resolved by reading both sides:
+- Growing canonical order: integ3's `StreamPlanner.begin_order / extend_order / close_order` (streaming verify0, 14z) is
+  the one API; EV's `OrderFeed` uses it (`extend_order` block sizes default to one group per block); new
+  `order_complete()` also counts groups that verify-in-train trained (`mark_pretrained`).
+- Block sizes: EV's verification blocks (default) and tail/fresh dispatch blocks now use integ3's
+  `canonical_groups_per_block` (deal_rows / PP aware) instead of the bare `canonical_block_groups`.
+- Seeds: engine verification calls draw `_call_seed("engine", rows)` (14ab canonical call identity) instead of
+  `next(_verify_seeds)`, so EV inherits integ3's run-to-run seed reproducibility (EV's own note §7 above).
+- `_finish_verify` / `_finish_verify_null`: integ3's `published` (streamed verify0) and EV's `clear` / `publish`
+  coexist; stats-only EV calls keep the ⊥-BV drop-IS log weight.
+- `_continue_sticky`: integ3's carried walk (`cw`, `busy`, `TailFeed`) and EV's pieces in flight (`pend`) and
+  `incoming` queue coexist. A piece's prefix is prompt + kept prefix + carried (undecided) tokens + pending (in flight)
+  tokens; carried-walk streams gate on `busy`, plain streams on `pend`.
+- Draft cut: `draft_cut_slack_s` (EV) and `draft_window_pace` (integ3) are alternatives.
+- Validation, new rejections (not built together; "not built yet", no evidence of a limit): `verify_on=engine` with
+  `sticky_continuation_decision != every` (carried-walk decisions are learner-side); `sticky_pieces_in_flight > 1`
+  with a carried walk; `draft_cut_slack_s > 0` with `draft_window_pace`. Already rejected by integ3's validators with
+  `verify_on=engine`: verify0_stream, verify_in_train, verify_yield, learner_prefix_cache. Default unchanged
+  (`verify_on` default is integ3's); everything here is opt-in.
+- Inference expert parallelism: `validate_expert_parallel` rejected every `verify_on != learner` at engine EP > 1
+  (733c7bd7: a generation worker blocked in a *scorer* forward leaves its EP peers' engine all-to-all unmatched). That
+  argument does not apply to `verify_on=engine`: its forwards are engine requests run by the engine loop (EP ranks in
+  step), and its decisions are rank-local head GEMMs on a side stream (TP 1; TP > 1 rejected above). The rule now
+  admits `engine`. Engine EP > 1 had never run end to end before this port, so it is validated by ev6-x-1eng-ep2 (L8)
+  and, at full Nano, by go_ev.sh (lanes at engine EP4).
+- Validation runs: research/engine_verify/ (ev6-\* in sbatch/queue_1node.tsv), full-Nano wrapper sbatch/go_ev.sh.
+
 ## 15. Open work
 
 - **Stragglers.** About one rejected draft per step decodes its remainder at about 3 ms

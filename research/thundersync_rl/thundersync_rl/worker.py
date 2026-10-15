@@ -1854,6 +1854,12 @@ class ThunderSyncMegatronPolicyWorker(verify_yield.YieldWorkerMixin, MegatronPol
             )
         return list(range(base, base + len(prompts)))
 
+    def draft_token_total(self) -> tuple[int, int]:
+        """(streamed draft tokens so far, unfinished drafts) on generation rank 0 (bench)."""
+        tokens = getattr(self, "_draft_tokens", None) or []
+        done = getattr(self, "_draft_done", None) or []
+        return sum(len(t) for t in tokens), sum(1 for d in done if not d)
+
     def draft_lengths(self, indices: list[int]) -> list[tuple[int, bool]]:
         """(streamed token count, finished) of the listed drafts (rank 0).
 
@@ -2628,12 +2634,17 @@ class ThunderSyncMegatronPolicyWorker(verify_yield.YieldWorkerMixin, MegatronPol
                     _drop_mcore_route_bookkeeping(controller)
                     # Before graph capture: the routers read the buffer.
                     worker._install_anchor_apply(context)
+                # Engine-side verification: every forward's head-input rows are
+                # copied before the last-token selection (captured in the graphs).
+                worker._install_verify_capture(context)
                 super().__init__(controller, context, *args, **kwargs)
                 if getattr(worker, "_route_log_state", None) is not None:
                     # An engine rebuilt after the route log was installed.
                     worker._wrap_route_log(controller, context)
                 if getattr(worker, "_anchor_apply", None) is not None:
                     worker._wrap_anchor_apply(self, controller, context)
+                if getattr(worker, "_verify_cap", None) is not None:
+                    worker._wrap_verify_capture(self, controller, context)
 
             def _validate_async_sched_support_for_config(self) -> None:
                 if getattr(worker, "_route_record", None) is None:
@@ -2918,7 +2929,8 @@ class ThunderSyncMegatronPolicyWorker(verify_yield.YieldWorkerMixin, MegatronPol
         from nemo_rl.models.megatron import sticky_routing
         from thundersync_rl.routes import EngineAnchors
 
-        if sticky_routing.get_anchor_horizon() is None:
+        if not sticky_routing.engine_anchor_apply():
+            # Neither an anchor horizon nor engine-side verification.
             return
         rec = self._route_record
         cfg = get_model_config(self._gen_model())
@@ -3369,6 +3381,767 @@ class ThunderSyncMegatronPolicyWorker(verify_yield.YieldWorkerMixin, MegatronPol
         if log is not None:
             log.pop(keys, close=True)
 
+    # ---- Engine-side verification (thundersync.verify_on=engine; engine_verify.py) ----
+    # The engine holding theta_k prefills drafted rows (one discarded sampled
+    # token each), keeps their LM-head input rows and decides block
+    # verification itself; p never leaves the engine rank that computed it.
+
+    def _install_verify_capture(self, context) -> None:
+        """Copy every engine forward's head-input rows before the last-token selection.
+
+        ``policy.megatron_cfg.engine_verify``. With
+        ``materialize_only_last_token_logits`` the model selects each request's
+        last row (``context.last_token_logits``) before the output layer; a
+        wrapper on that method first copies all [padded tokens, d] rows into a
+        static buffer (head-input dtype, as ``_install_hidden_copy`` rounds
+        them), so the copy is captured into the CUDA graphs and replays with
+        them. ``_wrap_verify_capture`` then keeps the rows of tagged
+        verification requests. Last pipeline stage only (the output layer);
+        every TP rank (the rows are gathered over sequence parallelism there).
+        Per rank: (max_tokens + 1024) x d x head-input bytes (Nano L8 fp32
+        head: 17408 x 2688 x 4 B = 187 MB) plus one row copy per forward.
+        """
+        if not ((getattr(self, "cfg", None) or {}).get("megatron_cfg") or {}).get("engine_verify"):
+            return
+        model = _unwrap(self._gen_model())
+        layer = getattr(model, "output_layer", None)
+        if layer is None:
+            return
+        if not bool(context.config.materialize_only_last_token_logits):
+            raise RuntimeError(
+                "engine-side verification needs "
+                "mcore_generation_config.materialize_only_last_token_logits=true"
+            )
+        try:
+            from megatron.core.inference.utils import InferenceMode
+        except ImportError:  # pragma: no cover
+            InferenceMode = None
+        from nemo_rl.models.megatron.fp16_gemm import head_input_dtype
+        from thundersync_rl.engine_verify import CaptureStore
+
+        weight = layer.weight
+        if weight is None:
+            weight = model.shared_embedding_or_output_weight()
+        d = int(weight.shape[1])
+        static = torch.empty(
+            (int(context.max_tokens) + 1024, d),
+            dtype=head_input_dtype(weight.dtype),
+            device=weight.device,
+        )
+        overflow = [0]
+        orig = context.last_token_logits
+
+        def last_token_logits(x):
+            if (
+                x.dim() == 3
+                and x.shape[-1] == d
+                and (InferenceMode is None or InferenceMode.is_active())
+            ):
+                rows = x.reshape(-1, d)
+                if rows.shape[0] <= static.shape[0]:
+                    static[: rows.shape[0]].copy_(rows)
+                else:
+                    overflow[0] += 1
+            return orig(x)
+
+        context.last_token_logits = last_token_logits
+        import threading
+
+        self._verify_cap = {
+            "static": static,
+            "d": d,
+            "store": CaptureStore(),
+            "lock": threading.Lock(),
+            "events": {},
+            "overflow": overflow,
+            "controller": None,
+            "captured_rows": 0,
+        }
+
+    def _wrap_verify_capture(self, engine, controller, ctx) -> None:
+        """Keep tagged verification requests' rows after every engine forward.
+
+        Wraps ``_dynamic_step_forward_logits`` (every forward, eager or graph
+        replay, as ``_wrap_anchor_apply``): before the launch the step's token
+        layout (CPU bookkeeping) selects the tokens of tagged requests at
+        positions plen-1 .. n-1; after it, those rows of the static buffer are
+        copied into the request's ``CaptureStore`` entry on the same stream (the
+        next forward is launched only after this returns). Python work per new
+        request (``SlotTags``) and numpy per token; no device sync.
+        """
+        from thundersync_rl.engine_verify import (
+            VERIFY_KEY_ATTR,
+            VERIFY_PLEN_ATTR,
+            capture_selection,
+        )
+        from thundersync_rl.routes import SlotTags
+
+        cap = self._verify_cap
+        if cap["controller"] is controller:
+            return
+        cap["controller"] = controller
+        store, static, d = cap["store"], cap["static"], cap["d"]
+        ids: dict[str, int] = {}
+        names: list[str] = []
+        bounds = {"lo": np.zeros(0, dtype=np.int64), "hi": np.zeros(0, dtype=np.int64)}
+
+        def key_id(key: str) -> int:
+            kid = ids.get(key)
+            if kid is None:
+                kid = ids[key] = len(names)
+                names.append(key)
+            return kid
+
+        def lookup(rid):
+            entry = engine.requests.get(rid)
+            if entry is None:
+                return None
+            sp = entry.record[-1].sampling_params
+            key = getattr(sp, VERIFY_KEY_ATTR, None)
+            if key is None:
+                return None
+            plen = int(getattr(sp, VERIFY_PLEN_ATTR))
+            n = len(entry.record[0].prompt_tokens)
+            kid = key_id(key)
+            if kid >= bounds["lo"].shape[0]:
+                grow = max(256, kid + 1 - bounds["lo"].shape[0])
+                bounds["lo"] = np.concatenate([bounds["lo"], np.zeros(grow, dtype=np.int64)])
+                bounds["hi"] = np.concatenate([bounds["hi"], np.zeros(grow, dtype=np.int64)])
+            bounds["lo"][kid], bounds["hi"][kid] = plen - 1, n
+            with cap["lock"]:
+                store.begin(key, plen - 1, n, d, static.dtype, static.device)
+            return key
+
+        tags = SlotTags(lookup, key_id)
+        orig_init = controller._dynamic_step_context_init
+        orig = controller._dynamic_step_forward_logits
+        dummy = [False]
+
+        def context_init(*args, **kwargs):
+            dummy[0] = bool(kwargs.get("is_dummy_forward", False))
+            return orig_init(*args, **kwargs)
+
+        def forward_logits(*args, **kwargs):
+            sel = None
+            if not dummy[0]:
+                n = int(ctx.active_token_count)
+                e = int(ctx.total_request_count)
+                if n > 0 and e > 0:
+                    slot_kid = tags.refresh(
+                        ctx.request_ids[:e].numpy(),
+                        ctx.request_in_prefill_status_tensor[:e].numpy() != 0,
+                    )
+                    if (slot_kid >= 0).any():
+                        sel, kids, pos = capture_selection(
+                            ctx.token_to_request_idx[:n].numpy(),
+                            ctx.token_to_pos_ids[:n].numpy(),
+                            slot_kid,
+                            bounds["lo"],
+                            bounds["hi"],
+                        )
+            out = orig(*args, **kwargs)
+            if sel is not None and sel.size:
+                idx = torch.from_numpy(sel).pin_memory().to(static.device, non_blocking=True)
+                rows = static.index_select(0, idx)
+                with cap["lock"]:
+                    for kid in np.unique(kids):
+                        m = np.flatnonzero(kids == kid)
+                        sub = rows.index_select(
+                            0, torch.from_numpy(m).pin_memory().to(rows.device, non_blocking=True)
+                        )
+                        store.put(names[int(kid)], pos[m], sub)
+                        ev = torch.cuda.Event()
+                        ev.record()
+                        cap["events"][names[int(kid)]] = ev
+                    cap["captured_rows"] += int(sel.size)
+            return out
+
+        controller._dynamic_step_context_init = context_init
+        controller._dynamic_step_forward_logits = forward_logits
+
+        # Verification requests go to the front of the waiting queue: the
+        # learner waits on them, while queued drafts (⊥-BV extras beyond the
+        # request capacity) only lose drafting time. Admission order changes
+        # timing only (drafts are cut by time; a verification is a function of
+        # its row). A request still needs a free slot: engine verification needs
+        # max_requests headroom of about one verification block per rank.
+        orig_sched = engine.schedule_waiting_requests
+
+        def is_verify(rid) -> bool:
+            entry = engine.requests.get(rid)
+            if entry is None:
+                return False
+            return getattr(entry.record[-1].sampling_params, VERIFY_KEY_ATTR, None) is not None
+
+        def schedule_waiting_requests(*args, **kwargs):
+            w = engine.waiting_request_ids
+            if len(w) > 1 and int(getattr(ctx, "chunked_prefill_request_id", -1)) < 0:
+                ids = list(w)
+                ver = [r for r in ids if is_verify(r)]
+                if ver and ids[: len(ver)] != ver:
+                    vs = set(ver)
+                    w.clear()
+                    w.extend(ver + [r for r in ids if r not in vs])
+            return orig_sched(*args, **kwargs)
+
+        engine.schedule_waiting_requests = schedule_waiting_requests
+
+    async def run_verify_requests(
+        self,
+        rows: list[Any],
+        keys: list[str],
+        prompt_lens: list[int],
+        anchor_keys: Optional[list[Optional[str]]] = None,
+    ) -> dict[str, float]:
+        """Generation rank 0: prefill ``rows`` on this engine; return once all finished.
+
+        Each row is a request generating one token (discarded), tagged with
+        its verification key and draft prompt length (and, with sticky
+        routing, its anchor key: the engine applies the draft's anchors in the
+        prefill). The coordinator places requests on any data-parallel rank;
+        that rank keeps the rows (``engine_verify_ready``).
+        """
+        from thundersync_rl.engine_q import ANCHOR_KEY_ATTR
+        from thundersync_rl.engine_verify import VERIFY_KEY_ATTR, VERIFY_PLEN_ATTR
+
+        if self.inference_client is None or self._inference_loop is None:
+            raise RuntimeError("run_verify_requests: no inference engine on this worker")
+        t0 = time.perf_counter()
+        anchor_keys = anchor_keys or [None] * len(rows)
+
+        async def one(row, key, plen, akey):
+            sp = self._build_sampling_params(greedy=False, stop_words=None)
+            sp.num_tokens_to_generate = 1
+            attrs = {VERIFY_KEY_ATTR: key, VERIFY_PLEN_ATTR: int(plen)}
+            if akey:
+                attrs[ANCHOR_KEY_ATTR] = akey
+            sp.add_attributes(attrs)
+            await self.inference_client.add_request([int(t) for t in row], sp)
+
+        async def run():
+            await asyncio.gather(
+                *(one(r, k, p, a) for r, k, p, a in zip(rows, keys, prompt_lens, anchor_keys))
+            )
+
+        await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(run(), self._inference_loop))
+        return {"requests": float(len(rows)), "s": time.perf_counter() - t0}
+
+    def engine_verify_ready(self, keys: list[str]) -> list[str]:
+        """The listed verification keys whose rows this rank holds completely."""
+        cap = getattr(self, "_verify_cap", None)
+        if cap is None:
+            return []
+        with cap["lock"]:
+            return [k for k in keys if cap["store"].complete(k)]
+
+    def _verify_pop(self, key: str) -> Optional[torch.Tensor]:
+        cap = self._verify_cap
+        with cap["lock"]:
+            ev = cap["events"].pop(key, None)
+            rows = cap["store"].pop(key)
+        if ev is not None:
+            ev.synchronize()
+        return rows
+
+    def engine_verify_take(self, keys: list[str]) -> dict[str, torch.Tensor]:
+        """Captured rows [n - plen + 1, d] (CPU) of the listed keys this rank holds.
+
+        q recompute (``hidden_transport="recompute"``): the drafting lane
+        prefilled the drafts at the drafting weights; row j is the head input
+        the drafter sampled token j from.
+        """
+        cap = getattr(self, "_verify_cap", None)
+        if cap is None:
+            return {}
+        out = {}
+        for k in keys:
+            with cap["lock"]:
+                ok = cap["store"].complete(k)
+            if ok:
+                rows = self._verify_pop(k)
+                if rows is not None:
+                    out[k] = rows.cpu()
+        return out
+
+    def engine_verify_drop(self, keys: list[str]) -> None:
+        """Forget captured rows of these keys (a failed or abandoned call)."""
+        cap = getattr(self, "_verify_cap", None)
+        if cap is None:
+            return
+        with cap["lock"]:
+            cap["store"].drop(keys)
+            for k in keys:
+                cap["events"].pop(k, None)
+
+    def add_engine_anchors(self, entries: dict[str, Any]) -> int:
+        """{anchor key: RouteRefs} the engine applies to tagged verification prefills.
+
+        Added to (not replacing) the registered entries; ``drop_engine_anchors``
+        removes them after the call. Only handles are stored; the rank that
+        admits a request fetches its own stage's blocks.
+        """
+        refs = dict(getattr(self, "_engine_anchor_refs", None) or {})
+        refs.update(entries)
+        self._engine_anchor_refs = refs
+        return len(refs)
+
+    def drop_engine_anchors(self, keys: list[str]) -> None:
+        refs = getattr(self, "_engine_anchor_refs", None) or {}
+        for k in keys:
+            refs.pop(k, None)
+
+    def head_stash_cpu(self, version: int, after: Any = None) -> Optional[torch.Tensor]:
+        """This rank's stashed LM-head shard of ``version`` on the host.
+
+        None only on ranks without the head (pipeline stages before the last).
+        ``after``: the stash call's ref, so Ray runs this export after it
+        (asyncio actors do not keep submission order).
+        """
+        w = getattr(self, "_head_stash", {}).get(version)
+        if w is None:
+            if self._lm_head() is not None:
+                raise RuntimeError(
+                    f"head_stash_cpu: no LM-head stash of version {version} "
+                    f"(have {sorted(getattr(self, '_head_stash', {}))})"
+                )
+            return None
+        return w.detach().cpu()
+
+    def import_head_stash(
+        self, version: int, weight: Optional[torch.Tensor], keep: list[int], after: Any = None
+    ) -> int:
+        """Install another lane's stashed head shard as ``version`` (same TP/PP rank).
+
+        Engine-side verification on lanes: the verifying lane needs the LM head
+        of the version that drafted the cohort (q rows). Per rank: V/TP x d x
+        2 B per kept version. ``after``: a ref this import must follow (Ray
+        data dependency; unused).
+        """
+        head = self._lm_head()
+        if head is None:
+            return 0
+        if weight is None:
+            raise RuntimeError(f"import_head_stash: no LM-head shard of version {version}")
+        _, live, _ = head
+        if not hasattr(self, "_head_stash"):
+            self._head_stash = {}
+        self._head_stash[version] = weight.to(device=live.device, dtype=live.dtype)
+        for v in list(self._head_stash):
+            if v not in keep and v != version:
+                del self._head_stash[v]
+        return len(self._head_stash)
+
+    def _engine_head_logprobs_fn(self, weight: torch.Tensor, vocab_limit: int):
+        """(head GEMM fn [k, d] -> fp32 logits shard, head-input dtype) for ``weight``.
+
+        ``fp16_gemm.head_matmul`` is the model's LM-head GEMM (fp16 operands /
+        exact hi-lo fp32 head of the recipe), called directly rather than
+        through the output layer: the engine's own pre-hooks fire on any
+        output-layer call while the engine is active (process-wide flag).
+        """
+        from nemo_rl.models.megatron.fp16_gemm import head_input_dtype, head_matmul
+
+        head = self._lm_head()
+        scale = head[2] if head is not None else None
+        dtype = head_input_dtype(weight.dtype)
+
+        def fn(h: torch.Tensor) -> torch.Tensor:
+            z = head_matmul(h.to(device=weight.device, dtype=dtype), weight)
+            if scale is not None:
+                z = scale(z)
+            return z
+
+        return fn
+
+    async def engine_verify_decide(self, **kwargs) -> list[tuple[str, dict[str, Any]]]:
+        """Decide block verification of the items whose rows this rank captured.
+
+        Runs in a thread (the actor keeps serving the driver's draft and log
+        calls meanwhile). See ``_engine_verify_decide``.
+        """
+        dev = torch.cuda.current_device()
+        if getattr(self, "_ev_stream", None) is None:
+            # Own (non-blocking) stream: the decision's host syncs wait for its
+            # own kernels only, not for the engine's decode steps queued on the
+            # engine's stream.
+            self._ev_stream = torch.cuda.Stream(device=dev)
+
+        def run():
+            torch.cuda.set_device(dev)
+            with torch.cuda.stream(self._ev_stream):
+                out = self._engine_verify_decide(**kwargs)
+                self._ev_stream.synchronize()
+            return out
+
+        return await asyncio.to_thread(run)
+
+    @torch.no_grad()
+    def _engine_verify_decide(
+        self,
+        items: list[dict[str, Any]],
+        seed: int,
+        vocab_limit: int,
+        q_lane: Optional[list[Any]] = None,
+        chunk_rows: int = 512,
+        check: bool = False,
+    ) -> list[tuple[str, dict[str, Any]]]:
+        """Block verification on the engine: p from this rank's captured rows.
+
+        ``items[i]``: {"key", "tokens" (draft), "logq" (engine log q of the
+        draft tokens), "hidden" (the drafter's head inputs: tensor,
+        ``HiddenRefs`` or ``HiddenRecompute``), "segments", optional
+        "envelopes" (⊥-BV grid), "band", "plen", "row"}. Items whose rows this
+        rank does not hold are skipped (another rank decides them).
+
+        p: ``HeadLogprobRows`` over the captured rows with the live LM head
+        (theta_k), ``chunk_rows`` rows per head GEMM. q rows: the stashed head
+        of the drafting version over the drafter's head inputs; with
+        ``HiddenRecompute`` the rows are rebuilt by a prefill on the drafting
+        lane ``q_lane`` = [rank-0 actor, every worker actor] (two-pass
+        decision, ``verify_rows_two_pass``). Every row has its own random
+        stream (``row_seed(seed, key)``). The rule is ``verify_engine_q`` /
+        ``verify_engine_q_grid``, as on the learner; results have the learner
+        method's keys. ``check``: also "p_token_logprobs" (log p of every
+        drafted token) and q rows rebuilt and compared with the engine's log q.
+
+        Tensor parallel size 1 only (validated): at TP>1 the vocab gather
+        would be a collective outside the engine's own step order.
+        """
+        from megatron.core import parallel_state as ps
+        from thundersync_rl.engine_q import HiddenRows
+        from thundersync_rl.engine_verify import (
+            HeadLogprobRows,
+            HiddenRecompute,
+            NeedQ,
+            decide_row,
+            decide_whole_rows,
+            verify_rows_two_pass,
+        )
+
+        if ps.get_tensor_model_parallel_world_size() != 1:
+            raise NotImplementedError("engine-side verification at TP>1 is not built yet")
+        cap = getattr(self, "_verify_cap", None)
+        head = self._lm_head()
+        if cap is None or head is None:
+            return []
+        t0 = time.perf_counter()
+        live = head[1]
+        p_head = self._engine_head_logprobs_fn(live, vocab_limit)
+        mine: list[dict[str, Any]] = []
+        prows: dict[str, torch.Tensor] = {}
+        for it in sorted(items, key=lambda x: x["key"]):
+            with cap["lock"]:
+                ok = cap["store"].complete(it["key"])
+            if not ok:
+                continue
+            rows = self._verify_pop(it["key"])
+            if rows is None:
+                continue
+            prows[it["key"]] = rows
+            mine.append(it)
+        dev = live.device
+        stash_fns: dict[int, Any] = {}
+
+        def q_fn(version: int):
+            fn = stash_fns.get(version)
+            if fn is None:
+                w = getattr(self, "_head_stash", {}).get(version)
+                if w is None:
+                    raise RuntimeError(
+                        f"engine verify: no LM-head stash of drafting version {version} "
+                        f"(have {sorted(getattr(self, '_head_stash', {}))})"
+                    )
+                fn = stash_fns[version] = self._engine_head_logprobs_fn(w, vocab_limit)
+            return fn
+
+        from thundersync_rl.engine_q import gathered_log_softmax, no_gather
+
+        def q_rows_from(src, segments, g):
+            version = [0] * g
+            for v, a, b in segments:
+                version[a:b] = [v] * (b - a)
+            h = HiddenRows(src) if not isinstance(src, torch.Tensor) else None
+
+            def q_rows(idx):
+                idx_l = idx.tolist()
+                out: list[Any] = [None] * len(idx_l)
+                by_v: dict[int, list[int]] = {}
+                for j, t in enumerate(idx_l):
+                    by_v.setdefault(version[t], []).append(j)
+                for v, js in by_v.items():
+                    pos = [idx_l[j] for j in js]
+                    hv = src[pos] if h is None else h(pos)
+                    lp = gathered_log_softmax(q_fn(v)(hv), no_gather, vocab_limit)
+                    for k, j in enumerate(js):
+                        out[j] = lp[k]
+                return torch.stack(out)
+
+            return q_rows
+
+        def own_q(it):
+            src = it["hidden"]
+            if isinstance(src, HiddenRecompute):
+
+                def raise_need(idx):
+                    raise NeedQ()
+
+                return raise_need
+            return q_rows_from(src, it["segments"], len(it["tokens"]))
+
+        stats = {"q_rows": 0, "check_tok": 0, "check_exact": 0, "check_max": 0.0, "recompute_s": 0.0}
+        # Phase 1 of every row needs log p of all its drafted tokens: one batched
+        # head pass over every row (few large GEMMs instead of per-row launches).
+        from thundersync_rl.engine_verify import batched_token_logprobs
+
+        t_lp = time.perf_counter()
+        # Every row's draft ids and log q in one host-to-device copy each (the
+        # same values as one torch.tensor per row).
+        lens = [len(it["tokens"]) for it in mine]
+        keys_m = [it["key"] for it in mine]
+        if mine:
+            tok_all = torch.from_numpy(
+                np.concatenate([np.asarray(it["tokens"], dtype=np.int64).reshape(-1) for it in mine])
+            ).to(dev)
+            lq_all = torch.from_numpy(
+                np.concatenate([np.asarray(it["logq"], dtype=np.float32).reshape(-1) for it in mine])
+            ).to(dev)
+            drafts_t = dict(zip(keys_m, torch.split(tok_all, lens)))
+            lq_t = dict(zip(keys_m, torch.split(lq_all, lens)))
+        else:
+            drafts_t, lq_t = {}, {}
+        lpx_all = dict(
+            zip(
+                [it["key"] for it in mine],
+                batched_token_logprobs(
+                    [prows[it["key"]] for it in mine],
+                    [drafts_t[it["key"]] for it in mine],
+                    p_head,
+                    vocab_limit,
+                    int(os.environ.get("THUNDERSYNC_EV_CHUNK_ROWS", "2048")),
+                ),
+            )
+        )
+        t_lp = time.perf_counter() - t_lp
+
+        def decide_one(it, q_rows):
+            key = it["key"]
+            g = len(it["tokens"])
+            p_lp = HeadLogprobRows(prows[key], p_head, vocab_limit, chunk_rows)
+            p_lp.cached_token_logprobs = lpx_all[key]
+            assert prows[key].shape[0] == g + 1, (prows[key].shape, g)
+            draft = drafts_t[key]
+            lq = lq_t[key]
+            q_rows = q_rows if q_rows is not None else own_q(it)
+            env = it.get("envelopes")
+            res, lpx, n_eval = decide_row(
+                p_lp, draft, lq, q_rows, seed, key,
+                tuple(env) if env is not None else None, it.get("band"),
+            )
+            stats["q_rows"] += n_eval
+            if check:
+                if lpx is None:
+                    lpx = p_lp.token_logprobs(draft)
+                res["p_token_logprobs"] = lpx.tolist()
+                if g:
+                    rec = q_rows(torch.arange(g)).gather(-1, draft.view(-1, 1))[:, 0]
+                    dq = (rec - lq).abs()
+                    stats["check_tok"] += g
+                    stats["check_exact"] += int((dq == 0).sum())
+                    stats["check_max"] = max(stats["check_max"], float(dq.max()))
+            res["hidden_bytes_fetched"] = 0
+            return res
+
+        def recompute_q(need):
+            t_rq = time.perf_counter()
+            try:
+                return _recompute_q(need)
+            finally:
+                stats["recompute_s"] += time.perf_counter() - t_rq
+
+        def _recompute_q(need):
+            if q_lane is None:
+                raise RuntimeError("engine verify: q rows need recompute but no drafting lane given")
+            rank0, workers = q_lane[0], q_lane[1]
+            qkeys = [f"q|{it['key']}" for it in need]
+            rows = [
+                np.asarray(list(it["prompt"]) + list(it["tokens"]), dtype=np.int64) for it in need
+            ]
+            ray.get(
+                rank0.run_verify_requests.remote(
+                    rows, qkeys, [int(it["plen"]) for it in need]
+                )
+            )
+            got: dict[str, torch.Tensor] = {}
+            for r in ray.get([w.engine_verify_take.remote(qkeys) for w in workers]):
+                got.update(r)
+            out = {}
+            for it, qk in zip(need, qkeys):
+                h = got.get(qk)
+                if h is None:
+                    raise RuntimeError(f"engine verify: q recompute returned no rows for {qk}")
+                g = len(it["tokens"])
+                out[it["key"]] = q_rows_from(h[:g].to(dev), it["segments"], g)
+            return out
+
+        fast: dict[str, dict[str, Any]] = {}
+        t_fast = 0.0
+        rowwise = os.environ.get("THUNDERSYNC_EV_DECIDE") == "rowwise"
+        if not check and not rowwise and mine:
+            # Rows accepted whole (most of them) in one batched pass; the others
+            # row by row below (DESIGN 14ac "Batched decisions").
+            t_fast = time.perf_counter()
+            fast, _ = decide_whole_rows(
+                [
+                    {
+                        "key": it["key"],
+                        "hidden": prows[it["key"]],
+                        "draft": drafts_t[it["key"]],
+                        "lpx": lpx_all[it["key"]],
+                        "lq": lq_t[it["key"]],
+                        "envelopes": it.get("envelopes"),
+                        "band": it.get("band"),
+                    }
+                    for it in mine
+                ],
+                p_head,
+                vocab_limit,
+                seed,
+                int(os.environ.get("THUNDERSYNC_EV_CHUNK_ROWS", "2048")),
+            )
+            t_fast = time.perf_counter() - t_fast
+            if fast and os.environ.get("THUNDERSYNC_EV_DECIDE_CHECK") == "1":
+                # Debug: the batched decisions must equal the per-row ones bitwise.
+                n_eq = 0
+                for it in mine:
+                    r = fast.get(it["key"])
+                    if r is None:
+                        continue
+                    ref = dict(decide_one(it, None))
+                    ref.pop("hidden_bytes_fetched", None)
+                    if ref != r:
+                        raise RuntimeError(
+                            f"engine verify: batched decision != per-row decision for {it['key']}"
+                        )
+                    n_eq += 1
+                print(
+                    f"[ev decide check] rank={self.rank} batched={len(fast)} equal={n_eq} "
+                    f"rows={len(mine)}",
+                    flush=True,
+                )
+            for r in fast.values():
+                r["hidden_bytes_fetched"] = 0
+        rest = [it for it in mine if it["key"] not in fast]
+        if check:
+            # Every row's q is rebuilt and compared: recompute them all up front.
+            recompute = [it for it in mine if isinstance(it["hidden"], HiddenRecompute)]
+            qs = recompute_q(recompute) if recompute else {}
+            results = [(it["key"], decide_one(it, qs.get(it["key"]))) for it in mine]
+            n_recomputed = len(recompute)
+        else:
+            results, n_recomputed = verify_rows_two_pass(rest, decide_one, recompute_q)
+            results = [(it["key"], fast[it["key"]]) for it in mine if it["key"] in fast] + results
+        for _, r in results:
+            r["engine_rank"] = int(self.rank)
+        if results:
+            results[0][1]["_engine_stats"] = {
+                "decide_s": time.perf_counter() - t0,
+                "decide_p_tokens_s": t_lp,
+                "decide_batched_s": t_fast,
+                "decide_batched_rows": float(len(fast)),
+                "decide_recompute_s": stats["recompute_s"],
+                "rows": float(len(results)),
+                "q_rows": float(stats["q_rows"]),
+                "q_recomputed_rows": float(n_recomputed),
+                "captured_rows": float(cap["captured_rows"]),
+                "capture_overflow": float(cap["overflow"][0]),
+            }
+        if check and stats["check_tok"]:
+            print(
+                f"[engine verify q check] rank={self.rank} tok={stats['check_tok']} "
+                f"exact={stats['check_exact']} max|dlogq|={stats['check_max']:.3e}",
+                flush=True,
+            )
+        return results
+
+    def parallel_ranks(self) -> dict[str, int]:
+        """(data, tensor, pipeline) parallel ranks of this worker and its stage role."""
+        from megatron.core import parallel_state as ps
+
+        return {
+            "dp": int(ps.get_data_parallel_rank()),
+            "tp": int(ps.get_tensor_model_parallel_rank()),
+            "pp": int(ps.get_pipeline_model_parallel_rank()),
+            "last": bool(
+                ps.get_pipeline_model_parallel_world_size() == 1
+                or ps.is_pipeline_last_stage(ignore_virtual=True)
+            ),
+        }
+
+    def live_head_cpu(self) -> Optional[torch.Tensor]:
+        """This rank's live LM-head shard on the host (None off the last stage)."""
+        head = self._lm_head()
+        return None if head is None else head[1].detach().cpu()
+
+    async def engine_prefill_logprobs(self, **kwargs) -> dict[str, list[float]]:
+        dev = torch.cuda.current_device()
+
+        def run():
+            torch.cuda.set_device(dev)
+            return self._engine_prefill_logprobs(**kwargs)
+
+        return await asyncio.to_thread(run)
+
+    @torch.no_grad()
+    def _engine_prefill_logprobs(
+        self,
+        items: list[dict[str, Any]],
+        vocab_limit: int,
+        head_shards: Optional[list[torch.Tensor]] = None,
+        chunk_rows: int = 512,
+    ) -> dict[str, list[float]]:
+        """log p of each item's tokens from this rank's captured prefill rows.
+
+        The premise check of engine-side verification
+        (THUNDERSYNC_ENGINE_PREFILL_CHECK): no decision, only p.
+        ``head_shards`` (tensor parallelism): every TP rank's live head shard in
+        rank order; this rank (TP rank 0 of its replica) runs one head GEMM per
+        shard with the shard's own shape and concatenates the logits, as the
+        engine's gathered output does, so no collective runs outside the engine.
+        Other TP ranks drop their rows and return {}.
+        """
+        from thundersync_rl.engine_verify import HeadLogprobRows
+
+        cap = getattr(self, "_verify_cap", None)
+        head = self._lm_head()
+        if cap is None or head is None:
+            return {}
+        live = head[1]
+        if head_shards is None:
+            p_head = self._engine_head_logprobs_fn(live, vocab_limit)
+        else:
+            head_shards = [ray.get(x) if isinstance(x, ray.ObjectRef) else x for x in head_shards]
+            fns = [
+                self._engine_head_logprobs_fn(w.to(device=live.device, dtype=live.dtype), vocab_limit)
+                for w in head_shards
+            ]
+
+            def p_head(h):
+                return torch.cat([f(h) for f in fns], -1)
+
+        out = {}
+        for it in items:
+            with cap["lock"]:
+                ok = cap["store"].complete(it["key"])
+            if not ok:
+                continue
+            rows = self._verify_pop(it["key"])
+            if rows is None:
+                continue
+            p_lp = HeadLogprobRows(rows, p_head, vocab_limit, chunk_rows)
+            toks = torch.tensor(it["tokens"], dtype=torch.long, device=live.device)
+            out[it["key"]] = p_lp.token_logprobs(toks).tolist()
+        return out
+
     def _lm_head(self):
         """(output layer, live head weight, logit scaling or None) of the training model.
 
@@ -3377,7 +4150,10 @@ class ThunderSyncMegatronPolicyWorker(verify_yield.YieldWorkerMixin, MegatronPol
         embedding weight as the output weight, synchronized by the embedding
         group, which ``shared_embedding_or_output_weight`` returns).
         """
-        gpt = _unwrap(self.model)
+        # Engine workers: the model the inference engine runs.
+        gpt = _unwrap(
+            self._gen_model() if getattr(self, "is_refit_destination", False) else self.model
+        )
         layer = getattr(gpt, "output_layer", None)
         if layer is None or not getattr(gpt, "post_process", True):
             return None
@@ -3497,6 +4273,7 @@ class ThunderSyncMegatronPolicyWorker(verify_yield.YieldWorkerMixin, MegatronPol
         walks: list[dict[str, Any] | None] | None = None,
         walk_scans: list[dict[str, Any] | None] | None = None,
         prefix_pins: list[int | None] | None = None,
+        return_token_logprobs: bool = False,
         **_: Any,
     ) -> list[tuple[int, dict[str, Any]]]:
         """Block verification with q from the engine and p from the training model.
@@ -3515,6 +4292,9 @@ class ThunderSyncMegatronPolicyWorker(verify_yield.YieldWorkerMixin, MegatronPol
         rejection scan of a carried block below its deciding piece; row i's draft is
         block positions [pos0, stop). ``prefix_pins[i]``: keep the cached boundary
         at or below this row position (the block's floor) for such a scan.
+
+        ``return_token_logprobs`` (THUNDERSYNC_ENGINE_VERIFY_CHECK): every result
+        also carries "p_token_logprobs", log p of every drafted token.
 
         Learner prefix-state cache (``prefix_keys``; DESIGN 14p): row i is
         cached under ``prefix_keys[i]`` (None: not cached) and forwarded only
@@ -3778,6 +4558,24 @@ class ThunderSyncMegatronPolicyWorker(verify_yield.YieldWorkerMixin, MegatronPol
             lq = torch.tensor(engine_logq[i], dtype=torch.float32, device=dev)
             assert lq.numel() == g, (lq.numel(), g)
             assert hidden_num_rows(hidden[i]) == g, (hidden_num_rows(hidden[i]), g)
+            from thundersync_rl.engine_verify import HiddenRecompute
+
+            if isinstance(hidden[i], HiddenRecompute):
+                # Engine-side verification's check (hidden_transport="recompute":
+                # no q rows here): p of the drafted tokens only, no decision.
+                if not return_token_logprobs:
+                    raise RuntimeError(
+                        "learner verification of a draft without logged hidden "
+                        "states (hidden_transport=recompute)"
+                    )
+                lpx = (
+                    p_lp.token_logprobs(draft)
+                    if isinstance(p_lp, GatheredLogprobRows)
+                    else p_lp[torch.arange(g, device=dev), draft]
+                )
+                results.append((i, {"p_token_logprobs": lpx.tolist(), "check_only": True}))
+                del p_lp
+                continue
             # Phase 2 only: rows (per segment) fetched when the scan asks.
             h = HiddenRows(hidden[i], prefetched=None if pf is None else pf.futures)
             version = [0] * g
@@ -3860,6 +4658,14 @@ class ThunderSyncMegatronPolicyWorker(verify_yield.YieldWorkerMixin, MegatronPol
                         res["band_log_weight"] = log_w
                         res["band_exited"] = exited
                     n_rows += n_eval + (tau < g)
+            if return_token_logprobs:
+                # Every drafted token's log p (check; also walk / scan / grid rows).
+                lpx = (
+                    p_lp.token_logprobs(draft)
+                    if isinstance(p_lp, GatheredLogprobRows)
+                    else p_lp[torch.arange(g, device=dev), draft]
+                )
+                res["p_token_logprobs"] = lpx.tolist()
             # What the scan needed (not the check): nominal and storage bytes,
             # and the time the scan waited for blocks.
             fetched = h.fetched_bytes

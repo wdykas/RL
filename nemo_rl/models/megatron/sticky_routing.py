@@ -68,7 +68,12 @@ _MISSING_ROUTE_ATTR = "_nrl_missing_route_fallback_patch"
 
 # Process-wide sticky threshold (router-score units); None: sticky off (plain
 # replay semantics unchanged).
-_STATE: dict[str, Any] = {"delta": None, "stats": None, "horizon": None}
+_STATE: dict[str, Any] = {
+    "delta": None,
+    "stats": None,
+    "horizon": None,
+    "engine_verify": False,
+}
 
 
 def sticky_routing_delta(config: Any) -> Optional[float]:
@@ -91,6 +96,22 @@ def sticky_anchor_horizon(config: Any) -> Optional[int]:
 
 def get_anchor_horizon() -> Optional[int]:
     return _STATE.get("horizon")
+
+
+def engine_verify_enabled(config: Any) -> bool:
+    """``policy.megatron_cfg.engine_verify``: the engine verifies drafts itself.
+
+    ThunderSync ``thundersync.verify_on=engine`` (or its prefill check): the
+    engine prefills drafted rows at the current weights, applying the drafts'
+    anchors in its forwards, and computes p from the captured head inputs.
+    """
+    megatron_cfg = (config or {}).get("megatron_cfg") or {}
+    return bool(megatron_cfg.get("engine_verify", False))
+
+
+def engine_anchor_apply() -> bool:
+    """Whether engine forwards apply per-request anchors (horizon or engine verify)."""
+    return _STATE.get("horizon") is not None or bool(_STATE.get("engine_verify"))
 
 
 def sticky_routing_enabled(config: Any) -> bool:
@@ -336,4 +357,5 @@ def configure(config: Any) -> Optional[float]:
         install()
     set_delta(delta)
     _STATE["horizon"] = None if delta is None else sticky_anchor_horizon(config)
+    _STATE["engine_verify"] = delta is not None and engine_verify_enabled(config)
     return delta

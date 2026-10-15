@@ -70,6 +70,7 @@ from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.logger import Logger
 from thundersync_rl.fused_train import FusedRef
 from thundersync_rl.lanes import CohortLanes, Lane, LaneStepOps, refit_lane
+from thundersync_rl.speculative import EngineVerifier
 from thundersync_rl.multi_turn import PrefixGuardGeneration, TurnEnvironment
 from thundersync_rl.null_bv import drafts_per_prompt
 from thundersync_rl.routes import RouteRefs
@@ -200,7 +201,27 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # when its lazy scan needs a q row in it (fully accepted drafts fetch
     # nothing). "driver": every draft's rows go generation worker -> driver ->
     # each learner worker (the earlier path, kept for A/B).
-    hidden_transport: Literal["object_store", "driver"] = "object_store"
+    # "recompute" (verify_on=engine with cohort lanes): no per-token hidden
+    # states are logged; q rows a lazy scan needs are rebuilt by a prefill of
+    # the draft on the lane that drafted it (it holds the drafting weights while
+    # the cohort's tails run).
+    hidden_transport: Literal["object_store", "driver", "recompute"] = "object_store"
+    # verify_on=engine: groups per verification block. Blocks are verified in
+    # group index order on the engine while the learner trains the groups of
+    # earlier blocks (canonical order: each block's ready groups, then the
+    # groups with tails, then the groups with fresh rows). None: canonical_block_groups.
+    engine_verify_block_groups: Optional[int] = None
+    # verify_on=engine: groups in the FIRST verification block (the learner waits
+    # for it: pipeline fill). None: engine_verify_block_groups. Blocks are a
+    # function of the group index only, so the training order stays a function
+    # of the verification results.
+    engine_verify_first_block_groups: Optional[int] = None
+    # verify_on=engine: submit the next block's first verification wave to the
+    # engine (prefill + head-input capture) while the current block is decided,
+    # so prefill and decisions overlap. Timing only (the rows, keys' randomness
+    # and decisions are those of the unpipelined path). Per verifying rank: the
+    # captured rows of up to two blocks in flight ((g+1) d b_h bytes per row).
+    engine_verify_prefetch: bool = False
     # Iterations drafted concurrently. A draft cut off at one deadline resumes
     # from its prefix, under the newer weights, in the next iteration.
     draft_lookahead: int = 3
@@ -220,7 +241,13 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # Worker groups that run weight stashes and verification: "learner",
     # "inference" or "both" (chunks round-robin over both pools). With large
     # models on few learner GPUs, "inference" keeps scorer memory off the learner.
-    verify_on: Literal["learner", "inference", "both"] = "both"
+    # "engine" (engine_verify.py, DESIGN 14ac): verification of drafts and
+    # continuation pieces runs on an engine holding theta_k (a prefill of the
+    # row with the drafts' anchors applied, p from the engine's own LM head on
+    # its captured head inputs); the learner only trains. Needs
+    # verify_source=engine; with sticky routing it needs cohort_lanes=2 and
+    # draft_weights=current (the drafting lane holds theta_k for the step).
+    verify_on: Literal["learner", "inference", "both", "engine"] = "both"
     # Run verification concurrently with the rollouts (rollouts start as their
     # plans are published) also when verify_on != "learner".
     verify_overlap: bool = True
@@ -369,6 +396,11 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # chunk/growth sizes above; decisions are a separate schedule. All exact.
     sticky_continuation_decision: str = "every"
     sticky_continuation_decision_dip: float = 0.1
+    # Continuation pieces in flight per stream: the next piece is cut and sent
+    # while earlier ones are verified (assuming they are accepted whole; a
+    # rejection discards the later results). 1: one at a time (the earlier
+    # behaviour). Bounds a stream's stall on verification latency.
+    sticky_pieces_in_flight: int = 1
     # Learner prefix-state cache (DESIGN.md section 14p; nemo_rl/models/megatron/
     # prefix_state_cache.py). Each continuation piece is verified by a forward
     # of positions [last Mamba chunk boundary before the piece, end of piece)
@@ -449,6 +481,10 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # Prior full window (s) before any cut is observed; None: no pacing until
     # a cohort is cut short once.
     draft_window_pace_init_s: Optional[float] = None
+    # Sticky draft cut: wait up to this many seconds after training ends for the
+    # drafts to finish (the cut is at that fixed time, or earlier once all are
+    # complete: exact). 0: cut when training ends.
+    draft_cut_slack_s: float = 0.0
     # Sticky routing anchor horizon H (generated positions; DESIGN.md section
     # 14i). None: anchors up to the rollout cap (every drafted rollout is
     # completed at theta_{k-1} before the refit). Set: anchors only at
@@ -701,6 +737,7 @@ def validate_config(master_config: ThunderSyncMasterConfig) -> None:
     validate_expert_parallel(master_config.thundersync, master_config.policy)
     validate_fused_verify_train(master_config.thundersync, master_config.policy)
     validate_engine_verify_source(master_config.thundersync, master_config.policy)
+    validate_engine_verify(master_config)
     validate_sticky_routing(master_config)
     validate_sticky_rounding(master_config)
     validate_null_bv(master_config)
@@ -720,6 +757,17 @@ def validate_config(master_config: ThunderSyncMasterConfig) -> None:
         raise ValueError(
             "thundersync.draft_window_pace requires sticky_routing (the only "
             "path whose drafts keep running to the deferred cut)"
+        )
+    ts = master_config.thundersync
+    if int(ts.sticky_pieces_in_flight) > 1 and ts.sticky_continuation_decision != "every":
+        raise ValueError(
+            "thundersync.sticky_pieces_in_flight > 1 needs sticky_continuation_decision="
+            "'every' (a carried walk advances one piece at a time; not built together)"
+        )
+    if float(ts.draft_cut_slack_s) > 0 and ts.draft_window_pace:
+        raise ValueError(
+            "thundersync.draft_cut_slack_s and draft_window_pace both set the draft cut: "
+            "use one"
         )
     validate_draft_weights(master_config)
     validate_cohort_lanes(master_config)
@@ -845,6 +893,73 @@ def check_multi_turn_template(master_config: Any, tokenizer: Any) -> None:
             "chat_template_kwargs.truncate_history_thinking=false (re-rendered history "
             "would not be a prefix of the sampled row)"
         )
+
+
+def validate_engine_verify(master_config: ThunderSyncMasterConfig) -> None:
+    """Settings engine-side verification (``verify_on=engine``) is built for."""
+    ts_cfg = master_config.thundersync
+    if ts_cfg.hidden_transport == "recompute" and not (
+        ts_cfg.verify_on == "engine" and ts_cfg.cohort_lanes == 2
+    ):
+        raise ValueError(
+            "thundersync.hidden_transport=recompute needs verify_on=engine and "
+            "cohort_lanes=2 (q rows are rebuilt on the lane that holds the drafting weights)"
+        )
+    if ts_cfg.verify_on != "engine":
+        return
+    mcfg = master_config.policy["megatron_cfg"]
+    gen = master_config.policy["generation"]
+    mcore_gen = gen.get("mcore_generation_config") or {}
+    problems = []
+    if ts_cfg.verify_source != "engine" or ts_cfg.verify_mode != "block":
+        problems.append("needs verify_source=engine and verify_mode=block")
+    if not mcfg.get("batch_invariant_mode"):
+        problems.append("needs policy.megatron_cfg.batch_invariant_mode (engine prefill == training forward)")
+    tp = max(
+        int(mcfg.get("tensor_model_parallel_size") or 1),
+        int(mcore_gen.get("tensor_model_parallel_size") or 1),
+    )
+    if tp > 1:
+        problems.append(
+            "tensor parallel size 1 only (not built yet at TP>1: the decision's vocab "
+            "all-gather would run on the engine's TP group outside the engine's step order)"
+        )
+    if mcore_gen.get("materialize_only_last_token_logits") is False:
+        problems.append("needs mcore_generation_config.materialize_only_last_token_logits=true")
+    if mcore_gen.get("enable_chunked_prefill"):
+        problems.append(
+            "needs mcore_generation_config.enable_chunked_prefill=false (a row's prefill in "
+            "one forward; chunk-boundary-aligned splits are not built yet)"
+        )
+    sticky = sticky_delta(ts_cfg) is not None
+    if sticky and ts_cfg.cohort_lanes != 2:
+        problems.append(
+            "with sticky routing it needs cohort_lanes=2: one engine holds the drafting "
+            "weights D_k for the cohort's continuations until they end, and theta_k only "
+            "after, so no engine holds theta_k while verification is needed"
+        )
+    if ts_cfg.draft_weights != "current":
+        problems.append(
+            "needs draft_weights=current (with lanes the verifying lane holds theta_k, "
+            "which is also the next cohort's drafter; momentum would need theta_k and "
+            "theta_hat_{k+1} on one lane at once, and its head stash lives on the "
+            "learner: not built)"
+        )
+    if ts_cfg.sticky_anchor_horizon is not None:
+        problems.append("sticky_anchor_horizon must be unset (not built together)")
+    if ts_cfg.learner_prefix_cache or ts_cfg.fused_verify_train:
+        problems.append("learner_prefix_cache and fused_verify_train must be off (learner-side tools)")
+    if ts_cfg.null_bv_prompt_drop:
+        problems.append("null_bv_prompt_drop is not built with engine verification yet")
+    if (master_config.grpo.max_rollout_turns or 1) > 1:
+        problems.append("multi-turn rollouts are not built with engine verification yet")
+    if ts_cfg.sticky_continuation_decision != "every":
+        problems.append(
+            "needs sticky_continuation_decision='every' (carried-walk decisions are "
+            "learner-side; not built on the engine yet)"
+        )
+    if problems:
+        raise ValueError("thundersync.verify_on=engine: " + "; ".join(problems) + ".")
 
 
 def validate_learner_prefix_cache(master_config: ThunderSyncMasterConfig) -> None:
@@ -1124,8 +1239,10 @@ def validate_null_bv(master_config: ThunderSyncMasterConfig) -> None:
             "thundersync.verify_mode='block' and verify_source='engine' are required "
             "(the scorer path is not built yet)"
         )
-    if ts_cfg.verify_on != "learner":
-        problems.append("thundersync.verify_on must be 'learner' (one worker decides a pool)")
+    if ts_cfg.verify_on not in ("learner", "engine"):
+        problems.append(
+            "thundersync.verify_on must be 'learner' or 'engine' (one worker decides a pool)"
+        )
     if ts_cfg.draft_lookahead != 1:
         problems.append(
             "thundersync.draft_lookahead must be 1 (multi-step cohort pools are not "
@@ -1284,9 +1401,15 @@ def configure_sticky_policy(master_config: Any) -> None:
         master_config.thundersync.sticky_rounding
     )
     # The generation workers apply anchors in their forwards (engine anchor
-    # apply) only with an anchor horizon.
+    # apply) with an anchor horizon or engine-side verification.
     master_config.policy["megatron_cfg"]["sticky_anchor_horizon"] = (
         master_config.thundersync.sticky_anchor_horizon if delta is not None else None
+    )
+    # Engine-side verification (or its prefill check): the engines capture head
+    # inputs of tagged prefills (worker ``_install_verify_capture``).
+    master_config.policy["megatron_cfg"]["engine_verify"] = bool(
+        master_config.thundersync.verify_on == "engine"
+        or os.environ.get("THUNDERSYNC_ENGINE_PREFILL_CHECK") == "1"
     )
 
 
@@ -1320,10 +1443,10 @@ def validate_engine_verify_source(
         problems.append(
             f"thundersync.verify_mode must be 'block' (got {ts_cfg.verify_mode!r})"
         )
-    if ts_cfg.verify_on != "learner":
+    if ts_cfg.verify_on not in ("learner", "engine"):
         problems.append(
-            "thundersync.verify_on must be 'learner' (p is the training model's "
-            f"forward; got {ts_cfg.verify_on!r})"
+            "thundersync.verify_on must be 'learner' or 'engine' (p is the training "
+            f"forward or, bitwise the same, the engine's prefill; got {ts_cfg.verify_on!r})"
         )
     if ts_cfg.fused_verify_train:
         problems.append("thundersync.fused_verify_train must be false")
@@ -1548,15 +1671,18 @@ def validate_expert_parallel(
 
     if (
         ts_cfg.speculate
-        and ts_cfg.verify_on != "learner"
+        and ts_cfg.verify_on not in ("learner", "engine")
         and merged_inference_megatron_cfg(policy_cfg)["expert_model_parallel_size"] > 1
     ):
         # The inference engine steps its EP ranks together; a generation worker
         # blocked in a verification forward leaves its peers' engine all-to-all
-        # unmatched while its own scorer all-to-all waits (deadlock).
+        # unmatched while its own scorer all-to-all waits (deadlock). Not
+        # verify_on=engine (DESIGN 14ac): its forwards are engine requests (run
+        # by the engine loop, EP ranks in step) and its decisions are rank-local
+        # head GEMMs on a side stream (TP 1), so no rank blocks the engine loop.
         raise ValueError(
             "speculation with inference expert parallelism requires "
-            f"thundersync.verify_on='learner' (got {ts_cfg.verify_on!r})"
+            f"thundersync.verify_on='learner' or 'engine' (got {ts_cfg.verify_on!r})"
         )
 
 
@@ -1814,6 +1940,76 @@ def install_keyed_fresh(generation: Any) -> None:
     )
 
 
+class OrderFeed:
+    """A step's canonical training order, extended as engine verification blocks finish.
+
+    ``extend(groups, sizes)`` appends groups (batch indices) to the planner's
+    incremental order (``StreamPlanner.extend_order``) and wakes the learner
+    loop; calls before ``attach`` are buffered. ``done()`` marks the order
+    final (every group listed).
+    """
+
+    def __init__(self, step: int, block_tokens: Optional[int] = None):
+        self.step = step
+        self.block_tokens = block_tokens
+        self.planner = None
+        self.wake: Optional[asyncio.Event] = None
+        self._buffer: list[tuple[list[int], list[int]]] = []
+        self.final = False
+
+    def attach(self, planner) -> None:
+        self.planner = planner
+        planner.begin_order(self.block_tokens)
+        for groups, sizes in self._buffer:
+            planner.extend_order([(self.step, p) for p in groups], sizes)
+        self._buffer = []
+
+    def extend(self, groups: list[int], sizes: list[int]) -> None:
+        if not groups:
+            return
+        if self.planner is None:
+            self._buffer.append((list(groups), list(sizes)))
+            return
+        self.planner.extend_order([(self.step, p) for p in groups], sizes)
+        if self.wake is not None:
+            self.wake.set()
+
+    def done(self) -> None:
+        self.final = True
+        if self.wake is not None:
+            self.wake.set()
+
+
+def classify_groups(
+    row_keys: list[tuple[int, ...]], G: int, groups: list[int], info: dict
+) -> dict[int, str]:
+    """Class of each group after verification: "ready", "tail" or "fresh".
+
+    ``info[key] = (plans, all complete)`` of the prompt's published plans.
+    fresh: fewer plans than rows (some row decodes at theta_k after the
+    refit); tail: some plan still needs continuation rounds; else ready. A
+    function of the verification results only.
+    """
+    need = collections.Counter(row_keys)
+    out = {}
+    for p in groups:
+        key = row_keys[p * G]
+        n_plans, complete = info.get(key, (0, True))
+        if n_plans < need[key]:
+            out[p] = "fresh"
+        elif not complete:
+            out[p] = "tail"
+        else:
+            out[p] = "ready"
+    return out
+
+
+def block_chunks(groups: list[int], b: int) -> list[int]:
+    """Sizes of consecutive blocks of at most ``b`` groups."""
+    b = max(1, int(b))
+    return [min(b, len(groups) - i) for i in range(0, len(groups), b)]
+
+
 async def _run_one_step(
     *,
     step: int,
@@ -1847,6 +2043,7 @@ async def _run_one_step(
     group_blocks: Optional[list[int]] = None,
     tail_groups: Optional[list[int]] = None,
     order_stream: Optional[StreamOrder] = None,
+    order_feed: Optional[OrderFeed] = None,
     ordered_learner: Optional[Any] = None,
     claim_row: Optional[Callable[[torch.Tensor, torch.Tensor], Any]] = None,
     tail_count: Optional[Callable[[torch.Tensor], int]] = None,
@@ -1959,6 +2156,9 @@ async def _run_one_step(
         return pl
 
     planner = make_planner(group_order, group_blocks)
+    if order_feed is not None:
+        # Engine verification: the order grows as verification blocks finish.
+        order_feed.attach(planner)
 
     begin_kw = dict(
         gbs=n,
@@ -2045,6 +2245,8 @@ async def _run_one_step(
     wake = asyncio.Event()
     if order_stream is not None:
         order_stream.wake = wake.set
+    if order_feed is not None:
+        order_feed.wake = wake
     rollouts_done = False
     rewards = [0.0] * n
     is_weights = [1.0] * n  # banded IS loss weights
@@ -2422,6 +2624,20 @@ async def _run_one_step(
                 )
                 num_dispatches += 1
             if rollouts_done and not planner.has_work():
+                if not planner.order_complete():
+                    # A failed verification leaves its groups unordered: name it.
+                    cause = (
+                        verify_task.exception()
+                        if verify_task is not None
+                        and verify_task.done()
+                        and not verify_task.cancelled()
+                        else None
+                    )
+                    raise RuntimeError(
+                        "canonical order incomplete after the last rollout "
+                        f"({len(planner.order)} of {len(planner.groups)} groups)"
+                        + (f"; verification failed: {cause!r}" if cause is not None else "")
+                    ) from cause
                 last_sent.set()
                 return
 
@@ -2890,6 +3106,20 @@ def make_speculative_generation(
     ``stream``: seed stream of this wrapper (the lane index): verification
     randomness is hash(grpo.seed, stream, step, counter) (``run_state``).
     """
+    spec = _make_speculative_generation(generation, policy, tokenizer, master_config, stream)
+    spec.pieces_in_flight = max(1, int(master_config.thundersync.sticky_pieces_in_flight))
+    spec.draft_cut_slack_s = max(0.0, float(master_config.thundersync.draft_cut_slack_s))
+    spec.engine_verify_prefetch = bool(master_config.thundersync.engine_verify_prefetch)
+    return spec
+
+
+def _make_speculative_generation(
+    generation: GenerationInterface,
+    policy: Policy,
+    tokenizer,
+    master_config: ThunderSyncMasterConfig,
+    stream: int,
+) -> SpeculativeGeneration:
     ts_cfg = master_config.thundersync
     spec = SpeculativeGeneration(
         generation,
@@ -2954,6 +3184,9 @@ def make_speculative_generation(
         ),
         seed=int(master_config.grpo.seed),
         seed_stream=str(stream),
+        engine_max_len=(
+            master_config.policy["generation"].get("mcore_generation_config") or {}
+        ).get("max_model_len"),
     )
     spec.verify_in_train = bool(ts_cfg.verify_in_train)
     spec.verify_yield = bool(ts_cfg.verify_yield)
@@ -2964,6 +3197,51 @@ def make_speculative_generation(
     spec.vit_bytes_per_token = float(ts_cfg.vit_bytes_per_token)
     spec.vit_predictor = vit.PassPredictor(ts_cfg.vit_pass_window)
     return spec
+
+
+def _ev_lane_heads(lane_x, lane_y, step: int, pending: list, ts_cfg) -> None:
+    """Engine verification on lanes: LM-head stashes and the step's verifier.
+
+    Lane y (refit to theta_step: the verifier of cohort ``step`` and the
+    drafter of cohort step+1) stashes its own head as version ``step``; the
+    head of version step-1 (cohort ``step``'s drafter, lane x) must be on lane
+    y for q rows: it was sent last step (``pending``). Lane y's head is sent
+    to lane x now, which verifies cohort step+1 next step (rank i -> rank i,
+    the lanes have the same layout). Per rank: one V/TP x d x 2 B transfer per
+    step through the object store, off the critical path except its first use.
+    """
+    gx = lane_x.generation._policy.worker_group
+    gy = lane_y.generation._policy.worker_group
+    # Nothing here waits; the first decision of the step waits for the stash
+    # and last step's import (``EngineVerifier.wait_refs``). Their order on
+    # lane y does not matter (both keep {step-1, step}). Every other order is
+    # a Ray data dependency, not submission order: the workers are asyncio
+    # actors, which run calls in the order their arguments resolve (an
+    # export sent right after a stash whose arguments are object-store refs
+    # ran first and shipped None, so the next step's verifier had no q head).
+    #   export of `step` on y      after the stash of `step` on y;
+    #   import of `step` into x    after its export (the argument), and after
+    #                              last step's import (whose argument was x's export
+    #                              of step-1, so x's stash is read before it is dropped).
+    prev = list(pending) or [None] * len(gx.workers)
+    pending.clear()
+    stash = [wy.stash_head.remote(step, [step - 1, step]) for wy in gy.workers]
+    wait = [r for r in prev if r is not None] + stash
+    pending.extend(
+        wx.import_head_stash.remote(
+            step, wy.head_stash_cpu.remote(step, after=s), [step, step + 1], after=a
+        )
+        for wx, wy, s, a in zip(gx.workers, gy.workers, stash, prev)
+    )
+    lane_x.spec.engine_verifier = EngineVerifier(
+        gy,
+        q_lane=(
+            [gx.workers[0], list(gx.workers)]
+            if ts_cfg.hidden_transport == "recompute"
+            else None
+        ),
+        wait_refs=wait,
+    )
 
 
 def thundersync_grpo_train(
@@ -3095,6 +3373,30 @@ def thundersync_grpo_train(
             )
         )
     sticky = spec is not None and spec.sticky_delta is not None
+    # Engine-side verification (DESIGN 14ac): lanes verify each cohort on the
+    # drafting lane (it holds theta_step); one engine verifies on itself.
+    ev_mode = spec is not None and ts_cfg.verify_on == "engine"
+    ev_pipe = ev_mode and sticky and ts_cfg.stream_training_over_tails
+    ev_head_import: list = []
+
+    def _canonical_bg() -> int:
+        """Groups per canonical dispatch block (deal_rows / PP aware; config and layout only)."""
+        return canonical_groups_per_block(
+            ts_cfg,
+            learner.dp_size,
+            master_config.grpo.num_generations_per_prompt,
+            train_micro_batch_rows(master_config),
+            resolve_min_pipeline_microbatches(
+                ts_cfg,
+                master_config.policy["megatron_cfg"].get("pipeline_model_parallel_size", 1)
+                or 1,
+            ),
+        )
+    # Premise check of engine-side verification on one engine (sticky, streaming).
+    prefill_check = os.environ.get("THUNDERSYNC_ENGINE_PREFILL_CHECK") == "1"
+    if ev_mode and sched is None:
+        spec.engine_verifier = EngineVerifier(policy_generation._policy.worker_group)
+        spec.ev_stash_on_engine = True
     G = master_config.grpo.num_generations_per_prompt
     multi_turn = sticky and (master_config.grpo.max_rollout_turns or 1) > 1
     if multi_turn:
@@ -3295,11 +3597,31 @@ def thundersync_grpo_train(
                 sched.pin(lane_y, step + 1)
                 if check_weights:
                     lane_y.cohort_fingerprint = lane_fp(lane_y)
+                if ev_mode:
+                    _ev_lane_heads(lane_x, lane_y, step, ev_head_import, ts_cfg)
+                bench_rows = int(os.environ.get("THUNDERSYNC_EV_PREFILL_BENCH", "0") or 0)
+                bench = ev_mode and bench_rows > 0 and step in (1, 2)
+                gy = lane_y.generation._policy.worker_group
+                if bench:
+                    lane_x.spec.engine_prefill_bench(
+                        gy, _prompts(batch)[:bench_rows],
+                        master_config.policy["generation"]["max_new_tokens"], "alone",
+                    )
                 next_prompts, null_slots = next_draft_prompts(next_batch, ts_cfg, G)
                 lane_drafts = asyncio.run(
                     lane_y.spec.draft_streaming(next_prompts, null_slots=null_slots)
                 )
                 lane_stats["lanes/draft_start_s"] = time.perf_counter() - t0
+                if bench:
+                    time.sleep(1.0)  # drafts in full decode
+                    lane_x.spec.engine_prefill_bench(
+                        gy, _prompts(batch)[:bench_rows],
+                        master_config.policy["generation"]["max_new_tokens"], "mixed",
+                    )
+            elif ev_mode and drafts is not None:
+                # Last step: no next cohort, but the verifier lane must hold theta_step.
+                sched.refit(lane_y, ("theta", step), lambda: refit_lane(policy, lane_y))
+                _ev_lane_heads(lane_x, lane_y, step, ev_head_import, ts_cfg)
         if lag and pending is None:
             # Step 0 of the lagged baseline: its rollouts come from theta_0.
             t1 = time.perf_counter()
@@ -3319,7 +3641,28 @@ def thundersync_grpo_train(
             handout_wait = time.perf_counter() - t1
         tails = None  # pending plans whose continuation rounds overlap training
         v0 = None  # streaming verify0 (DESIGN 14z): its calls run inside the step
-        if sticky and drafts is not None:
+        ev_drafts = ev_block_keys = None
+        if ev_pipe and drafts is not None:
+            # Engine verification pipelined against training: the drafts are
+            # verified inside the step, block by block (verify_sticky_blocks).
+            policy_generation.prepare_for_generation()
+            ev_row_keys = [tuple(x.tolist()) for x in _prompts(batch)]
+            ev_n_groups = len(ev_row_keys) // G
+            ev_bg = max(1, int(ts_cfg.engine_verify_block_groups or _canonical_bg()))
+            ev_b0 = max(1, int(ts_cfg.engine_verify_first_block_groups or ev_bg))
+            ev_starts = [0] + list(range(ev_b0, ev_n_groups, ev_bg))
+            ev_group_blocks = [
+                list(range(a, min(b, ev_n_groups)))
+                for a, b in zip(ev_starts, ev_starts[1:] + [ev_n_groups])
+                if a < ev_n_groups
+            ]
+            ev_block_keys = [
+                list(dict.fromkeys(ev_row_keys[p * G] for p in blk)) for blk in ev_group_blocks
+            ]
+            spec.prepare_verify_blocks(ev_block_keys)
+            ev_drafts, drafts = drafts, None
+            tails = []
+        elif sticky and drafts is not None:
             # Sticky routing: verify and complete every drafted rollout while
             # the engine still holds the drafting weights (theta_{step-1}, or
             # theta_hat_step with momentum draft weights), whose plain forward
@@ -3344,10 +3687,20 @@ def thundersync_grpo_train(
                 )
                 tails = []  # pending plans arrive with the decisions
             elif ts_cfg.stream_training_over_tails:
+                bench_rows = int(os.environ.get("THUNDERSYNC_EV_PREFILL_BENCH", "0") or 0)
+                if bench_rows and sched is None and step in (1, 2):
+                    # One engine at the top of the step: its draft streams still
+                    # decode (continuations), so this is the mixed case.
+                    spec.engine_prefill_bench(
+                        policy_generation._policy.worker_group, _prompts(batch)[:bench_rows],
+                        master_config.policy["generation"]["max_new_tokens"], "mixed",
+                    )
                 # Only the drafts' verification here; the continuation rounds
                 # run inside the step, under the training of complete groups.
                 spec.vit_dp = learner.dp_size
                 tails = asyncio.run(spec.begin_sticky(drafts))
+                if prefill_check and sched is None:
+                    spec.prefill_check_begin()
             else:
                 asyncio.run(spec.verify_sticky(drafts))
                 policy_generation.finish_generation()
@@ -3424,7 +3777,61 @@ def thundersync_grpo_train(
         tails_s = []
         group_order = group_blocks = tail_groups = None
         v0_order = None
-        if tails is None:
+        order_feed = None
+        if ev_drafts is not None:
+            order_feed = OrderFeed(step, ts_cfg.canonical_block_tokens)
+            tail_groups = []
+            ev_info: dict = {}
+            ev_fresh: list = []
+
+            async def ev_then_refit(
+                d=ev_drafts, keys=ev_block_keys, blocks=ev_group_blocks, row_keys=ev_row_keys
+            ):
+                nonlocal lane_fresh
+                t = time.perf_counter()
+
+                def on_block(b, info):
+                    ev_info.update(info)
+                    cls = classify_groups(row_keys, G, blocks[b], info)
+                    ready = [p for p in blocks[b] if cls[p] == "ready"]
+                    if ready:
+                        order_feed.extend(ready, [len(ready)])
+
+                def after_verify():
+                    every = [p for blk in blocks for p in blk]
+                    cls = classify_groups(row_keys, G, every, ev_info)
+                    tails_g = [p for p in every if cls[p] == "tail"]
+                    fresh_g = [p for p in every if cls[p] == "fresh"]
+                    ev_fresh.append(bool(fresh_g))
+                    tail_groups.extend(tails_g)
+                    if ts_cfg.canonical_block_tokens:
+                        # Each class is one segment, cut by tokens as it completes.
+                        order_feed.extend(tails_g, [len(tails_g)])
+                        order_feed.extend(fresh_g, [len(fresh_g)])
+                    else:
+                        bg = _canonical_bg()
+                        order_feed.extend(tails_g, block_chunks(tails_g, bg))
+                        order_feed.extend(fresh_g, block_chunks(fresh_g, bg))
+                    order_feed.done()
+
+                try:
+                    await spec.verify_sticky_blocks(d, keys, on_block, after_verify)
+                    policy_generation.finish_generation()
+                    tails_s.append(time.perf_counter() - t)
+                    await spec.learner_drain()
+                    # Rows never drafted need theta_k on the cohort lane (the
+                    # plans may already be taken by served rollouts, so read
+                    # the verification's classes, not spec.plans).
+                    lane_fresh = sched is not None and bool(ev_fresh and ev_fresh[0])
+                    refit_for_step()
+                except BaseException as exc:
+                    spec.weights_ready(error=exc)
+                    raise
+                spec.weights_ready()
+
+        if ev_drafts is not None:
+            pass
+        elif tails is None:
             refit_for_step()
         elif v0 is not None:
             # Streaming verify0: the canonical order grows with the decisions
@@ -3554,11 +3961,18 @@ def thundersync_grpo_train(
                     # none is sent while they run (they block the event loop).
                     await spec.learner_drain()
                     refit_for_step()
+                    if prefill_check and sched is None:
+                        # Premise check: the engine now holds theta_k (= the learner's).
+                        await spec.engine_prefill_check()
                 except BaseException as exc:
                     spec.weights_ready(error=exc)
                     raise
                 spec.weights_ready()
-        pre_rollout = None if tails is None else tails_then_refit
+        pre_rollout = (
+            ev_then_refit
+            if ev_drafts is not None
+            else (None if tails is None else tails_then_refit)
+        )
         chunked = (
             spec is not None
             and ts_cfg.verify_mode == "block"
@@ -3614,6 +4028,19 @@ def thundersync_grpo_train(
 
             else:
                 drafter = None
+        if (
+            step == 0
+            and sched is None
+            and spec is not None
+            and int(os.environ.get("THUNDERSYNC_EV_PREFILL_BENCH", "0") or 0)
+        ):
+            # Idle engine (step 0, before its rollouts): prefill throughput alone.
+            spec.engine_prefill_bench(
+                policy_generation._policy.worker_group,
+                _prompts(batch)[: int(os.environ["THUNDERSYNC_EV_PREFILL_BENCH"])],
+                master_config.policy["generation"]["max_new_tokens"],
+                "alone",
+            )
         policy.prepare_for_training()
         metrics = asyncio.run(
             _run_streaming_tails(spec, tails is not None)(
@@ -3651,6 +4078,7 @@ def thundersync_grpo_train(
                 group_blocks=group_blocks,
                 tail_groups=tail_groups,
                 order_stream=v0_order,
+                order_feed=order_feed,
                 ordered_learner=spec if tails is not None else None,
                 vit_spec=spec if tails is not None and ts_cfg.verify_in_train else None,
                 claim_log_weight=spec.claim_log_weight
@@ -3694,6 +4122,8 @@ def thundersync_grpo_train(
         if sticky:
             # This step's training has replayed every anchor targeted at it.
             spec.release_routes(step)
+        if ev_drafts is not None:
+            spec._plan_cv = None  # per-step gate of the pipelined verification
         metrics["time/verify"] = t_verify
         # Top of step waiting for the deferred draft handout (after the refit).
         metrics["time/draft_handout_wait"] = handout_wait

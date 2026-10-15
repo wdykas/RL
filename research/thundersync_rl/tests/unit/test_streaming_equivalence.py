@@ -403,6 +403,8 @@ def test_expert_parallel_rejects_open_group_buckets(ep, granularity, open_groups
         ("both", 2, False),
         ("inference", 2, False),
         ("both", 1, True),
+        # Engine-side verification: engine requests + rank-local decisions (DESIGN 14ac).
+        ("engine", 2, True),
     ],
 )
 def test_expert_parallel_speculation_verifies_on_learner(verify_on, gen_ep, ok):
