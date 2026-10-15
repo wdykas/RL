@@ -18,6 +18,13 @@ grpo:
   val_at_start: false
   val_at_end: false
 
+thundersync:
+  # ⊥-BV calibration (DESIGN 14d): v from a past-only moving average of the measured log-ratio
+  # variance and the measured per-draft verification cost in the envelope DP; lanes share one
+  # calibrator. Real training needs it: the fixed prior v is ~4.5x below measured Nano v
+  # (cal-x-l2: 3.5-3.8e-6). Exact (cal-x-l2, adm2-x-l2-grp-cal EXACT). Read only by null_bv arms.
+  null_bv_calibrate: true
+
 loss_fn:
   reference_policy_kl_penalty: 0.0
   skip_zero_advantage_rows: true
