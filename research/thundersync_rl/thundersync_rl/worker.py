@@ -64,6 +64,13 @@ from thundersync_rl.fused_train import (
 WORKER_FQN = "thundersync_rl.worker.ThunderSyncMegatronPolicyWorker"
 
 
+def _prefix_check_on() -> bool:
+    """``THUNDERSYNC_PREFIX_CACHE_CHECK=1``: each prefix-state forward is checked
+    against a whole-row forward (one extra forward per batch, matched by the
+    expert-parallel dummy forwards of ranks without rows)."""
+    return os.environ.get("THUNDERSYNC_PREFIX_CACHE_CHECK") == "1"
+
+
 def _model_in_eval(method):
     """Run ``method`` with ``self.model`` in eval mode.
 
@@ -3052,7 +3059,9 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             self._prof["hidden_prefetched_bytes"] = pf.submitted_bytes
             self._prof["hidden_prefetch_skipped"] = pf.skipped_batches
             pf.close()
-        for _ in range(n_dummy):
+        # The prefix-cache check runs a second (whole-row) forward per batch.
+        per_batch = 2 if cache is not None and _prefix_check_on() else 1
+        for _ in range(n_dummy * per_batch):
             # Expert parallelism: out of rows, join the other replicas' forwards.
             self._dummy_training_forward()
         self._prof["ep_dummy_forwards"] = n_dummy
@@ -3205,7 +3214,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         segs = [r[s:] for r, s in zip(rows, starts)]
         with cache.forward(keys, rows, starts):
             lb = self._training_forward_rows(segs, anchors=anchors, anchor_starts=starts)
-        if os.environ.get("THUNDERSYNC_PREFIX_CACHE_CHECK") == "1":
+        if _prefix_check_on():
             full = self._training_forward_rows(rows, anchors=anchors)
             if lb is not None:
                 st = self.__dict__.setdefault(
