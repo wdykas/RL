@@ -64,6 +64,17 @@ else
        policy.generation.colocated.resources.num_nodes=$(( GPS / 4 ))
        policy.generation.colocated.resources.gpus_per_node=4)
 fi
+# LANES=2 (ThunderSync arms, thundersync.cohort_lanes): a second engine of the
+# same shape (one full TP/EP replica per lane) built by run_thundersync_grpo.py
+# outside cluster.* (learner + lane 0); the job must hold GPS more GPUs.
+LANES=${LANES:-1}
+if [ "$LANES" = 2 ]; then
+  [ "$COLOCATED" = 0 ] || { echo "LANES=2 needs a split arm" >&2; exit 2; }
+  GPUS=$(( 3 * GPS ))
+  LANE_ARGS=(++thundersync.cohort_lanes=2)
+else
+  LANE_ARGS=()
+fi
 SP=$([ "$TP" -gt 1 ] && echo true || echo false)
 PAR=(policy.megatron_cfg.tensor_model_parallel_size=$TP
      policy.megatron_cfg.pipeline_model_parallel_size=$PP
@@ -82,14 +93,14 @@ mkdir -p "$OUT"
 rm -f "$OUT/history.json"
 echo "$ARM" > "$OUT/arm"
 echo "$GPUS" > "$OUT/gpus"  # GPUs the arm holds (summarizer: GPU-seconds per step)
-echo "[ab] ARM=$ARM TP=$TP PP=$PP EP=$EP GPS=$GPS GPUS=$GPUS COLOCATED=$COLOCATED STEPS=$STEPS PROMPTS=$PROMPTS G=$G MAXLEN=$MAXLEN PROMPT_CAP=$PROMPT_CAP MODEL=$MODEL" \
+echo "[ab] ARM=$ARM TP=$TP PP=$PP EP=$EP GPS=$GPS GPUS=$GPUS COLOCATED=$COLOCATED LANES=$LANES STEPS=$STEPS PROMPTS=$PROMPTS G=$G MAXLEN=$MAXLEN PROMPT_CAP=$PROMPT_CAP MODEL=$MODEL" \
   "RL_ROOT=$RL_ROOT @ $(git -C "$RL_ROOT" rev-parse --short HEAD) -> $OUT"
 timeout ${RUN_TIMEOUT:-14400} python $ENTRY --config $CFG --history-json "$OUT/history.json" \
   logger.log_dir="$OUT/logs" policy.model_name=$MODEL grpo.max_num_steps=$STEPS \
   grpo.num_prompts_per_step=$PROMPTS grpo.num_generations_per_prompt=$G \
   policy.train_global_batch_size=$((PROMPTS * G)) policy.max_total_sequence_length=$((PROMPT_CAP + MAXLEN)) \
   data.max_input_seq_length=$PROMPT_CAP policy.generation.max_new_tokens=$MAXLEN \
-  "${RES[@]}" "${PAR[@]}" "${USER_ARGS[@]}" > "$OUT/run.log" 2>&1
+  "${RES[@]}" "${PAR[@]}" "${LANE_ARGS[@]}" "${USER_ARGS[@]}" > "$OUT/run.log" 2>&1
 rc=$?
 echo "[ab] run exit=$rc"
 python $W/research/ab/summarize_ab.py --check "$OUT"
