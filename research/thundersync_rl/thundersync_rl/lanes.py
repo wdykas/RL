@@ -30,8 +30,9 @@ its drafts until its last continuation is verified (``CohortLanes.pin`` /
 ``unpin``); refitting a pinned lane raises, so a cohort's drafts,
 continuations and anchors all come from the one version that drafted it.
 
-Each lane has its own refit communicator: the learner keeps one process group
-per lane (``ThunderSyncMegatronPolicyWorker.keep_refit_group`` /
+Each lane has its own refit communicator (packed collective, or the native
+m2n refit group under ``refit_transport: mcore``, refit_m2n.py): the learner keeps
+one per lane (``ThunderSyncMegatronPolicyWorker.keep_refit_group`` /
 ``select_refit_group``) and refits only the lane being changed, through the
 same bucketed collective as a single engine.
 """
@@ -284,7 +285,8 @@ def build_engine_lanes(
 
     from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
     from nemo_rl.models.generation.megatron import MegatronGeneration
-    from nemo_rl.weight_sync.factory import create_weight_synchronizer
+
+    from thundersync_rl.refit_m2n import make_lane_synchronizer
 
     learners = policy.worker_group
     ray.get(learners.run_all_workers_single_data("keep_refit_group", lane=0))
@@ -306,15 +308,12 @@ def build_engine_lanes(
             name_prefix=f"megatron_generation_lane{i}",
             skip_weight_load=True,
         )
-        sync = create_weight_synchronizer(
-            policy=policy,
-            generation=gen,
-            generation_backend="megatron",
-            colocated=False,
-            train_cluster=train_cluster,
-            inference_cluster=cluster,
-        )
+        sync = make_lane_synchronizer(policy, gen, train_cluster, cluster)
         gen.weight_synchronizer = sync
+        if gen.uses_native_refit:
+            # The learner's cached plan (same key for every lane) would skip
+            # the plan build this lane's engine ranks run collectively.
+            ray.get(learners.run_all_workers_single_data("clear_refit_plan_cache"))
         sync.init_communicator()
         ray.get(learners.run_all_workers_single_data("keep_refit_group", lane=i))
         ray.get(learners.run_all_workers_single_data("select_refit_group", lane=i))

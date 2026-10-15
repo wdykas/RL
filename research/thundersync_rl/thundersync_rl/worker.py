@@ -64,6 +64,16 @@ from thundersync_rl.fused_train import (
 
 WORKER_FQN = "thundersync_rl.worker.ThunderSyncMegatronPolicyWorker"
 
+# Learner-side state of one engine lane's refit communicators (cohort lanes): the
+# packed collective's ``model_update_group`` and the native MCore (m2n) refit's
+# process group, copy service and destination rank offset (refit_transport mcore).
+_LANE_REFIT_ATTRS = (
+    "model_update_group",
+    "refit_pg",
+    "refit_copy_service",
+    "refit_dst_rank_offset",
+)
+
 
 def _prefix_check_on() -> bool:
     """``THUNDERSYNC_PREFIX_CACHE_CHECK=1``: each prefix-state forward is checked
@@ -530,22 +540,60 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         return engine_prof.summary()
 
     def keep_refit_group(self, lane: int) -> None:
-        """Learner rank: file the live refit communicator under engine lane ``lane``.
+        """Learner rank: file the live refit communicators under engine lane ``lane``.
 
         Cohort lanes (lanes.py) give every engine lane its own refit
-        communicator (learner ranks + that lane's ranks). ``init_collective``
-        releases the previous ``model_update_group``, so the live one is moved
-        out first; the next lane's ``init_collective`` then builds a new one.
+        communicators (learner ranks + that lane's ranks). ``init_collective``
+        releases the previous ``model_update_group``, so the live state is moved
+        out first; the next lane's init then builds new ones. The native MCore
+        refit plan is the same for every lane (same group-rank layout), but each
+        lane's engine ranks build it collectively at their init:
+        ``clear_refit_plan_cache`` makes the learner join that build.
         """
         groups = self.__dict__.setdefault("_lane_refit_groups", {})
-        if self.model_update_group is None:
+        state = {a: getattr(self, a, None) for a in _LANE_REFIT_ATTRS}
+        if state["model_update_group"] is None and state["refit_pg"] is None:
             raise RuntimeError("keep_refit_group: no refit communicator to keep")
-        groups[lane] = self.model_update_group
+        groups[lane] = state
         self.model_update_group = None
 
     def select_refit_group(self, lane: int) -> None:
-        """Learner rank: the next refit broadcast goes to engine lane ``lane`` only."""
-        self.model_update_group = self._lane_refit_groups[lane]
+        """Learner rank: the next refit goes to engine lane ``lane`` only."""
+        for attr, value in self._lane_refit_groups[lane].items():
+            setattr(self, attr, value)
+
+    def clear_refit_plan_cache(self) -> None:
+        """Learner rank: drop MCore's cached refit plans (before a new lane's native init)."""
+        from megatron.core.resharding.refit import clear_plan_cache
+
+        clear_plan_cache()
+
+    @torch.no_grad()
+    def engine_weight_digest(self) -> dict[str, list]:
+        """Engine rank (debug): bitwise digest of every parameter and buffer it holds.
+
+        Per tensor (named_parameters, then named_buffers, sorted by name) a
+        position-weighted sum of its raw bits (``refit_m2n.tensor_digest``): any
+        bit difference between two refits of the same weights changes it, with
+        probability ~1 - 2^-61. Includes derived caches (e.g. the Mamba
+        ``-exp(A_log)`` cache) and the fp16 expert buffers.
+        """
+        from thundersync_rl.refit_m2n import model_digest
+
+        names, digests, dtypes = model_digest(self.model)
+        return {"names": names, "digests": digests, "dtypes": dtypes}
+
+    @torch.no_grad()
+    def engine_poison_refit_weights(self) -> int:
+        """Engine rank (debug): overwrite every refit tensor with a sentinel.
+
+        The refit crosscheck refits the same weights twice; poisoning in between
+        makes a tensor the second transport skipped show up as a digest mismatch
+        instead of passing on the first transport's values.
+        """
+        from thundersync_rl.refit_m2n import poison_refit_tensors
+
+        return poison_refit_tensors(self.model)
 
     def _log_mem(self, where: str) -> None:
         if os.environ.get("THUNDERSYNC_MEM_LOG"):
