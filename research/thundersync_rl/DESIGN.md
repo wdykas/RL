@@ -2831,22 +2831,25 @@ merge commit messages):
   measured verify cost (one calibrator shared by the lanes), group draft admission (default).
   `ab_base` turns `thundersync.null_bv_calibrate` on: the fixed prior v is ~4.5x below the measured Nano v
   (cal-x-l2: 3.5-3.8e-6); cal-x-l2 and adm2-x-l2-grp-cal are EXACT.
-- ts-run-ready 32d89735 (14s): checkpoints/resume, epochs, validation, seeds, NaN guards, always-on weight sentinel,
+- ts-run-ready 04c4b855 (14s): checkpoints/resume, epochs, validation, seeds, NaN guards, always-on weight sentinel,
   multi-turn prefix and collect_drafts guards, leftover-plan fix. Guards and sentinel are validated (rr-gpu-unit,
-  rr-sentinel-lanes-ep). Exact resume is NOT yet shown: rr-resume-nano failed (the resumed run's LR scheduler refused
-  the checkpoint of a shorter max_num_steps; the sync arm was not reproducible before the resume; comparator bug).
-  `THUNDERSYNC_DEBUG_STOP_AT=N` (ends a run at checkpoint boundary N with max_num_steps unchanged) is added for the
-  test.
+  rr-sentinel-lanes-ep). 04c4b855 adds pinned mamba_ssm backward autotune configs (a cross-process
+  nondeterminism source), torch deterministic algorithms under deterministic_training, a kill-at-step env
+  (`THUNDERSYNC_DEBUG_STOP_AT`) and a resume precheck of the run length. Exact resume is NOT yet shown:
+  rr-resume-nano failed (LR schedule sized from a different max_num_steps; sync arm not reproducible before the
+  resume; comparator bug); the fixed test rr-resume-nano2 is pending.
 - ts-m2n-refit e31b781a (14q). m2n-xc-one / m2n-xc-lanes: crosscheck PASS on every refit (theta and theta-hat),
   m2n-x-one / m2n-x-lanes EXACT 6/6. So `ab_base` sets `refit_transport: mcore` + `refit_backend: nccl` for every
   arm on the ThunderSync loop (sync, async1, ts_*), so refit cost is equal across them; async1_nrl (stock loop) keeps
   its transport.
 - ts-verify-in-train (14r), the 4c4ae593 tree plus the candidate-selection fix 1fe2cf7a (VIT never engaged before
   it; vit-l2's "VIT on" perf arm therefore measured nothing). Opt-in, default off.
-- ts-carried-walk cb2a8415 (DESIGN section renumbered 14r -> 14t): continuation decision rules opt-in (default
-  `every`); prefix-cache `pin` policy and `auto` size are the defaults (LRU thrashes under cyclic rounds). cw-x-4k:
-  the row/dip rules hit a 68 GB OOM in a verification forward that materializes full-vocab logits on long rows
-  (chunked log p in the verify path is being added by the carried-walk agent; not in this merge).
+- ts-carried-walk 0997895f (DESIGN section renumbered 14r -> 14t): continuation decision rules opt-in (default
+  `every`); prefix-cache `pin` policy and `auto` size are the defaults (LRU thrashes under cyclic rounds); the
+  chunked verification head is always on (fp16 recipe, TP 1): cw-x-4k hit a 68 GB OOM in a verification forward
+  that materialized [rows x tokens x V] fp32 logits; now every verification forward (verify0, pieces, walk, scans)
+  takes log p from at most 4096 rows at a time, bitwise the materialized path. **Scale gap:** at TP > 1 the
+  vocab-parallel verification (`GatheredLogprobRows`) still keeps full-length [n, V/TP] logit shards per row.
 - ts-learner-callcost 45bbb962, opt-in: training expert GEMMs default to per-expert cuBLAS;
   `NEMO_RL_FP16_MOE_TRAIN_GEMM=auto|segment` (e.g. via `policy.megatron_cfg.env_vars`) selects the bitwise segment
   kernels (full-Nano EP4 fwd+bwd 1.6x at 1k, ~2 % at 8k, GPU kernel time ~2x cuBLAS's).
@@ -3405,6 +3408,24 @@ costs more than ~5k decode tokens, e.g. a 128k restart prefill). Full grid (all 
   path (14q) calls them unchanged; the walk state and decisions travel through the driver.
 Metrics: `spec/cw_decisions`, `_whole`, `_rejects`, `_scans`, `_scan_tokens`, `_ratio_mismatch` (must be 0: the scan's
 forward reproduces the pieces' log p bitwise), `_hidden_retained_bytes_max`.
+**Chunked verification head (all engine-sourced verification, ts-carried-walk).** A verification forward
+(verify0, continuation pieces, carried walk pieces and scans) used to materialize [rows x tokens x V] fp32 logits for
+the whole forward batch: cw-x-4k OOMed allocating 68 GiB (≈ 34 x 4096 x 131k x 4 B) at step 3 [M,
+runs_1node/cw-x-4k-row/run.log]. Now `verify_drafts_block_engine` runs its forwards under
+`deferred_head.verification_logits()`: with the fp32 head at TP=1 the model returns the `DeferredHeadLogits` stand-in
+(as training's deferred LM head), and each row's log-probs come from `engine_q.DeferredLogprobRows`, which forms
+`log_softmax(fp32_gemm(x_rows, W)[:vocab_limit])` for at most 4096 rows at a time (drafted-token log-probs) or for the
+rows a scan asks for. Same ops per row as the materialized path (row-invariant GEMM, row-wise log-softmax), so
+bitwise the same values [T: test_carried_walk_gpu.py::test_deferred_logprob_rows_equal_materialized]. Per rank:
+the head input (tokens x h x 4 B) plus one [4096, V] fp32 chunk (2 GiB at V 131k) instead of tokens x V x 4 B.
+Not covered: TP > 1 (vocab-parallel `GatheredLogprobRows` still keeps [n, V/TP] logits per row), heads outside the
+fp16-GEMM recipe (logits materialized as before; `[verify head] chunked=False` in the log). Engine placement (14q)
+already chunks p rows (`HeadLogprobRows`, 512 rows).
+
+**Debug** `THUNDERSYNC_DEBUG_CW_FORCE_REJECT=N`: the first N decisions of each plan fail their terminal test (only when
+b < 1) so short exactness runs exercise the rejection scan; changes the law (not an exactness test of the rule),
+leaves every bitwise check meaningful. `spec/cw_forced`.
+
 Requirements (`validate_carried_walk`): sticky routing, verify_source=engine, verify_on=learner on this branch, no
 banded IS. Not built: carrying the walk through verify0 (it decides; ⊥-BV pools need its outcomes), speculative forks.
 

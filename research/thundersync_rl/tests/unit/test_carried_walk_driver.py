@@ -80,7 +80,8 @@ def test_carried_block_decides_at_stream_end_and_scans_below():
     assert p2["rows"] == [[1, 4, 5, 6, 7, 8]] and p2["plens"] == [4]
     assert p3["rows"] == [[1, 4, 5, 6, 7, 8, 9, EOD]] and p3["plens"] == [6]
     assert p1["walks"][0]["n"] == 0 and p2["walks"][0] == {
-        "log_b": -0.1, "floor": 1, "n": 2, "final": False, "rule": {"mode": "row", "dip": 0.1}
+        "log_b": -0.1, "floor": 1, "n": 2, "final": False, "rule": {"mode": "row", "dip": 0.1},
+        "force_reject": False,
     }
     assert p3["walks"][0]["final"] is True and p3["walks"][0]["n"] == 4
     # the scan: block positions [0, 4) (the floor 1 lies in the first piece)

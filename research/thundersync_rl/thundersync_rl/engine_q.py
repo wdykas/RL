@@ -923,6 +923,54 @@ def residual_rows_needed(n_eval: int, tau: int, g: int) -> int:
     return n_eval + (tau < g)
 
 
+class DeferredLogprobRows(GatheredLogprobRows):
+    """Log-prob rows of one row's fp32 head computed from its head input in chunks.
+
+    ``x`` [n, h]: the LM head's input at positions plen - 1 .. n - 1 of a
+    verification forward (``deferred_head.verification_logits``); ``weight`` the
+    fp32 head [V, h]. A row is ``log_softmax(fp32_gemm(x[i], W)[:vocab_limit])``,
+    the materialized path's ops on the same row (row-invariant GEMM, row-wise
+    log-softmax), so values are bitwise those of whole-batch logits; at most
+    ``chunk_rows`` (default ``deferred_head.CHUNK_TOKENS`` = 4096) rows of
+    [V] fp32 exist at a time. Memory per verification forward: the head input
+    (tokens x h) instead of tokens x V x 4 B (68 GiB at 34 x 4096 x 131k).
+    """
+
+    def __init__(self, x: torch.Tensor, weight: torch.Tensor, vocab_limit: int, chunk_rows: Optional[int] = None):
+        from nemo_rl.models.megatron.deferred_head import CHUNK_TOKENS
+
+        self.local = x
+        self.weight = weight
+        self.gather = None
+        self.vocab_limit = vocab_limit
+        self.chunk_rows = int(chunk_rows or CHUNK_TOKENS)
+
+    def _rows(self, x: torch.Tensor) -> torch.Tensor:
+        from nemo_rl.models.megatron import fp16_gemm
+
+        logits = fp16_gemm.fp32_gemm(x.to(torch.float32), self.weight)
+        return torch.log_softmax(logits[..., : self.vocab_limit].float(), -1)
+
+    def __call__(self, idx: torch.Tensor) -> torch.Tensor:
+        idx = idx.to(self.local.device)
+        out = [self._rows(self.local[idx[a : a + self.chunk_rows]]) for a in range(0, idx.numel(), self.chunk_rows)]
+        if not out:
+            return torch.zeros(0, self.vocab_limit, dtype=torch.float32, device=self.local.device)
+        return torch.cat(out) if len(out) > 1 else out[0]
+
+    def token_logprobs(self, tokens: torch.Tensor) -> torch.Tensor:
+        k = tokens.numel()
+        out = []
+        for a in range(0, k, self.chunk_rows):
+            b = min(k, a + self.chunk_rows)
+            lp = self._rows(self.local[a:b])
+            out.append(lp.gather(-1, tokens[a:b].view(-1, 1).to(lp.device))[:, 0])
+            del lp
+        if not out:
+            return torch.zeros(0, dtype=torch.float32, device=self.local.device)
+        return torch.cat(out)
+
+
 def verify_engine_q(
     p_logprobs: Union[torch.Tensor, GatheredLogprobRows],
     draft: torch.Tensor,

@@ -3492,7 +3492,12 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         _call_log(self, "verify_drafts_block_engine")
         from megatron.core import parallel_state as ps
         from thundersync_rl.block_verification import banded_log_weight, nonfinite_context
+        from nemo_rl.models.megatron.deferred_head import (
+            DeferredHeadLogits,
+            verification_logits,
+        )
         from thundersync_rl.engine_q import (
+            DeferredLogprobRows,
             GatheredLogprobRows,
             HiddenPrefetch,
             HiddenRefs,
@@ -3593,30 +3598,43 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                     prefetch(bi)
                     prefetch(bi + 1)
                 t0 = time.perf_counter()
-                if cache is not None:
-                    lb = self._prefix_cached_forward(
-                        cache,
-                        [prefix_keys[i] for i in batch],
-                        [rows[i] for i in batch],
-                        [starts[i] for i in batch],
-                        None if anchors is None else [anchors[i] for i in batch],
-                        [prompt_lens[i] for i in batch],
-                        None if prefix_pins is None else [prefix_pins[i] for i in batch],
-                    )
-                elif anchors is not None:
-                    lb = self._training_forward_rows(
-                        [rows[i] for i in batch],
-                        anchors=[anchors[i] for i in batch],
-                    )
-                elif len(batch) == 1:
-                    lb = self._training_forward(rows[batch[0]])
-                else:
-                    lb = self._training_forward_rows([rows[i] for i in batch])
+                with verification_logits():
+                    if cache is not None:
+                        lb = self._prefix_cached_forward(
+                            cache,
+                            [prefix_keys[i] for i in batch],
+                            [rows[i] for i in batch],
+                            [starts[i] for i in batch],
+                            None if anchors is None else [anchors[i] for i in batch],
+                            [prompt_lens[i] for i in batch],
+                            None if prefix_pins is None else [prefix_pins[i] for i in batch],
+                        )
+                    elif anchors is not None:
+                        lb = self._training_forward_rows(
+                            [rows[i] for i in batch],
+                            anchors=[anchors[i] for i in batch],
+                        )
+                    elif len(batch) == 1:
+                        lb = self._training_forward(rows[batch[0]])
+                    else:
+                        lb = self._training_forward_rows([rows[i] for i in batch])
                 self._prof["forward"] = (
                     self._prof.get("forward", 0.0) + time.perf_counter() - t0
                 )
-                for k, i in enumerate(batch):
-                    yield i, (None if lb is None else lb[k : k + 1])
+                if not getattr(self, "_verify_head_logged", False):
+                    self._verify_head_logged = True
+                    print(
+                        f"[verify head] rank={self.rank} chunked="
+                        f"{isinstance(lb, DeferredHeadLogits)} (False: whole-batch logits)",
+                        flush=True,
+                    )
+                if isinstance(lb, DeferredHeadLogits):
+                    # Chunked verification head: per row its head input only.
+                    for k, i in enumerate(batch):
+                        yield i, ("deferred", lb.row_input(k), lb.head_weight)
+                else:
+                    for k, i in enumerate(batch):
+                        yield i, (None if lb is None else lb[k : k + 1])
                 del lb
 
         for i, logits in row_logits():
@@ -3627,12 +3645,18 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             # Logits of positions [starts[i], n) (prefix-state cache; else 0).
             off = starts[i]
             plen, n = plen - off, n - off
-            dev = logits.device
+            dev = logits[1].device if isinstance(logits, tuple) else logits.device
             if gen is None:
                 gen = torch.Generator(device=dev).manual_seed(
                     seed * 1_000_003 + ps.get_data_parallel_rank()
                 )
-            if tp == 1:
+            deferred = isinstance(logits, tuple)
+            if deferred:
+                # Never [tokens, V] for a batch: rows in <= 4096-row chunks from
+                # the head input, bitwise the materialized rows (DeferredLogprobRows).
+                _, x_rows, w_head = logits
+                p_lp = DeferredLogprobRows(x_rows[plen - 1 : n], w_head, vocab_limit)
+            elif tp == 1:
                 # Log-probs exactly as training computes them (fp32 log-softmax).
                 with timed("p_log_softmax"):
                     p_lp = torch.log_softmax(
@@ -3927,9 +3951,18 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 st = self.__dict__.setdefault(
                     "_prefix_check", {"rows": 0, "exact": 0, "hits": 0, "positions": 0}
                 )
+                from nemo_rl.models.megatron.deferred_head import DeferredHeadLogits
+
                 for b, (r, s, p) in enumerate(zip(rows, starts, prompt_lens)):
                     n = r.numel()
-                    same = torch.equal(lb[b, p - 1 - s : n - s], full[b, p - 1 : n])
+                    if isinstance(lb, DeferredHeadLogits) and isinstance(full, DeferredHeadLogits):
+                        # Chunked verification head: equal head inputs (and the same
+                        # weight) give equal logits rows (row-invariant fp32_gemm).
+                        same = torch.equal(
+                            lb.row_input(b)[p - 1 - s : n - s], full.row_input(b)[p - 1 : n]
+                        )
+                    else:
+                        same = torch.equal(lb[b, p - 1 - s : n - s], full[b, p - 1 : n])
                     st["rows"] += 1
                     st["exact"] += int(same)
                     st["hits"] += int(s > 0)
