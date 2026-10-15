@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import concurrent.futures
 import contextlib
 import itertools
 import math
@@ -1786,6 +1787,11 @@ async def _run_one_step(
             all_trajectories.append(traj)
             planner.add(traj)
             wake.set()
+            if planner.has_work(flush=False):
+                # Completed rollouts (served from complete plans) resolve
+                # without suspending this loop: yield so the learner loop
+                # sends the dispatch now, not after the last row is served.
+                await asyncio.sleep(0)
         if order_replay:
             # Same trajectories, two other arrival orders under the canonical
             # order (must equal the real step bitwise) and one with arrival
@@ -1805,14 +1811,18 @@ async def _run_one_step(
         if ordered is not None and draft_task is not None:
             # Sticky streams go on decoding after the cut (their tokens become
             # continuation pieces), so the cut time only moves tokens between
-            # the next verify0 and its continuation rounds: cut while the last
-            # training dispatch runs instead of after it.
+            # the next verify0 and its continuation rounds. A deferrable cut
+            # is one snapshot call: drafts run until training ends and are
+            # handed out at the next step's top (``_resolve_drafts``, beside
+            # the drafting lane's refit). Otherwise cut while the last
+            # training dispatch runs.
             async def cut_drafts():
-                await last_sent.wait()
-                t = time.perf_counter()
                 d = await draft_task
+                deferrable = callable(d) and getattr(d, "deferrable", False)
+                await (learner_task if deferrable else last_sent.wait())
+                t = time.perf_counter()
                 if callable(d):
-                    d = await asyncio.to_thread(d)
+                    d = await asyncio.to_thread(d, True) if deferrable else await asyncio.to_thread(d)
                 return d, time.perf_counter() - t
 
             cut_task = asyncio.create_task(cut_drafts())
@@ -2191,6 +2201,7 @@ def thundersync_grpo_train(
     )
     lag = ts_cfg.rollout_lag
     pending = None  # rollout_lag=1: rollouts of the next step's batch
+    handout_pool = concurrent.futures.ThreadPoolExecutor(1, thread_name_prefix="ts-handout")
     def _prompts(b):
         r = b.repeat_interleave(G)
         return [
@@ -2209,6 +2220,9 @@ def thundersync_grpo_train(
         t0 = time.perf_counter()
         t_verify = 0.0
         t_first = 0.0
+        # A deferred cut (``cut_drafts``): hand the drafts out beside the
+        # drafting lane's refit below (different lane, no learner call).
+        handout = handout_pool.submit(drafts) if callable(drafts) else None
         lane_x = lane_y = lane_drafts = None
         lane_stats: dict[str, float] = {}
         if sched is not None:
@@ -2253,6 +2267,11 @@ def thundersync_grpo_train(
             t_first = time.perf_counter() - t1
         if spec is not None:
             spec.current_step = step
+        handout_wait = 0.0
+        if handout is not None:
+            t1 = time.perf_counter()
+            drafts = handout.result()
+            handout_wait = time.perf_counter() - t1
         tails = None  # pending plans whose continuation rounds overlap training
         if sticky and drafts is not None:
             # Sticky routing: verify and complete every drafted rollout while
@@ -2535,6 +2554,8 @@ def thundersync_grpo_train(
             # This step's training has replayed every anchor targeted at it.
             spec.release_routes(step)
         metrics["time/verify"] = t_verify
+        # Top of step waiting for the deferred draft handout (after the refit).
+        metrics["time/draft_handout_wait"] = handout_wait
         if spec is not None:
             metrics.update(spec.stats)
             spec.stats = {}
