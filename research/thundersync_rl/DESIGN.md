@@ -2966,6 +2966,10 @@ content independence (exact zero), row-absent and correction fp differences (inf
 what trains. Bitwise needs `policy.megatron_cfg.deterministic_training=true` (14n). Cluster line vit-x; result: see the
 agent note.
 
+**Decision (2026-10-15).** Plan of record: hybrid placement (VIT for fully-drafted all-accepted groups, engine-side
+verification inside the continuation prefill for the rest), linear correction dropped. VIT rows are exact without
+`deterministic_training` (decisions come from the training forward itself); determinism is only for bitwise tests.
+
 **Placement.** VIT for fully-finished groups, engine-side verification (14q) for unfinished drafts (ideally inside the
 continuation's own prefill). Per-rank cost of VIT: no memory beyond a training micro-batch; q (4 B/token) and the row
 seed to the row's last PP stage; one [V/TP] head row per rejected position.
