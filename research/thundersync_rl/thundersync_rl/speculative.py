@@ -55,7 +55,7 @@ from thundersync_rl.engine_q import (
 )
 from thundersync_rl.fused_train import FusedRef
 from thundersync_rl.multi_turn import TurnEnvironment, TurnRecord, pair_rows, replay
-from thundersync_rl.null_bv import NullGroup, NullPolicy, row_envelopes
+from thundersync_rl.null_bv import LogRatioCalibration, NullGroup, NullPolicy, row_envelopes
 from thundersync_rl.prefix_cache import PrefixCacheDirectory, lpt_owners
 from thundersync_rl.tail_trace import TailTrace
 from thundersync_rl.routes import (
@@ -76,6 +76,7 @@ HIDDEN_FETCH_KEYS = ("hidden_bytes_fetched", "hidden_real_bytes_fetched", "hidde
 def _null_result(res: dict[str, Any], m: Optional[float]) -> dict[str, Any]:
     """A ⊥-BV row's result at envelope ``m`` from its grid (None: unused)."""
     base = {k: res.get(k, 0) for k in HIDDEN_FETCH_KEYS}
+    base["lr_moments"] = res.get("null_lr_moments", (0, 0.0, 0.0))
     if m is None:
         return {**base, "null": "unused", "accepted": 0, "next": -1, "logprobs": []}
     tau, y, lp_y = res["null_grid"][m]
@@ -551,8 +552,18 @@ class SpeculativeGeneration:
         # step -> {prompt key: slots} of the drafts made for that step.
         self.null_bv = null_bv
         self.null_bv_policy = dict(null_bv_policy or {})
-        # Built once: its DP table is memoised across steps.
+        calibrate = self.null_bv_policy.pop("calibrate", False)
+        decay = self.null_bv_policy.pop("calibration_decay", 0.5)
+        # Built once: its DP table is memoised across steps (rebuilt per step
+        # when calibrated: ``_verify_null``).
         self._null_policy = NullPolicy(**self.null_bv_policy) if null_bv else None
+        # Calibrated ⊥-BV policy: per-token Var log p/q from earlier steps'
+        # verified drafts only (null_bv.LogRatioCalibration: exactness).
+        self._null_calib = (
+            LogRatioCalibration(self.null_bv_policy.get("logratio_var", 8e-7), decay)
+            if null_bv and calibrate
+            else None
+        )
         # Drop-IS (opt-in, unbiased gradient, not exact samples): outputs that
         # need a tail decode are discarded like BOT; kept rows are weighted.
         self.null_bv_drop_is = null_bv_drop_is
@@ -1720,6 +1731,14 @@ class SpeculativeGeneration:
         (``decide_pools``); rows after the slots fill are "unused", and those
         never forwarded cost nothing (their hidden states are freed).
         """
+        calib = self.__dict__.get("_null_calib")  # absent on test stubs
+        if calib is not None:
+            # This step's v: earlier steps' rows only (fixed before any of
+            # this step's drafts is verified).
+            v = calib.estimate()
+            if v != self._null_policy.logratio_var:
+                self._null_policy = NullPolicy(**{**self.null_bv_policy, "logratio_var": v})
+            self.stats["spec/null_v_used"] = v
         policy = self._null_policy
         queue: dict[str, list[int]] = defaultdict(list)
         for i, g in enumerate(groups):
@@ -1872,6 +1891,20 @@ class SpeculativeGeneration:
                 ),
             }
         )
+        # Per-token log p/q moments of every row verified this step (decided or
+        # not): the calibration of LATER steps' policies, and a logged signal.
+        moments = [tuple(by_row[r].get("lr_moments", (0, 0.0, 0.0))) for r in range(len(flat))]
+        n_lr = sum(m[0] for m in moments)
+        if n_lr >= 2:
+            mean = sum(m[1] for m in moments) / n_lr
+            self.stats["spec/logratio_var_step"] = max(
+                sum(m[2] for m in moments) / n_lr - mean * mean, 0.0
+            )
+            self.stats["spec/logratio_mean_step"] = mean
+        calib = self.__dict__.get("_null_calib")  # absent on test stubs
+        if calib is not None:
+            calib.update(moments)
+            self.stats["spec/null_v_next"] = calib.estimate()
         if self._null_policy.prompt_drop:
             inv = {name: key for key, name in self._null_names.items()}
             self.null_dropped_keys = {inv[g] for g in dropped_groups}

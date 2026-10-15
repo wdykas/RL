@@ -268,6 +268,17 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     null_bv_drafts_per_output: float = 1.5
     null_bv_logratio_var: float = 8e-7
     null_bv_fixed_m: Optional[float] = None
+    # Calibrated M_j policy: the DP's per-token Var log p/q is a moving
+    # average (weight null_bv_calibration_decay on the past) of the variance
+    # measured on EARLIER steps' verified drafts (null_bv_logratio_var until
+    # the first step; v drifts as the policy sharpens). Exact: within a step v
+    # is fixed before its drafts are verified, so M_j still depends on the
+    # counts only (null_bv.LogRatioCalibration). Logs spec/null_v_used and
+    # spec/logratio_var_step. null_bv_tail_weight: critical-path cost of a
+    # tail decode relative to a fresh decode of a slot (DP cost model).
+    null_bv_calibrate: bool = False
+    null_bv_calibration_decay: float = 0.5
+    null_bv_tail_weight: float = 1.0
     # Opt-in (agent_tail.md; agent_tail_exact_schemes.md section 3.2): constant
     # envelope null_bv_fixed_m at every count (never the forced M = 1), and a
     # prompt whose pool can no longer fill its G slots is DROPPED. The drop
@@ -777,6 +788,10 @@ def validate_null_bv(master_config: ThunderSyncMasterConfig) -> None:
         problems.append("thundersync.null_bv_fixed_m must be >= 1")
     if not ts_cfg.null_bv_logratio_var >= 0:
         problems.append("thundersync.null_bv_logratio_var must be >= 0")
+    if not 0.0 <= ts_cfg.null_bv_calibration_decay < 1.0:
+        problems.append("thundersync.null_bv_calibration_decay must be in [0, 1)")
+    if not ts_cfg.null_bv_tail_weight > 0:
+        problems.append("thundersync.null_bv_tail_weight must be > 0")
     if ts_cfg.null_bv_prompt_drop and ts_cfg.null_bv_fixed_m is None:
         problems.append("thundersync.null_bv_prompt_drop needs null_bv_fixed_m (a constant envelope)")
     if ts_cfg.null_bv_spare_prompts < 0:
@@ -885,6 +900,9 @@ def null_bv_policy(master_config: Any) -> dict[str, Any]:
         "ref_len": int(master_config.policy["generation"]["max_new_tokens"]),
         "fixed_m": ts_cfg.null_bv_fixed_m,
         "prompt_drop": bool(ts_cfg.null_bv_prompt_drop),
+        "tail_weight": float(ts_cfg.null_bv_tail_weight),
+        "calibrate": bool(ts_cfg.null_bv_calibrate),
+        "calibration_decay": float(ts_cfg.null_bv_calibration_decay),
     }
 
 

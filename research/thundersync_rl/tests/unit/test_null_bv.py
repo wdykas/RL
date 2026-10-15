@@ -564,6 +564,9 @@ def test_null_config_default_off_and_policy_args():
         "ref_len": 2048,
         "fixed_m": 1.5,
         "prompt_drop": False,
+        "tail_weight": 1.0,
+        "calibrate": False,
+        "calibration_decay": 0.5,
     }
 
 
@@ -820,3 +823,34 @@ def test_wave_decisions_equal_the_one_shot_process(seed):
     out = s._verify_null(flat, [None] * len(groups), groups, slots)
     want = decide_pools(groups, slots, [{M: o[1] >= 0 for M, o in g.items()} for g in grid], policy)
     assert [out[i].get("null_m") for i in range(len(groups))] == want
+
+
+def test_logratio_calibration_uses_past_steps_only():
+    from thundersync_rl.null_bv import LogRatioCalibration
+
+    cal = LogRatioCalibration(prior=8e-7, decay=0.5)
+    assert cal.estimate() == 8e-7  # no step seen yet: the prior
+    # One step: tokens with log p/q in {-0.1, 0.1}: variance 0.01.
+    cal.update([(2, 0.0, 0.02), (2, 0.0, 0.02)])
+    assert cal.estimate() == pytest.approx(0.01)
+    cal.update([(4, 0.0, 0.0)])  # a step with variance 0: halfway (decay 0.5)
+    assert cal.estimate() == pytest.approx(0.005)
+    cal.update([(1, 0.3, 0.09)])  # fewer than 2 tokens: ignored
+    assert cal.estimate() == pytest.approx(0.005)
+    with pytest.raises(ValueError):
+        LogRatioCalibration(prior=1e-6, decay=1.0)
+
+
+def test_larger_logratio_var_and_tail_weight_raise_the_envelope():
+    from thundersync_rl.null_bv import NullPolicy
+
+    base = NullPolicy(logratio_var=8e-7, ref_len=1024)
+    calibrated = NullPolicy(logratio_var=1e-4, ref_len=1024)
+    assert base.m(12, 8) < calibrated.m(12, 8)
+    for v in (1e-5, 1e-4):
+        plain = NullPolicy(logratio_var=v, ref_len=1024)
+        weighted = NullPolicy(logratio_var=v, ref_len=1024, tail_weight=4.0)
+        assert all(weighted.costs()[m] == 4.0 * plain.costs()[m] for m in plain.grid)
+        assert weighted.m(12, 8) >= plain.m(12, 8)
+    # Still counts only, and M = 1 once drafts no longer exceed slots.
+    assert weighted.m(8, 8) == 1.0

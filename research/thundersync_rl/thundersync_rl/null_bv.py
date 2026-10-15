@@ -60,6 +60,18 @@ section 2.3, validated on real rows): log w_t under p is Brownian with drift
 +a^2/2 and variance a^2 = L v over a draft of length L. M = 1 whenever
 d <= s (never risk a fresh decode while drafts suffice).
 
+Calibration (``thundersync.null_bv_calibrate``): v is a moving average of the
+per-token Var log p/q measured on EARLIER steps' verified drafts
+(``LogRatioCalibration``; workers return each row's token count, sum and sum
+of squares of log p/q: 3 numbers per row, nothing per token). A step's policy
+is built from it before any of the step's drafts is verified, so within the
+step v is a constant determined by the past, like a hyperparameter, and M_j
+remains a function of the counts only: the argument above holds unchanged.
+Estimating v from the step's own rows would make M_j depend on the drafts'
+contents (forbidden, section 3.4 above). ``tail_weight`` scales the tail cost
+against a fresh decode (a constant of the cost model). v drifts over training
+as the policy sharpens, so a fixed v leaves M near 1 when tails are not rare.
+
 Placement (scale): verification forwards are placed on data-parallel ranks
 by tokens (``speculative.lpt_owners``), independent of prompts. Each rank verifies its
 rows for every M the policy can pick (``envelopes``) with one set of random
@@ -131,6 +143,8 @@ class NullPolicy:
     ref_len: int = 32768
     fixed_m: Optional[float] = None
     prompt_drop: bool = False
+    # Critical-path weight of a tail decode against a fresh decode of a slot.
+    tail_weight: float = 1.0
     grid: tuple[float, ...] = M_GRID
     _table: dict[tuple[int, int], float] = field(default_factory=dict, repr=False)
     _value: dict[tuple[int, int], float] = field(default_factory=dict, repr=False)
@@ -156,7 +170,7 @@ class NullPolicy:
             # Tail length given a tail decode: BV rejections are front-loaded
             # (E[1 - tau/g | fail] ~ 0.6); ⊥-BV ones sit late (tau > g/2: ~0.25).
             self._cost = {
-                M: tail_decode_prob(M, a) * (0.6 if M == 1.0 else 0.25) / M
+                M: self.tail_weight * tail_decode_prob(M, a) * (0.6 if M == 1.0 else 0.25) / M
                 for M in self.grid
             }
         return self._cost
@@ -203,6 +217,44 @@ class NullPolicy:
                     self._table[(dd, ss)] = bm
                     self._value[(dd, ss)] = best
         return self._table[key]
+
+
+class LogRatioCalibration:
+    """Running estimate of the per-token Var log p/q that the M_j policy models.
+
+    Exactness: a step's NullPolicy is built from ``estimate()`` BEFORE its
+    drafts are verified, from the moments of earlier steps' verified drafts
+    only (``update`` after a step's verification). Given the past, v is a
+    constant for the whole step, like a hyperparameter: M_j is still a
+    function of the counts (d, s) alone within the step, never of the
+    contents of this step's drafts, so the argument in the module docstring
+    (successes in index order are iid p) is unchanged. Using this step's own
+    rows would be forbidden (section 3.4 of agent_tail_exact_schemes.md).
+
+    ``decay``: weight of the past in the exponential moving average of the
+    pooled per-step estimates (v drifts over training as the policy sharpens).
+    """
+
+    def __init__(self, prior: float, decay: float = 0.5):
+        if not 0.0 <= decay < 1.0:
+            raise ValueError(f"calibration decay must be in [0, 1) (got {decay})")
+        self.prior, self.decay = float(prior), float(decay)
+        self.value: Optional[float] = None
+        self.last_step: Optional[float] = None
+
+    def estimate(self) -> float:
+        return self.prior if self.value is None else self.value
+
+    def update(self, moments: list[tuple[int, float, float]]) -> None:
+        """Fold in one step's per-row (tokens, sum log p/q, sum (log p/q)^2)."""
+        n = sum(m[0] for m in moments)
+        if n < 2:
+            return
+        s = sum(m[1] for m in moments)
+        sq = sum(m[2] for m in moments)
+        v = max(sq / n - (s / n) ** 2, 0.0)
+        self.last_step = v
+        self.value = v if self.value is None else self.decay * self.value + (1 - self.decay) * v
 
 
 def drafts_per_prompt(k: float, group_size: int) -> int:

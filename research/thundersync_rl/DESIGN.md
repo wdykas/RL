@@ -1704,6 +1704,24 @@ The defaults are unchanged: fixed G, the DP envelopes, and the standard GRPO est
   pool-wide content statistic, such as the mean length of all other drafts, is biased
   (z = +208, `agent_tail_exact_schemes.md` §3.4).
 
+**Calibrated envelope policy (`thundersync.null_bv_calibrate`, opt-in; ts-lanes-stream).** The DP's
+tail model needs the per-token Var log p/q v. A constant v is wrong in both directions: at Nano L8
+1k, v = 8e-7 makes tails look free at M ≥ 1.1, so the DP picks M ≈ 1.1 (⊥ on ~9% of drafts). Yet
+about one output per step (1/128) needs a tail of 400–500 tokens. That tail is the slowest row,
+and with streaming it sets the step [M, ord-p-l2-m128 steps 3–4]. During real post-training, v
+also drifts as the policy sharpens. The calibration measures v on every verified row:
+- each worker returns (tokens, Σ log p/q, Σ (log p/q)²) per row, 3 numbers, O(rows) per rank;
+- the driver keeps a moving average over steps (`null_bv_calibration_decay`);
+- the policy table is rebuilt at the step's first verification, from earlier steps only.
+Exactness: within a step v is fixed before any of the step's drafts is verified (a function of the
+past, like a hyperparameter), so M_j stays a function of the counts (d, s) alone. The optional-
+sampling argument above holds unchanged. Estimating v from the step's own rows would be forbidden
+(content-dependent M). Lanes: each lane's speculator calibrates from the steps it verified.
+`null_bv_tail_weight` scales the tail cost against a fresh decode (a constant). Logged:
+`spec/null_v_used`, `spec/logratio_var_step`, `spec/logratio_mean_step`, `spec/null_v_next`.
+Unit-tested (past-only update, decay, counts-only M). Validation queued: order-replay exactness run
+and perf vs `cut-p-l2-M13` (fixed M = 1.3).
+
 ## 14e. Banded importance sampling (`thundersync.banded_is_band`)
 
 *Opt-in, off by default (unset = every row is an exact sample of the current policy). Unit-tested
