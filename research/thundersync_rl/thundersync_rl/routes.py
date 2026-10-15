@@ -440,28 +440,30 @@ def fetch_anchors(
     topk: Optional[int],
     width: int,
     get: Callable[[Any], Any],
+    lo: int = 0,
 ) -> torch.Tensor:
-    """Learner side: dense anchors [width, len(layers), K] of the given layers.
+    """Learner side: dense anchors [width, len(layers), K] of positions [lo, lo + width).
 
     Fetches only blocks that hold some of ``layers`` (this rank's pipeline
-    stage) and some position below ``min(width, refs.length)``. Unlogged
+    stage) and some position in [lo, min(lo + width, refs.length)). Unlogged
     entries and positions past the anchored length are -1 (self). ``topk``
     None: taken from the first fetched block (1 if none is fetched).
+    ``lo`` > 0: a prefix-state forward of the row's positions from ``lo``.
     """
     col = {int(ln): j for j, ln in enumerate(layers)}
-    n_max = 0 if refs is None else min(width, refs.length)
+    n_max = 0 if refs is None else min(lo + width, refs.length)
     out = None if topk is None else _no_anchors(width, len(layers), topk)
     for b in refs.blocks if refs is not None else ():
-        hi = min(b.hi, n_max)
+        a, hi = max(b.lo, lo), min(b.hi, n_max)
         src = [j for j, ln in enumerate(b.layers) if ln in col]
-        if hi <= b.lo or not src:
+        if hi <= a or not src:
             continue
-        rows = get(b.ref)[: hi - b.lo][:, src].to(ROUTE_DTYPE)
+        rows = get(b.ref)[a - b.lo : hi - b.lo][:, src].to(ROUTE_DTYPE)
         if out is None:
             out = _no_anchors(width, len(layers), int(rows.shape[-1]))
         dst = torch.tensor([col[b.layers[j]] for j in src], dtype=torch.long)
         idx = rows.ge(0).all(-1).all(-1).nonzero().flatten()
-        out[(b.lo + idx).unsqueeze(1), dst.unsqueeze(0)] = rows[idx]
+        out[(a - lo + idx).unsqueeze(1), dst.unsqueeze(0)] = rows[idx]
     return _no_anchors(width, len(layers), 1) if out is None else out
 
 

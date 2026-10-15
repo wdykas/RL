@@ -127,8 +127,29 @@ def _varlen_layout(batch: int, seqlen: int, chunk_size: int, device: torch.devic
     return cu_chunk_seqlens, seq_idx, last_chunk_indices
 
 
-def _engine_scan(x, dt, A, B, C, chunk_size, D, z, dt_bias, dt_softplus, dt_limit):
-    """Megatron's varlen SSD forward over (batch, seqlen, ...) rows, FP32 chunk states."""
+def _engine_scan(
+    x,
+    dt,
+    A,
+    B,
+    C,
+    chunk_size,
+    D,
+    z,
+    dt_bias,
+    dt_softplus,
+    dt_limit,
+    initial_states=None,
+    return_chunk_states=False,
+):
+    """Megatron's varlen SSD forward over (batch, seqlen, ...) rows, FP32 chunk states.
+
+    ``initial_states`` [batch, nheads, headdim, dstate] (fp32): each row's SSM
+    state before its first token (the state at a chunk boundary of a longer
+    row: the scan then continues that row exactly, ``prefix_state_cache``).
+    ``return_chunk_states``: also return the fp32 state at the end of every
+    chunk, [batch, chunks per row, nheads, headdim, dstate].
+    """
     from megatron.core.ssm.ops.mamba2.ssd_combined import (
         mamba_chunk_scan_combined_varlen,
     )
@@ -142,7 +163,7 @@ def _engine_scan(x, dt, A, B, C, chunk_size, D, z, dt_bias, dt_softplus, dt_limi
         return None if t is None else t.reshape(batch * seqlen, *t.shape[2:])
 
     out = torch.empty_like(flat(x))
-    mamba_chunk_scan_combined_varlen(
+    states = mamba_chunk_scan_combined_varlen(
         x=flat(x),
         dt=flat(dt),
         A=A,
@@ -158,9 +179,13 @@ def _engine_scan(x, dt, A, B, C, chunk_size, D, z, dt_bias, dt_softplus, dt_limi
         dt_bias=dt_bias,
         dt_softplus=dt_softplus,
         dt_limit=dt_limit,
+        initial_states=initial_states,
+        return_raw_states=return_chunk_states,
         state_dtype=torch.float32,
     )
-    return out.view_as(x)
+    if not return_chunk_states:
+        return out.view_as(x)
+    return out.view_as(x), states[1].view(batch, -1, *states[1].shape[1:])
 
 
 class _EngineChunkScanFn(torch.autograd.Function):
@@ -212,54 +237,144 @@ def mamba_chunk_scan_combined_train(
     )
 
 
-def _ssm_training(self, zxBCdt, packed_seq_params=None):
-    """``MambaMixer._ssm_training`` on the engine's kernels in batch-invariant mode."""
+def _split_proj(self, zxBCdt):
+    """(z, xBC, dt) of the in-projection output, (l, b, d) -> (b, l, d) each."""
+    from einops import rearrange
+
+    zxBCdt = rearrange(zxBCdt, "l b d -> b l d").contiguous()
+    d_inner = self.cp.d_inner_local_tpcp
+    groups_state = self.cp.ngroups_local_tpcp * self.d_state
+    return torch.split(
+        zxBCdt, [d_inner, d_inner + 2 * groups_state, self.cp.nheads_local_tpcp], dim=-1
+    )
+
+
+def _conv(self, xBC_bdl):
+    """The non-fused training conv (``MambaMixer._static_prefill``) over (b, d, l) inputs.
+
+    Bitwise equal to the engine's varlen prefill conv and its decode update.
+    Returns (b, l, d).
+    """
     from causal_conv1d import causal_conv1d_fn
     from einops import rearrange
 
-    if not self.config.batch_invariant_mode:
-        return _ORIGINAL_SSM_TRAINING[0](self, zxBCdt, packed_seq_params)
+    out = causal_conv1d_fn(
+        x=xBC_bdl,
+        weight=rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
+        bias=self.cp.get_conv1d_bias(),
+        activation=self.activation,
+    )
+    return rearrange(out, "b d l -> b l d").contiguous()
+
+
+def _scan_and_gate(self, xBC, z, dt, scan):
+    """SSD scan of the conv output, gate inside the scan, gated RMSNorm: (l, b, d).
+
+    ``scan(*args)``: ``mamba_chunk_scan_combined_train`` (training) or an
+    ``_engine_scan`` closure (prefix-state forwards); returns (y, extra).
+    """
+    from einops import rearrange
+
+    d_inner = self.cp.d_inner_local_tpcp
+    groups_state = self.cp.ngroups_local_tpcp * self.d_state
+    x, B, C = torch.split(xBC, [d_inner, groups_state, groups_state], dim=-1)
+    D = self.cp.get_D()
+    if self.D_has_hdim:
+        D = rearrange(D.float(), "(h p) -> h p", p=self.headdim)
+    y, extra = scan(
+        rearrange(x, "b l (h p) -> b l h p", p=self.headdim).contiguous(),
+        dt.contiguous(),
+        -torch.exp(self.cp.get_A_log().float()),
+        rearrange(B, "b l (g n) -> b l g n", n=self.d_state).contiguous(),
+        rearrange(C, "b l (g n) -> b l g n", n=self.d_state).contiguous(),
+        self.chunk_size,
+        D,
+        rearrange(z, "b l (h p) -> b l h p", p=self.headdim).contiguous(),
+        self.cp.get_dt_bias().float(),
+    )
+    y = rearrange(y, "b l h p -> l b (h p)").contiguous()
+    y = self.cp.post_conv_ssm(y)
+    # The gate went through the scan, as the engine's prefill and decode apply it.
+    return self.norm(y), extra
+
+
+def _check_bi_mixer(self, packed_seq_params) -> None:
     assert packed_seq_params is None, (
         "batch-invariant Mamba training does not pack sequences"
     )
     assert self.rmsnorm, "batch-invariant Mamba requires the gated RMSNorm"
 
-    zxBCdt = rearrange(zxBCdt, "l b d -> b l d").contiguous()
-    A = -torch.exp(self.cp.get_A_log().float())
-    d_inner = self.cp.d_inner_local_tpcp
-    groups_state = self.cp.ngroups_local_tpcp * self.d_state
-    z, xBC, dt = torch.split(
-        zxBCdt, [d_inner, d_inner + 2 * groups_state, self.cp.nheads_local_tpcp], dim=-1
-    )
-    # The non-fused training conv (MambaMixer._static_prefill), bitwise equal to the
-    # engine's varlen prefill conv and its decode update.
-    xBC = causal_conv1d_fn(
-        x=rearrange(xBC, "b l d -> b d l").contiguous(),
-        weight=rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
-        bias=self.cp.get_conv1d_bias(),
-        activation=self.activation,
-    )
-    xBC = rearrange(xBC, "b d l -> b l d").contiguous()
-    x, B, C = torch.split(xBC, [d_inner, groups_state, groups_state], dim=-1)
-    D = self.cp.get_D()
-    if self.D_has_hdim:
-        D = rearrange(D.float(), "(h p) -> h p", p=self.headdim)
-    y = mamba_chunk_scan_combined_train(
-        rearrange(x, "b l (h p) -> b l h p", p=self.headdim).contiguous(),
-        dt.contiguous(),
-        A,
-        rearrange(B, "b l (g n) -> b l g n", n=self.d_state).contiguous(),
-        rearrange(C, "b l (g n) -> b l g n", n=self.d_state).contiguous(),
-        self.chunk_size,
-        D=D,
-        z=rearrange(z, "b l (h p) -> b l h p", p=self.headdim).contiguous(),
-        dt_bias=self.cp.get_dt_bias().float(),
-        dt_softplus=True,
-    )
-    y = rearrange(y, "b l h p -> l b (h p)").contiguous()
-    y = self.cp.post_conv_ssm(y)
-    # The gate went through the scan, as the engine's prefill and decode apply it.
-    return self.norm(y)
+
+def _ssm_training(self, zxBCdt, packed_seq_params=None):
+    """``MambaMixer._ssm_training`` on the engine's kernels in batch-invariant mode."""
+    from einops import rearrange
+
+    if not self.config.batch_invariant_mode:
+        return _ORIGINAL_SSM_TRAINING[0](self, zxBCdt, packed_seq_params)
+    _check_bi_mixer(self, packed_seq_params)
+    z, xBC, dt = _split_proj(self, zxBCdt)
+    xBC = _conv(self, rearrange(xBC, "b l d -> b d l").contiguous())
+
+    def scan(x, dt, A, B, C, chunk_size, D, z, dt_bias):
+        y = mamba_chunk_scan_combined_train(
+            x, dt, A, B, C, chunk_size, D=D, z=z, dt_bias=dt_bias, dt_softplus=True
+        )
+        return y, None
+
+    return _scan_and_gate(self, xBC, z, dt, scan)[0]
+
+
+def ssm_prefix_forward(self, zxBCdt, conv_init, ssm_init):
+    """``_ssm_training`` of row segments that continue longer rows (no autograd).
+
+    Row b of ``zxBCdt`` (l, b, d) holds the in-projection of positions
+    [s_b, s_b + l) of a row, s_b a multiple of ``chunk_size`` (padding past the
+    row's end is harmless: everything is causal). ``conv_init`` (b, conv_dim,
+    d_conv - 1): the conv inputs (xBC) of positions [s_b - d_conv + 1, s_b)
+    (zeros for s_b = 0); ``ssm_init`` (b, nheads, headdim, dstate) fp32: the
+    SSM state at s_b (zeros for s_b = 0).
+
+    Bitwise the rows' positions [s_b, s_b + l) of ``_ssm_training`` of the whole
+    rows: the conv of every output position sees the same d_conv inputs in
+    the same order, and the chunked scan restarted at a chunk boundary from
+    that boundary's fp32 state runs the same per-chunk kernels and the same
+    state recurrence as the full scan (the engine's batch-invariant prefill
+    with prefix caching relies on the same identity).
+
+    Returns (y (l, b, d), xBC_ext (b, conv_dim, d_conv - 1 + l) conv inputs,
+    chunk_states (b, chunks, nheads, headdim, dstate) fp32 states at the end
+    of each chunk).
+    """
+    from einops import rearrange
+
+    _check_bi_mixer(self, None)
+    assert not torch.is_grad_enabled(), "prefix-state forwards run without autograd"
+    z, xBC, dt = _split_proj(self, zxBCdt)
+    xBC_ext = torch.cat(
+        [conv_init.to(xBC.dtype), rearrange(xBC, "b l d -> b d l")], dim=-1
+    ).contiguous()
+    width = conv_init.shape[-1]
+    xBC_out = _conv(self, xBC_ext)[:, width:].contiguous()
+
+    def scan(x, dt, A, B, C, chunk_size, D, z, dt_bias):
+        return _engine_scan(
+            x,
+            dt,
+            A,
+            B,
+            C,
+            chunk_size,
+            D,
+            z,
+            dt_bias,
+            True,
+            (0.0, float("inf")),
+            initial_states=ssm_init,
+            return_chunk_states=True,
+        )
+
+    y, chunk_states = _scan_and_gate(self, xBC_out, z, dt, scan)
+    return y, xBC_ext, chunk_states
 
 
 def install() -> None:

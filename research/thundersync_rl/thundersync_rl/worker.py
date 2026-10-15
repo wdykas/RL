@@ -265,6 +265,21 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         sticky_rounding.configure(
             sticky_rounding.sticky_rounding_enabled(self.cfg), self.model
         )
+        # Bumped whenever the learner's parameters change (optimizer step, draft
+        # weight swap): state cached from a forward (learner prefix-state cache)
+        # is valid only for the version it was computed at.
+        self._weights_version = 0
+        if getattr(self, "optimizer", None) is not None:
+            step = self.optimizer.step
+
+            def step_and_bump(*args: Any, **kwargs: Any) -> Any:
+                try:
+                    return step(*args, **kwargs)
+                finally:
+                    self._weights_version += 1
+
+            self.optimizer.step = step_and_bump
+        self._prefix_cache = None
 
     def stream_begin_step(
         self,
@@ -382,6 +397,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         _call_log(self, "load_draft_weights")
         if getattr(self, "_draft_swap", None) is not None:
             raise RuntimeError("draft weights already loaded")
+        self._weights_version += 1
         self._draft_swap: Optional[DraftSwap] = load_draft(self.optimizer, kind)
         self._log_mem(f"load_draft_weights {kind}")
         return dict(self._draft_swap.stats)
@@ -392,6 +408,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         swap, self._draft_swap = self._draft_swap, None
         if swap is None:
             raise RuntimeError("no draft weights loaded")
+        self._weights_version += 1
         return restore_training(swap)
 
     def stage_engine_weights(self) -> dict[str, float]:
@@ -2700,9 +2717,22 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         null_envelopes: list[list[float]] | None = None,
         row_ranks: list[int] | None = None,
         band: float | None = None,
+        prefix_keys: list[str | None] | None = None,
+        prefix_release: list[str] | None = None,
+        prefix_gpu_gb: float = 8.0,
         **_: Any,
     ) -> list[tuple[int, dict[str, Any]]]:
         """Block verification with q from the engine and p from the training model.
+
+        Learner prefix-state cache (``prefix_keys``; DESIGN 14o): row i is
+        cached under ``prefix_keys[i]`` (None: not cached) and forwarded only
+        from its largest cached chunk boundary <= prompt_lens[i] - 1 whose
+        tokens match; its p logits are bitwise those of the whole-row forward
+        (``prefix_state_cache.py``). ``prefix_release``: keys to drop first.
+        The driver decides membership (the same lists reach every rank of a
+        replica); ``prefix_gpu_gb`` bounds this rank's device residency
+        (colder rows wait in pinned host memory). Each result then carries
+        "prefix_start" (positions not forwarded).
 
         ``row_ranks[i]``: the data-parallel rank that verifies row i (the
         driver balances tokens, ``speculative.lpt_owners``); default: a stable
@@ -2820,10 +2850,19 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             )
         else:
             mine = self._my_rows(rows, keys)
+        cache = None
+        starts = dict.fromkeys(mine, 0)
+        if prefix_keys is not None:
+            cache = self._prefix_state_cache(prefix_gpu_gb)
+            cache.set_weights_version(self._weights_version)
+            cache.release(prefix_release)
+            starts = {
+                i: cache.start(prefix_keys[i], rows[i], prompt_lens[i]) for i in mine
+            }
         # Several drafts per training-shaped forward (padded as training pads a
         # micro-batch): batch-invariant kernels give each row the same logits
         # as a one-row forward, and per-call overhead dominates small rows.
-        batches = self._row_batches([rows[i] for i in mine], batch_tokens)
+        batches = self._row_batches([rows[i][starts[i] :] for i in mine], batch_tokens)
         batches = [[mine[j] for j in b] for b in batches]
         lockstep = self._expert_parallel_lockstep([[] for _ in batches])
         n_dummy = 0 if lockstep is None else len(lockstep) - len(batches)
@@ -2869,7 +2908,16 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                     prefetch(bi)
                     prefetch(bi + 1)
                 t0 = time.perf_counter()
-                if anchors is not None:
+                if cache is not None:
+                    lb = self._prefix_cached_forward(
+                        cache,
+                        [prefix_keys[i] for i in batch],
+                        [rows[i] for i in batch],
+                        [starts[i] for i in batch],
+                        None if anchors is None else [anchors[i] for i in batch],
+                        [prompt_lens[i] for i in batch],
+                    )
+                elif anchors is not None:
                     lb = self._training_forward_rows(
                         [rows[i] for i in batch],
                         anchors=[anchors[i] for i in batch],
@@ -2890,6 +2938,9 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             g = n - plen
             if logits is None:  # not the last pipeline stage
                 continue
+            # Logits of positions [starts[i], n) (prefix-state cache; else 0).
+            off = starts[i]
+            plen, n = plen - off, n - off
             dev = logits.device
             if gen is None:
                 gen = torch.Generator(device=dev).manual_seed(
@@ -2906,7 +2957,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 # invariant training's gathered log-softmax computes them.
                 p_lp = GatheredLogprobRows(logits[0, plen - 1 : n], gather, vocab_limit)
             del logits
-            draft = rows[i][plen:].to(dev)
+            draft = rows[i][plen + off :].to(dev)
             lq = torch.tensor(engine_logq[i], dtype=torch.float32, device=dev)
             assert lq.numel() == g, (lq.numel(), g)
             assert hidden_num_rows(hidden[i]) == g, (hidden_num_rows(hidden[i]), g)
@@ -2993,6 +3044,8 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                             f"versions_at={[version[t] for t in pos]} segs={segments[i]}",
                             flush=True,
                         )
+            if cache is not None:
+                res["prefix_start"] = off
             results.append((i, {**res, "hidden_bytes_fetched": fetched, **fetch_info}))
             del p_lp, h
         if pf is not None:
@@ -3004,6 +3057,14 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             self._dummy_training_forward()
         self._prof["ep_dummy_forwards"] = n_dummy
         self._prof["q_rows"] = n_rows
+        if cache is not None:
+            self._prof["prefix_tokens_skipped"] = sum(starts.values())
+            self._prof["prefix_tokens_forwarded"] = sum(
+                rows[i].numel() - starts[i] for i in mine
+            )
+            self._prof.update(
+                {f"prefix_cache_{k}_bytes": v for k, v in cache.bytes().items() if k != "rows"}
+            )
         self._prof.update(prof_pop())
         self._log_mem("verify_drafts_block_engine")
         if check and last_stage:
@@ -3112,6 +3173,55 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 "fused verification + training unsupported: " + "; ".join(problems)
             )
 
+    def _prefix_state_cache(self, gpu_gb: float):
+        """This rank's learner prefix-state cache (created on first use; hooks the model)."""
+        from nemo_rl.models.megatron.prefix_state_cache import PrefixStateCache
+
+        if self._prefix_cache is None:
+            from nemo_rl.models.megatron import sticky_rounding
+
+            if sticky_rounding.enabled():
+                raise NotImplementedError(
+                    "learner_prefix_cache with sticky_rounding: the theta_n anchor "
+                    "forward's cached state is not built yet"
+                )
+            self._prefix_cache = PrefixStateCache(self.model, int(gpu_gb * 2**30))
+        self._prefix_cache.gpu_bytes = int(gpu_gb * 2**30)
+        return self._prefix_cache
+
+    def prefix_state_cache_costs(self) -> dict[str, int]:
+        """This rank's cache bytes per cached position and per kept chunk boundary."""
+        return self._prefix_state_cache(8.0).costs()
+
+    def _prefix_cached_forward(
+        self, cache, keys, rows, starts, anchors, prompt_lens
+    ) -> torch.Tensor | None:
+        """Logits [B, S, V] of rows[b][starts[b]:] continued from the prefix-state cache.
+
+        ``THUNDERSYNC_PREFIX_CACHE_CHECK=1``: also run the whole rows and count
+        the rows whose logits at positions [prompt - 1, n) are bitwise equal
+        (expected: all).
+        """
+        segs = [r[s:] for r, s in zip(rows, starts)]
+        with cache.forward(keys, rows, starts):
+            lb = self._training_forward_rows(segs, anchors=anchors, anchor_starts=starts)
+        if os.environ.get("THUNDERSYNC_PREFIX_CACHE_CHECK") == "1":
+            full = self._training_forward_rows(rows, anchors=anchors)
+            if lb is not None:
+                st = self.__dict__.setdefault(
+                    "_prefix_check", {"rows": 0, "exact": 0, "hits": 0, "positions": 0}
+                )
+                for b, (r, s, p) in enumerate(zip(rows, starts, prompt_lens)):
+                    n = r.numel()
+                    same = torch.equal(lb[b, p - 1 - s : n - s], full[b, p - 1 : n])
+                    st["rows"] += 1
+                    st["exact"] += int(same)
+                    st["hits"] += int(s > 0)
+                    st["positions"] += n - p + 1
+                print(f"[prefix cache check] rank={self.rank} {st}", flush=True)
+            del full
+        return lb
+
     def _row_batches(
         self, rows: list[torch.Tensor], batch_tokens: int
     ) -> list[list[int]]:
@@ -3147,7 +3257,11 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         return self._training_forward_rows([row], anchors=[anchors])
 
     def _anchor_batch(
-        self, anchors: list[Any] | None, batch: int, width: int
+        self,
+        anchors: list[Any] | None,
+        batch: int,
+        width: int,
+        starts: list[int] | None = None,
     ) -> torch.Tensor | None:
         """``routed_experts`` [batch, width, L_stage, K] for a sticky-routing forward.
 
@@ -3155,6 +3269,8 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         (or None). Only this pipeline stage's MoE layers are materialized, and
         only their blocks are fetched from the object store. Rows without
         anchors (and padding) get -1: anchor = self, i.e. plain routing.
+        ``starts[b]``: row b's batch row holds positions [starts[b], ...) of the
+        rollout (prefix-state forwards), so its anchors start there too.
         """
         from nemo_rl.models.megatron import sticky_routing
 
@@ -3166,7 +3282,8 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         out = torch.full((batch, width, len(layers), k), -1, dtype=ROUTE_DTYPE)
         for b, a in enumerate(anchors or []):
             if a is not None:
-                out[b] = fetch_anchors(a, layers, k, width, ray.get)
+                lo = 0 if starts is None else starts[b]
+                out[b] = fetch_anchors(a, layers, k, width, ray.get, lo=lo)
         return out
 
     def _stage_route_layers(self) -> tuple[list[int], int]:
@@ -3187,9 +3304,15 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         return layers
 
     def _training_forward_rows(
-        self, rows: list[torch.Tensor], anchors: list[Any] | None = None
+        self,
+        rows: list[torch.Tensor],
+        anchors: list[Any] | None = None,
+        anchor_starts: list[int] | None = None,
     ) -> torch.Tensor | None:
         """Logits [B, S, V] of ``rows`` in one micro-batch, exactly as a training forward.
+
+        ``anchor_starts[b]``: rows[b] holds rollout positions [anchor_starts[b], ...)
+        (a prefix-state forward); its anchors are taken from there.
 
         Same padding (``make_sequence_length_divisible_by``), micro-batch
         processing and ``model_forward`` call as ``train_microbatch``; autograd
@@ -3208,7 +3331,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         for b, row in enumerate(rows):
             ids[b, : lens[b]] = row
         data = BatchedDataDict({"input_ids": ids, "input_lengths": torch.tensor(lens)})
-        routed = self._anchor_batch(anchors, len(rows), ids.shape[1])
+        routed = self._anchor_batch(anchors, len(rows), ids.shape[1], anchor_starts)
         if routed is not None:
             # Sticky routing: the forward that defines p replays the anchors
             # through the training path's RouterReplay (REPLAY_FORWARD).

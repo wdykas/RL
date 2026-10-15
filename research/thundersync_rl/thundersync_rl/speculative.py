@@ -56,6 +56,7 @@ from thundersync_rl.engine_q import (
 from thundersync_rl.fused_train import FusedRef
 from thundersync_rl.multi_turn import TurnEnvironment, TurnRecord, pair_rows, replay
 from thundersync_rl.null_bv import NullGroup, NullPolicy, row_envelopes
+from thundersync_rl.prefix_cache import PrefixCacheDirectory, lpt_owners
 from thundersync_rl.tail_trace import TailTrace
 from thundersync_rl.routes import (
     RouteRefs,
@@ -88,20 +89,6 @@ def _null_result(res: dict[str, Any], m: Optional[float]) -> dict[str, Any]:
         "null_m": m,
         "log_wstar": res.get("null_log_wstar", 0.0),
     }
-
-
-def lpt_owners(lengths: list[int], ranks: int) -> list[int]:
-    """Rank of each row: longest first onto the least-loaded rank (by tokens).
-
-    Placement only: which rank forwards a row does not enter any decision.
-    """
-    load = [0] * ranks
-    owner = [0] * len(lengths)
-    for i in sorted(range(len(lengths)), key=lambda i: (-lengths[i], i)):
-        r = min(range(ranks), key=lambda r: (load[r], r))
-        owner[i] = r
-        load[r] += lengths[i]
-    return owner
 
 
 def data_parallel_size(group) -> int:
@@ -195,6 +182,9 @@ class Plan:
     # Needed a continuation after verification (a tail row: rejected inside
     # its draft, or a whole-accepted draft cut before EOS / the cap).
     tail: bool = field(default=False, compare=False)
+    # Learner prefix-state cache: the key the learner caches this rollout's
+    # verification state under (continuation pieces; DESIGN 14o).
+    prefix_key: Optional[str] = field(default=None, compare=False)
     # Log of the row's importance (loss) weight, 0 for exact samples of p.
     # Opt-in tools only: drop-IS (log max(1, W*/M), needs null_bv) or banded
     # IS (log w at the band exit, excludes null_bv).
@@ -372,6 +362,7 @@ class SpeculativeGeneration:
         max_seq_len: Optional[int] = None,
         anchor_horizon: Optional[int] = None,
         banded_is_band: Optional[float] = None,
+        learner_prefix_cache: Optional[dict[str, float]] = None,
     ):
         self.base = base
         self.learner_policy = learner_policy
@@ -486,6 +477,15 @@ class SpeculativeGeneration:
         # Continuations are verified every this many decoded tokens while the
         # engine keeps decoding them (``_continue_sticky``).
         self.sticky_chunk_tokens = sticky_chunk_tokens
+        # Learner prefix-state cache (DESIGN 14o): continuation pieces are
+        # forwarded from the row's cached state on the learner rank that holds
+        # it ({"gpu_gb", "max_gb"} per learner rank; None: off).
+        self.prefix_cache = (
+            None
+            if learner_prefix_cache is None
+            else PrefixCacheDirectory(**learner_prefix_cache)
+        )
+        self._prefix_step: Optional[int] = None
         # Measurement only: the deadline waits for every draft to finish.
         self.draft_until_complete = draft_until_complete
         self._cont_ids = itertools.count()
@@ -1464,7 +1464,9 @@ class SpeculativeGeneration:
         futs = self._submit_verify_block(flat, rows, null_envelopes, band=band)
         return self._verify_block_results(flat, [(a, ray.get(refs)) for a, refs in futs])
 
-    async def _verify_block_async(self, flat, rows) -> dict[int, dict[str, Any]]:
+    async def _verify_block_async(
+        self, flat, rows, prefix_keys: Optional[list[str]] = None
+    ) -> dict[int, dict[str, Any]]:
         """``_verify_block`` without blocking the driver's event loop.
 
         While streaming over the tails it is an ordered learner call
@@ -1472,7 +1474,7 @@ class SpeculativeGeneration:
         may start queued calls in different orders on different ranks; the
         numbered calls run in the same order everywhere.
         """
-        futs = self._submit_verify_block(flat, rows, ordered=True)
+        futs = self._submit_verify_block(flat, rows, ordered=True, prefix_keys=prefix_keys)
         done = []
         for a, refs in futs:
             # A worker thread waits on the results; the event loop keeps going.
@@ -1482,11 +1484,13 @@ class SpeculativeGeneration:
         return self._verify_block_results(flat, done)
 
     def _submit_verify_block(
-        self, flat, rows, null_envelopes=None, ordered=False, band=None
+        self, flat, rows, null_envelopes=None, ordered=False, band=None, prefix_keys=None
     ) -> list:
         """Send ``flat``'s block verification to the verifier pools: [(first row, refs)].
 
         ``ordered``: as numbered learner calls while streaming over the tails.
+        ``prefix_keys`` (learner prefix-state cache on): the rows' cache keys;
+        a row goes to the rank that holds its state (``PrefixCacheDirectory``).
         """
         # Contiguous row slices per verifier pool, verified concurrently.
         k = len(self.verifiers)
@@ -1498,7 +1502,24 @@ class SpeculativeGeneration:
                 # Rows placed on the pool's data-parallel ranks by tokens.
                 lengths = [r.numel() for r in rows[a:b]]
                 ranks = data_parallel_size(g)
-                owners = lpt_owners(lengths, ranks)
+                if prefix_keys is not None and self.prefix_cache is not None:
+                    plens = [d[0].numel() for _, d in flat[a:b]]
+                    loads = [
+                        self.prefix_cache.forwarded(k, n, p)
+                        for k, n, p in zip(prefix_keys[a:b], lengths, plens)
+                    ]
+                    owners, sent = self.prefix_cache.place(
+                        prefix_keys[a:b], lengths, plens, ranks
+                    )
+                    extra = {
+                        **extra,
+                        "prefix_keys": sent,
+                        "prefix_release": self.prefix_cache.take_release(),
+                        "prefix_gpu_gb": self.prefix_cache.gpu_gb,
+                    }
+                    lengths = loads
+                else:
+                    owners = lpt_owners(lengths, ranks)
                 extra = {**extra, "row_ranks": owners}
                 self._count_balance(lengths, owners, ranks)
             if null_envelopes is not None:
@@ -2666,6 +2687,8 @@ class SpeculativeGeneration:
         chunk = max(1, int(self.sticky_chunk_tokens))
         version = self.current_step - 1
         stats = dict(rounds=0, streams=0, tokens=0, kept=0, retries=0, turns=0)
+        stats.update(prefix_rows=0, prefix_hits=0, prefix_skipped=0)
+        self._prefix_cache_begin()
         live: list[dict[str, Any]] = []
         retries: dict[int, int] = defaultdict(int)
         turns: dict[asyncio.Task, tuple] = {}
@@ -2894,6 +2917,10 @@ class SpeculativeGeneration:
                 )
                 stats["tokens"] += g
                 stats["kept"] += n_acc
+                if "prefix_start" in out:
+                    stats["prefix_rows"] += 1
+                    stats["prefix_hits"] += int(out["prefix_start"] > 0)
+                    stats["prefix_skipped"] += out["prefix_start"]
                 start_pos = s["taken"]
                 if n_acc == g:
                     plan.prefix += list(toks)
@@ -2928,6 +2955,11 @@ class SpeculativeGeneration:
                         trace.completed(plan)
             if trace is not None:
                 trace.round(len(live), len(flat), t_verify, n_rejects)
+            if self.prefix_cache is not None:
+                # Complete rollouts need no more pieces: free their learner state.
+                self.prefix_cache.release(
+                    s["plan"].prefix_key for s in owners if s["plan"].complete
+                )
             if done_streams:
                 stop(done_streams)
                 # Rollouts waiting on these plans can be served and trained.
@@ -2963,7 +2995,11 @@ class SpeculativeGeneration:
                     flat, rows, owners = pieces(cand) if cand else ([], [], [])
                     if flat:
                         stats["rounds"] += 1
-                        task = asyncio.create_task(self._verify_block_async(flat, rows))
+                        task = asyncio.create_task(
+                            self._verify_block_async(
+                                flat, rows, self._prefix_keys([s["plan"] for s in owners])
+                            )
+                        )
                         inflight[task] = (flat, owners, time.perf_counter())
                         busy.update(id(s) for s in owners)
                         progressed = True
@@ -2977,6 +3013,15 @@ class SpeculativeGeneration:
         finally:
             for task in inflight:
                 task.cancel()
+            if self.prefix_cache is not None:
+                self.prefix_cache.release(plan.prefix_key for _, plan in pending)
+        if stats["prefix_rows"]:
+            self.stats.update(
+                {
+                    "spec/prefix_cache_hit_frac": stats["prefix_hits"] / stats["prefix_rows"],
+                    "spec/prefix_cache_tokens_skipped": float(stats["prefix_skipped"]),
+                }
+            )
         self.stats.update(
             {
                 "spec/sticky_rounds": float(stats["rounds"]),
@@ -2992,6 +3037,32 @@ class SpeculativeGeneration:
             # Environment latency now sits before the refit (DESIGN 14m).
             self.stats["spec/sticky_env_s"] = self.turn_env.env_s
             self.turn_env.env_s = 0.0
+
+    def _prefix_cache_begin(self) -> None:
+        """Learner prefix-state cache: costs on first use; empty at each new step.
+
+        The learner drops its cached states when its weights change (every
+        optimizer step), so the directory starts empty for each step's rounds.
+        """
+        if self.prefix_cache is None:
+            return
+        if not self.prefix_cache.configured:
+            costs = ray.get(
+                self.verifiers[0].run_all_workers_single_data("prefix_state_cache_costs")
+            )
+            self.prefix_cache.configure(costs)
+        if self._prefix_step != self.current_step:
+            self.prefix_cache.reset()
+            self._prefix_step = self.current_step
+
+    def _prefix_keys(self, plans) -> Optional[list[str]]:
+        """Cache keys of the plans whose pieces are verified (None: cache off)."""
+        if self.prefix_cache is None:
+            return None
+        for plan in plans:
+            if plan.prefix_key is None:
+                plan.prefix_key = self.prefix_cache.new_key()
+        return [plan.prefix_key for plan in plans]
 
     def claim_anchors(
         self, prompt: torch.Tensor, token_ids: torch.Tensor

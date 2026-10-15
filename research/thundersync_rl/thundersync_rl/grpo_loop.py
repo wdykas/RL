@@ -302,6 +302,22 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # remainder (2048 > a 1024 cap re-decoded the remainder: 1.2-1.9x plain
     # decode per kept token, DESIGN.md section 14k).
     sticky_continuation_chunk_tokens: int = 128
+    # Learner prefix-state cache (DESIGN.md section 14o; nemo_rl/models/megatron/
+    # prefix_state_cache.py). Each continuation piece is verified by a forward
+    # of positions [last Mamba chunk boundary before the piece, end of piece)
+    # from the row's cached attention K/V and Mamba conv/SSM state, instead of
+    # the whole row: per continued row O(L) learner work instead of
+    # O(L^2 / piece). Bitwise the whole-row forward's logits (batch
+    # invariance). The driver keeps a row on the learner rank that holds its
+    # state. Per learner rank: device residency gpu_gb (colder rows wait in
+    # pinned host memory), total max_gb (least recently verified rows are
+    # dropped beyond it: slower, same bits). Requires sticky_routing,
+    # verify_source=engine, verify_on=learner, no sticky_rounding, no context
+    # parallelism, a model without RoPE (Nemotron-H; RoPE offsets not built
+    # yet). Off until validated.
+    learner_prefix_cache: bool = False
+    learner_prefix_cache_gpu_gb: float = 8.0
+    learner_prefix_cache_max_gb: float = 32.0
     # Sticky, one engine: serve and train every rollout whose plan is complete
     # while the continuation rounds of the other rows still run (both are
     # learner-side at theta_k; DESIGN.md section 14k). False: training starts
@@ -481,6 +497,7 @@ def validate_config(master_config: ThunderSyncMasterConfig) -> None:
     validate_sticky_rounding(master_config)
     validate_null_bv(master_config)
     validate_tail_tools(master_config)
+    validate_learner_prefix_cache(master_config)
     if master_config.thundersync.draft_until_complete and not (
         master_config.thundersync.sticky_routing
     ):
@@ -491,6 +508,31 @@ def validate_config(master_config: ThunderSyncMasterConfig) -> None:
     validate_draft_weights(master_config)
     validate_cohort_lanes(master_config)
     validate_banded_is(master_config)
+
+
+def validate_learner_prefix_cache(master_config: ThunderSyncMasterConfig) -> None:
+    """Settings the learner prefix-state cache is built for (DESIGN 14o)."""
+    ts_cfg = master_config.thundersync
+    if not ts_cfg.learner_prefix_cache:
+        return
+    megatron_cfg = master_config.policy["megatron_cfg"]
+    problems = []
+    if not ts_cfg.sticky_routing:
+        problems.append("it caches continuation pieces: needs sticky_routing")
+    if ts_cfg.verify_source != "engine":
+        problems.append("needs verify_source=engine")
+    if ts_cfg.verify_on != "learner":
+        problems.append("needs verify_on=learner")
+    if ts_cfg.sticky_rounding:
+        problems.append("sticky_rounding's theta_n anchor forward is not cached (not built yet)")
+    if not megatron_cfg.get("batch_invariant_mode"):
+        problems.append("needs policy.megatron_cfg.batch_invariant_mode")
+    if megatron_cfg.get("context_parallel_size", 1) != 1:
+        problems.append("context parallelism not built yet")
+    if ts_cfg.learner_prefix_cache_max_gb <= 0 or ts_cfg.learner_prefix_cache_gpu_gb < 0:
+        problems.append("needs learner_prefix_cache_max_gb > 0 and gpu_gb >= 0")
+    if problems:
+        raise ValueError("thundersync.learner_prefix_cache: " + "; ".join(problems) + ".")
 
 
 def validate_cohort_lanes(master_config: ThunderSyncMasterConfig) -> None:
@@ -1827,6 +1869,14 @@ def make_speculative_generation(
         max_seq_len=master_config.policy["max_total_sequence_length"],
         anchor_horizon=(
             ts_cfg.sticky_anchor_horizon if sticky_delta(ts_cfg) is not None else None
+        ),
+        learner_prefix_cache=(
+            {
+                "gpu_gb": ts_cfg.learner_prefix_cache_gpu_gb,
+                "max_gb": ts_cfg.learner_prefix_cache_max_gb,
+            }
+            if ts_cfg.learner_prefix_cache
+            else None
         ),
     )
 
