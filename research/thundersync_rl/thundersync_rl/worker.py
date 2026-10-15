@@ -570,6 +570,7 @@ class ThunderSyncMegatronPolicyWorker(verify_yield.YieldWorkerMixin, MegatronPol
         this rank; ``caches``: also check the fp16 expert-weight cache against
         the parameters (only while the learner holds its training weights).
         """
+        self._assert_no_refit("sentinel_weight_digest")
         from megatron.core import parallel_state as ps
 
         from thundersync_rl.sentinel import (
@@ -746,6 +747,38 @@ class ThunderSyncMegatronPolicyWorker(verify_yield.YieldWorkerMixin, MegatronPol
         from thundersync_rl import engine_prof
 
         return engine_prof.summary()
+
+    # -- refit-in-flight guard (research/ray_order_audit.md, "latent: mid-refit window") --
+    # The refit transfers below are ``async def`` and run off the actor's event loop
+    # (``await_off_loop``), so the actor serves other calls meanwhile. Calls that read the
+    # live weights (head stash, engine verification, weight digests) must never run then:
+    # today the driver's schedule guarantees it; this turns a regression into an error.
+    def _refit_guard_enter(self) -> None:
+        self.__dict__["_ts_refit_in_flight"] = self.__dict__.get("_ts_refit_in_flight", 0) + 1
+
+    def _refit_guard_exit(self) -> None:
+        self.__dict__["_ts_refit_in_flight"] = self.__dict__.get("_ts_refit_in_flight", 1) - 1
+
+    def _assert_no_refit(self, what: str) -> None:
+        if self.__dict__.get("_ts_refit_in_flight", 0) > 0:
+            raise RuntimeError(
+                f"{what} called while a weight refit is in flight on this worker "
+                "(it would read half-updated weights; research/ray_order_audit.md)"
+            )
+
+    async def update_weights_from_collective(self, *args, **kwargs):
+        self._refit_guard_enter()
+        try:
+            return await super().update_weights_from_collective(*args, **kwargs)
+        finally:
+            self._refit_guard_exit()
+
+    async def nccl_reshard_refit(self, *args, **kwargs):
+        self._refit_guard_enter()
+        try:
+            return await super().nccl_reshard_refit(*args, **kwargs)
+        finally:
+            self._refit_guard_exit()
 
     def keep_refit_group(self, lane: int) -> None:
         """Learner rank: file the live refit communicators under engine lane ``lane``.
@@ -3601,6 +3634,7 @@ class ThunderSyncMegatronPolicyWorker(verify_yield.YieldWorkerMixin, MegatronPol
         prefill). The coordinator places requests on any data-parallel rank;
         that rank keeps the rows (``engine_verify_ready``).
         """
+        self._assert_no_refit("run_verify_requests")
         from thundersync_rl.engine_q import ANCHOR_KEY_ATTR
         from thundersync_rl.engine_verify import VERIFY_KEY_ATTR, VERIFY_PLEN_ATTR
 
@@ -3759,6 +3793,7 @@ class ThunderSyncMegatronPolicyWorker(verify_yield.YieldWorkerMixin, MegatronPol
         Runs in a thread (the actor keeps serving the driver's draft and log
         calls meanwhile). See ``_engine_verify_decide``.
         """
+        self._assert_no_refit("engine_verify_decide")
         dev = torch.cuda.current_device()
         if getattr(self, "_ev_stream", None) is None:
             # Own (non-blocking) stream: the decision's host syncs wait for its
@@ -4174,6 +4209,7 @@ class ThunderSyncMegatronPolicyWorker(verify_yield.YieldWorkerMixin, MegatronPol
         Pipeline parallelism: only the last stage holds the head and verifies;
         other stages stash nothing and return 0.
         """
+        self._assert_no_refit("stash_head")
         head = self._lm_head()
         if head is None:
             return 0
