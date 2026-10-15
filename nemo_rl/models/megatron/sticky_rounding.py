@@ -641,11 +641,15 @@ def _patch_forward(cls: type, wrap) -> None:
     """``cls.forward = wrap(cls.forward)`` unless cls's own forward is already patched.
 
     A subclass that inherits a patched forward is covered by its base's patch.
+    Patched forwards carry ``_sticky_rounding_patch`` (``__wrapped__`` is not a
+    marker: MCore decorates some forwards with ``functools.wraps``).
     """
     own = cls.__dict__.get("forward")
-    if own is None or hasattr(own, "__wrapped__"):
+    if own is None or getattr(own, "_sticky_rounding_patch", False):
         return
-    cls.forward = wrap(own)
+    patched = wrap(own)
+    patched._sticky_rounding_patch = True  # type: ignore[attr-defined]
+    cls.forward = patched
 
 
 def install() -> None:

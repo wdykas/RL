@@ -513,6 +513,46 @@ def test_patch_forward_is_idempotent_and_skips_inherited_forwards():
         Base.forward = orig
 
 
+def test_patch_forward_patches_forwards_decorated_with_functools_wraps():
+    """MCore decorates some forwards (LanguageModelEmbedding) with functools.wraps: still patched."""
+    import functools
+
+    def deco(f):
+        @functools.wraps(f)
+        def g(*a, **k):
+            return f(*a, **k)
+
+        return g
+
+    class Emb(torch.nn.Module):
+        @deco
+        def forward(self, x):
+            return x
+
+    calls = []
+
+    def wrap(orig):
+        def forward(self, *a, **k):
+            calls.append(1)
+            return orig(self, *a, **k)
+
+        return forward
+
+    sr._patch_forward(Emb, wrap)
+    sr._patch_forward(Emb, wrap)
+    Emb()(1)
+    assert calls == [1]
+
+
+def test_install_patches_every_lockstep_forward():
+    pytest.importorskip("megatron.core")
+    from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
+
+    sr.install()
+    for cls in (*sr._model_classes(), LanguageModelEmbedding, *sr._layer_classes()):
+        assert getattr(cls.__dict__["forward"], "_sticky_rounding_patch", False), cls
+
+
 def test_lockstep_units_reject_layers_without_a_lockstep():
     pytest.importorskip("megatron.core")
 
