@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import heapq
 import math
 from dataclasses import dataclass, field
 from typing import Any, Callable, Hashable, Optional
@@ -733,18 +734,24 @@ def deal_chunks(
     load = [(0, 0, 0)] * dp_size
     free = []
 
-    def put(r: int, c: Chunk) -> None:
+    def add(r: int, c: Chunk) -> tuple[int, int, int]:
         per_rank[r].append(c)
         load[r] = tuple(a + b for a, b in zip(load[r], cost(c)))
+        return load[r]
 
     for c in chunks:
         r = None if pinned_rank is None else pinned_rank(c)
         if r is None:
             free.append(c)
         else:
-            put(r, c)
+            add(r, c)
+    # Least-loaded rank, lowest index on ties: O(log DP) per chunk (DP up to
+    # hundreds of ranks at scale).
+    heap = [(load[r], r) for r in range(dp_size)]
+    heapq.heapify(heap)
     for c in sorted(free, key=lambda c: cost(c)[1:], reverse=True):
-        put(load.index(min(load)), c)
+        _, r = heapq.heappop(heap)
+        heapq.heappush(heap, (add(r, c), r))
     return per_rank
 
 

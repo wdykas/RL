@@ -8,7 +8,7 @@ thundersync:
   max_buckets_per_group: 2  # distinct rewards per open group before collapsing to (G1, G2)
   max_open_groups: 4  # cap on groups holding gradient buckets (bounds accumulator memory)
   max_chunk_trajectories: 8
-  # Deal each training dispatch's rows over every learner DP rank, one micro-batch per unit (DESIGN.md 14v):
+  # Deal each training dispatch's rows over every learner DP rank, one micro-batch per unit (DESIGN.md 14w):
   # no all-masked filler micro-batches under expert parallelism. false: whole max_chunk_trajectories chunks per rank.
   deal_rows: true
   # Sticky fp16 rounding toward a theta_{k-1} anchor forward (DESIGN.md 14g; opt-in, needs sticky_routing).

@@ -106,6 +106,12 @@ if [ "${CUBLAS_WS_SHIM:-0}" = 1 ]; then
         "++policy.megatron_cfg.env_vars.CUBLAS_WORKSPACE_FIXED_BYTES='0'"
         "++policy.megatron_cfg.env_vars.LD_PRELOAD=$W/research/callcost/cublas_ws_shim/libcublas_ws_shim.so")
 fi
+# Opt-in learner attribution (multi-node workers get it through env_vars): LEARNER_PROF=1 prints one
+# "[learner prof] rank=.. chunks=.. rows=.. shapes=.. secs=.." line per rank per learner call (two device syncs per
+# call); LEARNER_TORCHPROF=N runs the torch profiler once, on the call holding the N-th trained item, and prints its
+# top-30 CPU-time table (that one dispatch is slower).
+[ "${LEARNER_PROF:-0}" = 1 ] && PAR+=("++policy.megatron_cfg.env_vars.THUNDERSYNC_LEARNER_PROF='1'")
+[ -n "${LEARNER_TORCHPROF:-}" ] && PAR+=("++policy.megatron_cfg.env_vars.THUNDERSYNC_LEARNER_TORCHPROF='$LEARNER_TORCHPROF'")
 # Engine EP != learner EP (e.g. EP4 lanes under an EP8 learner) needs the EP-invariant MoE combine
 # (exact limb sums; DESIGN 14u): without it plainly sampled rows differ (np-v2-lanes-ep, epinv-lanes-ep-off).
 # EPINV=1 forces it on at equal EP, EPINV=0 off (the validators then refuse an EP mismatch).

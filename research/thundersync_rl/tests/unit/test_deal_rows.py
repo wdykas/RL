@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU tests: dealing dispatch rows over every DP rank (StreamPlanner deal_rows, DESIGN 14v).
+"""CPU tests: dealing dispatch rows over every DP rank (StreamPlanner deal_rows, DESIGN 14w).
 
 Shapes: full Nano (learner DP 8, EP on, MBS 1, G 8, canonical blocks of 4 / 2 / 1 groups),
 Nano L8 (DP 2), the 1T layout (DP 8, G 16) and a large-DP layout (DP 64).
@@ -295,3 +295,75 @@ def test_1t_shapes_no_fillers(dp, G):
         mb = microbatch_counts(d, 1)
         assert mb["filler"] == 0
         assert mb["per_rank"] == math.ceil(d.num_trajectories / dp)
+
+
+@pytest.mark.parametrize(
+    "dp,G,mbs,pp,want",
+    [
+        (
+            8,
+            16,
+            1,
+            1,
+            4,
+        ),  # 1T without the pipeline term: 64 rows, 8 micro-batches per rank
+        (
+            8,
+            16,
+            1,
+            8,
+            8,
+        ),  # 1T PP 8: 2 * PP = 16 micro-batches per rank -> 128-row blocks
+        (8, 8, 1, 2, 4),  # PP 2: 4 per rank is already met by 4 groups of 8 rows
+        (2, 8, 8, 4, 16),  # PP 4, MBS 8, DP 2: 8 micro-batches per rank need 128 rows
+    ],
+)
+def test_canonical_groups_per_block_fills_the_pipeline(dp, G, mbs, pp, want):
+    """Under PP every rank's one pipeline call per dispatch gets >= 2 * PP micro-batches."""
+    cfg = SimpleNamespace(canonical_block_groups=4, deal_rows=True)
+    min_pmb = 2 * pp if pp > 1 else 0
+    bg = canonical_groups_per_block(cfg, dp, G, mbs, min_pmb)
+    assert bg == want
+    pl = _planner(dp, mbs, G, bg, True)
+    for t in _rows(bg, G, 0):
+        pl.add(t)
+    d = pl.next_dispatch()
+    assert microbatch_counts(d, mbs)["per_rank"] >= min_pmb
+    assert microbatch_counts(d, mbs)["filler"] == 0
+
+
+def test_deal_places_pinned_chunks_and_keeps_counts_level():
+    """Fused (pinned) chunks count toward their rank's load before the units are dealt."""
+    from thundersync_rl.fused_train import FusedRef
+    from thundersync_rl.streaming import Chunk, deal_chunks
+
+    def chunk(n, tok, rank=None):
+        ts = [
+            Trajectory(group=0, index=i, reward=1.0, payload=None, num_tokens=tok)
+            for i in range(n)
+        ]
+        fused = (
+            None
+            if rank is None
+            else FusedRef(key=f"k{rank}", dp_rank=rank, num_tokens=tok)
+        )
+        return Chunk(
+            group=None,
+            reward=None,
+            trajectories=ts,
+            advantages=[1.0] * n,
+            fused=fused,
+            padding=False,
+        )
+
+    pinned = [chunk(1, 100, 0), chunk(1, 100, 0)]
+    units = [chunk(1, 10 + i) for i in range(6)]
+    per_rank = deal_chunks(
+        pinned + units,
+        4,
+        skip_zero_advantage=False,
+        micro_batch_size=1,
+        pinned_rank=lambda c: None if c.fused is None else c.fused.dp_rank,
+    )
+    counts = [len(cs) for cs in per_rank]
+    assert counts == [2, 2, 2, 2]

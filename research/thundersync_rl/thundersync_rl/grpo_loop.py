@@ -127,7 +127,7 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # Upper bound on trajectories per backward chunk (bounds activation memory).
     max_chunk_trajectories: int = 8
     # Deal the rows of each training dispatch over every learner DP rank, one
-    # micro-batch per unit (StreamPlanner deal_rows; DESIGN.md 14v): each rank
+    # micro-batch per unit (StreamPlanner deal_rows; DESIGN.md 14w): each rank
     # runs ceil(rows / (DP * MBS)) micro-batches, so under expert parallelism
     # no rank pads to a busier one with all-masked fillers. False: whole
     # max_chunk_trajectories-row chunks per rank (filler fraction ~1 - rows /
@@ -514,18 +514,32 @@ def train_micro_batch_rows(master_config: "ThunderSyncMasterConfig") -> int:
     return rows
 
 
-def canonical_groups_per_block(ts_cfg: "ThunderSyncConfig", dp_size: int, G: int) -> int:
+def canonical_groups_per_block(
+    ts_cfg: "ThunderSyncConfig",
+    dp_size: int,
+    G: int,
+    micro_batch_size: int = 1,
+    min_pipeline_microbatches: int = 0,
+) -> int:
     """Groups per canonical training dispatch.
 
-    ``canonical_block_groups``, and with ``deal_rows`` at least
-    ``ceil(dp_size / G)`` so a block's rows reach
-    every learner DP rank (fewer rows than ranks leave ranks to all-masked
-    fillers under expert parallelism). A function of the config and the layout
-    only, so the blocks stay canonical.
+    ``canonical_block_groups``, and with ``deal_rows`` at least enough groups
+    that a block's rows reach every learner DP rank (``ceil(dp_size / G)``:
+    fewer rows than ranks leave ranks to all-masked fillers under expert
+    parallelism) and, under pipeline parallelism, give every rank
+    ``min_pipeline_microbatches`` micro-batches per dispatch (one pipeline
+    call per dispatch pays the (PP - 1)-slot fill/drain once; the canonical
+    order does not hold rows back the way the arrival-order planner does). A
+    function of the config and the layout only, so the blocks stay canonical.
     """
     bg = max(1, int(ts_cfg.canonical_block_groups))
     if ts_cfg.deal_rows:
-        bg = max(bg, math.ceil(dp_size / max(1, int(G))))
+        G = max(1, int(G))
+        bg = max(
+            bg,
+            math.ceil(dp_size / G),
+            math.ceil(int(min_pipeline_microbatches) * dp_size * int(micro_batch_size) / G),
+        )
     return bg
 
 
@@ -1769,7 +1783,16 @@ async def _run_one_step(
         # Reproducible runs also need a reproducible gradient order: dispatch
         # the groups in index order (StreamPlanner.set_order), not by arrival.
         group_order = list(range(batch.size))
-        bg = canonical_groups_per_block(ts_cfg, learner.dp_size, G)
+        bg = canonical_groups_per_block(
+            ts_cfg,
+            learner.dp_size,
+            G,
+            train_micro_batch_rows(master_config),
+            resolve_min_pipeline_microbatches(
+                ts_cfg,
+                master_config.policy["megatron_cfg"].get("pipeline_model_parallel_size", 1) or 1,
+            ),
+        )
         group_blocks = [min(bg, len(group_order) - j) for j in range(0, len(group_order), bg)]
     # Streaming over the tails: training dispatches are ordered learner calls
     # (SpeculativeGeneration.learner_seq), interleaved with verification.
@@ -3296,7 +3319,17 @@ def thundersync_grpo_train(
                 else:
                     # Blocks of canonical_block_groups within each class.
                     bg = canonical_groups_per_block(
-                        ts_cfg, learner.dp_size, master_config.grpo.num_generations_per_prompt
+                        ts_cfg,
+                        learner.dp_size,
+                        master_config.grpo.num_generations_per_prompt,
+                        train_micro_batch_rows(master_config),
+                        resolve_min_pipeline_microbatches(
+                            ts_cfg,
+                            master_config.policy["megatron_cfg"].get(
+                                "pipeline_model_parallel_size", 1
+                            )
+                            or 1,
+                        ),
                     )
                     group_blocks = [
                         min(bg, len(c) - i) for c in classes for i in range(0, len(c), bg)
