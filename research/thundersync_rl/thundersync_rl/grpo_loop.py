@@ -660,14 +660,13 @@ def validate_sticky_routing(master_config: ThunderSyncMasterConfig) -> None:
     if horizon is not None and int(horizon) < 0:
         problems.append(f"thundersync.sticky_anchor_horizon must be >= 0 (got {horizon})")
     multi_turn = (master_config.grpo.max_rollout_turns or 1) > 1
-    if ts_cfg.stream_training_over_tails and (multi_turn or horizon is not None):
+    if ts_cfg.stream_training_over_tails and multi_turn:
         # Not built yet: a streamed rollout waits for its plan to complete in
         # the continuation rounds; multi-turn plans complete through
-        # environment steps (replay_row) and horizon plans on the refit engine.
+        # environment steps (replay_row).
         problems.append(
-            "multi-turn rollouts and sticky_anchor_horizon run with "
-            "thundersync.stream_training_over_tails=false (streaming over their "
-            "tails is not built yet)"
+            "multi-turn rollouts run with thundersync.stream_training_over_tails=false "
+            "(streaming over their tails is not built yet)"
         )
     if problems:
         raise ValueError("thundersync.sticky_routing: " + "; ".join(problems) + ".")
@@ -2295,7 +2294,11 @@ def thundersync_grpo_train(
         else:
             # Groups whose rows still decode tails (a pending plan of their
             # prompt), fixed by the drafts' verification, not by timing.
-            pending_keys = {key for key, _ in tails}
+            # Incomplete after verify0: continuation rounds on the drafting
+            # version, or (anchor horizon) decoded by the refit engine at theta_k.
+            pending_keys = {
+                key for key, queue in spec.plans.items() for plan in queue if not plan.complete
+            }
             row_keys = [tuple(x.tolist()) for x in _prompts(batch)]
             tail_groups = [
                 p for p in range(len(row_keys) // G) if row_keys[p * G] in pending_keys

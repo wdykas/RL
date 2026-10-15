@@ -274,3 +274,48 @@ def test_canonical_blocks_dispatch_whole_blocks_independent_of_arrival():
     pl = _planner(groups)
     with pytest.raises(ValueError, match="partition"):
         pl.set_order(order, [2, 2])
+
+
+def test_horizon_plan_waits_for_theta_k_after_its_rounds():
+    """Anchor horizon: a tail plan that leaves the rounds incomplete (handed to the
+    refit engine) must not wait for completion forever; it waits for theta_k."""
+    spec = _spec()
+    tail = Plan(seed=-1, prefix=[1, 2])
+    spec._tail_plans = {id(tail)}
+    order = []
+
+    async def continue_sticky(pending, trace=None, ended=()):
+        for _, p in pending:
+            p.engine_key = "h0"  # anchors below the horizon logged; not complete
+        order.append("rounds")
+
+    spec._continue_sticky = continue_sticky
+
+    async def main():
+        spec.begin_streaming_tails()
+
+        async def serve():
+            await _gate_horizon(spec, tail)
+            order.append("served")
+
+        task = asyncio.create_task(serve())
+        await asyncio.sleep(0)
+        await spec.complete_tails([((0,), tail)])
+        await asyncio.sleep(0.01)
+        assert "served" not in order  # waits for the refit
+        order.append("refit")
+        spec.weights_ready()
+        await asyncio.wait_for(task, 1)
+
+    asyncio.run(main())
+    assert order == ["rounds", "refit", "served"]
+
+
+def _gate_horizon(spec, plan):
+    async def wait():
+        if id(plan) in getattr(spec, "_tail_plans", ()):
+            await spec._await_plan(plan)
+        if not plan.complete:
+            await spec._weights_ready.wait()
+
+    return wait()

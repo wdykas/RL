@@ -574,8 +574,8 @@ def test_sticky_config_default_and_valid():
     m = _master(stream_training_over_tails=False)
     m.grpo.max_rollout_turns = 3
     validate_sticky_routing(m)
-    with pytest.raises(ValueError, match="stream_training_over_tails"):
-        validate_sticky_routing(_master(sticky_anchor_horizon=64))
+    # The anchor horizon streams over tails (ts-one-engine-hz fixes).
+    validate_sticky_routing(_master(sticky_anchor_horizon=64))
     validate_sticky_routing(_master(sticky_anchor_horizon=64, stream_training_over_tails=False))
     m = _master(sticky_routing_delta=None)
     configure_sticky_policy(m)

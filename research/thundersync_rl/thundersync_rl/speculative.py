@@ -1209,7 +1209,9 @@ class SpeculativeGeneration:
         Then no rollout of this step decodes on the engine (``_one`` returns the
         plan), so the engine need not hold theta_k for the step.
         ``pending_ok``: plans the continuation rounds are still completing
-        count (``begin_sticky`` before ``complete_tails``).
+        count (``begin_sticky`` before ``complete_tails``). Not with an anchor
+        horizon: a continued plan may stop at the horizon and then needs the
+        refit engine at theta_k.
         """
         if self._row_plans:
             # Multi-turn: drafted plans are paired with rows (``bind_rows``).
@@ -1218,7 +1220,16 @@ class SpeculativeGeneration:
             )
         need = Counter(_key(p) for p in prompts)
         return all(
-            all(pending_ok or plan.complete for plan in self.plans.get(key, [])[:n])
+            all(
+                plan.complete
+                # Plans the continuation rounds are completing (no horizon).
+                or (
+                    pending_ok
+                    and self.anchor_horizon is None
+                    and id(plan) in self.__dict__.get("_tail_plans", ())
+                )
+                for plan in self.plans.get(key, [])[:n]
+            )
             and len(self.plans.get(key, [])) >= n
             for key, n in need.items()
         )
@@ -2401,7 +2412,9 @@ class SpeculativeGeneration:
         if cv is None or plan.complete:
             return
         async with cv:
-            while not plan.complete:
+            # Done when complete, or (anchor horizon) handed to the refit engine,
+            # which continues it once it holds theta_k.
+            while not (plan.complete or plan.engine_key is not None):
                 if self._tail_error is not None:
                     raise RuntimeError("sticky continuation failed") from self._tail_error
                 await cv.wait()
@@ -3202,7 +3215,8 @@ class SpeculativeGeneration:
             # theta_k once the engine holds it.
             if id(plan) in getattr(self, "_tail_plans", ()):
                 await self._await_plan(plan)
-            elif not plan.complete:
+            if not plan.complete:
+                # Never drafted, or (anchor horizon) continued at theta_k.
                 await self._weights_ready.wait()
                 if self._tail_error is not None:
                     raise RuntimeError("sticky tails or refit failed") from self._tail_error
