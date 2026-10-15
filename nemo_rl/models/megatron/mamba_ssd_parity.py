@@ -440,14 +440,55 @@ def install(deterministic: bool = False) -> None:
     """
     pin_engine_kernels()
     if deterministic:
+        import os
+
         from mamba_ssm.utils.determinism import set_deterministic_mode
 
         set_deterministic_mode(True)
+        # Modules imported from now on filter their autotune candidates at import.
+        os.environ["MAMBA_DETERMINISTIC"] = "1"
         _DETERMINISTIC[0] = True
-    if _INSTALLED:
-        return
-    from megatron.core.ssm.mamba_mixer import MambaMixer
+    if not _INSTALLED:
+        from megatron.core.ssm.mamba_mixer import MambaMixer
 
-    _ORIGINAL_SSM_TRAINING.append(MambaMixer._ssm_training)
-    MambaMixer._ssm_training = _ssm_training
-    _INSTALLED.append(True)
+        _ORIGINAL_SSM_TRAINING.append(MambaMixer._ssm_training)
+        MambaMixer._ssm_training = _ssm_training
+        _INSTALLED.append(True)
+    if deterministic:
+        n = pin_mamba_ssm_autotuners()
+        print(
+            f"[mamba_ssd_parity] deterministic: {n} autotuned mamba_ssm kernels pinned to one config",
+            flush=True,
+        )
+
+
+def pin_mamba_ssm_autotuners() -> int:
+    """Give every already-imported multi-config mamba_ssm Triton autotuner one config.
+
+    mamba_ssm applies its deterministic config choice (``autotune_configs``: the
+    TRITON_AUTOTUNE_BLOCK_SIZE_* filter, else the cheapest block size x stages)
+    when a kernel module is *imported* in deterministic mode. The training
+    backward kernels (chunk scan / state / state passing / bmm backward) are
+    imported before ``set_deterministic_mode`` runs here, so they kept every
+    candidate and autotuned by timing in each process: within one process the
+    choice is cached (in-process replays agree), but two processes can pick
+    different tiles, hence different reduction orders and gradient bits
+    (rr-resume-nano @cf3bc405: same rollouts, different gradients at step 0).
+    The same rule is applied now, process-independently. Forward kernels of the
+    engine path are pinned separately (``pin_engine_kernels``). Returns the count.
+    """
+    import sys
+
+    from mamba_ssm.utils.determinism import autotune_configs
+    from triton.runtime.autotuner import Autotuner
+
+    n = 0
+    for name, mod in list(sys.modules.items()):
+        if mod is None or not name.startswith("mamba_ssm.ops"):
+            continue
+        for attr in list(vars(mod).values()):
+            if isinstance(attr, Autotuner) and len(attr.configs) > 1:
+                attr.configs = list(autotune_configs(attr.configs))
+                attr.cache.clear()
+                n += 1
+    return n

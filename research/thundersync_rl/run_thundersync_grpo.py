@@ -29,7 +29,7 @@ from thundersync_rl.grpo_loop import (
     thundersync_grpo_train,
 )
 from thundersync_rl.lanes import build_engine_lanes
-from thundersync_rl.run_state import load_state, resolve_resume
+from thundersync_rl.run_state import check_schedule_unchanged, load_state, resolve_resume
 from thundersync_rl.refit_m2n import crosscheck_enabled, install_crosscheck
 from thundersync_rl.worker import WORKER_FQN
 
@@ -88,6 +88,9 @@ def main() -> None:
     resume_path = resolve_resume(ckpt_cfg)
     start_step = int(load_state(resume_path)["next_step"]) if resume_path else 0
     if resume_path:
+        check_schedule_unchanged(
+            resume_path, config.grpo.max_num_steps, config.grpo.max_num_epochs
+        )
         print(f"[thundersync] resuming from {resume_path} (next step {start_step})", flush=True)
 
     init_ray()
