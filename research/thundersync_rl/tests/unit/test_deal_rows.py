@@ -156,6 +156,7 @@ def test_async1_leftover_dispatch():
     assert microbatch_counts(d, 1) == {
         "real": 8,
         "filler": 0,
+        "skipped": 0,
         "per_rank": 1,
         "max_rank_tokens": max(
             t.num_tokens for cs in d.per_rank for c in cs for t in c.trajectories

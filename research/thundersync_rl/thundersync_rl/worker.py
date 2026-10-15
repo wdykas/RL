@@ -202,6 +202,30 @@ def group_pipeline_calls(
     return calls
 
 
+def count_only_chunk(state: dict[str, Any], item: dict[str, Any]) -> None:
+    """Add a skipped chunk's valid sequences/tokens to the step's normalization.
+
+    The same sums ``_prepare_train_piece`` adds before its forward, so the
+    loss normalizer (and the gradient) equals training the chunk: every one
+    of its rows has advantage 0, i.e. exactly zero gradient (the loss and
+    model are validated advantage-weighted, ``_require_advantage_weighted_gradients``).
+    Raises if a row carries a nonzero advantage (never drop gradient silently).
+    """
+    data = item["data"]
+    if item.get("group") is not None or item.get("fused_key") is not None:
+        raise RuntimeError("count-only chunks must be final, unfused chunks")
+    sample_mask = data["sample_mask"]
+    token_mask = data["token_mask"][:, 1:] * sample_mask.unsqueeze(-1)
+    if bool((data["advantages"][:, 1:] * token_mask).ne(0).any()):
+        raise RuntimeError(
+            "count-only chunk has a row with a nonzero advantage on a valid token "
+            "(planner / worker disagree on zero-advantage rows)"
+        )
+    state["num_chunks"] += 1
+    state["local_valid_seqs"] = state["local_valid_seqs"] + torch.sum(sample_mask).to(torch.float64)
+    state["local_valid_toks"] = state["local_valid_toks"] + torch.sum(token_mask).to(torch.float64)
+
+
 def apply_draft_frame(
     frame: dict[str, Any],
     tokens: list[int],
@@ -764,6 +788,15 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         fused_trained = fused_tokens = fused_fallback = 0
         vit_results: list[dict[str, Any]] = []
         state = self._train_step_state
+        # Count-only chunks (planner: all-zero advantage under expert
+        # parallelism, StreamPlanner.count_only): normalization counts only, no
+        # forward. Every rank skips exactly the chunks the planner marked, so
+        # forward counts stay equal across the EP all-to-all.
+        skipped = [it for it in items if it.get("count_only")]
+        if skipped:
+            items = [it for it in items if not it.get("count_only")]
+            for it in skipped:
+                count_only_chunk(state, it)
         calls = group_pipeline_calls(
             items, merge=getattr(self, "_stream_merge_calls", True)
         )
@@ -854,6 +887,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         acc = self._train_step_state["grad_stream"]
         return {
             "num_items": len(items),
+            "num_skipped_items": len(skipped),
             "num_calls": len(calls),
             "open_buffers": acc.num_open_buffers(),
             "fused_trained": fused_trained,

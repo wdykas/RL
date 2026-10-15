@@ -1824,9 +1824,13 @@ async def _run_one_step(
             max_open_groups=max_open_groups,
             micro_batch_size=mbs,
             equal_rank_microbatches=expert_parallel,
+            # Under expert parallelism only with dealt rows: the planner then
+            # marks zero-advantage chunks count-only and pads the live forwards
+            # to equal per-rank counts, so the worker skips exactly those chunks
+            # on every rank (StreamPlanner.count_only; DESIGN 14x).
             skip_zero_advantage_chunks=(
                 bool(getattr(loss_fn, "skip_zero_advantage_rows", False))
-                and not expert_parallel
+                and (not expert_parallel or ts_cfg.deal_rows)
             ),
             min_pipeline_microbatches=min_pipeline_microbatches,
             tail_excluded_baseline=(
@@ -1921,6 +1925,11 @@ async def _run_one_step(
                     "group": c.group,
                     "reward": c.reward,
                     "fused_key": None if c.fused is None else c.fused.key,
+                    # Expert parallelism: the worker counts this chunk for
+                    # normalization and runs no forward (planner decision, the
+                    # same on every rank). Without EP the worker skips
+                    # zero-advantage rows itself (loss_fn.skip_zero_advantage_rows).
+                    "count_only": expert_parallel and planner.count_only(c),
                 }
                 for c in chunks
             ]
@@ -1943,7 +1952,7 @@ async def _run_one_step(
     arrivals: list[tuple[float, int, int, float]] = []
     dispatches: list[tuple] = []
     # Planner micro-batches over the step (``microbatch_counts``).
-    mb_totals = {"real": 0, "filler": 0, "per_rank": 0, "filler_heavy": 0}
+    mb_totals = {"real": 0, "filler": 0, "skipped": 0, "per_rank": 0, "filler_heavy": 0}
     # (group, dispatch start, dispatch end) for every group a dispatch trains.
     group_dispatch: list[tuple[int, float, float]] = []
     last_rollout_t = None
@@ -2274,8 +2283,8 @@ async def _run_one_step(
                 chunks = [c for cs in d.per_rank for c in cs if not c.padding]
                 for gid in sorted({t.group[1] for c in chunks for t in c.trajectories}):
                     group_dispatch.append((gid, t0 - t_start, t1 - t_start))
-                mb = microbatch_counts(d, mbs)
-                for k in ("real", "filler", "per_rank"):
+                mb = microbatch_counts(d, mbs, planner.count_only)
+                for k in ("real", "filler", "skipped", "per_rank"):
                     mb_totals[k] += mb[k]
                 if mb["filler"] > 0.25 * (mb["real"] + mb["filler"]):
                     # Validator: more than a quarter of the dispatch's forwards
@@ -2638,6 +2647,8 @@ async def _run_one_step(
         # EP); per_rank = what one rank runs (sum over dispatches of the max).
         "learner/real_microbatches": float(mb_totals["real"]),
         "learner/filler_microbatches": float(mb_totals["filler"]),
+        # Zero-advantage micro-batches counted for normalization, never run.
+        "learner/skipped_microbatches": float(mb_totals["skipped"]),
         "learner/microbatches_per_rank": float(mb_totals["per_rank"]),
         "learner/filler_frac": float(mb_totals["filler"])
         / max(1.0, float(mb_totals["real"] + mb_totals["filler"])),

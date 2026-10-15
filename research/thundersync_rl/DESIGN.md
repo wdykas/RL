@@ -3611,6 +3611,42 @@ already; less sequence padding per micro-batch. Nothing new per parameter.
   reward). Expected [D, learner_offload_design §6]: per 32-row dispatch ~4 micro-batches per rank and ~5.5–6.5 s
   (was 11.3–13.2), ts_por training ≈ 96–110 s (was 193–209), async1 train ≈ 105–107 s (was 119–121). Pending.
 
+## 14x. Zero-advantage skipping under expert parallelism (with `deal_rows`; 2026-10-15)
+
+**Problem [M].** `loss_fn.skip_zero_advantage_rows` (ab_base: true) was forced off under EP: the worker
+dropped rows by a per-rank data test, so ranks could run different forward counts and hang the EP
+all-to-all. Every arm therefore trained all 512 rows per step although only 176–328 (34–64%) have a
+nonzero advantage (`train/nonzero_adv_rows`, runs_ab/*-ab2; GRPO zero-advantage groups are whole groups).
+At full Nano 8k that is ~1.65 s per skipped micro-batch-slot, i.e. 35–60 s of exactly-zero gradient work
+per step per arm (sync training 105–108 s).
+
+**Design.** The planner decides, not the worker:
+- `skip_zero_advantage_chunks` is on under EP when `deal_rows` is on. Rows are dealt per class
+  (nonzero / zero advantage, `_classes`), so a zero chunk never holds a live row.
+- `StreamPlanner.count_only(c)`: final, unfused, non-padding chunk whose every advantage is 0.
+  `_pad_to_equal_microbatches` equalizes the **live** forwards per rank (count-only chunks count 0) and
+  gives every rank at least one forward per dispatch (metric schema; an all-zero dispatch costs one
+  filler per rank).
+- `_build_dispatch` ships `count_only` per item (EP only; without EP the worker keeps skipping by its own
+  test as before). The worker (`worker.count_only_chunk`) adds the chunk's `sample_mask` / token sums to
+  the step's normalization exactly as `_prepare_train_piece` would and runs no forward; it raises if any
+  valid token carries a nonzero advantage (never drops gradient silently).
+
+**Exactness.** The skipped rows' gradient is exactly zero: the worker already validates that every gradient
+term is advantage-weighted (`_require_advantage_weighted_gradients`: no MoE aux / z-loss, no bias updates,
+no capacity dropping, no MTP), and that validation runs whenever the loss asks for skipping, EP or not.
+Their tokens stay in the token-level normalizer (float64 integer sums: order-free). What changes is the
+placement of the remaining rows (fp32 summation order, as `deal_rows`). The sampling law is untouched.
+
+**Per-rank cost / scale.** Planner O(rows / DP) per dispatch as before; the worker reads two masks per
+skipped chunk. Saved per rank: (zero rows / DP) micro-batches per step at any DP / EP / PP (with PP the live
+count per rank sets the pipeline call). 1T (DP 8, G 16): same rule, no new communication.
+
+**Expected [D].** Full Nano 8k, 512 rows, ~50% zero: training ≈ 64 → ≈ 33 live micro-batches per rank,
+sync ≈ 106 → ≈ 55–60 s, ThunderSync (after deal_rows ≈ 105 s) → ≈ 55–60 s, async1 → generation-bound
+(~110 s). **Validation:** CPU tests `test_skip_zero_ep.py`; GPU: `sbatch/queue_1node.tsv` sz-* (L8, EP 2:
+exactness + skipped counts), multi-node `sbatch/go_bughunt.sh`.
+
 ## 15. Open work
 
 - **Stragglers.** About one rejected draft per step decodes its remainder at about 3 ms

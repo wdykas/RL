@@ -375,6 +375,24 @@ class StreamPlanner:
                 n += math.ceil(min(m, k - s) / self.micro_batch_size)
         return n
 
+    def count_only(self, c: Chunk) -> bool:
+        """A chunk the learner counts for normalization but runs no forward on.
+
+        All-zero-advantage final chunks under ``skip_zero_advantage_chunks``
+        (their gradient is exactly zero; their tokens stay in the loss's
+        normalization). Under ``equal_rank_microbatches`` (expert parallelism)
+        the worker skips exactly these chunks -- a planner decision shipped with
+        the chunk, not a per-rank data test -- and padding equalizes the forwards
+        of the others, so every rank runs the same number of forwards.
+        Fused chunks always run (their retained graph is consumed by the call).
+        """
+        return (
+            self.skip_zero_advantage_chunks
+            and not c.padding
+            and c.fused is None
+            and c.zero_advantage
+        )
+
     def _unit_rows(self) -> int:
         """Rows per dealt unit (``deal_rows``): one micro-batch, within the chunk cap."""
         return max(1, min(self.micro_batch_size, self.max_chunk_trajectories))
@@ -597,8 +615,13 @@ class StreamPlanner:
         shortest trajectory (cheapest forward) and fully masked out.
         """
         mbs = self.micro_batch_size
-        counts = [sum(c.num_microbatches(mbs) for c in cs) for cs in per_rank]
-        target = max(counts)
+        counts = [
+            sum(c.num_microbatches(mbs) for c in cs if not self.count_only(c)) for cs in per_rank
+        ]
+        # Count-only chunks (skipped zero-advantage rows) run no forward; every
+        # rank still runs at least one micro-batch per dispatch, so each rank
+        # reports per-micro-batch metrics every step it trains.
+        target = max(max(counts), 1)
         template = min(
             (t for c in chunks for t in c.trajectories), key=lambda t: t.num_tokens
         )
@@ -755,23 +778,37 @@ def deal_chunks(
     return per_rank
 
 
-def microbatch_counts(d: Dispatch, micro_batch_size: int) -> dict[str, int]:
+def microbatch_counts(
+    d: Dispatch,
+    micro_batch_size: int,
+    count_only: Optional[Callable[[Chunk], bool]] = None,
+) -> dict[str, int]:
     """Real and all-masked filler micro-batches of one dispatch (summed over ranks).
 
     ``per_rank``: the most any rank runs (every rank under equal counts);
-    ``max_rank_tokens``: real tokens on the busiest rank.
+    ``max_rank_tokens``: real tokens on the busiest rank. ``count_only``
+    (``StreamPlanner.count_only``): chunks that run no forward; their
+    micro-batches are reported as ``skipped``, not ``real``.
     """
+    skip = count_only or (lambda c: False)
     real = [
-        sum(c.num_microbatches(micro_batch_size) for c in cs if not c.padding)
+        sum(c.num_microbatches(micro_batch_size) for c in cs if not c.padding and not skip(c))
         for cs in d.per_rank
     ]
+    skipped = sum(
+        c.num_microbatches(micro_batch_size) for cs in d.per_rank for c in cs if skip(c)
+    )
     filler = [sum(1 for c in cs if c.padding) for cs in d.per_rank]
     return {
         "real": sum(real),
         "filler": sum(filler),
+        "skipped": skipped,
         "per_rank": max((a + b for a, b in zip(real, filler)), default=0),
         "max_rank_tokens": max(
-            (sum(c.num_tokens for c in cs if not c.padding) for cs in d.per_rank),
+            (
+                sum(c.num_tokens for c in cs if not c.padding and not skip(c))
+                for cs in d.per_rank
+            ),
             default=0,
         ),
     }
