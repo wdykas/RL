@@ -83,6 +83,7 @@ from thundersync_rl.run_state import (
 )
 from thundersync_rl.sentinel import WeightSentinel
 from thundersync_rl.speculative import SpeculativeGeneration, cohort_draft
+from thundersync_rl.verify0_stream import StreamOrder, Verify0Risk
 from thundersync_rl import vit
 from thundersync_rl.streaming import (
     Chunk,
@@ -414,6 +415,19 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # of the canonical order), so a dispatch's size does not depend on the
     # response length; canonical_block_groups is then unused.
     canonical_block_tokens: Optional[int] = None
+    # Risk-first streaming verify0 (DESIGN 14z; opt-in). verify0 runs inside
+    # the step as ordered learner calls over whole prompts, riskiest first (a
+    # past-only prediction: draft length bucket x earlier steps' whole
+    # acceptance), and each prompt's plans are published at its decision:
+    # its tails start then and its ready groups train between the calls.
+    # Calls are cut by forward tokens (first call smaller, so the riskiest
+    # tails start early); ``window`` calls are queued on the learner at once.
+    verify0_stream: bool = False
+    verify0_stream_first_chunk_tokens: int = 262144
+    verify0_stream_chunk_tokens: int = 524288
+    verify0_stream_window: int = 2
+    # "risk" (past-only risk score, riskiest first) | "drafting" (drafting order; the control).
+    verify0_stream_order: str = "risk"
     # Measurement only (research/agent_tail.md): the drafting deadline waits
     # until every draft finished (EOS or the cap), so each step verifies whole
     # rollouts and its post-refit tail is the rejection tail alone. Exact (no
@@ -691,6 +705,45 @@ def validate_config(master_config: ThunderSyncMasterConfig) -> None:
     validate_run_control(master_config)
     validate_verify_in_train(master_config)
     validate_verify_yield(master_config)
+    validate_verify0_stream(master_config)
+
+
+def validate_verify0_stream(master_config: ThunderSyncMasterConfig) -> None:
+    """Settings risk-first streaming verify0 is built for (DESIGN 14z)."""
+    ts_cfg = master_config.thundersync
+    if not getattr(ts_cfg, "verify0_stream", False):
+        return
+    problems = []
+    if sticky_delta(ts_cfg) is None:
+        problems.append("needs sticky_routing (the streaming-over-tails path)")
+    if not (ts_cfg.stream_training_over_tails and ts_cfg.canonical_group_order):
+        problems.append("needs stream_training_over_tails and canonical_group_order")
+    if ts_cfg.verify_mode != "block" or ts_cfg.verify_on != "learner":
+        problems.append("needs verify_mode=block and verify_on=learner")
+    if (master_config.grpo.max_rollout_turns or 1) > 1:
+        problems.append("multi-turn rollouts are not built")
+    for name in (
+        # Prompt drop selects the trained prompts after every pool is decided.
+        "null_bv_prompt_drop",
+        "verify_in_train",
+        "fused_verify_train",
+        # The tail-excluded baseline needs every group's tail count at step start.
+        "tail_excluded_baseline",
+    ):
+        if getattr(ts_cfg, name, False):
+            problems.append(f"{name} must be off (not built with verify0_stream)")
+    if ts_cfg.sticky_anchor_horizon is not None:
+        problems.append("the anchor horizon is not built with verify0_stream")
+    if min(
+        ts_cfg.verify0_stream_first_chunk_tokens,
+        ts_cfg.verify0_stream_chunk_tokens,
+        ts_cfg.verify0_stream_window,
+    ) < 1:
+        problems.append("chunk tokens and window must be >= 1")
+    if ts_cfg.verify0_stream_order not in ("risk", "drafting"):
+        problems.append("verify0_stream_order must be risk or drafting")
+    if problems:
+        raise ValueError("thundersync.verify0_stream: " + "; ".join(problems) + ".")
 
 
 def _section(master_config: Any, name: str) -> dict[str, Any]:
@@ -1771,6 +1824,7 @@ async def _run_one_step(
     group_order: Optional[list[int]] = None,
     group_blocks: Optional[list[int]] = None,
     tail_groups: Optional[list[int]] = None,
+    order_stream: Optional[StreamOrder] = None,
     ordered_learner: Optional[Any] = None,
     claim_row: Optional[Callable[[torch.Tensor, torch.Tensor], Any]] = None,
     tail_count: Optional[Callable[[torch.Tensor], int]] = None,
@@ -1790,6 +1844,9 @@ async def _run_one_step(
     the step's groups (prompt indices) one at a time in this order
     (``StreamPlanner.set_order``). ``tail_groups``: groups with pending tails,
     logged with each group's completion and dispatch times.
+    ``order_stream`` (streaming verify0, DESIGN 14z): ``group_order`` /
+    ``group_blocks`` are its lists, which grow while the step runs; the
+    planner follows them as they grow (``StreamPlanner.extend_order``).
     ``ordered_learner`` (the spec while streaming over the tails): training
     dispatches are numbered learner calls (``learner_seq``) that every learner
     rank runs in the same order, interleaved with the tails' verification
@@ -1868,7 +1925,10 @@ async def _run_one_step(
                 G,
                 tails=tail_count(prompt) if ts_cfg.tail_excluded_baseline and tail_count else 0,
             )
-        if order is not None:
+        if order_stream is not None and order is order_stream.order and not order_stream.closed:
+            # Streaming verify0: the order grows with the decisions.
+            order_stream.attach(pl, step)
+        elif order is not None:
             pl.set_order(
                 [(step, p) for p in order],
                 block_sizes,
@@ -1961,6 +2021,8 @@ async def _run_one_step(
 
     t_start = time.perf_counter()
     wake = asyncio.Event()
+    if order_stream is not None:
+        order_stream.wake = wake.set
     rollouts_done = False
     rewards = [0.0] * n
     is_weights = [1.0] * n  # banded IS loss weights
@@ -2966,6 +3028,8 @@ def thundersync_grpo_train(
     specs = [lane.spec for lane in lanes] if lanes is not None else ([spec] if spec else [])
     for sp in specs:
         sp.sentinel = sentinel
+    # Streaming verify0 (DESIGN 14z): one past-only risk model for every lane.
+    v0_risk = Verify0Risk()
     if resume is not None:
         seeds = resume.get("seeds") or {}
         for i, sp in enumerate(specs):
@@ -3222,6 +3286,7 @@ def thundersync_grpo_train(
             drafts = handout.result()
             handout_wait = time.perf_counter() - t1
         tails = None  # pending plans whose continuation rounds overlap training
+        v0 = None  # streaming verify0 (DESIGN 14z): its calls run inside the step
         if sticky and drafts is not None:
             # Sticky routing: verify and complete every drafted rollout while
             # the engine still holds the drafting weights (theta_{step-1}, or
@@ -3234,7 +3299,19 @@ def thundersync_grpo_train(
                 spec.bind_rows(
                     [_initial_sample_state(rows, i) for i in range(rows.size)]
                 )
-            if ts_cfg.stream_training_over_tails:
+            if ts_cfg.stream_training_over_tails and ts_cfg.verify0_stream:
+                # Only the schedule here (counts and past steps); verify0's
+                # calls, the decisions and the tails run inside the step.
+                v0 = spec.prepare_stream(
+                    drafts,
+                    v0_risk,
+                    ts_cfg.verify0_stream_first_chunk_tokens,
+                    ts_cfg.verify0_stream_chunk_tokens,
+                    ts_cfg.verify0_stream_window,
+                    ts_cfg.verify0_stream_order,
+                )
+                tails = []  # pending plans arrive with the decisions
+            elif ts_cfg.stream_training_over_tails:
                 # Only the drafts' verification here; the continuation rounds
                 # run inside the step, under the training of complete groups.
                 spec.vit_dp = learner.dp_size
@@ -3267,6 +3344,8 @@ def thundersync_grpo_train(
         draft_now = (
             staged
             and sticky
+            # Streaming verify0: unknown at the step top (taken as not covered).
+            and v0 is None
             and spec.plans_cover(_prompts(batch), pending_ok=tails is not None)
         )
         refit_s = []
@@ -3312,8 +3391,54 @@ def thundersync_grpo_train(
 
         tails_s = []
         group_order = group_blocks = tail_groups = None
+        v0_order = None
         if tails is None:
             refit_for_step()
+        elif v0 is not None:
+            # Streaming verify0: the canonical order grows with the decisions
+            # (ready groups of each decided call, then the tail groups, then
+            # groups with rows never drafted; StreamOrder), a function of the
+            # schedule (counts, past steps) and the decisions.
+            row_keys = [tuple(x.tolist()) for x in _prompts(batch)]
+            v0_order = StreamOrder(
+                [row_keys[p * G] for p in range(len(row_keys) // G)],
+                collections.Counter(row_keys),
+                canonical_groups_per_block(
+                    ts_cfg,
+                    learner.dp_size,
+                    master_config.grpo.num_generations_per_prompt,
+                    train_micro_batch_rows(master_config),
+                    resolve_min_pipeline_microbatches(
+                        ts_cfg,
+                        master_config.policy["megatron_cfg"].get(
+                            "pipeline_model_parallel_size", 1
+                        )
+                        or 1,
+                    ),
+                ),
+                block_tokens=ts_cfg.canonical_block_tokens,
+            )
+            group_order, group_blocks = v0_order.order, v0_order.blocks
+            tail_groups = v0_order.tail_groups
+
+            async def tails_then_refit(v0=v0, order=v0_order):
+                # verify0's calls and the continuation rounds on the drafting
+                # weights, then theta_k: rollouts never drafted and the next
+                # cohort's drafts wait for it.
+                nonlocal lane_fresh
+                t = time.perf_counter()
+                try:
+                    await spec.complete_stream(v0, order.decided, order.close)
+                    policy_generation.finish_generation()
+                    tails_s.append(time.perf_counter() - t)
+                    await spec.learner_drain()
+                    # Lanes: the cohort lane takes theta_k only if a row decodes fresh.
+                    lane_fresh = sched is not None and bool(order.fresh)
+                    refit_for_step()
+                except BaseException as exc:
+                    spec.weights_ready(error=exc)
+                    raise
+                spec.weights_ready()
         else:
             # Groups whose rows still decode tails (a pending plan of their
             # prompt), fixed by the drafts' verification, not by timing.
@@ -3493,6 +3618,7 @@ def thundersync_grpo_train(
                 group_order=group_order,
                 group_blocks=group_blocks,
                 tail_groups=tail_groups,
+                order_stream=v0_order,
                 ordered_learner=spec if tails is not None else None,
                 vit_spec=spec if tails is not None and ts_cfg.verify_in_train else None,
                 claim_log_weight=spec.claim_log_weight
