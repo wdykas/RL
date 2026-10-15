@@ -593,6 +593,12 @@ class SpeculativeGeneration:
         self.verify_in_train = False
         self.vit_group_size = 0
         self._vit_groups: list = []
+        self.vit_mbs = 0
+        self.vit_dp = 1
+        self.vit_min_pass_prob = 0.0
+        self.vit_checkpoint_bytes = float("inf")
+        self.vit_bytes_per_token = 0.0
+        self.vit_predictor = vit.PassPredictor()
         self.plans: dict[tuple[int, ...], list[Plan]] = defaultdict(list)
         self.stats: dict[str, float] = {}
         # Multi-iteration drafts: target step -> drafts for that step's rollouts.
@@ -1534,7 +1540,11 @@ class SpeculativeGeneration:
             raise RuntimeError("verify_in_train needs pooled ⊥-BV drafts")
         G = int(self.vit_group_size)
         base = next(self._verify_seeds)
+        pred = self.vit_predictor
+        pred.end_step()  # the previous step's outcomes join the window
+        spread = self.vit_spread_rows() is not None
         keep = []
+        pis, gated = [], 0
         for v in drafts:
             key = _key(v[0][0])
             n_slots = int(slots[names[key]]) if names is not None else len(v)
@@ -1552,6 +1562,19 @@ class SpeculativeGeneration:
                     for d in head
                 )
             )
+            if ok:
+                # Gate (past steps' counts only): high predicted pass probability,
+                # and a spread group's retained forwards within the budget.
+                pi = pred.group_pass([len(d[2]) for d in head])
+                tokens_rank = -(-G // max(1, int(self.vit_dp))) * max(
+                    d[0].numel() + len(d[2]) for d in head
+                )
+                fits = (not spread) or tokens_rank * self.vit_bytes_per_token <= self.vit_checkpoint_bytes
+                if pi < self.vit_min_pass_prob or not fits:
+                    ok = False
+                    gated += 1
+                else:
+                    pis.append(pi)
             if not ok:
                 keep.append(v)
                 continue
@@ -1570,9 +1593,32 @@ class SpeculativeGeneration:
             )
         self._vit_seed_base = base
         self._vit_null = names is not None
+        self.stats["vit/gated_groups"] = float(gated)
+        self.stats["vit/predicted_pass_mean"] = sum(pis) / len(pis) if pis else float("nan")
         self.stats["vit/candidate_groups"] = float(len(self._vit_groups))
         self.stats["vit/candidate_rows"] = float(G * len(self._vit_groups))
         return keep
+
+    def vit_spread_rows(self) -> Optional[int]:
+        """Rows per micro-batch of a group spread over ranks; None: a group fits one.
+
+        ``THUNDERSYNC_VIT_FORCE_SPREAD_ROWS=r`` (test): spread every group in
+        micro-batches of r rows (exercises the forward-first path at short rows).
+        """
+        forced = os.environ.get("THUNDERSYNC_VIT_FORCE_SPREAD_ROWS")
+        if forced:
+            return int(forced)
+        return None if self.vit_group_size <= self.vit_mbs else int(self.vit_mbs)
+
+    def vit_observe_bytes_per_token(self, b: float) -> None:
+        """Measured retained bytes/token of a spread group (the gate's memory estimate)."""
+        self.vit_bytes_per_token = float(b)
+
+    def _vit_observe(self, d, res) -> None:
+        """A decided draft's whole-acceptance, for the pass predictor (finished drafts only)."""
+        if self._stopped(d):
+            whole = res.get("null") in (None, "out") and res.get("accepted") == len(d[2])
+            self.vit_predictor.observe(len(d[2]), whole)
 
     def _vit_place(self) -> None:
         """Placeholder plans the VIT groups' rollouts wait on (``_await_plan``)."""
@@ -1615,6 +1661,7 @@ class SpeculativeGeneration:
                 raise RuntimeError("verify_in_train: an accepted candidate is not a finished rollout")
             plan.verified = (g, g)
             plan.tail = False
+            self.vit_predictor.observe(g, True)
             await self._vit_fill(vg.placeholders[j], plan)
         self._release_hidden(vg.drafts)
         vg.passed = True
@@ -1664,6 +1711,7 @@ class SpeculativeGeneration:
                     tau, y, _ = r["null_grid"][m]
                     state.record(y >= 0)
                     res = _null_result(r, m)
+                    self._vit_observe(d, res)
                     if res["null"] == "bot":
                         continue
                 else:
@@ -2028,6 +2076,8 @@ class SpeculativeGeneration:
                 n_tail_drops += 1
                 continue
             m_sum += float(res["null_m"])
+            if self.verify_in_train:
+                self._vit_observe(d, res)
             g = len(d[2])
             decided_len.append(g)
             if state == "bot":

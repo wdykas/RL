@@ -239,3 +239,125 @@ def add_vit_fields(data, rows: list[dict]) -> None:
     data["vit_seed"] = seed
     data["vit_m"] = m
     data["vit_row"] = row
+
+
+# -- groups larger than one micro-batch (forward first, then decide; DESIGN 14r) --
+
+
+@dataclass
+class RetainedSlot:
+    """One micro-batch's training forward kept between the decision and the backward.
+
+    ``output``: the decoder's output with its autograd graph (under activation
+    recompute the graph holds only the checkpointed layer inputs); ``routes``:
+    per router-replay instance, the routes this forward used (the backward's
+    recompute must replay them).
+    """
+
+    ids: torch.Tensor  # [b, S] model input ids (CPU)
+    output: Any
+    routes: list
+    num_tokens: int
+
+
+@contextmanager
+def substitute_decoder_output(decoder: torch.nn.Module, output: Any):
+    """Make ``decoder(...)`` return ``output`` (and run nothing) for one forward."""
+    calls = []
+
+    def forward(*args: Any, **kwargs: Any) -> Any:
+        if calls:
+            raise RuntimeError("verify_in_train: a retained decoder output was used twice")
+        calls.append(1)
+        return output
+
+    decoder.forward = forward
+    try:
+        yield
+    finally:
+        del decoder.forward  # back to the class method
+
+
+def retained_forward(slot: RetainedSlot, original, decoder, instances, kwargs) -> Any:
+    """``model_forward`` from a retained slot: same ids, decoder output reused, routes restored.
+
+    Runs inside ``forward_with_post_processing_fn`` after its
+    ``set_router_replay_forward`` appended the anchors as this micro-batch's
+    backward routes; those are replaced by the routes the retained forward
+    actually used (the sticky rule may have kept plain routes).
+    """
+    ids = kwargs["input_ids_cp_sharded"]
+    if tuple(ids.shape) != tuple(slot.ids.shape) or not torch.equal(ids.detach().cpu(), slot.ids):
+        raise RuntimeError("verify_in_train: the micro-batch differs from the retained forward")
+    for inst, r in zip(instances, slot.routes):
+        if r is not None and inst.replay_backward_list:
+            inst.replay_backward_list[-1] = r
+    out, slot.output = slot.output, None
+    with substitute_decoder_output(decoder, out):
+        return original(**kwargs)
+
+
+def plan_group_layout(lengths: list[int], dp_size: int, micro_batch_size: int):
+    """One group's rows on (rank, micro-batch): [[row ids per micro-batch] per rank].
+
+    Rows sorted by (length desc, id), dealt to ranks in snake order, cut into
+    micro-batches of at most ``micro_batch_size`` rows; ranks with fewer
+    micro-batches get filler slots ``None`` (a masked copy of the shortest row)
+    so every rank runs the same count. A function of the lengths only.
+    """
+    order = sorted(range(len(lengths)), key=lambda i: (-lengths[i], i))
+    per_rank: list[list[int]] = [[] for _ in range(dp_size)]
+    for j, i in enumerate(order):
+        lap, k = divmod(j, dp_size)
+        per_rank[k if lap % 2 == 0 else dp_size - 1 - k].append(i)
+    slots = [
+        [rows[a : a + micro_batch_size] for a in range(0, len(rows), micro_batch_size)]
+        for rows in per_rank
+    ]
+    target = max(len(s) for s in slots)
+    for s in slots:
+        s.extend([None] * (target - len(s)))
+    return slots
+
+
+class PassPredictor:
+    """P(a group of finished drafts is accepted whole), from past steps' counts only.
+
+    Per draft-length bucket (powers of two), whole-acceptance counts of the
+    finished drafts verified in the last ``window`` steps (verify0, VIT and
+    fallback outcomes). rate = (whole + 1) / (n + 1): 1 without data, so short
+    rows start on verify-in-train. A group's pass probability is the product
+    over its candidate drafts. Exactness does not depend on it (``vit.py``
+    module doc): it only chooses where a group is verified.
+    """
+
+    def __init__(self, window: int = 4):
+        self.window = max(1, int(window))
+        self.steps: list[dict[int, list[int]]] = []
+        self.current: dict[int, list[int]] = {}
+
+    @staticmethod
+    def bucket(length: int) -> int:
+        return max(0, int(length) - 1).bit_length()
+
+    def observe(self, length: int, whole: bool) -> None:
+        c = self.current.setdefault(self.bucket(length), [0, 0])
+        c[0] += int(bool(whole))
+        c[1] += 1
+
+    def end_step(self) -> None:
+        self.steps.append(self.current)
+        self.current = {}
+        del self.steps[: -self.window]
+
+    def rate(self, length: int) -> float:
+        b = self.bucket(length)
+        w = sum(s.get(b, [0, 0])[0] for s in self.steps)
+        n = sum(s.get(b, [0, 0])[1] for s in self.steps)
+        return (w + 1) / (n + 1)
+
+    def group_pass(self, lengths: list[int]) -> float:
+        p = 1.0
+        for n in lengths:
+            p *= self.rate(n)
+        return p

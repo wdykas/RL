@@ -425,6 +425,15 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # the tails with the canonical order, group granularity, PP = 1 and
     # G <= the training micro-batch rows.
     verify_in_train: bool = False
+    # Verify-in-train gate: a group goes to VIT only if its predicted probability
+    # of being accepted whole (past steps' per-length counts, vit.PassPredictor,
+    # last vit_pass_window steps) is at least vit_min_pass_prob, and, when it
+    # spans several micro-batches, its retained forwards (estimated per rank from
+    # the measured bytes/token, initially vit_bytes_per_token) fit vit_checkpoint_gb.
+    vit_min_pass_prob: float = 0.5
+    vit_pass_window: int = 4
+    vit_checkpoint_gb: float = 16.0
+    vit_bytes_per_token: float = 1.0e6
 
 
 def train_micro_batch_rows(master_config: "ThunderSyncMasterConfig") -> int:
@@ -629,11 +638,8 @@ def validate_verify_in_train(master_config: ThunderSyncMasterConfig) -> None:
         problems.append("pipeline parallelism is not built")
     if (mcfg.get("context_parallel_size", 1) or 1) > 1:
         problems.append("context parallelism is not built")
-    if G > train_micro_batch_rows(master_config):
-        problems.append(
-            f"a group ({G} rows) must fit one training micro-batch "
-            f"({train_micro_batch_rows(master_config)} rows)"
-        )
+    if not 0.0 <= ts_cfg.vit_min_pass_prob <= 1.0 or ts_cfg.vit_checkpoint_gb < 0:
+        problems.append("vit_min_pass_prob must be in [0, 1] and vit_checkpoint_gb >= 0")
     if (master_config.grpo.max_rollout_turns or 1) > 1:
         problems.append("multi-turn rollouts are not built")
     for name in (
@@ -1766,6 +1772,9 @@ async def _run_one_step(
                         }
                     )
                 adv = adv_fn([t.reward for t in trajs])
+                entries.append((p, vg, trajs, rows, adv, gi))
+
+            def make_item(trajs, rows, adv, gi, spread):
                 data = build_chunk_data(
                     Chunk(
                         group=None,
@@ -1780,15 +1789,15 @@ async def _run_one_step(
                     1,
                 )
                 vit.add_vit_fields(data, rows)
-                item = {
+                return {
                     "data": data,
                     "group": None,
                     "reward": None,
                     "fused_key": None,
                     "vit": True,
+                    "vit_spread": spread,
                     "vit_group": gi,
                 }
-                entries.append((p, vg, trajs, item))
 
             def pad_item(item):
                 data = BatchedDataDict(
@@ -1799,32 +1808,81 @@ async def _run_one_step(
                     data[k] = torch.zeros_like(data[k])
                 return {**item, "data": data, "vit_group": -1}
 
-            # Canonical: blocks of canonical_block_groups in group order; groups placed
-            # on ranks by tokens in that order (a function of the data).
-            bg = max(1, int(ts_cfg.canonical_block_groups))
-            sent = []
-            for a in range(0, len(entries), bg):
-                blk = entries[a : a + bg]
-                per_rank = [[] for _ in range(learner.dp_size)]
-                load = [0] * learner.dp_size
-                for _, _, trajs, item in blk:
-                    r = load.index(min(load))
-                    per_rank[r].append(item)
-                    load[r] += sum(t.num_tokens for t in trajs)
-                if expert_parallel:
-                    target = max(len(x) for x in per_rank)
-                    for x in per_rank:
-                        while len(x) < target:
-                            x.append(pad_item(blk[0][3]))
+            dp = learner.dp_size
+            spread_rows = vit_spec.vit_spread_rows()
+
+            def submit(per_rank, what):
                 seq = None if ordered is None else ordered.learner_seq()
                 refs = learner.submit(per_rank, [], seq=seq)
                 if seq is not None:
                     ordered.learner_track(refs)
-                sent.append((blk, refs, time.perf_counter()))
+                sent.append((what, refs, time.perf_counter()))
+
+            def flush(blk):
+                # One micro-batch per group, groups placed on ranks by tokens in group order.
+                if not blk:
+                    return
+                per_rank = [[] for _ in range(dp)]
+                load = [0] * dp
+                for e in blk:
+                    r = load.index(min(load))
+                    per_rank[r].append(make_item(e[2], e[3], e[4], e[5], False))
+                    load[r] += sum(t.num_tokens for t in e[2])
+                if expert_parallel:
+                    target = max(len(x) for x in per_rank)
+                    for x in per_rank:
+                        while len(x) < target:
+                            x.append(pad_item(next(y for z in per_rank for y in z)))
+                submit(per_rank, list(blk))
+
+            # Canonical: groups in group order; single-micro-batch groups in blocks of
+            # canonical_block_groups, a group larger than one micro-batch alone, spread
+            # over every rank (vit.plan_group_layout) and decided after all its forwards.
+            bg = max(1, int(ts_cfg.canonical_block_groups))
+            sent = []
+            blk = []
+            n_spread = 0
+            for e in entries:
+                p, vg, trajs, rows, adv, gi = e
+                if spread_rows is None or G <= spread_rows:
+                    blk.append(e)
+                    if len(blk) == bg:
+                        flush(blk)
+                        blk = []
+                    continue
+                flush(blk)
+                blk = []
+                n_spread += 1
+                layout = vit.plan_group_layout(
+                    [t.num_tokens for t in trajs], dp, int(spread_rows)
+                )
+                shortest = min(range(G), key=lambda j: (trajs[j].num_tokens, j))
+                per_rank = []
+                for slots in layout:
+                    items = []
+                    for slot in slots:
+                        if slot is None:
+                            items.append(
+                                pad_item(make_item([trajs[shortest]], [rows[shortest]], [adv[shortest]], gi, True))
+                            )
+                        else:
+                            items.append(
+                                make_item(
+                                    [trajs[j] for j in slot],
+                                    [rows[j] for j in slot],
+                                    [adv[j] for j in slot],
+                                    gi,
+                                    True,
+                                )
+                            )
+                    per_rank.append(items)
+                submit(per_rank, [e])
+            flush(blk)
             vit_submitted.set()
             failed = []
             n_pass = 0
-            for blk, refs, t_sub in sent:
+            bpt = []
+            for blk_e, refs, t_sub in sent:
                 rank_results = await asyncio.gather(*refs)
                 if ordered is not None:
                     ordered._learner_inflight.difference_update(refs)
@@ -1834,19 +1892,26 @@ async def _run_one_step(
                     for e in rr.get("vit", []):
                         if e["group"] < 0:
                             continue
-                        rows = {j: lpx for j, _, lpx in e["rows"]}
+                        if "retained_bytes_per_token" in e:
+                            bpt.append(float(e["retained_bytes_per_token"]))
                         prev = dec.get(e["group"])
                         if prev is not None and prev[0] != e["pass"]:
                             raise RuntimeError("verify_in_train: ranks disagree on a group")
-                        dec[e["group"]] = (e["pass"], rows)
-                for p, vg, trajs, item in blk:
-                    ok, rows = dec[item["vit_group"]]
+                        rows_lp = {} if prev is None else prev[1]
+                        rows_lp.update({j: lpx for j, _, lpx in e["rows"]})
+                        dec[e["group"]] = (e["pass"], rows_lp)
+                for p, vg, trajs, rows, adv, gi in blk_e:
+                    ok, rows_lp = dec[gi]
                     if ok:
                         planner.mark_pretrained((step, p), [t.reward for t in trajs])
-                        await vit_spec.vit_pass(vg, rows)
+                        await vit_spec.vit_pass(vg, rows_lp)
                         n_pass += 1
                     else:
                         failed.append(vg)
+            if bpt:
+                vit_spec.vit_observe_bytes_per_token(max(bpt))
+                vit_stats["vit/retained_bytes_per_token"] = max(bpt)
+            vit_stats["vit/spread_groups"] = float(n_spread)
             vit_stats["vit/train_s"] = time.perf_counter() - t0
             pending_tails = await vit_spec.vit_fallback(failed)
             vit_stats.update(
@@ -2366,6 +2431,11 @@ def make_speculative_generation(
     )
     spec.verify_in_train = bool(ts_cfg.verify_in_train)
     spec.vit_group_size = int(master_config.grpo.num_generations_per_prompt)
+    spec.vit_mbs = int(train_micro_batch_rows(master_config))
+    spec.vit_min_pass_prob = float(ts_cfg.vit_min_pass_prob)
+    spec.vit_checkpoint_bytes = float(ts_cfg.vit_checkpoint_gb) * 2**30
+    spec.vit_bytes_per_token = float(ts_cfg.vit_bytes_per_token)
+    spec.vit_predictor = vit.PassPredictor(ts_cfg.vit_pass_window)
     return spec
 
 
@@ -2559,6 +2629,7 @@ def thundersync_grpo_train(
             if ts_cfg.stream_training_over_tails:
                 # Only the drafts' verification here; the continuation rounds
                 # run inside the step, under the training of complete groups.
+                spec.vit_dp = learner.dp_size
                 tails = asyncio.run(spec.begin_sticky(drafts))
             else:
                 asyncio.run(spec.verify_sticky(drafts))

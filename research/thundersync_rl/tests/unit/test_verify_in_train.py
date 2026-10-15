@@ -212,3 +212,56 @@ def test_assistant_span():
         {"role": "environment", "token_ids": torch.arange(2)},
     ]
     assert vit.assistant_span(log) == (5, 3)
+
+
+def test_plan_group_layout_spreads_one_group_and_pads():
+    lay = vit.plan_group_layout([5, 9, 7, 3, 8], dp_size=2, micro_batch_size=2)
+    rows = sorted(j for slots in lay for s in slots if s is not None for j in s)
+    assert rows == [0, 1, 2, 3, 4]
+    assert len(lay[0]) == len(lay[1])  # equal micro-batch counts (EP lockstep)
+    assert any(s is None for slots in lay for s in slots)  # 5 rows on 2 ranks x 2 rows: a filler
+    assert all(s is None or len(s) <= 2 for slots in lay for s in slots)
+    assert lay == vit.plan_group_layout([5, 9, 7, 3, 8], 2, 2)  # a function of the lengths
+
+
+def test_pass_predictor_uses_past_steps_only():
+    pr = vit.PassPredictor(window=2)
+    assert pr.group_pass([100, 3000]) == 1.0  # no data: start on VIT
+    for _ in range(9):
+        pr.observe(3000, False)
+    pr.observe(3000, True)
+    assert pr.rate(3000) == 1.0  # the current step does not count yet
+    pr.end_step()
+    assert pr.rate(3000) == (1 + 1) / (10 + 1)
+    assert pr.rate(100) == 1.0  # other bucket
+    pr.end_step()
+    pr.end_step()  # window 2: the observations fall out
+    assert pr.rate(3000) == 1.0
+
+
+def test_retained_forward_reuses_output_and_restores_routes():
+    class Dec(torch.nn.Module):
+        def forward(self, x):
+            raise AssertionError("the decoder must not run")
+
+    class Inst:
+        def __init__(self):
+            self.replay_backward_list = [torch.tensor([9])]  # anchors appended by the forward
+
+    dec, insts = Dec(), [Inst(), Inst()]
+    out = torch.ones(2, requires_grad=True)
+    slot = vit.RetainedSlot(
+        ids=torch.tensor([[1, 2]]), output=out, routes=[torch.tensor([3]), None], num_tokens=2
+    )
+    got = vit.retained_forward(
+        slot, lambda **kw: dec(None) * 2, dec, insts, {"input_ids_cp_sharded": torch.tensor([[1, 2]])}
+    )
+    assert torch.equal(got, out * 2) and got.requires_grad
+    assert torch.equal(insts[0].replay_backward_list[-1], torch.tensor([3]))
+    assert torch.equal(insts[1].replay_backward_list[-1], torch.tensor([9]))  # no route recorded
+    assert "forward" not in dec.__dict__  # decoder restored
+    with pytest.raises(RuntimeError, match="differs"):
+        vit.retained_forward(
+            vit.RetainedSlot(ids=torch.tensor([[1, 2]]), output=out, routes=[], num_tokens=2),
+            lambda **kw: dec(None), dec, [], {"input_ids_cp_sharded": torch.tensor([[1, 3]])},
+        )
