@@ -45,6 +45,7 @@ from __future__ import annotations
 import collections
 import contextlib
 import os
+import threading
 from typing import Any, Iterator, Optional
 
 import torch
@@ -399,6 +400,62 @@ if HAVE_TRITON:
         )
 
     @triton.jit
+    def _segment_gemm_tma_kernel(
+        a_ptr,  # [M, R] rows grouped by expert (unpadded), 16-bit, 16-byte aligned rows
+        w_ptr,  # base pointer of the first expert's weight
+        w_off_ptr,  # [E] int64 element offset of each expert's weight from w_ptr
+        counts_ptr,  # [E] int32 rows per expert
+        out_ptr,  # [M, C] fp32
+        M,
+        C,
+        R,
+        E,
+        E_POW2: tl.constexpr,
+        TRANS: tl.constexpr,  # B = W_e^T (W_e [C, R]); else B = W_e (W_e [R, C])
+        B_FP16: tl.constexpr,  # convert weight elements to fp16 (else keep the dtype)
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        # _segment_gemm_kernel's math with both operands fed through TMA descriptors
+        # (the weight's per expert, built on device). A row tile may read rows of
+        # the next expert (or zero fill past M): they are computed and not stored.
+        expert, row0, seg_end = _segment_tile(
+            counts_ptr, tl.program_id(0), E, E_POW2, BLOCK_M
+        )
+        if expert >= E:
+            return
+        w_base = w_ptr + tl.load(w_off_ptr + expert)
+        ad = tl.make_tensor_descriptor(
+            a_ptr, shape=[M, R], strides=[R, 1], block_shape=[BLOCK_M, BLOCK_K]
+        )
+        n0 = tl.program_id(1) * BLOCK_N
+        r0 = row0.to(tl.int32)
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        if TRANS:
+            wd = tl.make_tensor_descriptor(
+                w_base, shape=[C, R], strides=[R, 1], block_shape=[BLOCK_N, BLOCK_K]
+            )
+            for k0 in range(0, R, BLOCK_K):
+                b = wd.load([n0, k0])
+                if B_FP16:
+                    b = b.to(tl.float16)
+                acc = tl.dot(ad.load([r0, k0]), b.T, acc)
+        else:
+            wd = tl.make_tensor_descriptor(
+                w_base, shape=[R, C], strides=[C, 1], block_shape=[BLOCK_K, BLOCK_N]
+            )
+            for k0 in range(0, R, BLOCK_K):
+                acc = tl.dot(ad.load([r0, k0]), wd.load([k0, n0]), acc)
+        rm = row0 + tl.arange(0, BLOCK_M).to(tl.int64)
+        rn = n0 + tl.arange(0, BLOCK_N)
+        tl.store(
+            out_ptr + rm[:, None] * C + rn[None, :],
+            acc,
+            mask=(rm[:, None] < seg_end) & (rn[None, :] < C),
+        )
+
+    @triton.jit
     def _segment_wgrad_kernel(
         g_ptr,  # [M, N] bf16 output gradients, rows grouped by expert (unpadded)
         x_ptr,  # [M, K] bf16 inputs, same rows
@@ -574,7 +631,20 @@ def live_rows_bound(
     return pairs + min(num_local_experts, pairs) * (block_m - 1)
 
 
-_ALLOCATOR_SET = False
+# Triton's allocator is per thread (a context variable): the autograd engine runs
+# backward kernels on its own threads, so each thread sets it once.
+_ALLOCATOR_SET = threading.local()
+
+
+def _set_triton_allocator() -> None:
+    """On-device TMA descriptors need Triton scratch memory (set once per thread)."""
+    if not getattr(_ALLOCATOR_SET, "done", False):
+        triton.set_allocator(
+            lambda size, align, stream: torch.empty(
+                size, dtype=torch.int8, device="cuda"
+            )
+        )
+        _ALLOCATOR_SET.done = True
 
 
 def grouped_gemm_fp16w(
@@ -593,14 +663,7 @@ def grouped_gemm_fp16w(
     of ``offsets[-1]``) only sizes the persistent grid; any live row count is
     computed correctly whatever the hint.
     """
-    global _ALLOCATOR_SET
-    if not _ALLOCATOR_SET:  # on-device TMA descriptors need scratch memory
-        triton.set_allocator(
-            lambda size, align, stream: torch.empty(
-                size, dtype=torch.int8, device="cuda"
-            )
-        )
-        _ALLOCATOR_SET = True
+    _set_triton_allocator()
     bm, bn, bk, warps, stages = config
     m_pad, k = x16.shape
     e, n, _ = w16.shape
@@ -992,21 +1055,38 @@ def _aligned_rows(m_splits: list[int], block_m: int, device) -> tuple:
 # Training expert GEMMs: one Triton launch per grouped linear (``segment``) or one
 # cuBLAS GEMM per expert (``cublas``). Both give the same bits (exact 16-bit
 # products, the reduction accumulated in order in fp32, no split-K); they differ in
-# cost. cuBLAS costs ~20-60 us of host time per GEMM (PyTorch re-parses
-# CUBLAS_WORKSPACE_CONFIG on every call under the batch-invariant :0:0 setting), so
-# at few rows per expert a forward over many local experts is launch-bound (Nano
-# EP1: 128 experts x 2 linears x #MoE layers GEMMs); at many rows per expert
-# cuBLAS's tiles are faster on the GPU. ``auto`` takes the segment kernel below
-# _SEGMENT_MAX_ROWS rows per expert (crossover ~1000-1500 rows per expert at Nano
-# expert shapes, thundersync_work/research/callcost/moe_bench_seg*.json).
-# NEMO_RL_FP16_MOE_TRAIN_GEMM overrides it (auto | segment | cublas).
-_SEGMENT_MAX_ROWS = 1024
-# (rows per expert bound, (BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages))
-_SEGMENT_CONFIGS: tuple[tuple[int, TileConfig], ...] = (
+# cost. cuBLAS costs ~25 us of host time per GEMM, ~60 us under the batch-invariant
+# CUBLAS_WORKSPACE_CONFIG=:0:0 (PyTorch < 2.13 re-parses it with std::regex on every
+# call), so with many local experts and few rows each a pass is launch-bound; the
+# segment kernel (no TMA) reaches ~1/3 of cuBLAS's GPU throughput at large M.
+# Measured at Nano expert shapes, 32 experts (thundersync_work/research/callcost/
+# kbench_e32.json, seg_tile_sweep_e32.json), GPU ms per pass segment / cuBLAS:
+# fwd and dgrad 0.13 / 0.19 at 48 rows per expert, 0.29 / 0.21 at 192, 0.84 / 0.33
+# at 768, 1.76 / 0.49 at 1536; wgrad 0.23 / 0.37 at 48 ... 0.60 / 0.68 at 1536.
+# ``auto``: wgrad always takes the segment kernel. Forward and dgrad take it while
+# its GPU time per expert (~_SEGMENT_US_PER_ROW_NK x rows x N x K) stays below
+# cuBLAS's host time per expert GEMM, i.e. up to ~1700 rows per expert at Nano
+# shapes with the :0:0 env (~700 without the per-call parse); cuBLAS above (its
+# GPU time is then the bound). NEMO_RL_FP16_MOE_TRAIN_GEMM overrides forward and
+# dgrad (auto | segment | cublas). The choice never changes bits.
+_SEGMENT_US_PER_ROW_NK = 0.80e3 / (1536 * 32 * 1856 * 2688)
+_CUBLAS_HOST_US = {"parsed_env": 60.0, "plain": 25.0}
+# Forward / dgrad tiles: (rows per expert bound, (BLOCK_M, BLOCK_N, BLOCK_K,
+# num_warps, num_stages)); the fastest bitwise configurations of the sweeps
+# (seg_tma_proto_e32.json for the TMA kernel, seg_tile_sweep_e32.json otherwise).
+_SEGMENT_TMA_CONFIGS: tuple[tuple[int, TileConfig], ...] = (
+    (64, (64, 128, 64, 4, 4)),
+    (1 << 62, (128, 256, 64, 8, 4)),
+)
+_SEGMENT_FWD_CONFIGS: tuple[tuple[int, TileConfig], ...] = (
     (16, (16, 64, 64, 4, 3)),
-    (64, (32, 64, 64, 4, 3)),
-    (256, (64, 64, 64, 4, 3)),
-    (1 << 62, (128, 128, 64, 8, 3)),
+    (64, (64, 64, 32, 4, 4)),
+    (1 << 62, (128, 64, 64, 4, 4)),
+)
+_SEGMENT_DGRAD_CONFIGS: tuple[tuple[int, TileConfig], ...] = (
+    (16, (16, 64, 64, 4, 3)),
+    (256, (64, 128, 64, 8, 4)),
+    (1 << 62, (128, 64, 64, 8, 3)),
 )
 # wgrad tiles (BLOCK_N, BLOCK_K, BLOCK_R, num_warps, num_stages) by rows per expert.
 _WGRAD_CONFIGS: tuple[tuple[int, tuple], ...] = (
@@ -1015,19 +1095,21 @@ _WGRAD_CONFIGS: tuple[tuple[int, tuple], ...] = (
 )
 
 
-def _train_gemm_kind(rows: int, experts: int) -> str:
+def _train_gemm_kind(rows: int, experts: int, n: int, k: int) -> str:
+    """Kernel of a forward / dgrad pass: ``rows`` rows over ``experts`` [n, k] experts."""
     mode = os.environ.get("NEMO_RL_FP16_MOE_TRAIN_GEMM", "auto")
     if mode in ("segment", "cublas"):
         return mode
-    return "segment" if rows <= _SEGMENT_MAX_ROWS * max(experts, 1) else "cublas"
+    host_us = _CUBLAS_HOST_US[
+        "parsed_env" if "CUBLAS_WORKSPACE_CONFIG" in os.environ else "plain"
+    ]
+    seg_us = _SEGMENT_US_PER_ROW_NK * rows / max(experts, 1) * n * k
+    return "segment" if seg_us <= host_us else "cublas"
 
 
-def _segment_config(rows: int, experts: int) -> TileConfig:
+def _pick(table: tuple, rows: int, experts: int) -> tuple:
     per = rows / max(experts, 1)
-    for bound, cfg in _SEGMENT_CONFIGS:
-        if per <= bound:
-            return cfg
-    return _SEGMENT_CONFIGS[-1][1]
+    return next(cfg for bound, cfg in table if per <= bound)
 
 
 def _segment_gemm(
@@ -1049,10 +1131,34 @@ def _segment_gemm(
     cols, (s_r, s_c) = (n, (1, k)) if transpose else (k, (k, 1))
     assert r == (k if transpose else n) and a.is_contiguous()
     e = len(weights)
-    bm, bn, bk, warps, stages = _segment_config(m, e)
     out = torch.empty((m, cols), dtype=torch.float32, device=a.device)
     if m == 0:
         return out
+    if _tma_ok(a, weights):
+        bm, bn, bk, warps, stages = _pick(_SEGMENT_TMA_CONFIGS, m, e)
+        _set_triton_allocator()
+        _segment_gemm_tma_kernel[(triton.cdiv(m, bm) + e, triton.cdiv(cols, bn))](
+            a,
+            base,
+            w_offs,
+            counts,
+            out,
+            m,
+            cols,
+            r,
+            e,
+            E_POW2=triton.next_power_of_2(e),
+            TRANS=transpose,
+            B_FP16=b_fp16,
+            BLOCK_M=bm,
+            BLOCK_N=bn,
+            BLOCK_K=bk,
+            num_warps=warps,
+            num_stages=stages,
+        )
+        return out
+    table = _SEGMENT_FWD_CONFIGS if transpose else _SEGMENT_DGRAD_CONFIGS
+    bm, bn, bk, warps, stages = _pick(table, m, e)
     grid = (triton.cdiv(m, bm) + e, triton.cdiv(cols, bn))
     _segment_gemm_kernel[grid](
         a,
@@ -1076,6 +1182,17 @@ def _segment_gemm(
     return out
 
 
+def _tma_ok(a: torch.Tensor, weights: tuple[torch.Tensor, ...]) -> bool:
+    """TMA descriptors need sm90+, 16-byte aligned bases and 16-byte row strides."""
+    if torch.cuda.get_device_capability(a.device)[0] < 9:
+        return False
+    tensors = (a, *weights)
+    return all(
+        t.data_ptr() % 16 == 0 and (t.shape[-1] * t.element_size()) % 16 == 0
+        for t in tensors
+    )
+
+
 def _segment_wgrad(
     g: torch.Tensor, x: torch.Tensor, counts: torch.Tensor, e: int
 ) -> torch.Tensor:
@@ -1083,8 +1200,7 @@ def _segment_wgrad(
     m, n = g.shape
     k = x.shape[1]
     out = torch.empty((e, n, k), dtype=torch.float32, device=g.device)
-    per = m / max(e, 1)
-    bn, bk, br, warps, stages = next(c for bound, c in _WGRAD_CONFIGS if per <= bound)
+    bn, bk, br, warps, stages = _pick(_WGRAD_CONFIGS, m, e)
     _segment_wgrad_kernel[(triton.cdiv(n, bn), triton.cdiv(k, bk), e)](
         g,
         x,
@@ -1132,13 +1248,18 @@ class GroupedFp16Linear(torch.autograd.Function):
         x16 = x.reshape(-1, k).to(torch.float16)
         splits = list(m_splits)
         counts = None
-        if x16.is_cuda and _train_gemm_kind(x16.shape[0], len(splits)) == "segment":
+        if x16.is_cuda:
+            # Rows per expert on the device: the segment kernels' only routing input.
             counts = torch.tensor(splits, dtype=torch.int32).to(
                 x16.device, non_blocking=True
             )
-            out = _segment_gemm(x16.contiguous(), weights, counts, True, True)
-        elif x16.is_cuda:
-            out = _expert_gemm_cublas(x16, splits, weights)
+            if (
+                _train_gemm_kind(x16.shape[0], len(splits), *weights[0].shape)
+                == "segment"
+            ):
+                out = _segment_gemm(x16.contiguous(), weights, counts, True, True)
+            else:
+                out = _expert_gemm_cublas(x16, splits, weights)
         else:
             cfg = select_config(sum(splits) / max(len(splits), 1))
             dest, offs, m_pad = _aligned_rows(splits, cfg[0], x.device)
@@ -1161,29 +1282,31 @@ class GroupedFp16Linear(torch.autograd.Function):
             return _grouped_backward_reference(ctx, g, x16, weights)
         w0 = weights[0]
         same = all(w.dtype == w0.dtype and w.shape == w0.shape for w in weights)
-        if ctx.counts is not None and same and w0.dtype == torch.bfloat16:
-            # One dgrad and one wgrad launch for all experts (same bits as below).
-            dx = None
-            if ctx.needs_input_grad[0]:
-                dx = _segment_gemm(g.contiguous(), weights, ctx.counts, False, False)
-                dx = dx.to(ctx.x_dtype).view(ctx.x_shape)
-            wg32 = _segment_wgrad(
-                g.contiguous(), x16.to(torch.bfloat16), ctx.counts, len(weights)
-            )
-            return (dx, None, *wg32.to(w0.dtype).unbind(0))
-        # Per expert: the same cuBLAS GEMMs as before, on views of whole-tensor
-        # casts and into views of whole-tensor outputs (one bf16 cast of x, one
-        # bf16 cast of all wgrads), so the host issues one GEMM per expert and
-        # nothing else. Bitwise the same as casting / rounding expert by expert.
+        # The segment kernels take bf16 weights of one shape; their bits are the
+        # per-expert cuBLAS bits (see _train_gemm_kind for which is used when).
+        segment = ctx.counts is not None and same and w0.dtype == torch.bfloat16
+        mode = os.environ.get("NEMO_RL_FP16_MOE_TRAIN_GEMM", "auto")
         x_bf = x16.to(torch.bfloat16)
         g_e, x_e = g.split(splits), x_bf.split(splits)
         dx = None
         if ctx.needs_input_grad[0]:
-            dx = torch.empty(x16.shape, dtype=torch.float32, device=x16.device)
-            for gi, w, di in zip(g_e, weights, dx.split(splits)):
-                if gi.shape[0]:
-                    torch.mm(gi, w.to(torch.bfloat16), out_dtype=torch.float32, out=di)
+            if (
+                segment
+                and _train_gemm_kind(g.shape[0], len(splits), *w0.shape) == "segment"
+            ):
+                dx = _segment_gemm(g.contiguous(), weights, ctx.counts, False, False)
+            else:
+                # One cuBLAS GEMM per expert, into views of one output.
+                dx = torch.empty(x16.shape, dtype=torch.float32, device=x16.device)
+                for gi, w, di in zip(g_e, weights, dx.split(splits)):
+                    if gi.shape[0]:
+                        torch.mm(
+                            gi, w.to(torch.bfloat16), out_dtype=torch.float32, out=di
+                        )
             dx = dx.to(ctx.x_dtype).view(ctx.x_shape)
+        if segment and mode != "cublas":
+            wg32 = _segment_wgrad(g.contiguous(), x_bf, ctx.counts, len(weights))
+            return (dx, None, *wg32.to(w0.dtype).unbind(0))
         if not same:
             return (
                 dx,
@@ -1193,6 +1316,7 @@ class GroupedFp16Linear(torch.autograd.Function):
                     for gi, xi, w in zip(g_e, x_e, weights)
                 ),
             )
+        # One cuBLAS GEMM per expert into one fp32 buffer, one cast to the weight dtype.
         wg32 = torch.empty(
             (len(weights), *w0.shape), dtype=torch.float32, device=g.device
         )
