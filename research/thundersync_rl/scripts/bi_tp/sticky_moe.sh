@@ -53,6 +53,9 @@ SCHED=${SCHED:-async}
 export TAG=${TAG:-sticky$STICKY-d$DELTA-ep$EP-tp$TP-pp$PP-$SCHED-dw$DRAFT_WEIGHTS$([ "$LANES" != 1 ] && echo -lanes$LANES)$([ "${STREAM:-1}" != 1 ] && echo -nostream)$([ "${PERF:-0}" = 1 ] && echo -perf)-$(basename "$MODEL")}
 STICKY_ARGS="++thundersync.draft_lookahead=1 ++policy.generation.mcore_generation_config.async_sched_mode=$SCHED"
 STICKY_ARGS+=" ++thundersync.draft_weights=$DRAFT_WEIGHTS"
+# Engine request capacity (the draft-capacity guard needs max_requests x engine DP >= a cohort's
+# primary drafts, PROMPTS x 8 here).
+STICKY_ARGS+=" ++policy.generation.mcore_generation_config.max_requests=${MAX_REQUESTS:-128}"
 # STREAM (1): train complete groups while other rows' sticky tails still run (DESIGN 14k); 0 = after the last tail.
 STICKY_ARGS+=" ++thundersync.stream_training_over_tails=$([ "${STREAM:-1}" = 1 ] && echo true || echo false)"
 if [ "$STICKY" = 1 ]; then
