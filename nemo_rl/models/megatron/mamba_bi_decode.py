@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+import os
 from typing import Any, Optional
 
 import torch
@@ -173,6 +174,74 @@ if HAVE_TRITON:
         tl.store(o_ptrs, acc, mask=mask)
 
 
+    @triton.jit
+    def _decode_prep_kernel(
+        bi_ptr,
+        nbuf_ptr,
+        x_ptr,
+        dt_ptr,
+        b_ptr,
+        c_ptr,
+        sx_ptr,
+        sdt_ptr,
+        sb_ptr,
+        sc_ptr,
+        out_ptr,
+        rows_ptr,
+        flags_ptr,
+        starts_ptr,
+        stride_x,
+        stride_dt,
+        stride_b,
+        stride_c,
+        n_x,
+        n_dt,
+        n_bc,
+        n_out,
+        CHUNK: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        """One decode entry's bookkeeping in one program (all integer moves and copies).
+
+        Equal to MCore's per-step sequence for entry e with slot s = batch_indices[e]:
+        write pos w = num_buffered[s]; rows x/dt/B/C of the current token into buffer row
+        s * CHUNK + w; target_rows[e] = w (-1 inactive); chunk_flags[e] = (w + 1 == CHUNK);
+        chunk_starts[e] = s * CHUNK; out[e] = 0; num_buffered[s] = 0 if crossed else w + 1.
+        The scan pipeline reads none of num_buffered, so its update moves here.
+        """
+        e = tl.program_id(0)
+        s = tl.load(bi_ptr + e)
+        tl.store(starts_ptr + e, s * CHUNK)
+        offs = tl.arange(0, BLOCK)
+        zero = tl.zeros([BLOCK], dtype=tl.float32)
+        for o in range(0, n_out, BLOCK):
+            tl.store(out_ptr + e * n_out + o + offs, zero, mask=o + offs < n_out)
+        if s < 0:
+            tl.store(rows_ptr + e, -1)
+            tl.store(flags_ptr + e, 0)
+            return
+        w = tl.load(nbuf_ptr + s)
+        row = (s * CHUNK + w).to(tl.int64)
+        for o in range(0, n_x, BLOCK):
+            m = o + offs < n_x
+            v = tl.load(x_ptr + e * stride_x + o + offs, mask=m)
+            tl.store(sx_ptr + row * n_x + o + offs, v, mask=m)
+        for o in range(0, n_dt, BLOCK):
+            m = o + offs < n_dt
+            v = tl.load(dt_ptr + e * stride_dt + o + offs, mask=m)
+            tl.store(sdt_ptr + row * n_dt + o + offs, v, mask=m)
+        for o in range(0, n_bc, BLOCK):
+            m = o + offs < n_bc
+            v = tl.load(b_ptr + e * stride_b + o + offs, mask=m)
+            tl.store(sb_ptr + row * n_bc + o + offs, v, mask=m)
+            v = tl.load(c_ptr + e * stride_c + o + offs, mask=m)
+            tl.store(sc_ptr + row * n_bc + o + offs, v, mask=m)
+        crossed = w + 1 == CHUNK
+        tl.store(rows_ptr + e, w)
+        tl.store(flags_ptr + e, crossed.to(tl.int32))
+        tl.store(nbuf_ptr + s, tl.where(crossed, 0, w + 1))
+
+
 def _gate_target_rows(
     out: torch.Tensor, z: torch.Tensor, target_rows: torch.Tensor
 ) -> None:
@@ -216,7 +285,7 @@ def _allocate(
     def zeros(*shape):
         return torch.zeros(max_requests, chunk_size, *shape, device=device, dtype=dtype)
 
-    return cls(
+    buf = cls(
         x=zeros(nheads, headdim),
         z=None,
         dt=zeros(nheads),
@@ -227,6 +296,9 @@ def _allocate(
         target_rows=torch.empty(max_requests, device=device, dtype=torch.int32),
         chunk_flags=torch.empty(max_requests, device=device, dtype=torch.int32),
     )
+    # Per-entry chunk starts (slot * chunk), written by the fused decode prep kernel.
+    buf.chunk_starts = torch.empty(max_requests, device=device, dtype=torch.int32)
+    return buf
 
 
 def _seed(self, x, z, dt, B, C, cu_seqlens, batch_indices):
@@ -273,6 +345,10 @@ def _decode_buffered_scan(
     """
     if buffers.z is not None:
         return _ORIG["scan"](
+            buffers, x, z, dt, B, C, A, D, dt_bias, batch_indices, ssm_state
+        )
+    if _FUSED_PREP["on"] and x.is_cuda:
+        return _decode_buffered_scan_fused(
             buffers, x, z, dt, B, C, A, D, dt_bias, batch_indices, ssm_state
         )
     from megatron.core.ssm.ops.mamba2 import batch_invariant_decode as bid
@@ -340,6 +416,92 @@ def _decode_buffered_scan(
     update(
         buffers.num_buffered.unsqueeze(1), batch_indices, next_write_pos.unsqueeze(1)
     )
+    return out.unsqueeze(1)
+
+
+# Decode-step bookkeeping in one kernel (``_decode_prep_kernel``); THUNDERSYNC_BI_DECODE_FUSED=0
+# restores the op-by-op sequence (same bits, ~25 more kernels per Mamba layer per step).
+_FUSED_PREP = {"on": os.environ.get("THUNDERSYNC_BI_DECODE_FUSED", "1") != "0"}
+
+
+def _decode_buffered_scan_fused(
+    buffers, x, z, dt, B, C, A, D, dt_bias, batch_indices, ssm_state
+):
+    """``_decode_buffered_scan`` with its ~26 bookkeeping kernels fused into one.
+
+    The scan pipeline and the gate are unchanged; every value the fused kernel writes is
+    an integer or a copied element, so the result is bitwise the op-by-op path's.
+    """
+    from megatron.core.ssm.ops.mamba2 import batch_invariant_decode as bid
+
+    n, tokens_per_entry, nheads, headdim = x.shape
+    ngroups, dstate = B.shape[-2], B.shape[-1]
+    chunk_size = buffers.x.shape[1]
+    assert tokens_per_entry == 1, "batch-invariant Mamba decode: one token per request"
+    assert ssm_state.dtype == torch.float32, (
+        "batch-invariant Mamba decode: fp32 SSM state"
+    )
+    assert n <= buffers.out.shape[0], "increase max_requests"
+    assert batch_indices.dtype == torch.int32 and buffers.num_buffered.dtype == torch.int32
+    starts_all = getattr(buffers, "chunk_starts", None)
+    if starts_all is None:
+        starts_all = buffers.chunk_starts = torch.empty_like(buffers.target_rows)
+    out = buffers.out[:n]
+    target_rows = buffers.target_rows[:n]
+    chunk_flags = buffers.chunk_flags[:n]
+    chunk_starts = starts_all[:n]
+    x2, dt2 = x[:, 0].flatten(1), dt[:, 0]
+    b2, c2 = B[:, 0].flatten(1), C[:, 0].flatten(1)
+    for t, dtype in ((x2, buffers.x.dtype), (dt2, buffers.dt.dtype), (b2, buffers.B.dtype),
+                     (c2, buffers.C.dtype)):
+        assert t.stride(-1) == 1 and t.dtype == dtype
+    assert out.is_contiguous() and buffers.x.is_contiguous() and buffers.B.is_contiguous()
+    if n:
+        _decode_prep_kernel[(n,)](
+            batch_indices,
+            buffers.num_buffered,
+            x2,
+            dt2,
+            b2,
+            c2,
+            buffers.x,
+            buffers.dt,
+            buffers.B,
+            buffers.C,
+            out,
+            target_rows,
+            chunk_flags,
+            chunk_starts,
+            x2.stride(0),
+            dt2.stride(0),
+            b2.stride(0),
+            c2.stride(0),
+            nheads * headdim,
+            nheads,
+            ngroups * dstate,
+            out[0].numel(),
+            CHUNK=chunk_size,
+            BLOCK=1024,
+        )
+    bid._mamba_chunk_scan_decode_rows(
+        buffers.x.view(-1, nheads, headdim),
+        None,
+        buffers.dt.view(-1, nheads),
+        A,
+        buffers.B.view(-1, ngroups, dstate),
+        buffers.C.view(-1, ngroups, dstate),
+        chunk_size,
+        chunk_starts=chunk_starts,
+        slots=batch_indices,
+        target_rows=target_rows,
+        chunk_flags=chunk_flags,
+        initial_states=ssm_state,
+        out=out,
+        D=D,
+        dt_bias=dt_bias,
+        dt_softplus=True,
+    )
+    _gate_target_rows(out, z[:, 0], target_rows)
     return out.unsqueeze(1)
 
 
