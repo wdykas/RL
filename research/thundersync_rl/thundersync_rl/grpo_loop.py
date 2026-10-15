@@ -1441,6 +1441,8 @@ async def _run_one_step(
         out = grad_digests()
         if per_param_replay:
             replay_params[key] = _run_workers(learner.policy, "grad_param_digests")
+            if key == "canonical_a":
+                _run_workers(learner.policy, "grad_param_snapshot", tag=key)
         learner.abort()
         learner.begin(loss_fn, **begin_kw)
         return out
@@ -1747,6 +1749,12 @@ async def _run_one_step(
     assert planner.all_done()
     if order_replay:
         real = grad_digests()
+        if per_param_replay:
+            _run_workers(learner.policy, "grad_param_snapshot", tag="real")
+            for r, diff in enumerate(
+                _run_workers(learner.policy, "grad_param_compare", a="canonical_a", b="real")
+            ):
+                print(f"[order replay] step={step} rank={r} canonical_a_vs_real={diff}", flush=True)
         bad = []
         for k, v in replay_digests.items():
             same = v == real

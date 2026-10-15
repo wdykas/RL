@@ -729,6 +729,30 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 out[name] = zlib.crc32(raw)
         return out
 
+    def grad_param_snapshot(self, tag: str) -> None:
+        """Debug: keep a CPU copy of every parameter's accumulated gradient under ``tag``."""
+        snaps = self.__dict__.setdefault("_grad_snapshots", {})
+        snaps[tag] = {
+            name: p.main_grad.detach().cpu().clone()
+            for name, p in self.model.named_parameters()
+            if getattr(p, "main_grad", None) is not None
+        }
+
+    def grad_param_compare(self, a: str, b: str, drop: bool = True) -> list[tuple]:
+        """Debug: (name, differing elements, max |diff|, signed zeros only) per differing parameter."""
+        snaps = self.__dict__.get("_grad_snapshots", {})
+        out = []
+        for name, ga in snaps[a].items():
+            gb = snaps[b][name]
+            ne = ga.view(torch.int32) != gb.view(torch.int32)
+            n = int(ne.sum())
+            if n:
+                d = (ga.float() - gb.float()).abs()
+                out.append((name, n, ga.numel(), float(d.max()), bool((d[ne] == 0).all())))
+        if drop:
+            snaps.clear()
+        return out
+
     def get_flat_grads(self) -> torch.Tensor:
         """Return this rank's gradient buffers on CPU (for equivalence tests).
 
