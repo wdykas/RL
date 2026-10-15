@@ -955,7 +955,11 @@ def validate_engine_verify_source(
     ):
         train_v = megatron_cfg.get(key, 1)
         gen_v = mcore_gen.get(key)
-        if gen_v is not None and gen_v != train_v:
+        # Debug (THUNDERSYNC_ALLOW_EP_MISMATCH=1): run an engine EP different from
+        # the learner's (zero_train_gen_mismatch has the same override); the run's
+        # exactness checks decide whether the requirement holds.
+        allow = os.environ.get("THUNDERSYNC_ALLOW_EP_MISMATCH") == "1"
+        if gen_v is not None and gen_v != train_v and not allow:
             problems.append(
                 f"policy.generation.mcore_generation_config.{key} ({gen_v}) must "
                 f"equal policy.megatron_cfg.{key} ({train_v}): batch invariance "

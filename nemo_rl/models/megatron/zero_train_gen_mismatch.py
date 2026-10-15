@@ -261,6 +261,13 @@ def validate_batch_invariant_mode(config: PolicyConfig) -> ZeroTrainGenValidatio
             "lm_head_precision",
             "down_proj_prescale_log2",
         )
+        if os.environ.get("THUNDERSYNC_ALLOW_EP_MISMATCH") == "1":
+            # Debug: a different expert-parallel size on the engine (e.g. cohort
+            # lanes of EP4 under an EP8 learner). Per-token MoE math (row-local
+            # expert GEMMs, top-k combine in routing order) is not expected to
+            # depend on EP, but that is untested; the run's exactness checks
+            # decide whether this field may be relaxed.
+            matching_fields = tuple(f for f in matching_fields if f != "expert_model_parallel_size")
         mismatched_fields = [
             field
             for field in matching_fields
