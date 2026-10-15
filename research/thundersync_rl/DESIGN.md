@@ -3959,3 +3959,29 @@ p-lanes / p-async1. Full Nano: thundersync_work/sbatch/go_integ3.sh (`x`, `sr`, 
 - **Fused verification + training on GPU.** Validate `fused_verify_train` end to end
   (`THUNDERSYNC_FUSED_CHECK=1`, gradient against the unfused path) and measure the saved
   learner time on short-output tasks (section 14).
+
+## 14ac. Engine decode step: fused small-op sequences (ts-decode-speed, 2026-10-15)
+
+Measured (research/agent_decode_speed.md, ledger DEC): the full-Nano engine decode step is GPU-bound at every row count
+(host blocked on the forward's events 78-87% of the step; GPU busy 95-97%). EP4 with rows held live: 7.6 / 8.7 / 12.2 /
+21.8 ms at 1 / 8 / 64 / 256 rows per rank; the earlier 7.6-8.5 ms bench engine held at most 8 requests, and the in-loop
+13.1-13.9 ms is the 41-64-row point. Per step: ~2.5k GPU ops, ~3.5 ms of them small elementwise/copy/cast kernels
+(row-independent), expert GEMMs at the HBM bound, and the batch-invariant Mamba replay scan (O(rows x chunk)).
+
+Built (bitwise; default on; THUNDERSYNC_BI_DECODE_FUSED=0 / THUNDERSYNC_FUSED_DECODE_OPS=0 restore the op-by-op paths;
+A/B launch knob DECODE_FUSED=0):
+- `mamba_bi_decode._decode_prep_kernel`: one kernel per Mamba layer and step for the replay-buffer bookkeeping (slot
+  gathers, write positions, the four row writes, target rows, chunk flags, chunk starts, output zeroing, write-cursor
+  update), ~26 kernels before. Integer moves and copies only.
+- `fused_decode_ops.rms_norm_fp32_nograd`: the no-autograd fp32 RMSNorm keeps x*x and MCore's own `mean_dim` and fuses
+  eps / rsqrt / (x * r) * w into one kernel (3 kernels instead of 7). The reduction is not re-implemented: a Triton copy
+  of `mean_kernel` inside a fused kernel was compiled with a different reduction layout (different sum order).
+- `fused_decode_ops.fp32_gemm_chunk` (router and LM head): hi/lo split in one kernel, the stacked GEMM, and one combine
+  kernel with IEEE div.rn / add.rn (3 kernels instead of 9).
+Effect (EP1, one GPU): 1.3-1.7 ms per step at every row count (8.27 -> 6.80 ms at 1 row, 17.1 -> 15.7 at 64, 27.0 ->
+25.4 at 256); greedy decode dumps bitwise identical with the fusions on and off, graphs on and off.
+
+Scaling: row-local kernels, one int32[max_requests] buffer per Mamba layer, no communication; independent of TP/PP/EP.
+At EP >= 32 the expert-GEMM share shrinks and the EP-independent terms (Mamba replay scan, small-op floor) grow in share.
+Not built: a target-row-only Mamba replay scan (must reproduce the training tile's tensor-core accumulation bitwise),
+router top-k fusion, norm -> fp16 emission for norm-fused linears, per-refit caching of Mamba A / D / dt_bias.
