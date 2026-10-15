@@ -2762,6 +2762,43 @@ Notes: thundersync_work/research/agent_nano_perf.md.*
   other orders, so it requires this mode. ThunderSync's `validate_config` rejects the replay without it.
 - *Measured.* With the full recipe the replay matched bitwise on Nano L8 steps 1-5 (one-engine agent).
 
+**Frozen for the full-Nano A/B (2026-10-15): ../RL-nano-perf-scale @ 5b3530de.**
+
+*Validation [M].*
+
+| run | tip | what | result |
+|---|---|---|---|
+| np-v2-x1k | 6ed6cb24 | 1k exactness + 59 GPU unit tests | EXACT 4/4 |
+| np-dh2-lanes-x | 9ff5bd21 | lanes exactness | EXACT |
+| np-dh3-8k | a6006fb0 | Nano L8 at 8k | EXACT 3/3, no learner OOM |
+| np-v-8k-pc | 9a96457d | Nano L8 at 8k, prefix cache on | perf (below) |
+
+*Learner memory at 8k (np-dh3-8k).* The fixes in this tip:
+- deferred LM head (logits never materialized for a whole micro-batch);
+- micro-batches bounded by tokens (`thundersync.train_micro_batch_tokens`);
+- cached memory released before the optimizer step, only under pressure.
+
+Measured: peak 81 GB allocated, 144-149 GB reserved, i.e. fragmentation.
+
+*First 8k piece-verify number (np-v-8k-pc, step 2).* With the prefix cache, 10.7 s, against 9.4 s of training; cache
+hits 76 %. A step whose drafts were cut at ~1 token decodes the whole cohort as tails (59 s), so the drafting window
+at 8k is the next lever.
+
+*Engine-vs-learner EP (np-v2-lanes-ep).* Rows the engine samples plainly differ under an EP mismatch, by up to 0.89 in
+log-prob. The MoE combine is EP-dependent, so the engine EP must equal the learner's. An EP-invariant combine has
+been handed to another agent.
+
+*A/B layout.* Every arm uses learner EP4 x DP2 on 8 GPUs plus 8 engine GPUs:
+- one EP4 engine at engine DP 2, or
+- 2 lanes x EP4.
+
+All arms set:
+- `max_requests` 128 per engine rank (the primaries of an EP4 lane);
+- `buffer_size_gb` 48;
+- prefix cache on at >= 4k on the ts arms;
+- no debug reward or noise (`submit_ab.sh` refuses them);
+- CHECKS=0.
+
 ## 14o. Engine MoE kernels on live-row grids (2026-10-14)
 
 *Branch ts-moe-livegrid (../RL-livegrid) from ts-nano-perf. Code: `nemo_rl/models/megatron/fp16_moe.py`
