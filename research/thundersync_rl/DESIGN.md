@@ -2785,8 +2785,8 @@ hits 76 %. A step whose drafts were cut at ~1 token decodes the whole cohort as 
 at 8k is the next lever.
 
 *Engine-vs-learner EP (np-v2-lanes-ep).* Rows the engine samples plainly differ under an EP mismatch, by up to 0.89 in
-log-prob. The MoE combine is EP-dependent, so the engine EP must equal the learner's. An EP-invariant combine has
-been handed to another agent.
+log-prob. The old MoE combine is EP-dependent. With `moe_ep_invariant_combine` (section 14q) the engine EP may
+differ from the learner's: epinv-lanes-ep, the same layout, is exact.
 
 *A/B layout.* Every arm uses learner EP4 x DP2 on 8 GPUs plus 8 engine GPUs:
 - one EP4 engine at engine DP 2, or
@@ -2976,6 +2976,72 @@ with mixed starts vs the whole rows, logits compared with torch.equal).
   piece forward ~0.5 s of token work vs ~4 ms for a 256-token cached segment. Per continued 32k row: 256 pieces x
   ~0.25 s (average 16k) ~ 60 s of learner work without the cache, ~1-2 s with it. The per-call cost is shared by all
   rows batched in one verification call and is not changed by the cache; it needs its own fix (profile first).
+
+## 14q. EP-invariant MoE combine (`policy.megatron_cfg.moe_ep_invariant_combine`, opt-in)
+
+*Branch ts-ep-invariant (../RL-epinv). Code: `nemo_rl/models/megatron/ep_invariant_combine.py`. Notes:
+thundersync_work/research/agent_ep_invariant.md.*
+
+**Problem [M].** The batch-invariant combine sums a token's expert rows per EP rank in fp64 and rounds each rank
+partial to fp32. The partials are then added in rank order. That makes the rounding points depend on EP.
+- Megatron's BI training unpermute mirrors the same tree, so the learner and the engine agree only at equal EP.
+- One Nano layer (EP emulated): EP2 or EP4 vs EP1 changes 98-100% of tokens (max 2.4e-7 per element). Engine EPn
+  equals learner EPn exactly.
+- Nothing else depends on EP: the expert rows are row-local GEMMs, and routing, padding, permutation order and
+  shared experts are EP-free.
+
+**Design.**
+- Each expert row value v is fp32 and, under the fp16 GEMM forward, a multiple of 2^-48. It maps to two fp64
+  integer limbs: `hi = floor(v)` and `lo = (v - hi) * 2^48`.
+- A token's limb sums are integers below 2^53 (checked at setup from top-k, the fc2 K and the prescale), so every
+  addition is exact. Any grouping or order (per local expert, per rank, any collective) gives the same sums.
+- `finalize` returns the correctly rounded fp32 of the exact sum (TwoSum round-to-odd, then fp32).
+- Engine (AllGather-V/RS-V):
+  - The unpermute kernel writes the rank's [T, 2H] fp64 limb partial into the NVLS RSV symmetric memory, which
+    is sized 4x at allocation.
+  - `limbs_reduce_scatter_v` sums the peers' limbs and finalizes. The NCCL dispatcher reduce-scatters fp64
+    limbs instead.
+  - At EP 1 the kernel finalizes directly. All of this is CUDA-graph safe.
+- Learner (AlltoAll): the combine already returns each token's k rows to its home rank, so the bytes do not
+  change. The BI unpermute sums the k rows through the limbs, with no rank grouping. The backward is unchanged
+  and deterministic.
+
+**Cost.**
+- Engine combine bytes and RSV memory go up 4x (16 B per element instead of 4 B). Nano at max_tokens 16384: 2.8
+  GB RSV at EP4 [D].
+- Returning the k rows instead would cost 4k B (Nano 24, Super 88, 1T-class 32), so limbs are the cheaper exact
+  form for k > 4.
+- Measured on one GB200 node:
+
+  | measurement | old | new |
+  |---|---|---|
+  | full Nano engine decode, EP4, CUDA graphs, ms/step (N = 1 / 8 / 128 per rank) | 7.52 / 8.48 / 8.46 | 7.94 / 8.89 / 8.88 (+5%) |
+  | combine (unpermute + RS) per layer, EP4, 128 tokens/rank | 27 us | 56 us |
+  | combine per layer, EP4, 4096 tokens/rank (prefill) | 0.44 ms | 1.14 ms (x23 layers: +16 ms/step) |
+  | learner unpermute fwd+bwd, 1k-16k tokens | 0.64-0.67 ms | 0.28-0.68 ms (no regression) |
+
+- The limb reduce-scatter (fp64 loads) is the cost; it is not tuned yet.
+- At Ultra/1T EP (32-64), the per-rank cost of the AllGather design grows with EP whatever the combine. There the
+  engine needs an AlltoAll dispatcher: the combine returns k rows, and the home rank runs the learner's
+  `unpermute_rows`. That dispatcher is not built yet.
+
+**Validation [M].**
+- Unit: 68 GPU tests pass.
+- NVLS EP2 and EP4 real reduce-scatter: limb results are bitwise equal to EP1, while the old ordered and multimem
+  results differ from EP1.
+- Nano L8 engine (livegrid, fp16, CUDA graphs on and off): greedy decode dumps at EP2 and EP4 are bitwise EP1 on
+  every rank with the new combine. The old combine differs in 46 and 92 log-prob sequences (max 0.28). New EP1
+  equals old EP1 on these dumps.
+- End to end, Nano L8, learner EP2, engine lanes EP1, `THUNDERSYNC_DEBUG_FRESH_MOD=3` (16-48 forced fresh,
+  engine-sampled rows per step), real gradients:
+  - epinv-lanes-ep: 4/4 steps mismatch 0, engine-q exact.
+  - epinv-lanes-ep-off (control, old combine): fails every step (max |dlogp| 0.66 / 0.30 / 0.79 / 0.74).
+  - epinv-ep2-ctl (equal EP, new combine): exact.
+- The validators (`zero_train_gen_mismatch`, `validate_engine_verify_source`) accept different learner and
+  engine EP when the combine is on.
+
+**Default.** Opt-in: +5% engine decode at EP4 and +16 ms per 4k-token-per-rank prefill step. Turn it on for
+layouts whose engine EP differs from the learner's (lanes, Ultra/1T).
 
 ## 15. Open work
 

@@ -937,3 +937,10 @@ def _tp_gen(tp, **mcore):
 def test_engine_source_config_rejects(ts_kw, policy, match):
     with pytest.raises(ValueError, match=match):
         validate_engine_verify_source(_ts(**ts_kw), policy)
+
+
+def test_engine_ep_may_differ_with_ep_invariant_combine():
+    # runs_1node/epinv-lanes-ep: learner EP2, engine EP1, exact with the combine on.
+    p = _gen(expert_model_parallel_size=1)
+    p["megatron_cfg"].update(expert_model_parallel_size=2, moe_ep_invariant_combine=True)
+    validate_engine_verify_source(_ts(), p)
