@@ -9,6 +9,10 @@ grpo:
     max_trajectory_age_steps: 1
     in_flight_weight_updates: false
 
+policy:
+  generation:
+    refit_transport: null  # stock NeMo-RL loop: its own refit path (ab_base sets mcore for the ThunderSync loop)
+
 loss_fn:
   use_importance_sampling_correction: true
   force_on_policy_ratio: false

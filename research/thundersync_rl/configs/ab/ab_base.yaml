@@ -70,9 +70,16 @@ policy:
       CUBLASLT_WORKSPACE_SIZE: "0"
       CUBLAS_WORKSPACE_CONFIG: ":0:0"
   generation:
+    # m2n refit (DESIGN 14q): every learner rank sends its own shards through MCore's native
+    # refit (no HF export, no rank-0 broadcast). Default for every arm on the ThunderSync loop
+    # (sync, async1, ts_*) so refit cost is the same across them. Validated: m2n-xc-one /
+    # m2n-xc-lanes crosscheck PASS on every refit (θ and θ̂), m2n-x-one / m2n-x-lanes EXACT 6/6.
+    # async1_nrl (stock NeMo-RL loop) keeps its stock transport; sync_coloc reshards in place.
+    refit_transport: mcore
     max_new_tokens: 8192  # generation cap (run_ab_arm.sh MAXLEN; 16384 / 32768 for the long-cap pass)
     mcore_generation_config:
       transformer_impl: inference_optimized
+      refit_backend: nccl  # with refit_transport mcore (nccl_m2n needs nccl.m2n, absent in the image)
       logprobs_mode: raw_logprobs
       enable_chunked_prefill: false
       enable_prefix_caching: false  # sticky routing forbids it; off on every arm for parity
