@@ -1950,6 +1950,9 @@ async def _run_one_step(
         # Rank 0's peak allocated / reserved memory over the step's dispatches.
         "learner/mem_peak_gb": results.get("learner_mem_peak_gb", float("nan")),
         "learner/mem_reserved_gb": results.get("learner_mem_reserved_gb", float("nan")),
+        # Seconds rank 0 spent releasing cached blocks before the optimizer step
+        # (0 when reserved memory was below the pressure threshold).
+        "learner/empty_cache_s": results.get("learner_empty_cache_s", float("nan")),
         "timeline/arrivals": arrivals,
         "timeline/dispatches": dispatches,
         "timeline/step_end": t_end - t_start,

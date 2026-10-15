@@ -720,11 +720,19 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         # step's largest micro-batch otherwise leave them no room (np-dh-8k:
         # "Cuda failure 2 'out of memory'" in the grad-norm all-reduce). Once
         # per step; the next dispatch re-reserves what it needs.
+        reserved = torch.cuda.memory_reserved()
+        total = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
         mem = {
             "learner_mem_peak_gb": torch.cuda.max_memory_allocated() / 2**30,
-            "learner_mem_reserved_gb": torch.cuda.memory_reserved() / 2**30,
+            "learner_mem_reserved_gb": reserved / 2**30,
+            "learner_empty_cache_s": 0.0,
         }
-        torch.cuda.empty_cache()
+        # Only under memory pressure (reserved above THUNDERSYNC_EMPTY_CACHE_FRAC of
+        # the device, default 0.8): releasing and re-reserving costs time otherwise.
+        if reserved > float(os.environ.get("THUNDERSYNC_EMPTY_CACHE_FRAC", "0.8")) * total:
+            t_free = time.perf_counter()
+            torch.cuda.empty_cache()
+            mem["learner_empty_cache_s"] = time.perf_counter() - t_free
         torch.cuda.reset_peak_memory_stats()
         if os.environ.get("THUNDERSYNC_MEM_LOG"):
             print(f"[thundersync mem] rank={self.rank} step dispatches: {mem}", flush=True)
