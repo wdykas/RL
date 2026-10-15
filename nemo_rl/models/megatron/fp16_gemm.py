@@ -210,7 +210,14 @@ def _fp32_gemm_chunked(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     x2 = x.reshape(-1, k)
     w16t = weight.to(torch.float16).t()  # no-op for engine weights held in fp16
     out = torch.empty((x2.shape[0], n), dtype=torch.float32, device=x.device)
+    from nemo_rl.models.megatron import fused_decode_ops as fdo
+
+    fused = fdo.fp32_gemm_supported(x2, w16t)
     for start in range(0, x2.shape[0], _FP32_GEMM_CHUNK_ROWS):
+        if fused:  # same split / GEMM / combine in 3 kernels (bitwise; fused_decode_ops)
+            rows = x2[start : start + _FP32_GEMM_CHUNK_ROWS]
+            fdo.fp32_gemm_chunk(rows, w16t, out[start : start + rows.shape[0]], _SPLIT_SCALE)
+            continue
         x32 = x2[start : start + _FP32_GEMM_CHUNK_ROWS].float()
         c = x32.shape[0]
         hi = x32.to(torch.float16)
@@ -441,7 +448,16 @@ class RMSNormFp32(torch.autograd.Function):
 def rms_norm_fp32(
     x: torch.Tensor, weight: torch.Tensor, eps: float, zero_centered_gamma: bool = False
 ) -> torch.Tensor:
-    """RMSNorm of x in fp32 (fp32 output), weight upcast to fp32 (``RMSNormFp32``)."""
+    """RMSNorm of x in fp32 (fp32 output), weight upcast to fp32 (``RMSNormFp32``).
+
+    Without autograd (engine and verification forwards) one fused kernel computes the
+    same op sequence bitwise (``fused_decode_ops.rms_norm_fp32_nograd``).
+    """
+    if not (torch.is_grad_enabled() and (x.requires_grad or weight.requires_grad)):
+        from nemo_rl.models.megatron import fused_decode_ops as fdo
+
+        if fdo.rms_norm_fp32_supported(x, weight, eps):
+            return fdo.rms_norm_fp32_nograd(x, weight, eps, zero_centered_gamma)
     return RMSNormFp32.apply(x, weight, eps, zero_centered_gamma)
 
 

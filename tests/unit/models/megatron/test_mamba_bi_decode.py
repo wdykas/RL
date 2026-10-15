@@ -74,7 +74,7 @@ def test_budget_noop_without_replay_and_unbuilt_branch():
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
-def _decode(z_free: bool, steps: int, slots, prefill, graph: bool, seed=0):
+def _decode(z_free: bool, steps: int, slots, prefill, graph: bool, seed=0, fused=False):
     """MCore's buffered decode (z buffer) or ours: per-step outputs and the final ssm_state."""
     from megatron.core.ssm.ops.mamba2 import batch_invariant_decode as bid
 
@@ -82,6 +82,7 @@ def _decode(z_free: bool, steps: int, slots, prefill, graph: bool, seed=0):
     R = max(slots) + 2
     g = torch.Generator(device="cuda").manual_seed(seed)
     mbd.install()  # idempotent; the reference arm calls MCore's originals
+    mbd._FUSED_PREP["on"] = fused
     cls = bid.BatchInvariantDecodeBuffers
     if z_free:
         alloc, seed_fn, scan = (
@@ -170,3 +171,26 @@ def test_decode_without_z_buffer_is_bitwise_identical(graph):
     assert torch.isfinite(out_ref[:, :3]).all()
     assert torch.equal(out_ref, out_new)
     assert torch.equal(st_ref, st_new)
+
+
+@cuda
+@pytest.mark.parametrize("graph", [False, True])
+@pytest.mark.parametrize("slots,prefill", [((0, 3, 1), (5, 127, 130)), ((7, 2, 5, 0, 9), (128, 1, 255, 64, 300))])
+def test_fused_decode_prep_is_bitwise_identical(graph, slots, prefill):
+    """Fused bookkeeping kernel vs the op-by-op z-free path (and MCore's z path): outputs and states."""
+    from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+        _pin_mamba_autotuners,
+    )
+
+    _pin_mamba_autotuners()
+    kw = dict(steps=300, slots=slots, prefill=prefill, graph=graph)
+    try:
+        out_ref, st_ref = _decode(False, **kw)
+        out_op, st_op = _decode(True, fused=False, **kw)
+        out_fu, st_fu = _decode(True, fused=True, **kw)
+    finally:
+        mbd._FUSED_PREP["on"] = True
+    assert torch.isfinite(out_fu[:, : len(slots)]).all()
+    assert (out_fu[:, -1] == 0).all()  # padding lane
+    assert torch.equal(out_op, out_fu) and torch.equal(st_op, st_fu)
+    assert torch.equal(out_ref, out_fu) and torch.equal(st_ref, st_fu)
