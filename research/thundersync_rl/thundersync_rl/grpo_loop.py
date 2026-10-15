@@ -413,6 +413,16 @@ class ThunderSyncMasterConfig(MasterConfig):
 def validate_config(master_config: ThunderSyncMasterConfig) -> None:
     """Fail fast on settings that would break exact equivalence."""
     loss_cfg = master_config.loss_fn
+    data_cfg = getattr(master_config, "data", None) or {}
+    max_in = data_cfg.get("max_input_seq_length") if isinstance(data_cfg, dict) else None
+    max_total = master_config.policy["max_total_sequence_length"]
+    if max_in is not None and max_in > max_total:
+        # A prompt between the two passes the data filter (which masks prompts
+        # >= max_input_seq_length) but overflows the engine's total-length cap.
+        raise ValueError(
+            f"data.max_input_seq_length ({max_in}) must not exceed "
+            f"policy.max_total_sequence_length ({max_total})"
+        )
     assert loss_cfg.reference_policy_kl_penalty == 0.0, (
         "gradient streaming supports kl=0 (the reference KL term would need the "
         "reference policy on the learner)"
