@@ -393,3 +393,33 @@ def test_theta_store_holds_expert_gemm_weights_as_fp16():
     # anything else keeps its dtype (1e-6 is not exact in fp16)
     assert got["mlp.experts.norm"].dtype == torch.bfloat16
     assert torch.equal(got["mlp.experts.norm"], layer.mlp.experts.norm.detach())
+
+
+@pytest.mark.parametrize("sticky", [True, False])
+def test_micro_batch_padding_is_never_anchored(sticky):
+    """The micro-batch padding repair keeps the missing-route sentinel under sticky
+    routing: padding is anchored to itself, so neither sticky routing nor sticky
+    rounding treats it as an anchored token (a step-0 batch has no anchored token)."""
+    from nemo_rl.models.megatron import sticky_routing
+    from nemo_rl.models.megatron.data import _fill_routed_experts_padding
+
+    # Row 0: drafted, anchors on its 3 tokens; row 1: undrafted (all -1); width 5.
+    routed = torch.full((2, 5, 2, 2), -1, dtype=torch.int16)
+    routed[0, :3] = torch.tensor([[3, 1], [0, 2]], dtype=torch.int16)
+    lengths = torch.tensor([3, 2])
+    old = sticky_routing.get_delta()
+    sticky_routing.set_delta(0.03 if sticky else None)
+    try:
+        out = _fill_routed_experts_padding(
+            routed, lengths, keep_missing_routes=sticky_routing.get_delta() is not None
+        )
+    finally:
+        sticky_routing.set_delta(old)
+    valid = sticky_routing.anchor_valid(out.transpose(0, 1).reshape(10, 2, 2)).all(-1)
+    valid = valid.view(5, 2)  # [S, B], Megatron's token order
+    assert valid[:3, 0].all()  # the drafted row's tokens
+    if sticky:
+        assert not valid[3:, 0].any() and not valid[:, 1].any()
+        assert bool(out[1].eq(-1).all()) and bool(out[0, 3:].eq(-1).all())
+    else:  # R3 keeps the dummy top-k route on padding
+        assert bool(out[0, 3:].eq(torch.tensor([0, 1], dtype=torch.int16)).all())

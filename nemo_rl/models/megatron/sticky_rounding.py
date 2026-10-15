@@ -726,7 +726,8 @@ def policy_forward(
     if (st is None or not st.ready) and bool(mask.any()):
         raise RuntimeError(
             "sticky rounding: anchored tokens but no theta_n snapshot (the first "
-            "drafts must follow an optimizer step)"
+            f"drafts must follow an optimizer step): {int(mask.sum())} of "
+            f"{mask.numel()} tokens anchored"
         )
     s = AnchorStream(st, mask, tp_rank, tp_size, rank)
     _STATE["stream"] = s

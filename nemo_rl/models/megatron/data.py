@@ -33,6 +33,7 @@ from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS, PackedTensor
 from nemo_rl.data_plane.schema import OPD_FULL_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
+from nemo_rl.models.generation.interfaces import ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL
 from nemo_rl.models.megatron.alignment import (
     get_fp8_token_alignment,
     get_parallel_token_alignment,
@@ -956,9 +957,14 @@ def process_microbatch(
                         "is disabled so padding rows can be repaired before router "
                         "replay."
                     )
+                from nemo_rl.models.megatron import sticky_routing
+
                 routed_experts = _fill_routed_experts_padding(
                     routed_experts,
                     data_dict["input_lengths"],
+                    # Sticky routing: padding is anchored to itself (plain
+                    # routing), as every position without a route anchor.
+                    keep_missing_routes=sticky_routing.get_delta() is not None,
                 )
                 routed_experts_cp_sharded = routed_experts
                 if r3_trace_verify_forward_enabled():
@@ -1132,8 +1138,16 @@ def _verify_r3_trace_cp_token_alignment(
 def _fill_routed_experts_padding(
     routed_experts: torch.Tensor,
     seq_lengths: torch.Tensor,
+    keep_missing_routes: bool = False,
 ) -> torch.Tensor:
-    """Replace materialized jagged padding with a valid dummy top-k route."""
+    """Replace materialized jagged padding with a valid dummy top-k route.
+
+    ``keep_missing_routes``: padding positions that already hold the missing-route
+    sentinel at every layer keep it, so the router routes them plainly (the
+    missing-route fallback). Sticky MoE routing relies on this: a sentinel
+    position is anchored to itself, and sticky rounding anchors exactly the
+    positions with valid route anchors, which must not include padding.
+    """
     if routed_experts.dim() != 4:
         raise ValueError(
             "routed_experts must have shape [batch, seq, num_moe_layers, topk]; "
@@ -1151,6 +1165,9 @@ def _fill_routed_experts_padding(
         device=routed_experts.device,
     ).unsqueeze(0)
     padding_mask = seq_positions >= seq_lengths.unsqueeze(1)
+    if keep_missing_routes:
+        missing = routed_experts.eq(ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL).flatten(2).all(-1)
+        padding_mask = padding_mask & ~missing
     if not bool(padding_mask.any().item()):
         return routed_experts
 
