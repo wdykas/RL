@@ -2722,6 +2722,24 @@ Notes: thundersync_work/research/agent_nano_perf.md.*
     today [D]), so EP8 gains more.
   - Also: `select_engine_config` picks the grouped-GEMM tile from the padded row count.
 
+**Deterministic training (opt-in, `policy.megatron_cfg.deterministic_training`, default false).**
+
+- *What the default gives.* Exactness needs a 0 logprob difference between the engine and the training forward. That is
+  batch invariance, which `enable_batch_invariant_kernels` installs by default (forward behaviour only).
+- *What the mode adds.* Bitwise-reproducible gradients: the same rows give the same update. It installs four fixes, all
+  backward-only, so forward values and exactness are unchanged:
+  1. fixed-order MoE token-gather backward (`moe_deterministic.GatherRows`);
+  2. Transformer Engine deterministic attention backward (`NVTE_ALLOW_NONDETERMINISTIC_ALGO=0`);
+  3. causal_conv1d weight/bias gradients per row, summed in row order (`mamba_ssd_parity._ConvFixedOrderGradFn`);
+  4. mamba_ssm deterministic chunk-scan backward.
+- *Cost (Nano L8).*
+  - The conv per-row gradient is ~+0.9 ms per Mamba layer per micro-batch: one kernel launch per row.
+  - The other three are within noise (0.40-0.42 vs 0.42-0.43 s per fwd+bwd).
+  - Per rank, the cost is proportional to rows x Mamba layers per micro-batch, independent of EP / node count.
+- *Coupling.* The in-loop order replay (`THUNDERSYNC_DEBUG_ORDER_REPLAY`) compares gradient digests of the same rows in
+  other orders, so it requires this mode. ThunderSync's `validate_config` rejects the replay without it.
+- *Measured.* With the full recipe the replay matched bitwise on Nano L8 steps 1-5 (one-engine agent).
+
 ## 14o. Engine MoE kernels on live-row grids (2026-10-14)
 
 *Branch ts-moe-livegrid (../RL-livegrid) from ts-nano-perf. Code: `nemo_rl/models/megatron/fp16_moe.py`

@@ -572,6 +572,12 @@ class MegatronConfig(TypedDict):
     freeze_config: NotRequired[dict[str, Any]]
     # Megatron-Core batch-invariant kernels (bitwise train/generation parity).
     batch_invariant_mode: NotRequired[bool]
+    # Opt-in bitwise-reproducible training on top of batch invariance (default false):
+    # fixed-order MoE token-gather backward, TE deterministic attention backward
+    # (NVTE_ALLOW_NONDETERMINISTIC_ALGO=0), causal_conv1d weight/bias grads per row in
+    # row order, mamba_ssm deterministic chunk-scan backward. Batch invariance (0
+    # train/generation logprob difference) does not need it.
+    deterministic_training: NotRequired[bool]
     # Sticky MoE routing threshold in router-score units (None/absent: off).
     # Set by ThunderSync from thundersync.sticky_routing_delta
     # (nemo_rl/models/megatron/sticky_routing.py).

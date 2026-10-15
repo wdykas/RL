@@ -282,6 +282,10 @@ class _ConvFixedOrderGradFn(torch.autograd.Function):
         return dx, dweight.to(weight.dtype), None if dbias is None else dbias.to(bias.dtype), None
 
 
+# Opt-in reproducible gradients (``install(deterministic=True)``).
+_DETERMINISTIC = [False]
+
+
 def _split_proj(self, zxBCdt):
     """(z, xBC, dt) of the in-projection output, (l, b, d) -> (b, l, d) each."""
     from einops import rearrange
@@ -302,14 +306,15 @@ def _conv(self, xBC_bdl):
     """
     from einops import rearrange
 
-    # Weight / bias gradients reduced in a fixed row order (_ConvFixedOrderGradFn);
-    # the forward is causal_conv1d_fn's.
-    out = _ConvFixedOrderGradFn.apply(
-        xBC_bdl,
-        rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
-        self.cp.get_conv1d_bias(),
-        self.activation,
-    )
+    from causal_conv1d import causal_conv1d_fn
+
+    weight = rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w")
+    bias = self.cp.get_conv1d_bias()
+    if _DETERMINISTIC[0]:
+        # Weight / bias gradients reduced in a fixed row order (same forward).
+        out = _ConvFixedOrderGradFn.apply(xBC_bdl, weight, bias, self.activation)
+    else:
+        out = causal_conv1d_fn(x=xBC_bdl, weight=weight, bias=bias, activation=self.activation)
     return rearrange(out, "b d l -> b l d").contiguous()
 
 
@@ -423,16 +428,22 @@ def ssm_prefix_forward(self, zxBCdt, conv_init, ssm_init):
     return y, xBC_ext, chunk_states
 
 
-def install() -> None:
-    """Train batch-invariant Mamba on the engine's pinned SSD kernels (idempotent)."""
-    pin_engine_kernels()
-    # mamba_ssm's chunk-scan backward otherwise adds the A_log / dt_bias
-    # gradient partials with atomics (bitwise different between identical
-    # steps); its deterministic mode reduces them in a fixed order (measured
-    # at the cost of noise on Nano-L8 per-layer shapes).
-    from mamba_ssm.utils.determinism import set_deterministic_mode
+def install(deterministic: bool = False) -> None:
+    """Train batch-invariant Mamba on the engine's pinned SSD kernels (idempotent).
 
-    set_deterministic_mode(True)
+    ``deterministic`` (policy.megatron_cfg.deterministic_training, opt-in):
+    bitwise-reproducible gradients. The conv weight / bias gradients are summed
+    per row in row order (``_ConvFixedOrderGradFn``, ~+0.9 ms per Mamba layer
+    per micro-batch on Nano L8) and mamba_ssm's chunk-scan backward reduces the
+    A_log / dt_bias partials in a fixed order instead of with atomics (cost at
+    noise on Nano-L8 shapes). Neither changes forward values.
+    """
+    pin_engine_kernels()
+    if deterministic:
+        from mamba_ssm.utils.determinism import set_deterministic_mode
+
+        set_deterministic_mode(True)
+        _DETERMINISTIC[0] = True
     if _INSTALLED:
         return
     from megatron.core.ssm.mamba_mixer import MambaMixer

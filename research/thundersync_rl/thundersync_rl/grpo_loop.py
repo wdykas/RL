@@ -445,6 +445,15 @@ def validate_config(master_config: ThunderSyncMasterConfig) -> None:
             f"data.max_input_seq_length ({max_in}) must not exceed "
             f"policy.max_total_sequence_length ({max_total})"
         )
+    if os.environ.get("THUNDERSYNC_DEBUG_ORDER_REPLAY") and not (
+        master_config.policy["megatron_cfg"].get("deterministic_training", False)
+    ):
+        # The replay compares gradient digests of the same rows in other orders;
+        # without reproducible backward kernels identical orders already differ.
+        raise ValueError(
+            "THUNDERSYNC_DEBUG_ORDER_REPLAY requires "
+            "policy.megatron_cfg.deterministic_training=true"
+        )
     assert loss_cfg.reference_policy_kl_penalty == 0.0, (
         "gradient streaming supports kl=0 (the reference KL term would need the "
         "reference policy on the learner)"

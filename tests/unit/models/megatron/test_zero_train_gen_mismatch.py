@@ -21,6 +21,7 @@ pushed through the same gates the workers run at startup.
 """
 
 import copy
+import os
 import sys
 import types
 from dataclasses import make_dataclass
@@ -713,7 +714,11 @@ def test_enable_batch_invariant_kernels_passes_the_recipe_settings(monkeypatch):
     )
     monkeypatch.setattr(zgm, "_use_inference_log_softmax", lambda: shimmed.append(True))
     mamba: list[bool] = []
-    monkeypatch.setattr(zgm.mamba_ssd_parity, "install", lambda: mamba.append(True))
+    monkeypatch.setattr(
+        zgm.mamba_ssd_parity, "install", lambda deterministic=False: mamba.append(deterministic)
+    )
+    moe: list[bool] = []
+    monkeypatch.setattr(zgm.moe_deterministic, "install", lambda: moe.append(True))
     monkeypatch.setattr(
         zgm.bi_mean, "install", lambda: calls.append(("bi_mean", (), {}))
     )
@@ -722,13 +727,34 @@ def test_enable_batch_invariant_kernels_passes_the_recipe_settings(monkeypatch):
 
     assert opened == [True]
     assert shimmed == [True]
-    assert mamba == [True]
+    # Batch invariance only by default: no deterministic-training fixes.
+    assert mamba == [False]
+    assert moe == []
     # The full-reduction mean fix is patched in before MCore registers aten::mean.dim.
     assert calls == [
         ("assert_te", (), {}),
         ("bi_mean", (), {}),
         ("enable", (), {"backend": "te_native", "collective": "ordered"}),
     ]
+
+
+def test_enable_batch_invariant_kernels_deterministic_training_opt_in(monkeypatch):
+    _fake_batch_invariant_kernels(monkeypatch)
+    monkeypatch.setattr(zgm, "allow_installed_flash_attn_4", lambda: None)
+    monkeypatch.setattr(zgm, "_use_inference_log_softmax", lambda: None)
+    monkeypatch.setattr(zgm.bi_mean, "install", lambda: None)
+    mamba: list[bool] = []
+    moe: list[bool] = []
+    monkeypatch.setattr(
+        zgm.mamba_ssd_parity, "install", lambda deterministic=False: mamba.append(deterministic)
+    )
+    monkeypatch.setattr(zgm.moe_deterministic, "install", lambda: moe.append(True))
+    monkeypatch.delenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", raising=False)
+    config = _policy_config()
+    config["megatron_cfg"]["deterministic_training"] = True
+    zgm.enable_batch_invariant_kernels(config)
+    assert mamba == [True] and moe == [True]
+    assert os.environ["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] == "0"
 
 
 def test_validate_kl_is_a_noop_when_everything_is_off():
