@@ -2722,6 +2722,92 @@ Notes: thundersync_work/research/agent_nano_perf.md.*
     today [D]), so EP8 gains more.
   - Also: `select_engine_config` picks the grouped-GEMM tile from the padded row count.
 
+## 14o. Engine MoE kernels on live-row grids (2026-10-14)
+
+*Branch ts-moe-livegrid (../RL-livegrid) from ts-nano-perf. Code: `nemo_rl/models/megatron/fp16_moe.py`
+(`engine_experts`, `permute_live`, persistent kernels). Notes: thundersync_work/research/agent_moe_livegrid.md.*
+
+**Problem [M, 14n].** The NVLS AllGather-V dispatcher gathers into a fixed buffer of global_max = max_tokens x EP
+rows (16384 x EP), the CUDA-graph-safe worst case. Every engine expert kernel launched a grid over that buffer and
+exited past the live rows: the activation one program per permuted row (393k at EP4, 786k at EP8), the grouped GEMM
+one per BLOCK_M tile, unpermute one per gathered token, permute a fixed grid looping to max_pairs, plus an 8 MB
+inverse-map fill per layer. The grouped-GEMM tile was picked from the padded row count (BM = 128 for a few rows per
+expert). Full Nano EP4 decode: 23.7 of 28.9 ms per engine step in these kernels; the cost grows linearly with EP.
+
+**Design.**
+- Persistent grids. Each kernel loops over its live work, read on device: GEMM M tiles below `offsets[-1]`,
+  activation rows below `offsets[-1]`, unpermute and permute tokens below `valid_tokens`. The launch shape is static
+  (CUDA-graph safe); the work is proportional to the live rows.
+- Grid = min(padded work, host hint, 8 programs per SM). The hint is the dispatcher's host estimate
+  (`_host_valid_tokens_estimate` = this rank's bucket or eager token count x EP); permuted rows are bounded by
+  tokens x min(topk, E_local) + min(E_local, pairs) x (BM - 1). The hint never decides which rows are computed:
+  NVLS does not sync bucket sizes across EP ranks, so the gathered count can exceed it, and the loops cover that.
+- `permute_live`: MCore's count (persistent variant) and aligned-offset kernels, then one persistent kernel over the
+  valid tokens that copies each local (token, expert) pair to an atomically claimed row of its segment and writes
+  the token's whole inverse-map row (-1 where it does not route). Same contract and buffer shapes as
+  `permute_tokens(..., return_batch_invariant_inverse_map=True)`. Row order inside a segment was already arbitrary
+  (atomics); outputs do not depend on it.
+- Tile from the bucket: `select_engine_config(hint x topk / (E_local x EP))`, the rule EP = 1 already applied
+  (there the buffer is the bucket).
+- The down-projection prescale (14b) moved into the activation (prob x 2^-s) and unpermute (y x 2^s) kernels: the
+  same fp32 multiplies, on live rows only.
+
+**Why bitwise identical.**
+- Per-row arithmetic is unchanged: each GEMM tile runs the same K loop (exact fp16 products, K in order into one fp32
+  accumulator); the activation and the fp64 expert-order sum run the same ops per element. The grid only decides
+  which program computes a row.
+- Tile choice: a row's bits do not depend on BLOCK_M/N/K (14b). EP = 1 has always picked the tile per bucket and
+  passed every engine-q exactness run against the cuBLAS learner. The new unit test checks every engine tile, each
+  with three grid sizes (including one program looping over all tiles), against cuBLAS at Nano fc1 (1856 x 2688)
+  and fc2 (2688 x 1856) shapes, with zero, -0, subnormal and 60000 rows [T].
+- `engine_experts` vs the pre-change path (MCore permute, padded tile, non-persistent GEMM, full-buffer activation):
+  bitwise on every live token for relu2 and swiglu, prescale 0 and 3, EP 1 / 4 / 8, and a hint below the live count.
+  Under CUDA-graph replay, with live rows changing from 5 to 300 against a 64-token capture hint, it is also
+  bitwise [T].
+
+**Scaling.** Per-rank work is O(live gathered tokens x topk) for permute and O(local live rows) for GEMM, activation
+and unpermute. The fixed overhead is at most 8 x SMs early-exit programs per kernel, independent of EP and
+max_tokens; the old path scaled with max_tokens x EP. The buffers keep the worst-case size (memory, not time).
+Gathering every token to every rank stays the AllGather-V dispatcher's design.
+
+**Results [M].** One Nano MoE layer (single GPU, EP-rank buffer emulated, CUDA-graph replay), x 23 MoE layers
+(`thundersync_work/research/moe_livegrid/moe_layer_bench.py`):
+
+| tokens/rank (bucket) | EP4 old | EP4 new | EP8 old | EP8 new |
+|---|---|---|---|---|
+| 1 (64) | 22.3 | 2.1 | 44.2 | 1.9 |
+| 8 (64) | 23.8 | 3.4 | 44.7 | 2.5 |
+| 32 (64) | 24.2 | 3.7 | 44.9 | 2.8 |
+| 128 (128) | 24.3 | 4.2 | 45.1 | 3.0 |
+| 1024 (eager) | 27.8 | 8.5 | 48.9 | 7.5 |
+| 4096 (eager) | 43.9 | 23.0 | 65.9 | 22.8 |
+
+ms per engine step. The EP4 old column reproduces the full-model profile (23.7 ms, 14n).
+
+Full Nemotron-3-Nano, engine-only decode bench (`thundersync_work/research/moe_livegrid/livegrid_bench.sh`, one
+4-GPU node; old = ts-nano-perf, new = bacfde29) [M]:
+
+| | old | new |
+|---|---|---|
+| EP4, graphs on, N = 1 / 8 / 32 / 128 per rank (C 512), ms/step | 27.9 / 29.0 / 29.0 / 29.0 | 7.6 / 8.5 / 8.5 / 8.5 |
+| EP4 device ms/step at N = 8 (graphs off): MoE kernels + expert activation | 14.0 + 9.7 | 2.2 + 0.1 |
+| EP2, graphs on (dump points), ms/step | 17.8-19.0 | 7.3-8.5 |
+
+- Bitwise: greedy tokens and raw log-probs, old vs new, every rank. EP4 and EP2, each with graphs on and graphs off,
+  over 5 points (prefill buckets from 48 x 8 to 512 tokens, decode at 1-8 requests per rank): 23 requests x 48 tokens
+  per rank, 0 token and 0 log-prob bit mismatches.
+- Nano L8 engine-q exactness, EP2: PASS 4/4 for ⊥-BV + momentum and for ⊥-BV + current. GPU unit suite: 307 + 31
+  pass (lg-val-bacfde29).
+- EP8 [D]: the old one-layer cost doubles with the buffer (EP8 - EP4 = +21 ms/step over 23 layers) and the new
+  one does not grow (-0.9). Estimate: ~50 ms/step old, ~8-9 ms/step new; the NVLS collectives add a little at 8
+  ranks.
+- What remains at EP4 decode (new, 8.5 ms): grouped GEMM 1.7 ms, which is the expert weight reads of the touched
+  experts; dense GEMM 1.3; elementwise/copies 3.2; Mamba 0.9; NVLS collectives ~0.5.
+
+**Upstream candidate (MCore, not opened).** `permute_tokens` / `_permute_tokens_kernel` loop to `max_pairs`, and
+`_init_permutation_map_kernel` / the inverse-map `torch.full` cover the whole buffer. Bounding them by `valid_pairs`
+/ `valid_tokens` is the same CUDA-graph-safe change, and it is independent of this recipe.
+
 ## 14p. Learner prefix-state cache for exact piece verification (`thundersync.learner_prefix_cache`)
 
 *Branch ts-learner-prefix-cache (../RL-prefixcache). Notes: thundersync_work/research/agent_prefix_cache.md.
