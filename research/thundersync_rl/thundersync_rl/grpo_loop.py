@@ -89,6 +89,7 @@ from thundersync_rl.streaming import (
     StreamingLearner,
     StreamPlanner,
     Trajectory,
+    microbatch_counts,
     pad_batch_to_multiple,
     tail_excluded_advantages,
 )
@@ -125,6 +126,13 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     max_open_groups: int = 4
     # Upper bound on trajectories per backward chunk (bounds activation memory).
     max_chunk_trajectories: int = 8
+    # Deal the rows of each training dispatch over every learner DP rank, one
+    # micro-batch per unit (StreamPlanner deal_rows; DESIGN.md 14v): each rank
+    # runs ceil(rows / (DP * MBS)) micro-batches, so under expert parallelism
+    # no rank pads to a busier one with all-masked fillers. False: whole
+    # max_chunk_trajectories-row chunks per rank (filler fraction ~1 - rows /
+    # (DP * max_chunk_trajectories) per dispatch). Placement only: fp32 order.
+    deal_rows: bool = True
     # Pipeline parallelism (DESIGN.md section 2, "Streaming under pipeline
     # parallelism"). Each learner rank runs all chunks of a dispatch that share
     # a gradient destination (all final chunks; one open-group bucket) as ONE
@@ -390,6 +398,8 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # class -- ready now, pending tails, never drafted -- in group index order;
     # a function of the data only). Each learner call has a fixed cost
     # (~0.35 s at Nano L8 EP2), so one group per call made training 2x slower.
+    # With deal_rows a block is raised to at least ceil(DP / G) groups so every
+    # learner DP rank gets a row (canonical_groups_per_block).
     canonical_block_groups: int = 4
     # Set: canonical blocks are cut by tokens instead (a block ends at the
     # first group at which its rows reach this many tokens, within each class
@@ -502,6 +512,21 @@ def train_micro_batch_rows(master_config: "ThunderSyncMasterConfig") -> int:
     if cap:
         rows = min(rows, max(1, int(cap) // int(master_config.policy["max_total_sequence_length"])))
     return rows
+
+
+def canonical_groups_per_block(ts_cfg: "ThunderSyncConfig", dp_size: int, G: int) -> int:
+    """Groups per canonical training dispatch.
+
+    ``canonical_block_groups``, and with ``deal_rows`` at least
+    ``ceil(dp_size / G)`` so a block's rows reach
+    every learner DP rank (fewer rows than ranks leave ranks to all-masked
+    fillers under expert parallelism). A function of the config and the layout
+    only, so the blocks stay canonical.
+    """
+    bg = max(1, int(ts_cfg.canonical_block_groups))
+    if ts_cfg.deal_rows:
+        bg = max(bg, math.ceil(dp_size / max(1, int(G))))
+    return bg
 
 
 def resolve_min_pipeline_microbatches(ts_cfg: ThunderSyncConfig, pp: int) -> int:
@@ -1744,7 +1769,7 @@ async def _run_one_step(
         # Reproducible runs also need a reproducible gradient order: dispatch
         # the groups in index order (StreamPlanner.set_order), not by arrival.
         group_order = list(range(batch.size))
-        bg = max(1, int(ts_cfg.canonical_block_groups))
+        bg = canonical_groups_per_block(ts_cfg, learner.dp_size, G)
         group_blocks = [min(bg, len(group_order) - j) for j in range(0, len(group_order), bg)]
     # Streaming over the tails: training dispatches are ordered learner calls
     # (SpeculativeGeneration.learner_seq), interleaved with verification.
@@ -1784,6 +1809,7 @@ async def _run_one_step(
             tail_excluded_baseline=(
                 make_tail_excluded_fn(master_config) if ts_cfg.tail_excluded_baseline else None
             ),
+            deal_rows=ts_cfg.deal_rows,
         )
         for p in range(n // G):
             prompt = torch.cat([m["token_ids"] for m in repeated["message_log"][p * G]])
@@ -1889,9 +1915,12 @@ async def _run_one_step(
     pipeline_calls = 0
     num_dispatches = 0
     # Timeline for offline analysis: (t, group, tokens, reward) per arrival and
-    # (t_start, t_end, n_trajectories, n_tokens, n_bucket_chunks) per dispatch.
+    # (t_start, t_end, n_trajectories, n_tokens, n_bucket_chunks, real / filler
+    # micro-batches, micro-batches per rank, busiest rank's tokens) per dispatch.
     arrivals: list[tuple[float, int, int, float]] = []
-    dispatches: list[tuple[float, float, int, int, int]] = []
+    dispatches: list[tuple] = []
+    # Planner micro-batches over the step (``microbatch_counts``).
+    mb_totals = {"real": 0, "filler": 0, "per_rank": 0, "filler_heavy": 0}
     # (group, dispatch start, dispatch end) for every group a dispatch trains.
     group_dispatch: list[tuple[int, float, float]] = []
     last_rollout_t = None
@@ -2222,6 +2251,23 @@ async def _run_one_step(
                 chunks = [c for cs in d.per_rank for c in cs if not c.padding]
                 for gid in sorted({t.group[1] for c in chunks for t in c.trajectories}):
                     group_dispatch.append((gid, t0 - t_start, t1 - t_start))
+                mb = microbatch_counts(d, mbs)
+                for k in ("real", "filler", "per_rank"):
+                    mb_totals[k] += mb[k]
+                if mb["filler"] > 0.25 * (mb["real"] + mb["filler"]):
+                    # Validator: more than a quarter of the dispatch's forwards
+                    # are all-masked fillers (rows < DP, or deal_rows off).
+                    mb_totals["filler_heavy"] += 1
+                    if mb_totals["filler_heavy"] == 1:
+                        print(
+                            f"[thundersync] step {step}: dispatch of {d.num_trajectories} rows "
+                            f"ran {mb['filler']} filler / {mb['real']} real micro-batches over "
+                            f"{learner.dp_size} learner DP ranks (deal_rows={ts_cfg.deal_rows})",
+                            flush=True,
+                        )
+                # (start, end, rows, tokens, bucket chunks, real micro-batches,
+                # filler micro-batches (both summed over ranks), micro-batches per
+                # rank, real tokens on the busiest rank)
                 dispatches.append(
                     (
                         t0 - t_start,
@@ -2229,6 +2275,10 @@ async def _run_one_step(
                         d.num_trajectories,
                         sum(c.num_tokens for c in chunks),
                         sum(1 for c in chunks if c.group is not None),
+                        mb["real"],
+                        mb["filler"],
+                        mb["per_rank"],
+                        mb["max_rank_tokens"],
                     )
                 )
                 num_dispatches += 1
@@ -2560,6 +2610,15 @@ async def _run_one_step(
             sum(1 for t in all_trajectories if planner._advantage(t) != 0.0)
         ),
         "learner/dispatches": num_dispatches,
+        # Micro-batches of the step's planner dispatches, summed over learner DP
+        # ranks: real ones and all-masked fillers (equal per-rank counts under
+        # EP); per_rank = what one rank runs (sum over dispatches of the max).
+        "learner/real_microbatches": float(mb_totals["real"]),
+        "learner/filler_microbatches": float(mb_totals["filler"]),
+        "learner/microbatches_per_rank": float(mb_totals["per_rank"]),
+        "learner/filler_frac": float(mb_totals["filler"])
+        / max(1.0, float(mb_totals["real"] + mb_totals["filler"])),
+        "learner/filler_heavy_dispatches": float(mb_totals["filler_heavy"]),
         "learner/pipeline_calls": pipeline_calls,
         "learner/peak_open_buffers": results["stream_peak_open_buffers"],
         # Rank 0's peak allocated / reserved memory over the step's dispatches.
@@ -3236,7 +3295,9 @@ def thundersync_grpo_train(
                     group_blocks = [len(c) for c in classes if c]
                 else:
                     # Blocks of canonical_block_groups within each class.
-                    bg = max(1, int(ts_cfg.canonical_block_groups))
+                    bg = canonical_groups_per_block(
+                        ts_cfg, learner.dp_size, master_config.grpo.num_generations_per_prompt
+                    )
                     group_blocks = [
                         min(bg, len(c) - i) for c in classes for i in range(0, len(c), bg)
                     ]

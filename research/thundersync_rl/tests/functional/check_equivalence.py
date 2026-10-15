@@ -234,6 +234,7 @@ def main():
             micro_batch_size=mbs,
             equal_rank_microbatches=expert_parallel,
             min_pipeline_microbatches=min_pipeline_microbatches,
+            deal_rows=bool(getattr(ts, "deal_rows", False)),
         )
         for gi in range(args.num_groups):
             planner.register_group(gi, G)

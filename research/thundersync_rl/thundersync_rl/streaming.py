@@ -176,6 +176,19 @@ class StreamPlanner:
             :meth:`has_work` / :meth:`next_dispatch`, used once the step's
             rollouts are done) ignores the threshold. Open-group bucket work
             and pending group closes are not held. 0 disables holding.
+        deal_rows: deal the rows of closed groups over every DP rank instead of
+            placing whole ``max_chunk_trajectories``-row chunks on ranks
+            (:func:`cut_units`, :func:`deal_chunks`). The rows, sorted by length,
+            are cut into micro-batch units of at most ``micro_batch_size`` rows
+            (consecutive in length, so a unit pads to its own longest row), as
+            many units as needed to give every rank the same count where the
+            rows allow it, and the units are dealt to ranks by micro-batch count
+            first, tokens second. Each rank then runs ``ceil(rows / (DP * MBS))``
+            micro-batches per dispatch, and under ``equal_rank_microbatches`` a
+            dispatch of R >= DP rows needs no all-masked filler (fewer than DP
+            otherwise). Only which rank and micro-batch backpropagates a row
+            changes (fp32 summation order); a function of the dispatch's rows,
+            so canonical dispatches stay canonical.
     """
 
     def __init__(
@@ -190,7 +203,9 @@ class StreamPlanner:
         skip_zero_advantage_chunks: bool = False,
         min_pipeline_microbatches: int = 0,
         tail_excluded_baseline: Optional[Callable[[float, list[float]], float]] = None,
+        deal_rows: bool = False,
     ):
+        self.deal_rows = deal_rows
         if tail_excluded_baseline is not None and max_open_groups > 0:
             raise ValueError("the tail-excluded baseline closes groups early; no open-group buckets")
         self.tail_excluded_baseline = tail_excluded_baseline
@@ -346,13 +361,33 @@ class StreamPlanner:
         n = sum(1 for t in trajs if t.fused is not None)
         rest = [t for t in trajs if t.fused is None]
         m = self.max_chunk_trajectories
-        for zero in (False, True):
+        for zero in self._classes():
             if zero and self.skip_zero_advantage_chunks:
                 continue
-            k = sum(1 for t in rest if (self._advantage(t) == 0.0) == zero)
+            k = sum(
+                1 for t in rest if zero is None or (self._advantage(t) == 0.0) == zero
+            )
+            if self.deal_rows:
+                n += num_units(k, self.dp_size, self._unit_rows())
+                continue
             for s in range(0, k, m):
                 n += math.ceil(min(m, k - s) / self.micro_batch_size)
         return n
+
+    def _unit_rows(self) -> int:
+        """Rows per dealt unit (``deal_rows``): one micro-batch, within the chunk cap."""
+        return max(1, min(self.micro_batch_size, self.max_chunk_trajectories))
+
+    def _classes(self) -> tuple[Optional[bool], ...]:
+        """Row classes chunked apart: (nonzero, zero) advantage, or one class.
+
+        Zero-advantage rows only need their own chunks when the worker skips
+        them; dealing rows (``deal_rows``) keeps the two classes apart only then,
+        so a dispatch's rows fill whole micro-batches on every rank.
+        """
+        if self.deal_rows and not self.skip_zero_advantage_chunks:
+            return (None,)
+        return (False, True)
 
     def holding(self) -> bool:
         """Whether closed-group rows are held back for the pipeline threshold."""
@@ -511,12 +546,13 @@ class StreamPlanner:
         # loss_fn.skip_zero_advantage_rows the worker counts and drops an
         # all-zero chunk without a forward, and no chunk mixes the two kinds.
         final.sort(key=lambda t: t.num_tokens)
-        for rows in (
-            [t for t in final if advantage(t) != 0.0],
-            [t for t in final if advantage(t) == 0.0],
-        ):
-            for s in range(0, len(rows), m):
-                trajs = rows[s : s + m]
+        for zero in self._classes():
+            rows = [t for t in final if zero is None or (advantage(t) == 0.0) == zero]
+            if self.deal_rows:
+                pieces = cut_units(rows, self.dp_size, self._unit_rows())
+            else:
+                pieces = [rows[s : s + m] for s in range(0, len(rows), m)]
+            for trajs in pieces:
                 chunks.append(
                     Chunk(
                         group=None,
@@ -537,11 +573,12 @@ class StreamPlanner:
                     f"fused trajectory pinned to DP rank {c.fused.dp_rank} "
                     f"of {self.dp_size}"
                 )
-        per_rank = balance_chunks(
+        per_rank = (deal_chunks if self.deal_rows else balance_chunks)(
             chunks,
             self.dp_size,
             skip_zero_advantage=self.skip_zero_advantage_chunks,
             pinned_rank=lambda c: None if c.fused is None else c.fused.dp_rank,
+            **({"micro_batch_size": self.micro_batch_size} if self.deal_rows else {}),
         )
         if self.equal_rank_microbatches and chunks:
             self._pad_to_equal_microbatches(per_rank, chunks)
@@ -632,6 +669,105 @@ def balance_chunks(
         live, total = cost(c)
         load[r] = (load[r][0] + live, load[r][1] + total)
     return per_rank
+
+
+def num_units(rows: int, dp_size: int, unit_rows: int) -> int:
+    """Units :func:`cut_units` makes of ``rows`` rows (one micro-batch each).
+
+    ``ceil(rows / unit_rows)`` units are enough; their count is rounded up to a
+    multiple of ``dp_size`` (never above ``rows``) so every rank can get the
+    same number: the per-rank micro-batch count ``ceil(units / DP)`` does not
+    grow, the units just hold fewer rows.
+    """
+    if rows <= 0:
+        return 0
+    u = math.ceil(rows / unit_rows)
+    return min(rows, dp_size * math.ceil(u / dp_size))
+
+
+def cut_units(rows: list, dp_size: int, unit_rows: int) -> list[list]:
+    """Cut length-sorted ``rows`` into :func:`num_units` consecutive units.
+
+    Units differ by at most one row (the first ``rows % units`` hold one more).
+    Consecutive rows keep a unit's lengths close (it pads to its longest row).
+    A function of ``rows`` (their order) and the config only.
+    """
+    u = num_units(len(rows), dp_size, unit_rows)
+    if u == 0:
+        return []
+    base, extra = divmod(len(rows), u)
+    out, at = [], 0
+    for i in range(u):
+        k = base + (1 if i < extra else 0)
+        out.append(rows[at : at + k])
+        at += k
+    return out
+
+
+def deal_chunks(
+    chunks: list[Chunk],
+    dp_size: int,
+    *,
+    skip_zero_advantage: bool,
+    micro_batch_size: int,
+    pinned_rank: Optional[Callable[[Chunk], Optional[int]]] = None,
+) -> list[list[Chunk]]:
+    """Place chunks on DP ranks by micro-batch count first, then tokens.
+
+    A rank's load is ``(live micro-batches, live tokens, tokens)``; chunks
+    (longest first, stable) go to the least-loaded rank (lowest index on ties).
+    With one-micro-batch units this deals them round-robin by count, longest
+    against shortest within each round, so per-rank micro-batch counts differ
+    by at most one and padding to equal counts adds fewer than ``dp_size``
+    fillers. A skipped chunk (all-zero advantage with ``skip_zero_advantage``)
+    counts no live work. Only which rank backpropagates a chunk changes, so
+    the step's gradient is the same up to fp32 summation order.
+    """
+
+    def cost(c: Chunk) -> tuple[int, int, int]:
+        if skip_zero_advantage and c.zero_advantage:
+            return (0, 0, c.num_tokens)
+        return (c.num_microbatches(micro_batch_size), c.num_tokens, c.num_tokens)
+
+    per_rank: list[list[Chunk]] = [[] for _ in range(dp_size)]
+    load = [(0, 0, 0)] * dp_size
+    free = []
+
+    def put(r: int, c: Chunk) -> None:
+        per_rank[r].append(c)
+        load[r] = tuple(a + b for a, b in zip(load[r], cost(c)))
+
+    for c in chunks:
+        r = None if pinned_rank is None else pinned_rank(c)
+        if r is None:
+            free.append(c)
+        else:
+            put(r, c)
+    for c in sorted(free, key=lambda c: cost(c)[1:], reverse=True):
+        put(load.index(min(load)), c)
+    return per_rank
+
+
+def microbatch_counts(d: Dispatch, micro_batch_size: int) -> dict[str, int]:
+    """Real and all-masked filler micro-batches of one dispatch (summed over ranks).
+
+    ``per_rank``: the most any rank runs (every rank under equal counts);
+    ``max_rank_tokens``: real tokens on the busiest rank.
+    """
+    real = [
+        sum(c.num_microbatches(micro_batch_size) for c in cs if not c.padding)
+        for cs in d.per_rank
+    ]
+    filler = [sum(1 for c in cs if c.padding) for cs in d.per_rank]
+    return {
+        "real": sum(real),
+        "filler": sum(filler),
+        "per_rank": max((a + b for a, b in zip(real, filler)), default=0),
+        "max_rank_tokens": max(
+            (sum(c.num_tokens for c in cs if not c.padding) for cs in d.per_rank),
+            default=0,
+        ),
+    }
 
 
 def pad_batch_to_multiple(data: BatchedDataDict, multiple: int) -> BatchedDataDict:

@@ -57,6 +57,7 @@ def _simulate(
     mbs=2,
     equal_rank_microbatches=False,
     skip_zero_advantage_chunks=False,
+    deal_rows=False,
 ):
     """Drive planner + one accumulator per DP rank with random arrivals."""
     rng = random.Random(seed)
@@ -85,6 +86,7 @@ def _simulate(
         micro_batch_size=mbs,
         equal_rank_microbatches=equal_rank_microbatches,
         skip_zero_advantage_chunks=skip_zero_advantage_chunks,
+        deal_rows=deal_rows,
     )
     for g in range(len(rewards_per_group)):
         planner.register_group(g, G)
