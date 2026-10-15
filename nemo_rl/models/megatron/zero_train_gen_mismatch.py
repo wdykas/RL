@@ -664,6 +664,26 @@ def enable_batch_invariant_kernels(config: PolicyConfig) -> None:
         # fwd+bwd gives bitwise equal gradients on Nemotron-3-Nano L8; measured
         # cost: none within noise (0.40-0.42 s vs 0.42-0.43 s per fwd+bwd).
         os.environ.setdefault("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
+        # Megatron's deterministic mode (Bridge _validate_and_apply_deterministic_mode):
+        # torch's deterministic implementations of every op that has one (index_add /
+        # scatter / embedding backward without atomics, ...). warn_only: the batch-
+        # invariant recipe runs cuBLAS with CUBLAS_WORKSPACE_CONFIG=:0:0 (no workspace,
+        # hence no split-K: deterministic), which torch's allowlist (:4096:8, :16:8)
+        # does not recognize; ops with no deterministic implementation are named in
+        # warnings instead of raising. No fill of uninitialized memory (Megatron's
+        # default in deterministic mode; it costs a write per allocation).
+        import torch
+
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        torch.utils.deterministic.fill_uninitialized_memory = False
+        if os.environ.get("NCCL_ALGO") not in ("Tree", "Ring", "CollnetDirect", "CollnetChain", "^NVLS"):
+            print(
+                "[zero_train_gen_mismatch] deterministic_training: NCCL_ALGO is "
+                f"{os.environ.get('NCCL_ALGO')!r}; Megatron's deterministic mode requires one of "
+                "Tree/Ring/CollnetDirect/CollnetChain/^NVLS (NVLS reductions are not "
+                "reproducible); set policy.megatron_cfg.env_vars.NCCL_ALGO",
+                flush=True,
+            )
     _use_inference_log_softmax()
     # Training LM head (fp32 head, TP=1): logits formed chunk by chunk inside the
     # log-prob op, never for a whole micro-batch (deferred_head.py). Forward

@@ -223,3 +223,14 @@ def test_run_control_validation():
     ):
         with pytest.raises(ValueError, match=msg):
             validate_run_control(_master(**over))
+
+
+def test_resume_refuses_a_changed_run_length(tmp_path):
+    import yaml
+
+    from thundersync_rl.run_state import check_schedule_unchanged
+
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump({"grpo": {"max_num_steps": 4, "max_num_epochs": 1}}))
+    check_schedule_unchanged(tmp_path, 4, 1)
+    with pytest.raises(RuntimeError, match="same run length"):
+        check_schedule_unchanged(tmp_path, 2, 1)  # the scheduler was sized for 4 steps

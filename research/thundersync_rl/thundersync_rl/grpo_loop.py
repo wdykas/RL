@@ -2066,10 +2066,20 @@ async def _run_one_step(
     t_rollout_end = last_rollout_t
     t_check = time.perf_counter()
     mismatch = (
-        train_gen_mismatch(all_trajectories, learner, tokenizer, master_config)
+        # Row order fixed by row index (not arrival), so the learner log-prob crc
+        # is comparable across runs.
+        train_gen_mismatch(
+            sorted(all_trajectories, key=lambda t: t.index), learner, tokenizer, master_config
+        )
         if os.environ.get("THUNDERSYNC_MISMATCH_CHECK")
         else {}
     )
+    grad_digests_pre_step = None
+    if os.environ.get("THUNDERSYNC_STEP_DIGEST"):
+        # Debug (resume tests): crc of every parameter's accumulated gradient on
+        # every learner rank before the step's DP reduction and update, to locate
+        # nondeterministic gradients between two runs of the same rollouts.
+        grad_digests_pre_step = _run_workers(learner.policy, "grad_param_digests")
     if mismatch:
         # Debug forward on the step's critical path: reported so step-time
         # comparisons can subtract it (``time/mismatch_check``).
@@ -2150,6 +2160,8 @@ async def _run_one_step(
         **mismatch,
         **(replay_metrics if order_replay else {}),
     }
+    if grad_digests_pre_step is not None:
+        out["digest/grads"] = grad_digests_pre_step
     if replay_row is not None:
         out["spec/replayed_multi_turn_rows"] = float(replayed[0])
     if next_rollouts is not None:
@@ -2946,6 +2958,13 @@ def thundersync_grpo_train(
             val_metrics = run_validation(step)
         if ckpt_on and (bounds.saves_after(step - 1) or last):
             save_boundary(step, val_metrics, final=last)
+            stop_at = int(os.environ.get("THUNDERSYNC_DEBUG_STOP_AT", "0") or 0)
+            if stop_at > 0 and step == stop_at and not last:
+                # Debug (resume tests): die like a killed job right after a durable
+                # checkpoint: no clean shutdown of the loop, workers or engines.
+                checkpointer.shutdown()
+                print(f"[thundersync] debug stop after step {step} (checkpoint durable)", flush=True)
+                os._exit(0)
     if checkpointer is not None:
         checkpointer.shutdown()
     return history

@@ -509,3 +509,30 @@ def test_template_that_truncates_history_needs_the_flag():
     mc.grpo.max_rollout_turns = 1
     mc.policy["tokenizer"] = {}
     check_multi_turn_template(mc, tok)  # single turn: no history is rendered
+
+
+def test_deterministic_training_pins_mamba_ssm_backward_autotuners():
+    # Imported before deterministic mode is set (as in the workers): every candidate kept,
+    # so each process would autotune its own tile -> run-to-run gradient bits differ.
+    import sys
+
+    pytest.importorskip("mamba_ssm")
+    from mamba_ssm.ops.triton import ssd_combined  # noqa: F401
+    from mamba_ssm.utils.determinism import set_deterministic_mode
+    from triton.runtime.autotuner import Autotuner
+
+    from nemo_rl.models.megatron.mamba_ssd_parity import pin_mamba_ssm_autotuners
+
+    def multi():
+        return [
+            n for m, mod in list(sys.modules.items()) if m.startswith("mamba_ssm.ops") and mod
+            for n, a in vars(mod).items() if isinstance(a, Autotuner) and len(a.configs) > 1
+        ]
+
+    set_deterministic_mode(True)
+    try:
+        before = multi()
+        n = pin_mamba_ssm_autotuners()
+        assert n == len(before) and multi() == []
+    finally:
+        set_deterministic_mode(None)

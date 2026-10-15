@@ -3087,6 +3087,21 @@ loop, which swallows per-turn generation errors). Templates with `truncate_histo
 default True) are refused for multi-turn unless `chat_template_kwargs.truncate_history_thinking=false`
 (set in `ab_base.yaml` and the multi-turn scripts).
 
+**Run-to-run determinism** (needed only for bitwise resume tests; opt-in `deterministic_training`):
+rr-resume-nano @cf3bc405 showed two runs with bitwise-identical rollouts (keyed fresh sampling) whose
+gradients already differ at step 0, while in-process replays were bitwise equal. Cause found: mamba_ssm
+filters its backward kernels' autotune candidates to one deterministic config only for modules imported
+in deterministic mode; they are imported before `set_deterministic_mode`, so 42 kernels kept every
+candidate and each process autotuned its own tile (cached within the process, so in-process replays
+agreed). Now pinned at install (`mamba_ssd_parity.pin_mamba_ssm_autotuners`, mamba_ssm's own rule), plus
+Megatron's deterministic mode (`torch.use_deterministic_algorithms(True)`, warn-only because the BI
+recipe's `CUBLAS_WORKSPACE_CONFIG=:0:0` — no split-K, deterministic — is not on torch's allowlist;
+`fill_uninitialized_memory=False`; NCCL_ALGO must be Ring/Tree, warned otherwise). Per-parameter
+gradient digests before each step (`THUNDERSYNC_STEP_DIGEST`) locate any remaining source.
+Resume must keep `grpo.max_num_steps` / `max_num_epochs` (Megatron's checkpointed LR/WD schedule is
+sized from them; checked before setup). Kill simulation: `THUNDERSYNC_DEBUG_STOP_AT=<step>` exits the
+driver (`os._exit`) right after that durable checkpoint.
+
 **Not built yet** (validation refuses): checkpoints with `rollout_lag=1`, with
 `data.use_multiple_dataloader`, with `ft_save_period`; checkpoints / validation on the non-streaming
 lanes loop (`stream_training_over_tails=false`); validation with `rollout_lag=1`.

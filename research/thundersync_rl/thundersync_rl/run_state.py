@@ -295,6 +295,29 @@ def resolve_resume(ckpt_cfg: dict[str, Any]) -> Optional[Path]:
     return path
 
 
+def check_schedule_unchanged(path: str | os.PathLike, max_num_steps: int, max_num_epochs: int) -> None:
+    """Refuse a resume whose run length changed (before setup() loads the checkpoint).
+
+    NeMo-RL sizes Megatron's LR / weight-decay schedule from min(max_num_steps,
+    epochs x batches) (``train_iters``), and the checkpointed scheduler must match
+    it (Megatron asserts deep inside the load otherwise). A stopped run resumes
+    with the same grpo.max_num_steps and grpo.max_num_epochs.
+    """
+    import yaml
+
+    cfg_path = Path(path) / "config.yaml"
+    if not cfg_path.exists():
+        return
+    grpo = (yaml.safe_load(cfg_path.read_text()) or {}).get("grpo") or {}
+    saved = (grpo.get("max_num_steps"), grpo.get("max_num_epochs"))
+    if saved != (max_num_steps, max_num_epochs):
+        raise RuntimeError(
+            f"resume from {path}: grpo.max_num_steps / max_num_epochs were {saved}, now "
+            f"{(max_num_steps, max_num_epochs)}; the checkpointed LR / weight-decay schedule "
+            "was sized for the saved values (resume with the same run length)"
+        )
+
+
 # Settings whose change between save and resume would change the run's law or
 # its data order; checked on resume (``config_fingerprint``).
 FINGERPRINT_KEYS = (
