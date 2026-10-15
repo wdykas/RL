@@ -118,8 +118,14 @@ fi
 if [ "${EPINV:-$([ "$GEN_EP" != "$EP" ] && echo 1 || echo 0)}" = 1 ]; then
   PAR+=(++policy.megatron_cfg.moe_ep_invariant_combine=true)
 fi
-# Micro-batch sizes (default: ab_base.yaml, 1 / 1 for long caps; the 1k-cap single-node runs use 8 / 4).
-[ -n "${MBS:-}" ] && PAR+=(policy.train_micro_batch_size=$MBS)
+# Micro-batch sizes (default: ab_base.yaml, train 2 rows bounded by 20480 tokens -> 2 at 8k, 1 at 16k+; logprob 1;
+# the 1k-cap single-node runs use 8 / 4). MBS=k sets the rows and, on every ThunderSync-loop arm, the token cap
+# k x (PROMPT_CAP + MAXLEN), so the cap never cuts MBS below what was asked (same rule in every arm).
+if [ -n "${MBS:-}" ]; then
+  PAR+=(policy.train_micro_batch_size=$MBS)
+  [ "$ENTRY" = research/thundersync_rl/run_thundersync_grpo.py ] && \
+    PAR+=(++thundersync.train_micro_batch_tokens=$(( MBS * (PROMPT_CAP + MAXLEN) )))
+fi
 [ -n "${LPBS:-}" ] && PAR+=(policy.logprob_batch_size=$LPBS)
 read -r -a USER_ARGS <<< "${ARGS:-}"
 OUT=$W/$RUNS/$TAG

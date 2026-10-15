@@ -19,6 +19,13 @@ grpo:
   val_at_end: false
 
 thundersync:
+  # Learner micro-batch token cap (every ThunderSync-loop arm: sync, async1, ts_*): rows per micro-batch =
+  # min(policy.train_micro_batch_size, 20480 // max_total_sequence_length) -> 2 rows at the 8k cap
+  # (2048 + 8192), 1 row at 16k / 32k. Full Nano EP4 bench (thundersync_work/runs_1node/mbs2-full-base):
+  # 1x8192 1655 ms / peak 88.4 GiB, 2x8192 2797 ms (1399 ms/row) / 112.4 GiB, 4x8192 OOM; in-loop peak
+  # at MBS 1 is ~135 GB -> MBS 2 ~159 GB, MBS 3 ~183 GB (> ~175 GB budget). research/agent_mbs.md.
+  # run_ab_arm.sh MBS=k overrides both (cap = k x the sequence budget).
+  train_micro_batch_tokens: 20480
   # ⊥-BV calibration (DESIGN 14d): v from a past-only moving average of the measured log-ratio
   # variance and the measured per-draft verification cost in the envelope DP; lanes share one
   # calibrator. Real training needs it: the fixed prior v is ~4.5x below measured Nano v
@@ -40,8 +47,8 @@ policy:
       truncate_history_thinking: false
   # run_ab_arm.sh sets max_total_sequence_length = data.max_input_seq_length (PROMPT_CAP) + max_new_tokens (MAXLEN)
   max_total_sequence_length: 10240
-  train_micro_batch_size: 1
-  logprob_batch_size: 1
+  train_micro_batch_size: 2  # bounded by thundersync.train_micro_batch_tokens (above)
+  logprob_batch_size: 1  # only the CHECKS=1 mismatch forward
   make_sequence_length_divisible_by: 128
   megatron_cfg:
     # Learner memory (DESIGN 14h): selective recompute of the MoE block, as engine_q_tp.sh's ACKPT
