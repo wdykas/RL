@@ -715,6 +715,20 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             crc = zlib.crc32(g.contiguous().view(torch.uint8).cpu().numpy().tobytes(), crc)
         return total, crc
 
+    def grad_param_digests(self) -> dict[str, int]:
+        """Debug: crc32 of each parameter's accumulated gradient (``main_grad``) now.
+
+        Names the parameters whose gradient bits differ between two
+        ``THUNDERSYNC_DEBUG_ORDER_REPLAY=params`` replays.
+        """
+        out = {}
+        for name, p in self.model.named_parameters():
+            g = getattr(p, "main_grad", None)
+            if g is not None:
+                raw = g.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()
+                out[name] = zlib.crc32(raw)
+        return out
+
     def get_flat_grads(self) -> torch.Tensor:
         """Return this rank's gradient buffers on CPU (for equivalence tests).
 

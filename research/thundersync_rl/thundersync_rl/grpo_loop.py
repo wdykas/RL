@@ -1413,11 +1413,15 @@ async def _run_one_step(
         group_order is not None
     )
     replay_digests: dict[str, Any] = {}
+    # =params: also name the parameters whose gradients differ (canonical_a vs
+    # canonical_a_again).
+    per_param_replay = os.environ.get("THUNDERSYNC_DEBUG_ORDER_REPLAY") == "params"
+    replay_params: dict[str, Any] = {}
 
     def grad_digests():
         return [tuple(x) for x in _run_workers(learner.policy, "grad_digest")]
 
-    def replay(trajs, order, seed, block_sizes=None):
+    def replay(key, trajs, order, seed, block_sizes=None):
         """Train ``trajs`` (arrival order shuffled by ``seed``) on a fresh step; digest it."""
         import random as _random
 
@@ -1435,6 +1439,8 @@ async def _run_one_step(
             d = pl.next_dispatch()
             ray.get(learner.submit(_build_dispatch(d), d.closes))
         out = grad_digests()
+        if per_param_replay:
+            replay_params[key] = _run_workers(learner.policy, "grad_param_digests")
         learner.abort()
         learner.begin(loss_fn, **begin_kw)
         return out
@@ -1685,10 +1691,14 @@ async def _run_one_step(
             # order dispatch (control: expected to differ).
             if ordered is not None:
                 await ordered.learner_drain()
-            replay_digests["canonical_a"] = replay(all_trajectories, group_order, 1, group_blocks)
-            replay_digests["canonical_b"] = replay(all_trajectories, group_order, 2, group_blocks)
-            replay_digests["canonical_a_again"] = replay(all_trajectories, group_order, 1, group_blocks)
-            replay_digests["arrival"] = replay(all_trajectories, None, 3)
+            trajs = all_trajectories
+            for key, order, seed, blocks in (
+                ("canonical_a", group_order, 1, group_blocks),
+                ("canonical_b", group_order, 2, group_blocks),
+                ("canonical_a_again", group_order, 1, group_blocks),
+                ("arrival", None, 3, None),
+            ):
+                replay_digests[key] = replay(key, trajs, order, seed, blocks)
         rollouts_done = True
         wake.set()
         if ordered is not None and draft_task is not None:
@@ -1750,6 +1760,15 @@ async def _run_one_step(
             f"{replay_digests['canonical_a'] == replay_digests['canonical_a_again']}",
             flush=True,
         )
+        if per_param_replay:
+            pairs = zip(replay_params["canonical_a"], replay_params["canonical_a_again"])
+            for r, (a, b) in enumerate(pairs):
+                diff = [k for k in a if a[k] != b.get(k)]
+                print(
+                    f"[order replay] step={step} rank={r} params_differ={len(diff)}/{len(a)} "
+                    f"{diff}",
+                    flush=True,
+                )
         if bad:
             raise RuntimeError(f"order replay: {bad} gradient differs from the real step")
         replay_metrics = {
