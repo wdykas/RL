@@ -634,6 +634,12 @@ def enable_batch_invariant_kernels(config: PolicyConfig) -> None:
     mamba_ssd_parity.install()
     # MoE: reproducible token-gather backward (no atomics over a token's top-k copies).
     moe_deterministic.install()
+    # Attention: Transformer Engine picks the deterministic flash-attention
+    # backward when this is 0 at module construction (this runs before the
+    # model is built). With the MoE gather above, repeating a micro-batch's
+    # fwd+bwd gives bitwise equal gradients on Nemotron-3-Nano L8; measured
+    # cost: none within noise (0.40-0.42 s vs 0.42-0.43 s per fwd+bwd).
+    os.environ.setdefault("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
     _use_inference_log_softmax()
     print(
         "[zero_train_gen_mismatch] batch-invariant kernels enabled: "
