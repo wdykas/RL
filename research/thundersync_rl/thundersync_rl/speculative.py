@@ -3114,6 +3114,9 @@ class SpeculativeGeneration:
                         self._cw_free_below_floor(s)
                         continue
                     cw_stats["decisions"] += 1
+                    if out.get("forced"):
+                        cw_forced[id(plan)] += 1
+                        cw_stats["forced"] += 1
                     if dec == "scan":
                         cw_stats["scans"] += 1
                         scans.append(s)
@@ -3186,7 +3189,11 @@ class SpeculativeGeneration:
                 cw_stats["scan_tokens"] += len(d_scan[2])
             return sflat, srows, scans, sscans
 
-        cw_stats = dict(decisions=0, whole=0, rejects=0, scans=0, scan_tokens=0, ratio_mismatch=0)
+        cw_stats = dict(
+            decisions=0, whole=0, rejects=0, scans=0, scan_tokens=0, ratio_mismatch=0, forced=0
+        )
+        cw_force = int(os.environ.get("THUNDERSYNC_DEBUG_CW_FORCE_REJECT", "0") or 0)
+        cw_forced: dict[int, int] = defaultdict(int)
         try:
             while live or inflight or turns:
                 progressed = False
@@ -3251,6 +3258,10 @@ class SpeculativeGeneration:
                                             **self._cw(s)["walk"],
                                             "final": bool(d[3]),
                                             "rule": self.cw_rule.as_dict(),
+                                            # debug: force the first N decisions of a
+                                            # plan to reject (THUNDERSYNC_DEBUG_CW_FORCE_REJECT)
+                                            "force_reject": cw_force > 0
+                                            and cw_forced[id(s["plan"])] < cw_force,
                                         }
                                         for (_, d), s in zip(flat, owners)
                                     ],

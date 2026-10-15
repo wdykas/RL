@@ -190,6 +190,15 @@ class DeferredHeadLogits(torch.Tensor):
         start, end = self._seq
         return self._x[start:end].transpose(0, 1).contiguous()
 
+    def row_input(self, b: int) -> torch.Tensor:
+        """Head input of batch row ``b`` over the slice, ``[n, h]`` (no autograd)."""
+        start, end = self._seq
+        return self._x[start:end, b].detach()
+
+    @property
+    def head_weight(self) -> torch.Tensor:
+        return self._w.detach()
+
     def materialize(self) -> torch.Tensor:
         """The logits through the autograd-tracked head (no memory saving)."""
         from nemo_rl.models.megatron import fp16_gemm
@@ -305,3 +314,28 @@ def _seq_slice(idx: Any, seq_dim: int) -> Optional[slice]:
 def deferred_head_logits(x: torch.Tensor, weight: torch.Tensor) -> DeferredHeadLogits:
     """The stand-in for ``fp16_linear(x, weight, FP32_HEAD)`` (``x`` ``[s, b, h]``)."""
     return DeferredHeadLogits(x, weight)
+
+
+class verification_logits:
+    """Context: no-grad forwards return ``DeferredHeadLogits`` too (fp32 head, TP=1).
+
+    Verification needs log-probs of the drafted tokens and a few full rows; the
+    caller computes them per row in chunks of at most ``CHUNK_TOKENS`` positions
+    (``thundersync_rl.engine_q.DeferredLogprobRows``), each chunk's logits by the
+    same row-invariant ``fp32_gemm`` and row-wise log-softmax as the materialized
+    path, so the values are bitwise those of a whole-batch head. Outside the fp16
+    head recipe (or at TP > 1) the head is unchanged and logits are materialized.
+    """
+
+    def __enter__(self):
+        from nemo_rl.models.megatron import fp16_gemm
+
+        self._prev = fp16_gemm._STATE.get("deferred_head_nograd")
+        fp16_gemm._STATE["deferred_head_nograd"] = True
+        return self
+
+    def __exit__(self, *exc):
+        from nemo_rl.models.megatron import fp16_gemm
+
+        fp16_gemm._STATE["deferred_head_nograd"] = self._prev
+        return False

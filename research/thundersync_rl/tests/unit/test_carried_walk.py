@@ -431,3 +431,19 @@ def test_implementation_monte_carlo_control():
     toy = Toy(V=3, N=4, seed=5, temp=1.0)
     z, _ = _mc_z(toy, toy.p_law(), DecisionRule("row"), torch.Generator().manual_seed(9), reset_walk=True)
     assert z > 20, z
+
+
+def test_debug_force_reject_fails_the_terminal_test_only_when_dipped():
+    g = torch.Generator().manual_seed(0)
+    V, n = 6, 10
+    P = torch.log_softmax(torch.randn(n + 1, V, generator=g), -1)
+    Q = torch.log_softmax(torch.randn(n, V, generator=g), -1)
+    draft = torch.randint(0, V, (n,), generator=g)
+    ar = torch.arange(n)
+    args = (P[ar, draft], Q[ar, draft], torch.zeros(n + 1), torch.zeros(n), lambda i: P[i], lambda i: Q[i])
+    walk = {"log_b": -0.5, "floor": 0, "n": 3, "force_reject": True}
+    out = carried_piece(*args, torch.Generator().manual_seed(1), walk, DecisionRule("row"), True)
+    assert out["forced"] and out["decision"] in ("reject", "scan")
+    out = carried_piece(*args, torch.Generator().manual_seed(1), {**walk, "force_reject": False},
+                        DecisionRule("row"), False)
+    assert out["decision"] is None and not out["forced"]

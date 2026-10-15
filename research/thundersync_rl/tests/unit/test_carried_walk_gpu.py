@@ -39,3 +39,21 @@ def test_gpu_matches_cpu(trial):
     Pc, Qc = P.cuda(), Q.cuda()
     m_gpu = _rows_mass(lambda i: Pc[i], lambda i: Qc[i], torch.zeros(n + 1, device="cuda"), torch.zeros(n, device="cuda"))
     assert _hits_desc(lb, fl - 1, eta, 1e-4, m_cpu)[0] == _hits_desc(lb, fl - 1, eta.cuda(), 1e-4, m_gpu)[0]
+
+
+@pytest.mark.parametrize("n,chunk", [(37, 8), (300, 4096), (5000, 4096)])
+def test_deferred_logprob_rows_equal_materialized(n, chunk):
+    """Chunked verification head rows == log_softmax of the whole-batch fp32 head (bitwise)."""
+    from nemo_rl.models.megatron import fp16_gemm
+    from thundersync_rl.engine_q import DeferredLogprobRows
+
+    g = torch.Generator(device="cuda").manual_seed(n)
+    h, V, vlim = 256, 3000, 2900
+    x = torch.randn(n, h, device="cuda", generator=g)
+    w = (torch.randn(V, h, device="cuda", generator=g) * 0.05).to(torch.bfloat16)
+    full = torch.log_softmax(fp16_gemm.fp32_gemm(x.unsqueeze(1), w)[:, 0, :vlim].float(), -1)
+    rows = DeferredLogprobRows(x, w, vlim, chunk_rows=chunk)
+    tok = torch.randint(0, vlim, (n,), device="cuda", generator=g)
+    assert torch.equal(rows.token_logprobs(tok), full[torch.arange(n, device="cuda"), tok])
+    idx = torch.tensor([0, n // 2, n - 1], device="cuda")
+    assert torch.equal(rows(idx), full[idx])

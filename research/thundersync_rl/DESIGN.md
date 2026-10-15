@@ -3066,6 +3066,24 @@ costs more than ~5k decode tokens, e.g. a 128k restart prefill). Full grid (all 
   path (14q) calls them unchanged; the walk state and decisions travel through the driver.
 Metrics: `spec/cw_decisions`, `_whole`, `_rejects`, `_scans`, `_scan_tokens`, `_ratio_mismatch` (must be 0: the scan's
 forward reproduces the pieces' log p bitwise), `_hidden_retained_bytes_max`.
+**Chunked verification head (all engine-sourced verification, ts-carried-walk).** A verification forward
+(verify0, continuation pieces, carried walk pieces and scans) used to materialize [rows x tokens x V] fp32 logits for
+the whole forward batch: cw-x-4k OOMed allocating 68 GiB (≈ 34 x 4096 x 131k x 4 B) at step 3 [M,
+runs_1node/cw-x-4k-row/run.log]. Now `verify_drafts_block_engine` runs its forwards under
+`deferred_head.verification_logits()`: with the fp32 head at TP=1 the model returns the `DeferredHeadLogits` stand-in
+(as training's deferred LM head), and each row's log-probs come from `engine_q.DeferredLogprobRows`, which forms
+`log_softmax(fp32_gemm(x_rows, W)[:vocab_limit])` for at most 4096 rows at a time (drafted-token log-probs) or for the
+rows a scan asks for. Same ops per row as the materialized path (row-invariant GEMM, row-wise log-softmax), so
+bitwise the same values [T: test_carried_walk_gpu.py::test_deferred_logprob_rows_equal_materialized]. Per rank:
+the head input (tokens x h x 4 B) plus one [4096, V] fp32 chunk (2 GiB at V 131k) instead of tokens x V x 4 B.
+Not covered: TP > 1 (vocab-parallel `GatheredLogprobRows` still keeps [n, V/TP] logits per row), heads outside the
+fp16-GEMM recipe (logits materialized as before; `[verify head] chunked=False` in the log). Engine placement (14q)
+already chunks p rows (`HeadLogprobRows`, 512 rows).
+
+**Debug** `THUNDERSYNC_DEBUG_CW_FORCE_REJECT=N`: the first N decisions of each plan fail their terminal test (only when
+b < 1) so short exactness runs exercise the rejection scan; changes the law (not an exactness test of the rule),
+leaves every bitwise check meaningful. `spec/cw_forced`.
+
 Requirements (`validate_carried_walk`): sticky routing, verify_source=engine, verify_on=learner on this branch, no
 banded IS. Not built: carrying the walk through verify0 (it decides; ⊥-BV pools need its outcomes), speculative forks.
 

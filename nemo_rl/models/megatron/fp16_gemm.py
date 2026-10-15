@@ -607,8 +607,12 @@ def _make_output_layer_forward(cls: type):
             _STATE.get("deferred_head")
             and comm == COMM_NONE
             and _STATE["head"] == FP32_HEAD
-            and torch.is_grad_enabled()
-            and w.requires_grad
+            and (
+                (torch.is_grad_enabled() and w.requires_grad)
+                # Verification forwards (no autograd) that consume log-probs in
+                # chunks (deferred_head.verification_logits); never for a batch.
+                or (_STATE.get("deferred_head_nograd") and not torch.is_grad_enabled())
+            )
             and self.bias is None
         ):
             # Training (TP=1): the loss needs only the target log-probs, so the

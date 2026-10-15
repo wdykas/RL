@@ -228,14 +228,20 @@ def carried_piece(
         "walk": {"log_b": lb[-1], "floor": floor, "n": pos0 + g},
         "decision": None,
         "rows_evaluated": 0,
+        "forced": False,
     }
     if not rule.due(lb[-1], final):
         return out
     dev = lse_p.device
     eta_t = torch.rand(1, generator=generator, dtype=torch.float64, device=dev)
-    if float(eta_t) <= math.exp(lb[-1]):
+    # Debug only (THUNDERSYNC_DEBUG_CW_FORCE_REJECT): fail the terminal test so the
+    # rejection / scan path runs in short E2E checks. Changes the law (a plan with a
+    # forced rejection is not a p sample); the bitwise checks stay meaningful.
+    forced = bool(walk.get("force_reject")) and lb[-1] < 0.0
+    if not forced and float(eta_t) <= math.exp(lb[-1]):
         out["decision"] = "whole"
         return out
+    out["forced"] = forced
     eta = torch.rand(g, generator=generator, dtype=torch.float64, device=dev)
     mass = _rows_mass(p_rows, q_rows, lse_p, lse_q)
     j, n_eval = _hits_desc(lb, floor - pos0, eta, lazy_slack(lse_p[:g]), mass)
