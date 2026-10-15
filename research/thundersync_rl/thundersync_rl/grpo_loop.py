@@ -276,6 +276,11 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # counts only (null_bv.LogRatioCalibration). Logs spec/null_v_used and
     # spec/logratio_var_step. null_bv_tail_weight: critical-path cost of a
     # tail decode relative to a fresh decode of a slot (DP cost model).
+    # ⊥-BV draft admission order: "primaries_first" (every group's G
+    # primaries, then the extras) or "group" (whole pools, group by group).
+    # Exact either way (counts and batch order only); logged:
+    # spec/null_groups_fully_drafted, spec/null_groups_whole_accepted.
+    draft_admission: str = "primaries_first"
     null_bv_calibrate: bool = False
     null_bv_calibration_decay: float = 0.5
     null_bv_tail_weight: float = 1.0
@@ -788,6 +793,8 @@ def validate_null_bv(master_config: ThunderSyncMasterConfig) -> None:
         problems.append("thundersync.null_bv_fixed_m must be >= 1")
     if not ts_cfg.null_bv_logratio_var >= 0:
         problems.append("thundersync.null_bv_logratio_var must be >= 0")
+    if ts_cfg.draft_admission not in ("primaries_first", "group"):
+        problems.append("thundersync.draft_admission must be primaries_first or group")
     if not 0.0 <= ts_cfg.null_bv_calibration_decay < 1.0:
         problems.append("thundersync.null_bv_calibration_decay must be in [0, 1)")
     if not ts_cfg.null_bv_tail_weight > 0:
@@ -2047,14 +2054,20 @@ def next_draft_prompts(
         # requests G rollouts per batch entry.
         n_drafts = drafts_per_prompt(ts_cfg.null_bv_drafts_per_output, G)
         nxt = next_batch.repeat_interleave(n_drafts)
-        # Submission order: every group's first G drafts (the ones its slots
-        # take unless some are rejected), then the extras. The engine admits
-        # drafts in this order, so with request capacity for the primaries
-        # the extras decode only in what is left of the window. Each pool's
-        # own order (draft index within the group) is unchanged.
-        primary = [i * n_drafts + j for i in range(next_batch.size) for j in range(G)]
-        extra = [i * n_drafts + j for i in range(next_batch.size) for j in range(G, n_drafts)]
-        nxt = nxt.select_indices(primary + extra)
+        # Submission (= engine admission) order, a function of the counts and
+        # the batch order only; each pool's own order (draft index within the
+        # group) is unchanged either way.
+        if ts_cfg.draft_admission == "primaries_first":
+            # Every group's first G drafts (the ones its slots take unless
+            # some are BOT), then the extras, which decode in what is left of
+            # the window: the most rows drafted, but the extras a BOT calls
+            # for are the late ones, about one per group.
+            primary = [i * n_drafts + j for i in range(next_batch.size) for j in range(G)]
+            extra = [i * n_drafts + j for i in range(next_batch.size) for j in range(G, n_drafts)]
+            nxt = nxt.select_indices(primary + extra)
+        # "group": whole pools in batch order, so whatever does not fit the
+        # engine's capacity is whole late groups, and the early groups are
+        # fully drafted, extras included.
         counts = collections.Counter()
         for i in range(next_batch.size):
             p = torch.cat([m["token_ids"] for m in next_batch["message_log"][i]])
@@ -2105,6 +2118,7 @@ def make_speculative_generation(
         null_bv_policy=null_bv_policy(master_config) if ts_cfg.null_bv else None,
         null_bv_drop_is=ts_cfg.null_bv_drop_is,
         null_bv_spare_prompts=ts_cfg.null_bv_spare_prompts,
+        draft_admission=ts_cfg.draft_admission,
         sticky_chunk_tokens=ts_cfg.sticky_continuation_chunk_tokens,
         sticky_chunk_growth=ts_cfg.sticky_continuation_chunk_growth,
         draft_until_complete=ts_cfg.draft_until_complete,

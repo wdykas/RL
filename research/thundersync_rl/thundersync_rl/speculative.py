@@ -367,6 +367,7 @@ class SpeculativeGeneration:
         null_bv_policy: Optional[dict[str, Any]] = None,
         null_bv_drop_is: bool = False,
         null_bv_spare_prompts: int = 0,
+        draft_admission: str = "primaries_first",
         sticky_chunk_tokens: int = 2048,
         sticky_chunk_growth: float = 0.0,
         draft_until_complete: bool = False,
@@ -570,6 +571,8 @@ class SpeculativeGeneration:
         # Prompt drop: the step trains on the first (prompts - spares) prompts
         # whose pools were not dropped (``null_selected_keys``, drafting order).
         self.null_bv_spare_prompts = null_bv_spare_prompts
+        # Engine admission order of ⊥-BV drafts (``next_draft_prompts``).
+        self.draft_admission = draft_admission
         self.null_selected_keys: Optional[list[tuple[int, ...]]] = None
         self._null_slots: dict[int, dict[tuple[int, ...], int]] = {}
         if null_bv and (self.verify_source != "engine" or verify_mode != "block"):
@@ -706,11 +709,14 @@ class SpeculativeGeneration:
                 del self._null_slots[t]  # never verified (no drafts reached it)
             self._null_slots[step + 1] = dict(null_slots)
         hkeys = self._hidden_keys([f"{step + 1}:{i}" for i in range(len(prompts))])
-        # ⊥-BV: the primaries (one per output slot) come first and must all
-        # run at once; the extras may queue behind them.
-        self._check_draft_capacity(
-            rank0, sum(null_slots.values()) if null_slots else len(prompts)
-        )
+        # ⊥-BV, primaries first: the primaries (one per output slot) must all
+        # run at once; the extras may queue behind them. Group admission:
+        # at least one whole pool must fit (later pools queue as whole groups).
+        if null_slots and self.__dict__.get("draft_admission") == "group":
+            need = max(1, len(prompts) // max(len(null_slots), 1))
+        else:
+            need = sum(null_slots.values()) if null_slots else len(prompts)
+        self._check_draft_capacity(rank0, need)
         t_start = time.perf_counter()
         ray.get(
             rank0.start_drafts.remote(
@@ -1825,6 +1831,10 @@ class SpeculativeGeneration:
         out_pairs: list[tuple[int, int]] = []
         rejected: list[tuple[int, int]] = []  # (draft length, tau) of tail decodes
         dropped_groups = getattr(self, "_null_dropped", set())
+        # Per group: every output's plan complete at verify0 (fully drafted),
+        # and also every draft accepted whole (trainable from its verify forward).
+        grp_done: dict[str, bool] = {}
+        grp_whole: dict[str, bool] = {}
         n_tail_drops = 0
         weights: list[float] = []
         for r, (_, d) in enumerate(flat):
@@ -1854,6 +1864,10 @@ class SpeculativeGeneration:
                 plan.log_weight = max(0.0, float(res["log_wstar"]) - math.log(res["null_m"]))
                 weights.append(math.exp(plan.log_weight))
             full += plan.complete and res["accepted"] == g
+            grp_done[groups[r]] = grp_done.get(groups[r], True) and plan.complete
+            grp_whole[groups[r]] = (
+                grp_whole.get(groups[r], True) and plan.complete and res["accepted"] == g
+            )
             kept += res["accepted"]
             total += g
             out_pairs.append((g, res["accepted"]))
@@ -1882,6 +1896,15 @@ class SpeculativeGeneration:
         )
         n_slots = sum(getattr(self, "_null_all_slots", {}).values())
         decided = n_out + n_bot
+        live = [grp for grp in slots if grp not in dropped_groups]
+        filled = {grp for grp in live if outs_by_group[grp] >= slots[grp]}
+        n_live = max(len(live), 1)
+        self.stats["spec/null_groups_fully_drafted"] = (
+            sum(grp_done.get(grp, False) for grp in filled) / n_live
+        )
+        self.stats["spec/null_groups_whole_accepted"] = (
+            sum(grp_whole.get(grp, False) for grp in filled) / n_live
+        )
         self.stats.update(
             {
                 "spec/draft_tokens": float(total),
