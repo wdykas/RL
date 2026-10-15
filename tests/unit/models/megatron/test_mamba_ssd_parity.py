@@ -182,3 +182,36 @@ def test_mamba_ssm_training_on_another_tiling_is_caught(mixer_factory):
         kernel.configs = saved
         kernel.cache.clear()
     assert not torch.equal(y_old, y_gen)
+
+
+@pytest.mark.parametrize("activation", ["silu", None])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+def test_conv_weight_grads_are_reproducible(activation, dtype):
+    """The training conv: kernel forward bits, close gradients, bitwise-repeatable weight grads."""
+    from causal_conv1d import causal_conv1d_fn
+
+    from nemo_rl.models.megatron.mamba_ssd_parity import _ConvFixedOrderGradFn
+
+    torch.manual_seed(0)
+    rows, channels, length, width = 8, 512, 1024, 4
+    x0 = torch.randn(rows, channels, length, device="cuda", dtype=dtype)
+    w0 = (0.3 * torch.randn(channels, width, device="cuda")).to(dtype)
+    b0 = (0.1 * torch.randn(channels, device="cuda")).to(dtype)
+    dout = torch.randn(rows, channels, length, device="cuda", dtype=dtype)
+
+    def run(fn):
+        x, w, b = (t.clone().requires_grad_() for t in (x0, w0, b0))
+        y = fn(x, w, b)
+        y.backward(dout)
+        return y.detach(), x.grad, w.grad, b.grad
+
+    ref = run(lambda x, w, b: causal_conv1d_fn(x=x, weight=w, bias=b, activation=activation))
+    got = run(lambda x, w, b: _ConvFixedOrderGradFn.apply(x, w, b, activation))
+    assert torch.equal(got[0], ref[0])  # forward: the kernel's bits
+    assert torch.equal(got[1], ref[1])  # input gradient: the kernel's
+    for g, r in zip(got[2:], ref[2:]):  # weight / bias: the same sums, rounded per row
+        scale = float(r.float().abs().max())
+        torch.testing.assert_close(g.float(), r.float(), rtol=0, atol=2e-3 * scale)
+    for _ in range(3):
+        again = run(lambda x, w, b: _ConvFixedOrderGradFn.apply(x, w, b, activation))
+        assert all(torch.equal(a, g) for a, g in zip(again, got))

@@ -212,9 +212,53 @@ def mamba_chunk_scan_combined_train(
     )
 
 
+class _ConvFixedOrderGradFn(torch.autograd.Function):
+    """``causal_conv1d_fn`` whose weight and bias gradients are summed over rows in a fixed order.
+
+    causal_conv1d's backward adds each batch row's weight / bias gradient into
+    the result with atomics, so with more than one row per micro-batch those
+    two gradients differ bit for bit between identical steps (the input
+    gradient does not; one row is reproducible). The forward and every row's
+    gradients are the kernel's; the backward runs the kernel once per row and
+    sums the rows' weight / bias gradients in row order in fp32. Per rank: the
+    same kernel work in ``rows`` launches per Mamba layer, plus fp32 copies of
+    the [channels, width] weight and its partial sums.
+    """
+
+    @staticmethod
+    def forward(ctx, x, weight, bias, activation):  # noqa: D102
+        from causal_conv1d import causal_conv1d_fn
+
+        ctx.save_for_backward(x, weight, bias)
+        ctx.activation = activation
+        return causal_conv1d_fn(x=x, weight=weight, bias=bias, activation=activation)
+
+    @staticmethod
+    def backward(ctx, dout):  # noqa: D102
+        from causal_conv1d.causal_conv1d_interface import causal_conv1d_bwd_function
+
+        x, weight, bias = ctx.saved_tensors
+        dout = dout.contiguous()
+        silu = ctx.activation in ("silu", "swish")
+        # fp32 weight / bias (exact upcasts; the kernel computes in fp32 either
+        # way) make the kernel return fp32 row partials.
+        w32 = weight.float()
+        b32 = None if bias is None else bias.float()
+        dx = torch.empty_like(x)
+        dweight = torch.zeros_like(w32)
+        dbias = None if bias is None else torch.zeros_like(b32)
+        for r in range(x.shape[0]):
+            _, dw, db, _ = causal_conv1d_bwd_function(
+                x[r : r + 1], w32, b32, dout[r : r + 1], None, None, None, dx[r : r + 1], False, silu
+            )
+            dweight += dw
+            if dbias is not None:
+                dbias += db
+        return dx, dweight.to(weight.dtype), None if dbias is None else dbias.to(bias.dtype), None
+
+
 def _ssm_training(self, zxBCdt, packed_seq_params=None):
     """``MambaMixer._ssm_training`` on the engine's kernels in batch-invariant mode."""
-    from causal_conv1d import causal_conv1d_fn
     from einops import rearrange
 
     if not self.config.batch_invariant_mode:
@@ -233,11 +277,12 @@ def _ssm_training(self, zxBCdt, packed_seq_params=None):
     )
     # The non-fused training conv (MambaMixer._static_prefill), bitwise equal to the
     # engine's varlen prefill conv and its decode update.
-    xBC = causal_conv1d_fn(
-        x=rearrange(xBC, "b l d -> b d l").contiguous(),
-        weight=rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
-        bias=self.cp.get_conv1d_bias(),
-        activation=self.activation,
+    # Weight / bias gradients reduced in a fixed order (_ConvFixedOrderGradFn).
+    xBC = _ConvFixedOrderGradFn.apply(
+        rearrange(xBC, "b l d -> b d l").contiguous(),
+        rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
+        self.cp.get_conv1d_bias(),
+        self.activation,
     )
     xBC = rearrange(xBC, "b d l -> b l d").contiguous()
     x, B, C = torch.split(xBC, [d_inner, groups_state, groups_state], dim=-1)
