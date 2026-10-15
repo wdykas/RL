@@ -253,7 +253,7 @@ def test_validate_cohort_lanes_accepts_sticky_lanes():
     [
         ({}, {"cohort_lanes": 3}, "1 or 2"),
         ({}, {"sticky_routing": False}, "sticky_routing"),
-        ({"refit_transport": "mcore"}, {}, "refit_transport"),
+        ({"refit_transport": "nccl_reshard"}, {}, "refit_transport"),
         ({"backend": "vllm"}, {}, "megatron"),
         ({}, {"draft_after_verify": True}, "draft_after_verify"),
     ],
@@ -263,6 +263,14 @@ def test_validate_cohort_lanes_rejects(gen, ts, msg):
 
     with pytest.raises(ValueError, match=msg):
         validate_cohort_lanes(_master(gen, **ts))
+
+
+@pytest.mark.parametrize("transport", [None, "mcore"])
+def test_validate_cohort_lanes_accepts_refit_transports(transport):
+    """Packed collective or the native m2n refit (refit_m2n.py), one group per lane."""
+    from thundersync_rl.grpo_loop import validate_cohort_lanes
+
+    validate_cohort_lanes(_master({"refit_transport": transport}))
 
 
 def _fingerprinted(fleet: FakeFleet, lanes: CohortLanes, step: int, draft_next: bool):

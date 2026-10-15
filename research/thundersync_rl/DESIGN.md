@@ -1288,8 +1288,9 @@ context is sized and the CUDA graphs are captured): each patched linear's, the u
 `.data` becomes its fp16 copy. That is the same bytes and no second copy, and the per-call cast becomes a no-op. Nothing
 is cached, so there is nothing to invalidate: refit `copy_` rounds bf16 -> fp16 once per refit, and momentum
 `EngineStage` stage/load round-trips the fp16 storage. Embeddings, norms, tied heads and Mamba conv/A/D stay bf16. The
-native MCore and M-to-N refits write raw sender-dtype bytes into the parameters, so with those transports the engine
-keeps the per-call cast (not built yet). The fp32 head (and router) GEMM runs once on stacked [hi; lo] rows on both sides
+native MCore refit (`refit_transport: mcore`, the m2n refit of section 14q) receives every fp16-held tensor through
+`Fp16HeldWeightReceive` (bf16 on the wire, `copy_` into the fp16 storage), so the engine holds fp16 under it too. The
+nccl_reshard M-to-N refit writes raw sender-dtype bytes, so with it the engine keeps the per-call cast. The fp32 head (and router) GEMM runs once on stacked [hi; lo] rows on both sides
 (bitwise the two-GEMM result: the BI GEMM is row-invariant).
 
 **Hybrid engine memory (engine package A).** Batch-invariant Mamba decode (MCore) replays the training chunk scan from
@@ -2275,10 +2276,10 @@ raises.
 **Scaling.** Every per-rank cost above is per lane-local GPU and independent of the learner
 size; nothing per token passes through the driver (routes, hidden rows and log-probs stay in each
 lane's object-store blocks, section 14c); no collective spans lanes. The refit is the existing
-transport with one communicator per lane, so it is as bucketed (packed collective) as one engine;
-the per-lane selection is a pointer swap on each learner rank. Not built yet: per-lane selection for
-the sharded M-to-N transports (`refit_transport: nccl_reshard`, the learner's per-PP-stage
-communicators would be kept per lane the same way), a multi-node lane launcher (each lane = whole
+transport with one communicator per lane: the packed collective, or the m2n refit (section 14q,
+`refit_transport: mcore`, one native refit group per lane); the per-lane selection is a pointer swap
+on each learner rank. Not built yet: per-lane selection for `refit_transport: nccl_reshard` (the
+learner's per-PP-stage communicators would be kept per lane the same way), a multi-node lane launcher (each lane = whole
 nodes of replicas; `build_engine_lanes` already takes multi-node placement shapes), lane
 rebalancing (static halves now; `lanes/idle_frac` is the metric), lookahead ≥ 2 (a+1 lanes, the
 version map of `agent_fp_async_floor.md` §2), and lanes without sticky routing (validated off).
@@ -3001,6 +3002,95 @@ with mixed starts vs the whole rows, logits compared with torch.equal).
   piece forward ~0.5 s of token work vs ~4 ms for a 256-token cached segment. Per continued 32k row: 256 pieces x
   ~0.25 s (average 16k) ~ 60 s of learner work without the cache, ~1-2 s with it. The per-call cost is shared by all
   rows batched in one verification call and is not changed by the cache; it needs its own fix (profile first).
+
+## 14q. m2n refit: every learner rank sends its own shards (`refit_transport: mcore`, 2026-10-15)
+
+**Why.** The default refit (`refit_transport: null`) exports the whole model in HF layout and broadcasts it from
+learner rank 0 to every engine rank (`packed_broadcast_producer src=0`). Every engine rank receives the full model P and
+one process sends it, per refit, and a ThunderSync step refits twice (θ̂_{k+1} for drafting, θ_k when some row decodes
+fresh). Measured at full Nano (P = 63 GB, EP8): 1.32–1.51 s per θ refit and 0.76 s per θ̂ refit, ≈ 45 GB/s
+(`runs_nano_scale/nano-full-*`). The cost grows with P: ≈ 5 s per refit at Super, ≈ 24 s at Ultra, ≈ 44 s at 1T.
+
+**What.** `refit_transport: mcore` with `mcore_generation_config.refit_backend: nccl` (or `nccl_m2n`) uses Megatron
+Core's native refit (`megatron.core.resharding`). The plan is built once per lane and cached. It works on Megatron names
+for every tensor, including Mamba, attention, embeddings, the head, the experts and the router `expert_bias`. There is no HF
+export and no rank-0 path. Each engine rank receives exactly its own shards. Each shard's source is balanced over the
+learner's DP replicas (`select_src_metadata_balanced`), and each learner rank sends straight from its live parameters.
+ThunderSync keeps engine TP and EP equal to the learner's (section 14j), so each tensor's plan is a whole-shard copy from
+one learner rank. With PP, an engine rank receives from each stage that owns its layers. `nccl` is batched NCCL
+point-to-point (`NCCLCopyService`). `nccl_m2n` is native NCCL M2N (`NCCLM2NCopyService`), which needs nccl-extensions'
+`nccl.m2n`. The nemo-rl-fa4b image does not have it (`ModuleNotFoundError: nccl.m2n`), so runs use `nccl` for now.
+
+**Bitwise contract.** After an m2n refit the engine must hold bitwise the weights the packed broadcast writes, for θ and
+θ̂. Three pieces make that hold:
+- **fp16-held weights.** The engine holds its dense GEMM weights, untied head and router (`hold_fp16_weights`) and its
+  expert buffers (`fp16_moe`) in fp16, but the plan's wire dtype is the learner's bf16. The plan is built at
+  `init_collective`, before engine initialization converts the weights. fp16 and bf16 have the same width, so a direct
+  receive would write bf16 bits into fp16 storage silently. `Fp16HeldWeightReceive` (`megatron_worker.py`) is a
+  receive-side transform. Each tensor whose current dtype is fp16 is received into a bf16 buffer, then written with
+  `copy_`, which is the broadcast path's bf16 → fp16 rounding. The transform subclasses `MXFP8ReshardTransform` only
+  because the M2N service accepts that type. Before this change the expert buffers were already fp16 under `mcore`, so
+  that combination wrote raw bf16 bits into them.
+- **Inference tensors.** The destination swap runs under `torch.inference_mode()`, as the colocated reshard does: engine
+  tensors allocated during generation are inference tensors.
+- **Derived caches.** MCore's `refresh_module_caches` refreshes derived caches such as the Mamba `-exp(A_log)` cache,
+  as the bridge import does.
+
+**Lanes.** Each lane gets its own native refit group: the learner ranks plus that lane's ranks, with no idle ranks, as
+M2N requires. `keep_refit_group` / `select_refit_group` file and restore `model_update_group`, `refit_pg`, the copy
+service and the rank offset. The plan's cache key is the same for every lane, so the learner clears MCore's plan cache
+before each new lane's init (`clear_refit_plan_cache`). Otherwise it would skip that lane's collective plan build and
+the lane's engine ranks would wait forever. The plan itself is identical across lanes (same group-rank layout).
+
+**θ̂.** θ̂ goes through the same path. `load_draft_weights` writes θ̂ into the learner's parameter buffer: each
+distributed-optimizer shard owner computes its slice, then a DP all-gather runs, as after an optimizer step. No rank
+gathers the model. The m2n refit then sends each rank's TP/EP/PP-local θ̂ shards. Not built yet: a direct push from the
+distributed-optimizer shards, which would skip the load all-gather and the restore (`draft/load_gather_s` 1.30 s at full
+Nano [M]). It needs a plan whose sources are DO-bucket ranges rather than whole TP-local parameters. Engine fan-in would
+be DP × PP sources per tensor, and per-rank bytes would be unchanged.
+
+**Per-rank cost per refit.** R is the bytes one engine GPU holds per weight version. P is the whole model. Bandwidths
+are [H]: NVLink-domain P2P ≈ 400 GB/s per GPU, inter-rack IB ≈ 45 GB/s per GPU (the measured broadcast rate). The m2n
+figures exclude fixed software overhead. nccl_reshard's measured 2.32 s at Ultra-v3 (1.1 TB, TP8xEP32xPP2 → TP8xDP8)
+bounds it from above.
+
+| model | P (bf16) | engine replica | R per engine GPU | broadcast per refit (P / 45 GB/s) | m2n per refit, NVLink / IB (R / BW) | learner send per rank |
+|---|---|---|---|---|---|---|
+| Nano | 63 GB | EP8 (8 GPUs) | 10.9 GB [M `draft/engine_stage_gb`] | 1.32–1.51 s [M] | 0.03 s / 0.24 s | ≈ R (8 learner ranks) |
+| Super | 240 GB | TP4×EP8 (8) [H] | ≈ 32 GB [H: 8% dense] | ≈ 5.3 s | 0.08 s / 0.7 s | P / L |
+| Ultra | 1.1 TB | TP8×EP64 (64) | ≈ 17 GB [D, future_scale_issues §2.2] | ≈ 24 s | – / 0.38 s | 1.1 TB / 512 ≈ 2.1 GB |
+| 1T | ≈ 2 TB | TP8×EP64 | ≈ 39 GB [D] | ≈ 44 s | – / 0.87 s | ≈ 2–4 GB |
+
+Other per-rank costs:
+- **Engine.** Transient bf16 staging for the fp16-held tensors of one execution batch, ≤ `refit_execution_batch_bytes`
+  (default 2% of GPU memory, ≤ 5 GiB).
+- **Learner.** Nothing extra: it sends views of its live parameters.
+- **Plan build.** Once per lane, an `all_gather_object` of every rank's tensor metadata: O(ranks × local tensors)
+  entries on every rank. At Ultra that is ~0.6k ranks × ~1.5k tensors [D]. It is one-time, not per refit.
+- **Nothing per refit through one process.** The engine's fan-in per tensor is learner PP (one stage owns a layer).
+
+**Crosscheck (debug).** With `THUNDERSYNC_REFIT_CROSSCHECK=1` (`refit_m2n.py`), every refit runs these steps:
+1. The packed broadcast, as the reference.
+2. A bitwise digest of every engine parameter and buffer, including the fp16 expert buffers and the Mamba cache. The
+   digest is a position-weighted sum of the raw bits modulo two primes.
+3. The engine overwrites every refit tensor with NaN or -7.
+4. The m2n refit.
+5. The digest again, compared per rank and per tensor.
+
+Each refit prints one line, `[m2n-crosscheck] PASS|FAIL refit=<n> ... broadcast_s m2n_s`. The poison step means a
+tensor the m2n refit skipped cannot pass by keeping the broadcast's values. The run continues on the m2n weights, so the
+same run's exactness checks (mismatch 0, engine-q, route check) also test them. With `=strict` the run raises on the
+first FAIL.
+
+**Status.** Unit tests (`tests/unit/test_refit_m2n.py`):
+- the digest changes on any one-bit change;
+- through MCore's real executor, the fp16 receive equals the broadcast's `copy_` bitwise, including fp16 subnormals and
+  overflow;
+- a direct receive does not equal it;
+- lane state is filed and restored per lane.
+
+GPU runs are queued (Nano L8, one engine EP2 and lanes 2×EP1, crosscheck plus exactness, with a same-tree broadcast
+control). The measured refit seconds go in this section when they report.
 
 ## 14s. Run readiness: checkpoints, resume, epochs, validation, always-on guards (branch ts-run-ready)
 

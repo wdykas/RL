@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+from contextlib import nullcontext
 import gc
 import importlib
 import os
@@ -54,6 +55,8 @@ from megatron.core.resharding.refit import (
     prepare_swap_model_weights,
     swap_model_weights,
 )
+from megatron.core.resharding.transforms import MXFP8ReshardTransform
+from megatron.core.resharding.utils import get_refit_tensor_dict
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.cuda_graph_config import (
     normalize_inference_cuda_graph_scope,
@@ -119,6 +122,62 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
     is_nccl_reshard_param,
     restore_refit_info_placements,
 )
+
+
+class Fp16HeldWeightReceive(MXFP8ReshardTransform):
+    """Native MCore refit into engine weights held in fp16 (receiver-side cast).
+
+    Under the fp16 GEMM recipe the engine holds its dense GEMM weights
+    (``fp16_gemm.hold_fp16_weights``) and expert weights (``fp16_moe``) in fp16,
+    while the learner's parameters, and therefore the plan's wire dtype, are bf16
+    (the plan is built at ``init_collective``, before the engine converts). fp16
+    and bf16 have the same width, so a direct receive into the fp16 storage would
+    reinterpret the bits silently. Every tensor whose current dtype is fp16 is
+    received into a bf16 buffer instead and written with ``copy_``: the same
+    bf16 -> fp16 rounding the packed collective refit's ``copy_`` applies, so the
+    engine ends with bitwise the same weights. Other tensors keep the direct
+    receive. Receiver-only: the sender transmits bf16 with no transform.
+
+    Subclasses ``MXFP8ReshardTransform`` only because ``NCCLM2NCopyService``
+    accepts that type for receiver-side conversion; no MXFP8 state is used.
+    """
+
+    def __init__(self, core: torch.nn.Module):
+        # No super().__init__: it validates MXFP8 persistent buffers.
+        self.core = core
+        self.convertible_params: set[str] = set()
+        self.persistent_buffers: dict = {}
+        self.buffer_key_prefix = ""
+        self.convert_on_send = False
+        self.backend = None
+        self._pending_1d: dict = {}
+
+    @property
+    def tensors(self) -> dict[str, torch.Tensor]:
+        # The refit executor's own name -> tensor map of the destination model
+        # (cached on the module; rebuilt when MCore replaces a buffer).
+        return get_refit_tensor_dict(self.core)
+
+    def should_transform(self, param_name: str) -> bool:
+        tensor = self.tensors.get(param_name)
+        return tensor is not None and tensor.dtype == torch.float16
+
+    def prepare_send(self, param_name, src_slice, src_param):
+        raise RuntimeError("Fp16HeldWeightReceive is a receiver-side transform")
+
+    def prepare_recv(self, param_name, dst_slice):
+        dst = self.tensors[param_name].data[dst_slice]
+        return [torch.empty(dst.shape, dtype=torch.bfloat16, device=dst.device)]
+
+    def finalize_recv(self, param_name, dst_slice, recv_buffers):
+        dst = self.tensors[param_name].data[dst_slice]
+        with torch.inference_mode() if dst.is_inference() else torch.no_grad():
+            dst.copy_(recv_buffers[0])
+
+
+def _refit_core(model: Any) -> torch.nn.Module:
+    """The module MCore's refit walks (``refit._unwrap_model_cores``)."""
+    return unwrap_model(model[0] if isinstance(model, (list, tuple)) else model)
 
 
 def _inference_optimized_transformer_layer_spec(config: Any) -> Any:
@@ -708,9 +767,12 @@ class MegatronGenerationMixin:
         """Engine-only numerics setup, before the context is sized and graphs captured.
 
         - fp16 GEMM forward: hold the dense GEMM weights in fp16 (``hold_fp16_weights``)
-          on a dedicated inference model whose refits write through ``copy_``
-          (``refit_transport: null``). The native MCore and M-to-N refits receive raw
-          bytes into the parameters in the sender's dtype, so those keep the per-call cast.
+          on a dedicated inference model whose refits write through ``copy_``: the
+          packed collective (``refit_transport: null``) and the native MCore refit
+          (``refit_transport: mcore``), which receives every fp16-held tensor through
+          ``Fp16HeldWeightReceive`` (bf16 on the wire, ``copy_`` into the fp16 storage).
+          The nccl_reshard M-to-N refit receives raw bytes in the sender's dtype, so it
+          keeps the per-call cast.
         - batch-invariant Mamba: decode without the z replay buffer and count the
           replay buffers in the inference memory budget (``mamba_bi_decode``).
         """
@@ -720,7 +782,8 @@ class MegatronGenerationMixin:
         if (
             fp16_gemm.enabled()
             and self.is_refit_destination
-            and refit_transport is None
+            and not self.is_generation_colocated
+            and refit_transport in (None, "mcore")
         ):
             n = fp16_gemm.hold_fp16_weights(self._gen_model())
             if self.rank == 0:
@@ -1630,15 +1693,33 @@ class MegatronGenerationRefitMixin:
         if self.refit_execution_batch_bytes is None:
             raise RuntimeError("Native MCore refit was not initialized.")
 
-        swap_model_weights(
-            src_model,
-            dst_model,
-            refit_method=self.refit_copy_service,
-            group=self.refit_pg,
-            src_rank_offset=0,
-            dst_rank_offset=self.refit_dst_rank_offset,
-            execution_batch_bytes=self.refit_execution_batch_bytes,
-        )
+        transform = None
+        if not is_source:
+            from nemo_rl.models.megatron import fp16_gemm
+
+            if fp16_gemm.enabled():
+                # The engine holds dense GEMM weights (hold_fp16_weights) and its
+                # expert weights (fp16_moe) in fp16 while the plan's wire dtype is
+                # the learner's bf16; see Fp16HeldWeightReceive.
+                transform = getattr(self, "_fp16_refit_receive", None)
+                if transform is None:
+                    transform = self._fp16_refit_receive = Fp16HeldWeightReceive(
+                        _refit_core(self.model)
+                    )
+        # Destination: engine tensors allocated lazily during generation (the fp16
+        # expert buffers) are inference tensors, which in-place writes may only
+        # touch under inference mode (as in _reshard_into_inference_model).
+        with torch.inference_mode() if dst_model is not None else nullcontext():
+            swap_model_weights(
+                src_model,
+                dst_model,
+                refit_method=self.refit_copy_service,
+                group=self.refit_pg,
+                src_rank_offset=0,
+                dst_rank_offset=self.refit_dst_rank_offset,
+                transform=transform,
+                execution_batch_bytes=self.refit_execution_batch_bytes,
+            )
 
         return True
 

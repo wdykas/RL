@@ -420,8 +420,8 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # the drafter of cohort k+1 and drafts it from the top of the step; roles
     # alternate. 1: one engine (single version). Requires sticky routing
     # (the lanes carry the continuation anchors; without it the remainder is
-    # plain theta_k decoding, not built on lanes yet) and the packed
-    # collective refit (policy.generation.refit_transport null).
+    # plain theta_k decoding, not built on lanes yet) and refit_transport null
+    # (packed collective) or mcore (native m2n refit, refit_m2n.py).
     cohort_lanes: int = 1
     # Banded importance sampling (block_verification.py, DESIGN.md section
     # 14e). None (default): off, every row is an exact sample of the current
@@ -718,10 +718,14 @@ def validate_cohort_lanes(master_config: ThunderSyncMasterConfig) -> None:
             "continuations on its drafting weights; the non-sticky remainder path "
             "is not built on lanes yet)"
         )
-    if gen.get("backend") != "megatron" or gen.get("refit_transport") is not None:
+    if gen.get("backend") != "megatron" or gen.get("refit_transport") not in (
+        None,
+        "mcore",
+    ):
         problems.append(
             "policy.generation.backend must be megatron with refit_transport null "
-            "(one packed-collective refit communicator per lane)"
+            "(packed collective) or mcore (native m2n refit); one refit "
+            "communicator per lane"
         )
     if ts_cfg.draft_after_verify or ts_cfg.fused_verify_train:
         problems.append("draft_after_verify and fused_verify_train must be off")
