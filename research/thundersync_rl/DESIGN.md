@@ -4268,4 +4268,71 @@ awaited before the next is sent. Fixed here: (1) chunked verification beside tra
 (2) `verify_sticky` continuation pieces (own ordered scope + drain); (3) call numbers are per worker group (`_group_seq`),
 so a second verifier pool no longer leaves gaps (a deadlock). Weights never change inside a step, so the pre-fix risk was
 cross-rank pairing at TP/PP/EP>1, not a forward at the wrong version. Engine sites all ordered by `ray.get` or refs (the
-lane head hand-off since 7a85a86d); latent: async refit transfers serve other calls mid-transfer (safe by schedule only).
+lane head hand-off since 7a85a86d); latent: async refit transfers serve other calls mid-transfer (safe by schedule only; since ts-integ4 a
+refit-in-flight guard makes stash_head, engine_verify_decide, run_verify_requests and sentinel_weight_digest raise
+when called during update_weights_from_collective / nccl_reshard_refit).
+
+## 14af. Canonical tail-group order by verify0-kept tokens (`thundersync.tail_group_order: kept`, opt-in; ts-integ4)
+
+**Problem [M, runs_ab/ts_por-...-bh-ab and -dr-ab, research/integ4/slow_row.py].** The canonical training order is
+[ready groups] [tail groups] [fresh groups], each class in group index order, cut into blocks of
+`canonical_block_groups` (4 groups = 32 rows per dispatch); a block dispatches once all its groups are complete and
+after every earlier block. The tail class holds 26-35 groups per step at full Nano 8k. When the slowest row's group is
+early in index order (bh-ab steps 1-4: positions 8, 3, 0, 0 of 33/35/26/32), every later tail block waits for it, and
+7-9 tail dispatches (bh 17-38 s, dr 41-51 s) run after the chain has ended. The iteration is then chain + those
+dispatches, not the chain.
+
+**Change.** With `tail_group_order: kept` the tail class is sorted by the fewest tokens kept at the verify0 decision among
+the group's tail plans (`plan.verified[1]`, recorded by `SpeculativeGeneration._note_tails` at each decision site:
+one-shot `begin_sticky`, streaming verify0's per-call decisions, engine verification's per-block decisions), most kept
+first, ties by group index; groups with no recorded tail plan first. `StreamOrder(tail_order=...)` (streaming verify0)
+and the engine-verification `after_verify` use the same helper (`grpo_loop.order_tail_groups`).
+
+**Exactness.** Unchanged: which rows are trained and with what log-probs does not depend on the order; the order
+decides which groups share a dispatch / micro-batch and the summation order of the accumulated gradient. The key is a
+function of the verification results (fixed at the decision, not of when tails finish), so the accumulated gradient stays
+bitwise independent of arrival times (14k). Kept counts of whole-accepted incomplete drafts depend on where the drafting
+window cut them, which is already true of the rollouts themselves.
+
+**Expected [D, replay of the measured group completion times, slow_row.py "order sim"].** Tail training end:
+bh-ab steps 1-5 index 168/181/170/168/175 s -> kept 150/155/148/147/178 (oracle 145/139/148/129/175): -19 s mean
+(step 5's slowest row was an under-drafted late group, already last); dr-ab -13 to -46 s (its learner was the binding
+resource, so less of that is realizable). Requires the learner to have slack during the chain (bh-ab: learner busy
+72-96 s of 157-177 s).
+
+**Costs / scale.** Driver only: one int per prompt with a tail; no per-rank state, no collective.
+Tests: tests/unit/test_tail_group_order.py.
+
+## 14ag. Integration round 4: ts-integ4 (2026-10-15; thundersync_work/research/agent_integ4.md)
+
+ts-integ4 = ts-integ3 2de3f17e + ts-v0s-lanes-fix 323bed0a (streaming verify0 on lanes; v0sl-x/xlanes EXACT) +
+ts-engine-verify-i3 fba0978f (14ac; ev6-x EXACT) + ts-decode-speed f002abf9 (14ad, default on, bitwise) +
+ts-ray-order 48014d4c (14ae) + tail_group_order (14af) + a refit-in-flight guard. Defaults unchanged except what the
+merged branches made default (decode fusions, ordered learner calls); every chain lever stays opt-in.
+
+**Two all-on configs, not one.** `verify_on=engine` excludes `verify0_stream`, `verify_yield` and
+`learner_prefix_cache` (validators; they are learner-side), so:
+- all-L (learner path): verify0_stream + verify_yield + growth-0 (128-token) pieces + learner prefix cache + graphed
+  prefill + tail_group_order=kept;
+- all-E (engine path): verify_on=engine (verify0 in pipelined canonical blocks on the theta lane + continuation pieces
+  on the engine, 2 in flight) + graphed prefill + tail_group_order=kept, piece growth 1.0: engine pieces re-prefill the
+  whole row (no engine prefix cache), so 128-token pieces would cost ~L^2/128 prefill tokens per continued row
+  (~30M tokens per step at 8k vs ~2M with growth 1.0).
+Both use draft_weights=current (engine verification requires it) and max_requests 256.
+
+**Lever classes (for the ratio vs async1 on the same tree).** Shared (speed async1 too, async1 runs them): decode
+fusions, Mamba fp32 pre-norm input, MBS 2 / deal_rows / zero-advantage skip / async1 one dispatch, graphed prefills,
+max_requests. ThunderSync-only: verify0_stream, engine verification, verify_yield, growth-0 pieces, learner prefix
+cache, tail_group_order, draft weights, acceptance work. go_integ4.sh runs async1 on the same frozen tree with the same
+shared settings; lever-off arms (-i4-nov0s, -i4-notail, option tord) attribute the ThunderSync-only part; option dec
+(DECODE_FUSED=0 on async1 and all-L) attributes the shared decode lever.
+
+**Slowest row (bh-ab / dr-ab, research/agent_integ4.md section 2).** Two kinds: (A) a capped draft rejected at
+verify0 near its start (positions 16-2922), which starts its remainder only when verify0 ends (34-46 s), and (B) a row
+of a late-admitted group (draft_admission=group, 768 ⊥-BV drafts for 512 lane slots) cut by the drafting window after
+271-2600 tokens, which keeps decoding through verify0 but must still decode ~6-8k tokens with 2-3 re-rejections.
+Re-rejections cost 1.0-3.1k wasted tokens each with growth-1.0 pieces (a rejection is detected only when its
+position-sized piece ends). Tail engine: 100-160 rows alive for the first 10-30 s after verify0 (mostly incomplete drafts:
+55-163 per step vs 12-29 verify0-rejected), at 12.5-13 ms/step; 10.1-10.9 ms/step at 1-15 rows per rank (rank-0
+[gen progress]) vs the 7.6 ms EP4 1-row bench: an in-loop ~3 ms/step excess at every batch size (unattributed;
+ENGINE_PROF=1 on every go_integ4 arm measures it).

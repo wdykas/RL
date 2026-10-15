@@ -444,7 +444,7 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # learner DP rank gets a row (canonical_groups_per_block).
     canonical_block_groups: int = 4
     # Canonical order of the TAIL class (groups with a pending continuation after
-    # verify0; DESIGN 14ae). "index": group index order (the slowest row's group
+    # verify0; DESIGN 14af). "index": group index order (the slowest row's group
     # blocks every later tail block: at full Nano 8k 7-9 tail dispatches, 20-41 s,
     # ran after the chain ended, bh-ab). "kept": by the fewest tokens kept at the
     # verify0 decision among the group's tail plans, most kept first (least
