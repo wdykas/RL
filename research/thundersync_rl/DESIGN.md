@@ -3521,7 +3521,7 @@ partial to fp32. The partials are then added in rank order. That makes the round
 **Default.** Opt-in: +5% engine decode at EP4 and +16 ms per 4k-token-per-rank prefill step. Turn it on for
 layouts whose engine EP differs from the learner's (lanes, Ultra/1T).
 
-## 14v. Tail speed: verification yields into training, graphed restart prefill, lookup on real tail rows
+## 14x. Tail speed: verification yields into training, graphed restart prefill, lookup on real tail rows
 
 *Branch ts-tail-speed (../RL-tail). Code: `thundersync_rl/verify_yield.py`, `worker.py` (`_run_train_pieces`,
 `ordered_call`), `speculative.py` (`_submit_verify_block`, `_verify_block_async`), `tail_trace.py` (dump). Notes,

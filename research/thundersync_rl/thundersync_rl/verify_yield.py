@@ -13,7 +13,7 @@
 # limitations under the License.
 """Continuation verification yields into training at micro-batch boundaries (opt-in).
 
-``thundersync.verify_yield`` (DESIGN.md section 14v). While streaming over the
+``thundersync.verify_yield`` (DESIGN.md section 14x). While streaming over the
 tails, learner calls are numbered and every rank runs them in that order
 (``ordered_call``). A piece verification sent while a training dispatch runs
 gets the next number, so it waits for the whole dispatch (Nano L8 1k: ~1 s;

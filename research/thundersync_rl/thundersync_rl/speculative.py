@@ -352,7 +352,7 @@ def behavior_logprobs(
 # every SpeculativeGeneration of the driver (one per engine lane).
 _LEARNER_SEQ = itertools.count()
 
-# verify_yield (DESIGN 14v): one VerifyMailbox per learner worker group, shared
+# verify_yield (DESIGN 14x): one VerifyMailbox per learner worker group, shared
 # by every SpeculativeGeneration (engine lane) of the process.
 _YIELD_MAILBOXES: dict[int, tuple[Any, bool]] = {}
 
@@ -2077,7 +2077,7 @@ class SpeculativeGeneration:
             seq = self.learner_seq() if ordered else None
             call = (method,) if seq is None else ("ordered_call",)
             if seq is not None and self._yield_ready(g):
-                # verify_yield (DESIGN 14v): the call goes to the mailbox; the
+                # verify_yield (DESIGN 14x): the call goes to the mailbox; the
                 # ordered call only holds its place in the learner order.
                 kwargs = dict(
                     extra,
