@@ -36,6 +36,7 @@ import math
 import os
 import time
 from collections import Counter, defaultdict
+import dataclasses
 from dataclasses import dataclass, field, replace
 from typing import Any, AsyncGenerator, Callable, Optional
 
@@ -57,6 +58,7 @@ from thundersync_rl.fused_train import FusedRef
 from thundersync_rl.multi_turn import TurnEnvironment, TurnRecord, pair_rows, replay
 from thundersync_rl.null_bv import LogRatioCalibration, NullGroup, NullPolicy, row_envelopes
 from thundersync_rl.prefix_cache import PrefixCacheDirectory, lpt_owners
+from thundersync_rl import vit
 from thundersync_rl.tail_trace import TailTrace
 from thundersync_rl.run_state import SeedStream
 from thundersync_rl.routes import (
@@ -203,6 +205,9 @@ class Plan:
     turn_start: int = 0
     turns: list[TurnRecord] = field(default_factory=list, compare=False)
     row: Optional[int] = None
+    # Verify-in-train (``vit.py``): a placeholder of a VIT group, filled once its
+    # training forward decides (or its fallback verification does).
+    vit: bool = field(default=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -608,6 +613,16 @@ class SpeculativeGeneration:
         self._verify_seeds = SeedStream(
             seed, f"verify/{seed_stream}", lambda: self.current_step
         )
+        # Verify-in-train (``vit.py``, opt-in; set by the training loop).
+        self.verify_in_train = False
+        self.vit_group_size = 0
+        self._vit_groups: list = []
+        self.vit_mbs = 0
+        self.vit_dp = 1
+        self.vit_min_pass_prob = 0.0
+        self.vit_checkpoint_bytes = float("inf")
+        self.vit_bytes_per_token = 0.0
+        self.vit_predictor = vit.PassPredictor()
         self.plans: dict[tuple[int, ...], list[Plan]] = defaultdict(list)
         self.stats: dict[str, float] = {}
         # Multi-iteration drafts: target step -> drafts for that step's rollouts.
@@ -1566,18 +1581,28 @@ class SpeculativeGeneration:
         self.null_dropped_keys, self._null_dropped = set(), set()
         self.null_selected_keys = None
         null = self._null_prepare(drafts)
+        self._vit_groups = []
         if null is not None:
             drafts, names, slots, n_empty = null
+            if self.verify_in_train:
+                drafts = self._vit_split(drafts, names, slots)
+                vit_names = {names[vg.key] for vg in self._vit_groups}
+                slots = {n: v for n, v in slots.items() if n not in vit_names}
             flat, rows = self._flat_rows(drafts)
             self._record_siblings(flat)
             groups = [names[_key(d[0])] for _, d in flat]
-            by_row = self._verify_null(flat, rows, groups, slots)
+            by_row = self._verify_null(flat, rows, groups, slots) if flat else {}
             self._finish_verify_null(flat, by_row, groups, slots, dropped, n_empty)
+            self._vit_place()
             self._count_tails()
             return
+        # verify_in_train needs pooled ⊥-BV drafts (one pool per prompt); without
+        # pools this step every draft is verified here (validated: null_bv).
         flat, rows = self._flat_rows(drafts)
         self._record_siblings(flat)
-        if self.verify_mode == "block":
+        if not flat:
+            by_row = {}
+        elif self.verify_mode == "block":
             by_row = self._verify_block(flat, rows, band=self.banded_is_band)
         else:
             res = ray.get(
@@ -1593,7 +1618,242 @@ class SpeculativeGeneration:
             )
             by_row = dict(x for rank_res in res for x in rank_res)
         self._finish_verify(drafts, flat, by_row, dropped)
+        self._vit_place()
         self._count_tails()
+
+    # -- verify-in-train (``vit.py``) -------------------------------------------
+
+    def _vit_split(self, drafts, names, slots):
+        """Take the pools whose first G drafts are all finished out of verify0.
+
+        A pool qualifies when it serves exactly G rows (one prompt), its first G
+        drafts (drafting order) are non-empty finished rollouts if whole-accepted
+        (``_stopped``) with engine log q and anchors. Which pools qualify is a
+        timing/length fact; the outcome of each pool is the regular
+        ``decide_pools`` outcome either way (``vit.py``).
+        """
+        if names is None:
+            raise RuntimeError("verify_in_train needs pooled ⊥-BV drafts")
+        G = int(self.vit_group_size)
+        base = next(self._verify_seeds)
+        pred = self.vit_predictor
+        pred.end_step()  # the previous step's outcomes join the window
+        spread = self.vit_spread_rows() is not None
+        keep = []
+        pis, gated = [], 0
+        for v in drafts:
+            key = _key(v[0][0])
+            n_slots = int(slots[names[key]]) if names is not None else len(v)
+            head = v[:G]
+            ok = (
+                G > 0
+                and n_slots == G
+                and len(v) >= G
+                and all(
+                    len(d[2]) > 0
+                    and self._stopped(d)
+                    and len(d) > 8
+                    and d[6] is not None
+                    and d[8] is not None
+                    for d in head
+                )
+            )
+            if ok:
+                # Gate (past steps' counts only): high predicted pass probability,
+                # and a spread group's retained forwards within the budget.
+                pi = pred.group_pass([len(d[2]) for d in head])
+                tokens_rank = -(-G // max(1, int(self.vit_dp))) * max(
+                    d[0].numel() + len(d[2]) for d in head
+                )
+                fits = (not spread) or tokens_rank * self.vit_bytes_per_token <= self.vit_checkpoint_bytes
+                if pi < self.vit_min_pass_prob or not fits:
+                    ok = False
+                    gated += 1
+                else:
+                    pis.append(pi)
+            if not ok:
+                keep.append(v)
+                continue
+            n = len(v)
+            ms = [
+                float(self._null_policy.m(n - j, G - j)) if names is not None else 1.0
+                for j in range(G)
+            ]
+            self._vit_groups.append(
+                vit.VitGroup(
+                    key=key,
+                    drafts=list(v),
+                    ms=ms,
+                    seeds=[vit.row_seed(base, d[4]) for d in v],
+                )
+            )
+        self._vit_seed_base = base
+        self._vit_null = names is not None
+        self.stats["vit/gated_groups"] = float(gated)
+        self.stats["vit/predicted_pass_mean"] = sum(pis) / len(pis) if pis else float("nan")
+        self.stats["vit/candidate_groups"] = float(len(self._vit_groups))
+        self.stats["vit/candidate_rows"] = float(G * len(self._vit_groups))
+        return keep
+
+    def vit_spread_rows(self) -> Optional[int]:
+        """Rows per micro-batch of a group spread over ranks; None: a group fits one.
+
+        ``THUNDERSYNC_VIT_FORCE_SPREAD_ROWS=r`` (test): spread every group in
+        micro-batches of r rows (exercises the forward-first path at short rows).
+        """
+        forced = os.environ.get("THUNDERSYNC_VIT_FORCE_SPREAD_ROWS")
+        if forced:
+            return int(forced)
+        return None if self.vit_group_size <= self.vit_mbs else int(self.vit_mbs)
+
+    def vit_observe_bytes_per_token(self, b: float) -> None:
+        """Measured retained bytes/token of a spread group (the gate's memory estimate)."""
+        self.vit_bytes_per_token = float(b)
+
+    def _vit_observe(self, d, res) -> None:
+        """A decided draft's whole-acceptance, for the pass predictor (finished drafts only)."""
+        if self._stopped(d):
+            whole = res.get("null") in (None, "out") and res.get("accepted") == len(d[2])
+            self.vit_predictor.observe(len(d[2]), whole)
+
+    def _vit_place(self) -> None:
+        """Placeholder plans the VIT groups' rollouts wait on (``_await_plan``)."""
+        for vg in self._vit_groups:
+            vg.placeholders = [Plan(seed=-1, vit=True) for _ in range(self.vit_group_size)]
+            self.plans[vg.key] = list(vg.placeholders)
+
+    def take_vit_groups(self) -> list:
+        """This step's VIT groups (once); creates the step's completion event."""
+        groups, self._vit_groups = self._vit_groups, []
+        self._vit_done = asyncio.Event()
+        self._vit_tail_pending = []
+        self._vit_error = None
+        if not groups:
+            self._vit_done.set()
+        return groups
+
+    async def _vit_fill(self, ph: Plan, plan: Plan) -> None:
+        for f in dataclasses.fields(Plan):
+            if f.name != "vit":
+                setattr(ph, f.name, getattr(plan, f.name))
+
+    async def vit_pass(self, vg, lpx_by_row: dict[int, list[float]]) -> None:
+        """The group's training forward accepted its first G drafts whole: serve them."""
+        G = self.vit_group_size
+        for j in range(G):
+            d = vg.drafts[j]
+            g = len(d[2])
+            lpx = lpx_by_row[j]
+            if len(lpx) != g:
+                raise RuntimeError(f"verify_in_train: {len(lpx)} log-probs for a {g}-token draft")
+            r = {
+                "accepted": g,
+                "next": -1,
+                "logprobs": list(lpx),
+                "draft_logq": [float(x) for x in d[6][:g]],
+            }
+            plan = self._plan(d, r)
+            if not plan.complete:
+                raise RuntimeError("verify_in_train: an accepted candidate is not a finished rollout")
+            plan.verified = (g, g)
+            plan.tail = False
+            self.vit_predictor.observe(g, True)
+            await self._vit_fill(vg.placeholders[j], plan)
+        self._release_hidden(vg.drafts)
+        vg.passed = True
+        await self._notify_tails()
+
+    async def vit_fallback(self, groups: list) -> list:
+        """Regular verification of failed VIT pools, with the rows' own streams.
+
+        Returns the pending (tail) plans; fills every placeholder.
+        """
+        if not groups:
+            return []
+        G = self.vit_group_size
+        flat, rows, envs = [], [], []
+        for t, vg in enumerate(groups):
+            n = len(vg.drafts)
+            for j, d in enumerate(vg.drafts):
+                flat.append((t, d))
+                rows.append(torch.cat([d[0], torch.tensor(d[2], dtype=torch.long)]))
+                if self._vit_null:
+                    envs.append(row_envelopes(self._null_policy, n, G, j))
+        futs = self._submit_verify_block(
+            flat,
+            rows,
+            null_envelopes=envs if self._vit_null else None,
+            ordered=True,
+            row_seed_base=self._vit_seed_base,
+        )
+        done = []
+        for a, refs in futs:
+            done.append((a, await asyncio.to_thread(ray.get, refs)))
+        if getattr(self, "learner_ordered", False):
+            self._learner_inflight.difference_update(r for _, refs in futs for r in refs)
+        by_row = self._verify_block_results(flat, done)
+        pending = []
+        at = 0
+        for vg in groups:
+            n = len(vg.drafts)
+            plans = []
+            state = NullGroup(n, G, self._null_policy) if self._vit_null else None
+            for j, d in enumerate(vg.drafts):
+                r = by_row[at + j]
+                if state is not None:
+                    m = state.next_m()
+                    if m is None:
+                        continue
+                    tau, y, _ = r["null_grid"][m]
+                    state.record(y >= 0)
+                    res = _null_result(r, m)
+                    self._vit_observe(d, res)
+                    if res["null"] == "bot":
+                        continue
+                else:
+                    if j >= G:
+                        break
+                    res = r
+                plan = self._plan(d, res)
+                plan.verified = (len(d[2]), res["accepted"])
+                plan.stream = None  # its draft stream was stopped at begin_sticky
+                plan.tail = not plan.complete
+                plans.append(plan)
+            at += n
+            if len(plans) != G:
+                raise RuntimeError(
+                    f"verify_in_train: fallback pool yielded {len(plans)} outputs for {G} rows "
+                    "(a fresh decode would need theta_k on the engine)"
+                )
+            for ph, plan in zip(vg.placeholders, plans):
+                await self._vit_fill(ph, plan)
+                if not ph.complete:
+                    pending.append((vg.key, ph))
+            vg.passed = False
+        self._release_hidden(d for vg in groups for d in vg.drafts)
+        await self._notify_tails()
+        return pending
+
+    def vit_finish(self, pending: list, error: Optional[BaseException] = None) -> None:
+        self._vit_tail_pending = pending
+        if error is not None:
+            self._vit_error = error
+            self._tail_error = error
+        ev = getattr(self, "_vit_done", None)
+        if ev is not None:
+            ev.set()
+
+    async def vit_complete_tails(self) -> None:
+        """Before the refit: wait for the VIT decisions, then the fallback pools' tails."""
+        ev = getattr(self, "_vit_done", None)
+        if ev is None:
+            return
+        await ev.wait()
+        if self._vit_error is not None:
+            raise RuntimeError("verify_in_train failed") from self._vit_error
+        pending, self._vit_tail_pending = self._vit_tail_pending, []
+        if pending:
+            await self.complete_tails(pending)
 
     def _select_prompts(self) -> None:
         """Prompt drop: keep the first (prompts - spares) undropped prompts in
@@ -1663,7 +1923,14 @@ class SpeculativeGeneration:
         return self._verify_block_results(flat, done)
 
     def _submit_verify_block(
-        self, flat, rows, null_envelopes=None, ordered=False, band=None, prefix_keys=None
+        self,
+        flat,
+        rows,
+        null_envelopes=None,
+        ordered=False,
+        band=None,
+        prefix_keys=None,
+        row_seed_base=None,
     ) -> list:
         """Send ``flat``'s block verification to the verifier pools: [(first row, refs)].
 
@@ -1705,6 +1972,10 @@ class SpeculativeGeneration:
                 extra = {**extra, "null_envelopes": [list(e) for e in null_envelopes[a:b]]}
             if band is not None:
                 extra = {**extra, "band": band}
+            if row_seed_base is not None:
+                if method != "verify_drafts_block_engine":
+                    raise RuntimeError("verify_in_train needs engine-sourced q")
+                extra = {**extra, "row_seed_base": int(row_seed_base)}
             seq = self.learner_seq() if ordered else None
             call = (method,) if seq is None else ("ordered_call",)
             if seq is not None:
@@ -1922,6 +2193,8 @@ class SpeculativeGeneration:
                 n_tail_drops += 1
                 continue
             m_sum += float(res["null_m"])
+            if self.verify_in_train:
+                self._vit_observe(d, res)
             g = len(d[2])
             decided_len.append(g)
             if state == "bot":
@@ -2507,6 +2780,7 @@ class SpeculativeGeneration:
             (key, plan)
             for key, plan in plans
             if not plan.complete
+            and not plan.vit
             and id(plan) not in waiting
             and not self._horizon_done(plan, len(key))
         ]
@@ -2515,6 +2789,8 @@ class SpeculativeGeneration:
         kept = {id(plan.stream) for _, plan in pending if plan.stream is not None}
         self._stop_streams([x for x in streams if id(x) not in kept])
         self._tail_plans = {id(plan) for _, plan in pending}
+        # Verify-in-train placeholders: their rollouts wait for the training forward.
+        self._tail_plans |= {id(plan) for _, plan in plans if plan.vit}
         # Rank-0 tail timeline of this step (TailTrace), finished by the
         # continuation rounds (``_continue_sticky``).
         self._tail_trace = trace

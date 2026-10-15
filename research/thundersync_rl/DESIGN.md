@@ -3092,6 +3092,53 @@ first FAIL.
 GPU runs are queued (Nano L8, one engine EP2 and lanes 2×EP1, crosscheck plus exactness, with a same-tree broadcast
 control). The measured refit seconds go in this section when they report.
 
+## 14r. Verify-in-train (VIT): design B, exactness, debug check (2026-10-15; not built beyond the check)
+
+*Notes and numbers: `thundersync_work/research/agent_verify_in_train.md`. Branch ts-verify-in-train (../RL-vit).*
+
+**Idea.** For a group whose G drafts are all finished at t_{n+1}, the block-verification forward at theta_{n+1} is the
+group's canonical training forward: decisions are read from the training forward's `next_token_logprobs` (same
+function of (p, q, u) as `verify_drafts`), then the backward runs. Verification of those rows costs no forward.
+
+**Design B (chosen).** Only groups whose drafts are all finished AND whole-accepted contribute gradient from the fused
+call; for them the draft rewards are the final rewards (no provisional advantage). A micro-batch in which the forward
+finds a rejection is masked like a padding row (sample_mask = token_mask = advantages = 0; the backward still runs on
+every rank, keeping EP/PP lockstep) and its group trains later in its canonical (tail-last) position. With
+group-aligned micro-batches and deterministic kernels the accumulated gradient equals canonical training bitwise.
+**Design A (provisional advantages + linear correction over all accepted rows) is rejected**: exact only in exact
+arithmetic (fp two-term sum; the replacement row trains in another micro-batch), and it saves <= 0.03 s/step at L8.
+
+**Measured coverage (Nano L8 1k, steps 2-5).** Fully-finished groups 0.48 (ord-p-l2-m128) / 0.69 (lanes2r-l2), 0 with
+one lane; fusable drafted-token share 0.50 / 0.80; P(rejection | finished group) 0.03-0.04. Group-major admission
+(untested) would raise m128's 0.48 toward 0.89.
+
+**Debug check `THUNDERSYNC_VIT_CHECK=1`** (`vit_check.py`; first `THUNDERSYNC_VIT_CHECK_CALLS` final calls per step):
+regular call twice (control), training-forward p vs generation_logprobs (verifier/engine p) bitwise, masked-row
+content independence (exact zero), row-absent and correction fp differences (information); the regular result is
+what trains. Bitwise needs `policy.megatron_cfg.deterministic_training=true` (14n). Cluster line vit-x; result: see the
+agent note.
+
+**Decision (2026-10-15).** Plan of record: hybrid placement (VIT for fully-drafted all-accepted groups, engine-side
+verification inside the continuation prefill for the rest), linear correction dropped. VIT rows are exact without
+`deterministic_training` (decisions come from the training forward itself); determinism is only for bitwise tests.
+
+**Placement.** VIT for fully-finished groups, engine-side verification (14q) for unfinished drafts (ideally inside the
+continuation's own prefill). Per-rank cost of VIT: no memory beyond a training micro-batch; q (4 B/token) and the row
+seed to the row's last PP stage; one [V/TP] head row per rejected position.
+
+**Built (opt-in `thundersync.verify_in_train`, 647deaec).** Pooled ⊥-BV, sticky routing, streaming over the tails
+with the canonical order, group granularity, PP 1. Pools whose first G drafts are finished skip verify0. Their draft
+rewards come from the rollout function run on the draft text. Their training calls (one micro-batch per group, on
+ranks by tokens in group order) are the step's first ordered learner calls. Each row's decision is
+eta_g(row seed) <= b_g(M_j), computed in the loss from the training forward's log-probs, bitwise the verifier's rule.
+A failed micro-batch's loss is multiplied by 0 (the backward runs on every rank), and its counts and metrics are
+removed. Its pool is then verified the regular way with the same per-row streams, its tails run before the refit,
+and it trains in its canonical position (after the groups ready at verify0). Passed groups leave the planner's order
+(`mark_pretrained`). Their rollouts are served from the drafts, with the training forward's log-probs as generation
+log-probs, so the in-loop mismatch check covers p == verifier bitwise. vit-x: training p == verifier p bitwise
+(278k tokens). A masked ROW inside a live micro-batch is not bitwise under EP (routing changes the expert GEMM
+shapes); VIT only ever masks whole micro-batches, which the check tests separately (wz/wm).
+
 ## 14s. Run readiness: checkpoints, resume, epochs, validation, always-on guards (branch ts-run-ready)
 
 Before this the loop could not run a long job (`research/future_training_dynamics_issues.md` issues 1-4,

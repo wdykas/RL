@@ -83,6 +83,7 @@ from thundersync_rl.run_state import (
 )
 from thundersync_rl.sentinel import WeightSentinel
 from thundersync_rl.speculative import SpeculativeGeneration, cohort_draft
+from thundersync_rl import vit
 from thundersync_rl.streaming import (
     Chunk,
     StreamingLearner,
@@ -448,6 +449,27 @@ class ThunderSyncConfig(BaseModel, extra="allow"):
     # buffers must never change. A mismatch is an error naming the tensors.
     # O(params / rank) reads per refit, no gather.
     weight_sentinel: bool = True
+    # Verify-in-train (vit.py, DESIGN.md section 14r; opt-in). A prompt whose G
+    # output drafts are all finished at the top of the step skips verify0: its
+    # rows are trained first, one micro-batch per group (never mixing groups),
+    # and each row's block-verification decision is read from that training
+    # forward. A group with any rejection leaves no gradient (its micro-batch's
+    # loss is zeroed; every rank still runs the backward) and is verified the
+    # regular way with the same per-row random streams, then trained after its
+    # tails in canonical order. Requires speculate, null_bv, verify_mode=block,
+    # verify_source=engine, verify_on=learner, sticky routing, streaming over
+    # the tails with the canonical order, group granularity, PP = 1 and
+    # G <= the training micro-batch rows.
+    verify_in_train: bool = False
+    # Verify-in-train gate: a group goes to VIT only if its predicted probability
+    # of being accepted whole (past steps' per-length counts, vit.PassPredictor,
+    # last vit_pass_window steps) is at least vit_min_pass_prob, and, when it
+    # spans several micro-batches, its retained forwards (estimated per rank from
+    # the measured bytes/token, initially vit_bytes_per_token) fit vit_checkpoint_gb.
+    vit_min_pass_prob: float = 0.5
+    vit_pass_window: int = 4
+    vit_checkpoint_gb: float = 16.0
+    vit_bytes_per_token: float = 1.0e6
 
 
 def train_micro_batch_rows(master_config: "ThunderSyncMasterConfig") -> int:
@@ -603,6 +625,7 @@ def validate_config(master_config: ThunderSyncMasterConfig) -> None:
     validate_cohort_lanes(master_config)
     validate_banded_is(master_config)
     validate_run_control(master_config)
+    validate_verify_in_train(master_config)
 
 
 def _section(master_config: Any, name: str) -> dict[str, Any]:
@@ -701,6 +724,51 @@ def validate_learner_prefix_cache(master_config: ThunderSyncMasterConfig) -> Non
         problems.append("needs learner_prefix_cache_max_gb > 0 and gpu_gb >= 0")
     if problems:
         raise ValueError("thundersync.learner_prefix_cache: " + "; ".join(problems) + ".")
+
+
+def validate_verify_in_train(master_config: ThunderSyncMasterConfig) -> None:
+    """Reject settings verify-in-train is not built for (vit.py)."""
+    ts_cfg = master_config.thundersync
+    if not ts_cfg.verify_in_train:
+        return
+    mcfg = master_config.policy["megatron_cfg"]
+    G = master_config.grpo.num_generations_per_prompt
+    problems = []
+    if not (ts_cfg.speculate and ts_cfg.null_bv and ts_cfg.verify_mode == "block"):
+        problems.append("needs speculate, null_bv (pooled drafts) and verify_mode=block")
+    if ts_cfg.verify_source != "engine" or ts_cfg.verify_on != "learner":
+        problems.append("needs verify_source=engine and verify_on=learner")
+    if sticky_delta(ts_cfg) is None:
+        problems.append("needs sticky_routing (the streaming-over-tails path)")
+    if not (ts_cfg.stream_training_over_tails and ts_cfg.canonical_group_order):
+        problems.append("needs stream_training_over_tails and canonical_group_order")
+    if ts_cfg.granularity != "group":
+        problems.append("needs granularity=group")
+    if (mcfg.get("pipeline_model_parallel_size", 1) or 1) > 1:
+        problems.append("pipeline parallelism is not built")
+    if (mcfg.get("context_parallel_size", 1) or 1) > 1:
+        problems.append("context parallelism is not built")
+    if not 0.0 <= ts_cfg.vit_min_pass_prob <= 1.0 or ts_cfg.vit_checkpoint_gb < 0:
+        problems.append("vit_min_pass_prob must be in [0, 1] and vit_checkpoint_gb >= 0")
+    if (master_config.grpo.max_rollout_turns or 1) > 1:
+        problems.append("multi-turn rollouts are not built")
+    for name in (
+        "null_bv_prompt_drop",
+        "null_bv_drop_is",
+        "fused_verify_train",
+        "tail_excluded_baseline",
+        "sticky_rounding",
+    ):
+        if getattr(ts_cfg, name, False):
+            problems.append(f"{name} must be off (not built with verify_in_train)")
+    if ts_cfg.banded_is_band is not None or ts_cfg.sticky_anchor_horizon is not None:
+        problems.append("banded IS and the anchor horizon are not built with verify_in_train")
+    if os.environ.get("THUNDERSYNC_DEBUG_ORDER_REPLAY"):
+        problems.append("THUNDERSYNC_DEBUG_ORDER_REPLAY does not replay VIT-trained groups")
+    if master_config.policy.get("sequence_packing", {}).get("enabled", False):
+        problems.append("sequence packing is not built")
+    if problems:
+        raise ValueError("thundersync.verify_in_train: " + "; ".join(problems) + ".")
 
 
 def validate_cohort_lanes(master_config: ThunderSyncMasterConfig) -> None:
@@ -1601,8 +1669,12 @@ async def _run_one_step(
     claim_log_weight: Optional[Callable[[torch.Tensor, torch.Tensor], float]] = None,
     stale_rollouts: Optional[list[tuple[int, dict, dict]]] = None,
     generate_next: Optional[Callable[[], Any]] = None,
+    vit_spec: Optional[Any] = None,
 ) -> dict[str, Any]:
     """One step: rollouts, streaming training and the next step's drafts.
+
+    ``vit_spec`` (verify-in-train, ``vit.py``): the spec holding this step's VIT
+    groups; their training calls go first, before any planner dispatch.
 
     ``drafts_after_pre_rollout``: the drafter also waits for ``pre_rollout``
     (sticky streaming over the tails: the continuation rounds and the refit
@@ -1814,8 +1886,262 @@ async def _run_one_step(
             gen.final_check(state["message_log"])
         return i, state, metrics, None
 
+    # Verify-in-train: this step's groups trained (and verified) by their own calls.
+    vit_groups = vit_spec.take_vit_groups() if vit_spec is not None else []
+    vit_submitted = asyncio.Event()
+    if not vit_groups:
+        vit_submitted.set()
+    vit_stats: dict[str, float] = {}
+
+    def _row_reward(state) -> float:
+        reward = float(state["total_reward"])
+        if os.environ.get("THUNDERSYNC_DEBUG_PARITY_REWARD"):
+            toks = torch.cat([m["token_ids"] for m in state["message_log"]])
+            reward = float(zlib.crc32(toks.to(torch.int64).numpy().tobytes()) & 1)
+        return reward
+
+    async def vit_run():
+        """Train the VIT groups first; decide each from its training forward."""
+        nonlocal learner_busy
+        t0 = time.perf_counter()
+        try:
+            key_to_p = {}
+            for p in range(n // G):
+                k = tuple(
+                    torch.cat([m["token_ids"] for m in repeated["message_log"][p * G]]).tolist()
+                )
+                key_to_p.setdefault(k, p)
+            groups = sorted(((key_to_p[vg.key], vg) for vg in vit_groups), key=lambda x: x[0])
+
+            async def stub(i, d):
+                g = len(d[2])
+                gen = vit.StubGeneration(
+                    getattr(policy_generation, "cfg", None),
+                    d[2],
+                    [float(x) for x in d[6][:g]],
+                )
+                return await run_sample_multi_turn_rollout(
+                    sample_idx=i,
+                    initial_sample_state=_initial_sample_state(repeated, i),
+                    policy_generation=gen,
+                    tokenizer=tokenizer,
+                    task_to_env=task_to_env,
+                    max_seq_len=master_config.policy["max_total_sequence_length"],
+                    max_rollout_turns=master_config.grpo.max_rollout_turns,
+                    greedy=False,
+                )
+
+            outs = await asyncio.gather(
+                *[stub(p * G + j, vg.drafts[j]) for p, vg in groups for j in range(G)]
+            )
+            vit_stats["vit/stub_s"] = time.perf_counter() - t0
+            entries = []
+            for gi, (p, vg) in enumerate(groups):
+                trajs, rows = [], []
+                for j in range(G):
+                    state, metrics = outs[gi * G + j]
+                    i = p * G + j
+                    d = vg.drafts[j]
+                    g = len(d[2])
+                    loss_mult = float(repeated["loss_multiplier"][i])
+                    if master_config.grpo.overlong_filtering and metrics["truncated"]:
+                        loss_mult = 0.0
+                    a, ln = vit.assistant_span(state["message_log"])
+                    toks = torch.cat([m["token_ids"] for m in state["message_log"]])
+                    if ln != g or toks[a : a + g].tolist() != list(d[2]):
+                        raise RuntimeError(
+                            "verify_in_train: the reward rollout's assistant tokens are not the draft"
+                        )
+                    trajs.append(
+                        Trajectory(
+                            group=(step, p),
+                            index=i,
+                            reward=_row_reward(state),
+                            payload={
+                                "message_log": state["message_log"],
+                                "loss_multiplier": loss_mult,
+                                "anchors": d[8].truncate(d[0].numel() + g),
+                            },
+                            num_tokens=int(toks.numel()),
+                        )
+                    )
+                    rows.append(
+                        {
+                            "start": a,
+                            "len": g,
+                            "logq": [float(x) for x in d[6][:g]],
+                            "seed": vg.seeds[j],
+                            "m": vg.ms[j],
+                            "row": j,
+                        }
+                    )
+                adv = adv_fn([t.reward for t in trajs])
+                entries.append((p, vg, trajs, rows, adv, gi))
+
+            def make_item(trajs, rows, adv, gi, spread):
+                data = build_chunk_data(
+                    Chunk(
+                        group=None,
+                        reward=None,
+                        trajectories=trajs,
+                        advantages=adv,
+                        fused=None,
+                        padding=False,
+                    ),
+                    tokenizer,
+                    master_config,
+                    1,
+                )
+                vit.add_vit_fields(data, rows)
+                return {
+                    "data": data,
+                    "group": None,
+                    "reward": None,
+                    "fused_key": None,
+                    "vit": True,
+                    "vit_spread": spread,
+                    "vit_group": gi,
+                }
+
+            def pad_item(item):
+                data = BatchedDataDict(
+                    {k: (v.clone() if isinstance(v, torch.Tensor) else list(v) if isinstance(v, list) else v)
+                     for k, v in item["data"].items()}
+                )
+                for k in ("sample_mask", "token_mask", "advantages"):
+                    data[k] = torch.zeros_like(data[k])
+                return {**item, "data": data, "vit_group": -1}
+
+            dp = learner.dp_size
+            spread_rows = vit_spec.vit_spread_rows()
+
+            def submit(per_rank, what):
+                seq = None if ordered is None else ordered.learner_seq()
+                refs = learner.submit(per_rank, [], seq=seq)
+                if seq is not None:
+                    ordered.learner_track(refs)
+                sent.append((what, refs, time.perf_counter()))
+
+            def flush(blk):
+                # One micro-batch per group, groups placed on ranks by tokens in group order.
+                if not blk:
+                    return
+                per_rank = [[] for _ in range(dp)]
+                load = [0] * dp
+                for e in blk:
+                    r = load.index(min(load))
+                    per_rank[r].append(make_item(e[2], e[3], e[4], e[5], False))
+                    load[r] += sum(t.num_tokens for t in e[2])
+                if expert_parallel:
+                    target = max(len(x) for x in per_rank)
+                    for x in per_rank:
+                        while len(x) < target:
+                            x.append(pad_item(next(y for z in per_rank for y in z)))
+                submit(per_rank, list(blk))
+
+            # Canonical: groups in group order; single-micro-batch groups in blocks of
+            # canonical_block_groups, a group larger than one micro-batch alone, spread
+            # over every rank (vit.plan_group_layout) and decided after all its forwards.
+            bg = max(1, int(ts_cfg.canonical_block_groups))
+            sent = []
+            blk = []
+            n_spread = 0
+            for e in entries:
+                p, vg, trajs, rows, adv, gi = e
+                if spread_rows is None or G <= spread_rows:
+                    blk.append(e)
+                    if len(blk) == bg:
+                        flush(blk)
+                        blk = []
+                    continue
+                flush(blk)
+                blk = []
+                n_spread += 1
+                layout = vit.plan_group_layout(
+                    [t.num_tokens for t in trajs], dp, int(spread_rows)
+                )
+                shortest = min(range(G), key=lambda j: (trajs[j].num_tokens, j))
+                per_rank = []
+                for slots in layout:
+                    items = []
+                    for slot in slots:
+                        if slot is None:
+                            items.append(
+                                pad_item(make_item([trajs[shortest]], [rows[shortest]], [adv[shortest]], gi, True))
+                            )
+                        else:
+                            items.append(
+                                make_item(
+                                    [trajs[j] for j in slot],
+                                    [rows[j] for j in slot],
+                                    [adv[j] for j in slot],
+                                    gi,
+                                    True,
+                                )
+                            )
+                    per_rank.append(items)
+                submit(per_rank, [e])
+            flush(blk)
+            vit_submitted.set()
+            failed = []
+            n_pass = 0
+            bpt = []
+            for blk_e, refs, t_sub in sent:
+                rank_results = await asyncio.gather(*refs)
+                if ordered is not None:
+                    ordered._learner_inflight.difference_update(refs)
+                learner_busy += time.perf_counter() - t_sub
+                dec: dict[int, tuple[bool, dict]] = {}
+                for rr in rank_results:
+                    for e in rr.get("vit", []):
+                        if e["group"] < 0:
+                            continue
+                        if "retained_bytes_per_token" in e:
+                            bpt.append(float(e["retained_bytes_per_token"]))
+                        prev = dec.get(e["group"])
+                        if prev is not None and prev[0] != e["pass"]:
+                            raise RuntimeError("verify_in_train: ranks disagree on a group")
+                        rows_lp = {} if prev is None else prev[1]
+                        rows_lp.update({j: lpx for j, _, lpx in e["rows"]})
+                        dec[e["group"]] = (e["pass"], rows_lp)
+                for p, vg, trajs, rows, adv, gi in blk_e:
+                    ok, rows_lp = dec[gi]
+                    if ok:
+                        planner.mark_pretrained((step, p), [t.reward for t in trajs])
+                        await vit_spec.vit_pass(vg, rows_lp)
+                        n_pass += 1
+                    else:
+                        failed.append(vg)
+            if bpt:
+                vit_spec.vit_observe_bytes_per_token(max(bpt))
+                vit_stats["vit/retained_bytes_per_token"] = max(bpt)
+            vit_stats["vit/spread_groups"] = float(n_spread)
+            vit_stats["vit/train_s"] = time.perf_counter() - t0
+            pending_tails = await vit_spec.vit_fallback(failed)
+            vit_stats.update(
+                {
+                    "vit/groups": float(len(entries)),
+                    "vit/passed_groups": float(n_pass),
+                    "vit/failed_groups": float(len(failed)),
+                    "vit/fallback_tails": float(len(pending_tails)),
+                    "vit/rows_trained": float(G * n_pass),
+                    "vit/s": time.perf_counter() - t0,
+                }
+            )
+            vit_spec.vit_finish(pending_tails)
+            wake.set()
+        except BaseException as exc:
+            vit_submitted.set()
+            vit_spec.vit_finish([], error=exc)
+            await vit_spec._notify_tails()
+            raise
+
+    vit_task = asyncio.create_task(vit_run()) if vit_groups else None
+
     async def learner_loop():
         nonlocal learner_busy, num_dispatches, pipeline_calls
+        # Verify-in-train calls are the step's first gradient contributions.
+        await vit_submitted.wait()
         while True:
             await wake.wait()
             wake.clear()
@@ -2014,6 +2340,8 @@ async def _run_one_step(
                 ("arrival", None, 3, None),
             ):
                 replay_digests[key] = replay(key, trajs, order, seed, blocks)
+        if vit_task is not None:
+            await vit_task
         rollouts_done = True
         wake.set()
         if ordered is not None and draft_task is not None:
@@ -2167,6 +2495,7 @@ async def _run_one_step(
         "time/finish_step": t_end - t_finish,
         "time/step_total": t_end - t_start,
         "learner/busy_s": learner_busy,
+        **vit_stats,
         # Non-vacuity of timing comparisons: rows whose GRPO advantage is
         # nonzero (all-zero-advantage rows may be skipped by the learner, which
         # makes training free when every reward is equal).
@@ -2294,7 +2623,7 @@ def make_speculative_generation(
     randomness is hash(grpo.seed, stream, step, counter) (``run_state``).
     """
     ts_cfg = master_config.thundersync
-    return SpeculativeGeneration(
+    spec = SpeculativeGeneration(
         generation,
         policy,
         vocab_limit=len(tokenizer),
@@ -2343,6 +2672,14 @@ def make_speculative_generation(
         seed=int(master_config.grpo.seed),
         seed_stream=str(stream),
     )
+    spec.verify_in_train = bool(ts_cfg.verify_in_train)
+    spec.vit_group_size = int(master_config.grpo.num_generations_per_prompt)
+    spec.vit_mbs = int(train_micro_batch_rows(master_config))
+    spec.vit_min_pass_prob = float(ts_cfg.vit_min_pass_prob)
+    spec.vit_checkpoint_bytes = float(ts_cfg.vit_checkpoint_gb) * 2**30
+    spec.vit_bytes_per_token = float(ts_cfg.vit_bytes_per_token)
+    spec.vit_predictor = vit.PassPredictor(ts_cfg.vit_pass_window)
+    return spec
 
 
 def thundersync_grpo_train(
@@ -2709,6 +3046,7 @@ def thundersync_grpo_train(
             if ts_cfg.stream_training_over_tails:
                 # Only the drafts' verification here; the continuation rounds
                 # run inside the step, under the training of complete groups.
+                spec.vit_dp = learner.dp_size
                 tails = asyncio.run(spec.begin_sticky(drafts))
             else:
                 asyncio.run(spec.verify_sticky(drafts))
@@ -2791,7 +3129,13 @@ def thundersync_grpo_train(
             # Incomplete after verify0: continuation rounds on the drafting
             # version, or (anchor horizon) decoded by the refit engine at theta_k.
             pending_keys = {
-                key for key, queue in spec.plans.items() for plan in queue if not plan.complete
+                key
+                for key, queue in spec.plans.items()
+                for plan in queue
+                if not plan.complete and not plan.vit
+            }
+            vit_keys = {
+                key for key, queue in spec.plans.items() for plan in queue if plan.vit
             }
             row_keys = [tuple(x.tolist()) for x in _prompts(batch)]
             tail_groups = [
@@ -2808,9 +3152,16 @@ def thundersync_grpo_train(
                     p for p in range(len(row_keys) // G)
                     if n_plans[row_keys[p * G]] < need[row_keys[p * G]]
                 }
-                late = set(tail_groups) | fresh
+                # Verify-in-train groups: trained by their own calls before any
+                # dispatch (passed ones leave the order); a failed one trains here,
+                # after the groups ready now (its tails decode meanwhile).
+                vit_groups = [
+                    p for p in range(len(row_keys) // G) if row_keys[p * G] in vit_keys
+                ]
+                late = set(tail_groups) | fresh | set(vit_groups)
                 classes = [
                     [p for p in range(len(row_keys) // G) if p not in late],
+                    [p for p in vit_groups if p not in fresh],
                     [p for p in tail_groups if p not in fresh],
                     sorted(fresh),
                 ]
@@ -2832,6 +3183,8 @@ def thundersync_grpo_train(
                 t = time.perf_counter()
                 try:
                     await spec.complete_tails(pending)
+                    # Verify-in-train: failed groups' tails also run on the drafting weights.
+                    await spec.vit_complete_tails()
                     policy_generation.finish_generation()
                     tails_s.append(time.perf_counter() - t)
                     # The momentum stage and the refit call the learner: no
@@ -2938,6 +3291,7 @@ def thundersync_grpo_train(
                 group_blocks=group_blocks,
                 tail_groups=tail_groups,
                 ordered_learner=spec if tails is not None else None,
+                vit_spec=spec if tails is not None and ts_cfg.verify_in_train else None,
                 claim_log_weight=spec.claim_log_weight
                 if spec is not None and ts_cfg.banded_is_band is not None
                 else None,

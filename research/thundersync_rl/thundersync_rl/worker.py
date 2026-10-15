@@ -26,6 +26,7 @@ the grad buffers and the regular ``finish_train_step`` runs unchanged.
 
 import asyncio
 import functools
+import itertools
 import os
 import time
 import zlib
@@ -55,6 +56,7 @@ from thundersync_rl.draft_weights import (
     restore_training,
 )
 from thundersync_rl import mem_debug
+from thundersync_rl import vit, vit_check
 from thundersync_rl.fused_train import (
     FusedGraph,
     FusedGraphStore,
@@ -760,6 +762,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         _call_log(self, "stream_accumulate")
         t0 = time.perf_counter()
         fused_trained = fused_tokens = fused_fallback = 0
+        vit_results: list[dict[str, Any]] = []
         state = self._train_step_state
         calls = group_pipeline_calls(
             items, merge=getattr(self, "_stream_merge_calls", True)
@@ -810,9 +813,18 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 )
             )
             del graph  # only the substitute forward holds it now
+            if first.get("vit"):
+                fn = self._vit_spread_call if first.get("vit_spread") else self._vit_train_call
+                vit_results.extend(fn(call_items, mbs_per_item, tprof))
+                continue
             try:
                 with substitute:
-                    self._stream_train_call(call_items, mbs_per_item, bucket, tprof)
+                    if self._vit_check_due(bucket, fused_key):
+                        vit_check.run_check(
+                            self, call_items, mbs_per_item, bucket, tprof, self._vit_calls
+                        )
+                    else:
+                        self._stream_train_call(call_items, mbs_per_item, bucket, tprof)
             finally:
                 # Frees the graph's activations also when no forward ran (a
                 # zero-advantage row skipped by the worker).
@@ -847,7 +859,281 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             "fused_trained": fused_trained,
             "fused_tokens": fused_tokens,
             "fused_fallback": fused_fallback,
+            "vit": vit_results,
         }
+
+    def _vit_train_call(
+        self,
+        call_items: list[dict[str, Any]],
+        mbs_per_item: list[int],
+        tprof: str | None,
+    ) -> list[dict[str, Any]]:
+        """Verify-in-train (``vit.py``): train each item (one group's rows, one
+        micro-batch) and decide its rows' block verification from that forward.
+
+        A failed micro-batch's loss is zeroed inside the loss (its backward still
+        runs: every rank keeps the same schedule) and its normalization counts and
+        metrics are taken back, so it leaves the step exactly as if never trained.
+        Zero-advantage rows are trained too: their forward is the verification.
+        Returns [{"group", "pass", "rows"}] per item in call order.
+        """
+        from megatron.core import parallel_state as ps
+
+        if (ps.get_pipeline_model_parallel_world_size() or 1) > 1:
+            raise RuntimeError("verify_in_train: pipeline parallelism is not built")
+        state = self._train_step_state
+        if any(int(it["data"].size) != int(m) for it, m in zip(call_items, mbs_per_item)):
+            raise RuntimeError("verify_in_train: every item must be exactly one micro-batch")
+        dev = torch.device("cuda", torch.cuda.current_device())
+        counts = []
+        for it in call_items:
+            d = it["data"]
+            d["vit_eta"] = torch.stack(
+                [
+                    vit.eta_last(int(d["vit_seed"][b]), int(d["vit_len"][b]), dev)
+                    if float(d["sample_mask"][b]) != 0.0
+                    else torch.ones((), dtype=torch.float64, device=dev)
+                    for b in range(d.size)
+                ]
+            ).cpu()
+            counts.append(vit.item_counts(d))
+        n_metrics = len(state["all_mb_metrics"])
+        n_losses = len(state["mb_losses"])
+        skip = state["skip_zero_advantage_rows"]
+        state["skip_zero_advantage_rows"] = False
+        results: list[dict[str, Any]] = []
+        try:
+            with vit.decision_hook(results):
+                self._stream_train_call(call_items, mbs_per_item, None, tprof)
+        finally:
+            state["skip_zero_advantage_rows"] = skip
+        if len(results) != len(call_items):
+            raise RuntimeError(
+                f"verify_in_train: {len(results)} decisions for {len(call_items)} micro-batches"
+            )
+        failed = [k for k, r in enumerate(results) if not r["pass"]]
+        for k in failed:
+            seqs, toks = counts[k]
+            for name, v in (("local_valid_seqs", seqs), ("local_valid_toks", toks)):
+                state[name] = state[name] - v.to(state[name].device)
+            for name, v in (("trained_valid_seqs", seqs), ("trained_valid_toks", toks)):
+                state[name] = state[name] - v.to(state[name].device)
+        new = state["all_mb_metrics"][n_metrics:]
+        if failed and len(new) == len(call_items):
+            kept = [m for k, m in enumerate(new) if k not in set(failed)]
+            del state["all_mb_metrics"][n_metrics:]
+            state["all_mb_metrics"].extend(kept)
+            del state["mb_losses"][n_losses:]
+            state["mb_losses"].extend(m["loss"] for m in kept if "loss" in m)
+        return [
+            {"group": it.get("vit_group", -1), **r} for it, r in zip(call_items, results)
+        ]
+
+    def _vit_spread_call(
+        self,
+        call_items: list[dict[str, Any]],
+        mbs_per_item: list[int],
+        tprof: str | None,
+    ) -> list[dict[str, Any]]:
+        """Verify-in-train for ONE group spread over ranks and micro-batches (``vit.py``).
+
+        Every rank holds some of the group's rows as micro-batches with only that
+        group's rows (fillers: fully masked). Phase 1 runs all of them forward
+        (training mode, autograd on, no backward) through the training path and
+        keeps each micro-batch's decoder output with its graph and the routes it
+        used; the loss hook reads each row's decision. The ranks then agree (MIN
+        all-reduce over the data-parallel group). Pass: the regular training call
+        runs over the same items with each forward replaced by its retained
+        decoder output (LM head, loss and backward run as always; activation
+        recompute replays the retained routes). Fail: nothing is backpropagated
+        and nothing is counted; the forwards served as the verification.
+        Memory per rank: the retained graphs, i.e. under full recompute the
+        layer inputs of this rank's rows of the group.
+        """
+        from megatron.core import parallel_state as ps
+
+        from nemo_rl.models.megatron.router_replay import _router_replay_instances_for_model
+        from nemo_rl.models.policy.workers.megatron_policy_worker import (
+            _should_use_router_replay,
+        )
+
+        if (ps.get_pipeline_model_parallel_world_size() or 1) > 1:
+            raise RuntimeError("verify_in_train: pipeline parallelism is not built")
+        state = self._train_step_state
+        dev = torch.device("cuda", torch.cuda.current_device())
+        for it in call_items:
+            d = it["data"]
+            d["vit_eta"] = torch.stack(
+                [
+                    vit.eta_last(int(d["vit_seed"][b]), int(d["vit_len"][b]), dev)
+                    if float(d["sample_mask"][b]) != 0.0
+                    else torch.ones((), dtype=torch.float64, device=dev)
+                    for b in range(d.size)
+                ]
+            ).cpu()
+        # Phase 1 on copies: ``_with_routes`` consumes the route handles, which the
+        # training call needs again.
+        datas = [self._with_routes(it["data"]) for it in vit_check.copy_items(call_items)]
+        datas = [d["data"] if isinstance(d, dict) and "data" in d else d for d in datas]
+        decoder = _unwrap(self.model).decoder
+        instances = [inst for inst, _ in _router_replay_instances_for_model(self.model)]
+        captured: list[Any] = []
+        retained: list[vit.RetainedSlot] = []
+        results: list[dict[str, Any]] = []
+        original = megatron_train.model_forward
+
+        def phase1_forward(**kwargs):
+            out = original(**kwargs)
+            routes = [
+                inst.replay_backward_list[-1] if inst.replay_backward_list else None
+                for inst in instances
+            ]
+            ids = kwargs["input_ids_cp_sharded"].detach().cpu()
+            retained.append(
+                vit.RetainedSlot(ids=ids, output=captured[-1], routes=routes, num_tokens=ids.numel())
+            )
+            return out
+
+        t0 = time.perf_counter()
+        mem0 = torch.cuda.memory_allocated()
+        hook = decoder.register_forward_hook(lambda _m, _a, out: captured.append(out))
+        try:
+            pieces = []
+            for data, mbs in zip(datas, mbs_per_item):
+                attach_media_token_validity_mask(data, self.media_placeholder_token_id)
+                iterator, n_mb, mb_size, _, padded = get_microbatch_iterator(
+                    data,
+                    self.cfg,
+                    mbs,
+                    straggler_timer=self.mcore_state.straggler_timer,
+                    delegate_pack_to_model=self.delegate_pack_to_model,
+                    delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
+                    model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
+                    mtp_enabled=self.mtp_enabled,
+                )
+                rr = _should_use_router_replay(
+                    enabled=self._router_replay_enabled, data=data, stage="train", require=True
+                )
+                pieces.append((iterator, int(n_mb), int(mb_size), int(padded), bool(rr)))
+            if any(p[1] != 1 for p in pieces):
+                raise RuntimeError("verify_in_train: every item must be exactly one micro-batch")
+            if len({p[4] for p in pieces}) > 1:
+                raise RuntimeError("verify_in_train: items disagree on router replay")
+            n = len(pieces)
+            post = megatron_train.LossPostProcessor(
+                loss_fn=state["loss_fn"],
+                cfg=self.cfg,
+                num_microbatches=n,
+                sampling_params=self.sampling_params,
+                draft_model=self.draft_model,
+                defer_draft_normalization=True,
+                teacher_output_layer_weight_by_index=self._opd_full_teacher_lm_heads,
+            )
+            one = torch.tensor(1.0, device="cuda")
+            with (
+                torch.enable_grad(),
+                vit.decision_hook(results),
+                substitute_model_forward(megatron_train, phase1_forward),
+            ):
+                megatron_train.megatron_forward_backward(
+                    model=self.model,
+                    data_iterator=itertools.chain.from_iterable(p[0] for p in pieces),
+                    num_microbatches=n,
+                    seq_length=max(p[3] for p in pieces),
+                    mbs=max(p[2] for p in pieces),
+                    post_processing_fn=post,
+                    forward_only=True,
+                    defer_fp32_logits=self.defer_fp32_logits,
+                    global_valid_seqs=one,
+                    global_valid_toks=one,
+                    sampling_params=self.sampling_params,
+                    straggler_timer=self.mcore_state.straggler_timer,
+                    model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
+                    draft_model=self.draft_model,
+                    enable_hidden_capture=False,
+                    use_fused_linear_logprobs=self.cfg["megatron_cfg"].get(
+                        "use_fused_linear_logprobs", False
+                    ),
+                    use_router_replay=pieces[0][4],
+                    router_replay_train=True,
+                )
+        finally:
+            hook.remove()
+        del captured
+        torch.cuda.synchronize()
+        retained_bytes = torch.cuda.memory_allocated() - mem0
+        n_tok = sum(r.num_tokens for r in retained)
+        if len(results) != len(call_items) or len(retained) != len(call_items):
+            raise RuntimeError(
+                f"verify_in_train: {len(results)} decisions / {len(retained)} forwards "
+                f"for {len(call_items)} micro-batches"
+            )
+        flag = torch.tensor([1 if all(r["pass"] for r in results) else 0], dtype=torch.int32, device="cuda")
+        torch.distributed.all_reduce(
+            flag, op=torch.distributed.ReduceOp.MIN, group=ps.get_data_parallel_group()
+        )
+        keep = bool(flag.item())
+        t1 = time.perf_counter()
+        if keep:
+            slots = iter(retained)
+
+            def phase2_forward(**kwargs):
+                return vit.retained_forward(next(slots), original, decoder, instances, kwargs)
+
+            skip = state["skip_zero_advantage_rows"]
+            state["skip_zero_advantage_rows"] = False
+            # Debug (THUNDERSYNC_VIT_SPREAD_CHECK=1): the retained-forward training
+            # equals the regular training of the same micro-batches (bitwise under
+            # deterministic_training); the regular result is kept.
+            check = os.environ.get("THUNDERSYNC_VIT_SPREAD_CHECK") == "1"
+            if check:
+                rerun = vit_check.copy_items(call_items)
+                snap = vit_check.snapshot(self)
+            try:
+                with substitute_model_forward(megatron_train, phase2_forward):
+                    self._stream_train_call(call_items, mbs_per_item, None, tprof)
+                if check:
+                    g_vit = vit_check.grads_to_host(self)
+                    vit_check.restore(self, snap)
+                    self._stream_train_call(rerun, mbs_per_item, None, tprof)
+                    diff = vit_check.compare(self, g_vit)
+                    del g_vit, snap
+                    print(
+                        f"[vit spread check] rank={self.rank} micro_batches={len(call_items)} "
+                        f"grad_diff={diff[0]}/{diff[1]:.3e}/{diff[2]:.3e}/{diff[3]}/{diff[4]}",
+                        flush=True,
+                    )
+            finally:
+                state["skip_zero_advantage_rows"] = skip
+        del retained
+        if os.environ.get("THUNDERSYNC_SPEC_PROF"):
+            print(
+                f"[vit spread] rank={self.rank} micro_batches={len(call_items)} kept={keep} "
+                f"retained_bytes_per_token={retained_bytes / max(n_tok, 1):.0f} "
+                f"phase1_s={t1 - t0:.3f} phase2_s={time.perf_counter() - t1:.3f}",
+                flush=True,
+            )
+        return [
+            {
+                "group": it.get("vit_group", -1),
+                "pass": keep,
+                "rows": r["rows"],
+                "retained_bytes_per_token": retained_bytes / max(n_tok, 1),
+            }
+            for it, r in zip(call_items, results)
+        ]
+
+    def _vit_check_due(self, bucket, fused_key) -> bool:
+        """Debug (``THUNDERSYNC_VIT_CHECK=1``): check the first final-advantage calls of each step."""
+        if not vit_check.enabled() or bucket is not None or fused_key is not None:
+            return False
+        key = id(self._train_step_state)
+        if getattr(self, "_vit_step_key", None) != key:
+            self._vit_step_key, self._vit_calls = key, 0
+        if self._vit_calls >= vit_check.max_calls():
+            return False
+        self._vit_calls += 1
+        return True
 
     def _stream_train_call(
         self,
@@ -3100,9 +3386,15 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         prefix_keys: list[str | None] | None = None,
         prefix_release: list[str] | None = None,
         prefix_gpu_gb: float = 8.0,
+        row_seed_base: int | None = None,
         **_: Any,
     ) -> list[tuple[int, dict[str, Any]]]:
         """Block verification with q from the engine and p from the training model.
+
+        ``row_seed_base`` (verify-in-train fallback, ``vit.py``): row i draws its
+        uniforms from its own generator seeded ``vit.row_seed(row_seed_base,
+        keys[i])`` instead of the call's per-rank stream, so its decision is
+        the one the training forward already made with the same stream.
 
         Learner prefix-state cache (``prefix_keys``; DESIGN 14p): row i is
         cached under ``prefix_keys[i]`` (None: not cached) and forwarded only
@@ -3362,6 +3654,11 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                         out[j] = lp[k]
                 return torch.stack(out)
 
+            row_gen = (
+                gen
+                if row_seed_base is None
+                else vit.row_generator(vit.row_seed(row_seed_base, keys[i]), dev)
+            )
             with nonfinite_context(
                 rank=self.rank, row=i, prompt_len=prompt_lens[i], g=g,
                 seed=seed, segments=segments[i],
@@ -3372,7 +3669,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                     assert band is None, "banded IS does not compose with pooled null_bv"
                     with timed("grid_scan_total"):
                         grid, lpx, n_eval = verify_engine_q_grid(
-                            p_lp, draft, lq, q_rows, gen, tuple(null_envelopes[i])
+                            p_lp, draft, lq, q_rows, row_gen, tuple(null_envelopes[i])
                         )
                     tau = max(t for t, _, _ in grid.values())
                     # log W* = max_t log prod_{u<=t} p/q over the draft (drop-IS weights).
@@ -3392,7 +3689,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                     n_rows += n_eval
                 else:
                     tau, y, logp, n_eval = verify_engine_q(
-                        p_lp, draft, lq, q_rows, gen, 1.0, band
+                        p_lp, draft, lq, q_rows, row_gen, 1.0, band
                     )
                     res = {
                         "accepted": tau,
