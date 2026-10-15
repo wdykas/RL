@@ -61,6 +61,7 @@ from thundersync_rl.null_bv import LogRatioCalibration, NullGroup, NullPolicy, r
 from thundersync_rl.prefix_cache import PrefixCacheDirectory, lpt_owners
 from thundersync_rl import vit
 from thundersync_rl.tail_trace import TailTrace
+from thundersync_rl.window_pace import WindowPacer
 from thundersync_rl.run_state import SeedStream
 from thundersync_rl.routes import (
     RouteRefs,
@@ -390,6 +391,7 @@ class SpeculativeGeneration:
         sticky_decision: str = "every",
         sticky_decision_dip: float = 0.1,
         draft_until_complete: bool = False,
+        window_pace: Optional[dict[str, float]] = None,
         draft_weights: str = "current",
         max_seq_len: Optional[int] = None,
         anchor_horizon: Optional[int] = None,
@@ -529,6 +531,9 @@ class SpeculativeGeneration:
         self._prefix_step: Optional[int] = None
         # Measurement only: the deadline waits for every draft to finish.
         self.draft_until_complete = draft_until_complete
+        # Drafting-window pacing (window_pace.py): the cut holds a target
+        # window fitted from earlier cuts (sticky streams only).
+        self._pacer = None if window_pace is None else WindowPacer(**window_pace)
         self._cont_ids = itertools.count()
         self._anchor_claims = PrefixClaims()
         self._row_claims = PrefixClaims()
@@ -781,10 +786,16 @@ class SpeculativeGeneration:
             plens = [p.numel() for p in prompts]
             if self.sticky_delta is not None:
                 t_cut = time.perf_counter()
+                pacer = self.__dict__.get("_pacer")  # absent on test stubs
                 if self.draft_until_complete:
                     idx = list(range(len(prompts)))
                     while not all(d for _, d in ray.get(rank0.draft_lengths.remote(idx))):
                         time.sleep(0.05)
+                elif pacer is not None:
+                    n = len(prompts)
+                    self.stats.update(
+                        pacer.hold(t_start, lambda: ray.get(rank0.count_unfinished_drafts.remote(n)))
+                    )
                 self.stats["tail/next_draft_complete_wait_s"] = time.perf_counter() - t_cut
                 self.stats["tail/next_draft_window_s"] = time.perf_counter() - t_start
                 t0 = time.perf_counter()
@@ -792,6 +803,11 @@ class SpeculativeGeneration:
                 self.stats["cut/peek_s"] = time.perf_counter() - t0
                 calib = self.__dict__.get("_null_calib")
                 running = [len(toks) for toks, done, _ in peeked if not done]
+                if pacer is not None:
+                    # Lengths only, used from the next cut on (past-only).
+                    pacer.observe(t0 - t_start, running, budget, all_done=not running)
+                    self.stats["pace/full_window_s"] = float(pacer.full_window_s or 0.0)
+                    self.stats["pace/running_at_cut"] = float(len(running))
                 if calib is not None and running:
                     # Per-token decode latency of one stream, for later steps'
                     # ⊥-BV verify cost (drafts admitted at the start run

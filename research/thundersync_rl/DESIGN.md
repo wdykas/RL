@@ -3558,3 +3558,31 @@ layouts whose engine EP differs from the learner's (lanes, Ultra/1T).
 - **Fused verification + training on GPU.** Validate `fused_verify_train` end to end
   (`THUNDERSYNC_FUSED_CHECK=1`, gradient against the unfused path) and measure the saved
   learner time on short-output tasks (section 14).
+
+## 14v. Drafting-window pacing (`thundersync.draft_window_pace`, opt-in, 2026-10-15)
+
+**Problem (measured).** With sticky streams and cohort lanes, cohort k+1 drafts from the top of step k until the cut at
+the end of step k's training, so its window is step k's length. When all drafts run at once (192 drafts, max_requests
+>= 192) they progress together and finish at ~7.1-7.4 s on Nano L8 1k. A fully drafted cohort gives a fast step
+(6.2-6.7 s window), which is just short of full: the next cohort is cut at ~87-89% (169.8k/174.8k of 196.6k tokens),
+pays a whole continuation phase and is slow (10.2-10.3 s), which gives a long window and a full cohort again
+(runs_1node/ev3-p-l2-b2-s05 steps 3-7: 6.16/10.33/6.72/10.20 s windows; ev2-p-l2-b2 and adm-p-l2-grp-m192 the same
+1/0/1/0 pattern). Mean step ~8.8 s although a fully drafted step at the full window would be ~7.4 s.
+
+**Damper.** `window_pace.WindowPacer` holds the cut until `t_start + W (1 + margin)`, `W` = fitted time for every draft to
+reach the cap, and releases it as soon as no draft is running. It does not wait when that deadline is more than
+`max_wait_frac * W` away (a partial wait cannot avoid the continuation phase; a slow step's window is already long).
+`W` is fitted from earlier cuts only: a cut with running drafts extrapolates `elapsed + (cap - min len) * elapsed / max
+len` (move up at once, late is expensive); a cut with all drafts done can only lower it (blend). One pacer per run,
+shared by the lanes (W is a property of the drafter). `draft_window_pace_init_s` is an optional prior.
+
+**Exactness.** The deadline is a function of earlier steps' timings and draft lengths. The early release depends on
+the current cohort through one count and only when it is 0: every draft is then finished, finished drafts do not
+change, so the handed-out cohort equals that of a cut at the past-only deadline. Any cut is a valid draft prefix set
+for verification in any case; pacing only moves tokens between verify0 and continuation rounds.
+
+**Scale.** Driver-side scalars; during a wait one O(1)-reply call per 20 ms poll to the drafting engine's rank 0
+(`count_unfinished_drafts`, O(n drafts) host work), no per-rank state, independent of TP/PP/EP and model size.
+
+**Validation** (queued, research/window_pace/val.sh, user submits): pace-x-l2 (exact, CHECKS=1, prior forces holds),
+pace-p1 (same commit: lanes m192 control vs paced vs async1, 8 steps), pace-p2 (default concurrency control vs paced).
