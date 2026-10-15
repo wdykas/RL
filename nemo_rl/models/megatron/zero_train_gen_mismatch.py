@@ -260,6 +260,7 @@ def validate_batch_invariant_mode(config: PolicyConfig) -> ZeroTrainGenValidatio
             "forward_gemm_precision",
             "lm_head_precision",
             "down_proj_prescale_log2",
+            "moe_ep_invariant_combine",
         )
         if os.environ.get("THUNDERSYNC_ALLOW_EP_MISMATCH") == "1":
             # Debug: a different expert-parallel size on the engine (e.g. cohort

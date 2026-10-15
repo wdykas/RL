@@ -185,7 +185,29 @@ def fused_unpermute(
     ep_size: Optional[int] = None,
     cross_rank_fp64: Optional[bool] = None,
 ) -> torch.Tensor:
-    """Drop-in for ``megatron.core.transformer.moe.batch_invariant.unpermute`` (bitwise)."""
+    """Drop-in for ``megatron.core.transformer.moe.batch_invariant.unpermute`` (bitwise).
+
+    With the EP-invariant combine on (``ep_invariant_combine.enabled()``), the token's
+    rows are summed through exact fixed-point limbs instead (no EP-rank grouping), the
+    same function the engine's combine computes at any EP size.
+    """
+    from nemo_rl.models.megatron import ep_invariant_combine as eic
+
+    if eic.enabled():
+        if probs is not None or permuted_tokens.dtype != torch.float32:
+            raise NotImplementedError(
+                "moe_ep_invariant_combine needs probability-weighted fp32 expert rows "
+                "(the fp16 MoE path); got "
+                f"probs={'set' if probs is not None else None} dtype={permuted_tokens.dtype}"
+            )
+        eic.log_once(
+            f"learner: AlltoAll unpermute through exact limbs (topk={inverse_map.shape[-1]}, "
+            f"hidden={permuted_tokens.shape[1]})"
+        )
+        out = eic.unpermute_rows(
+            permuted_tokens, inverse_map, int(restore_shape[0]), num_experts
+        )
+        return out.view(restore_shape)
     if (
         probs is not None
         or not HAVE_TRITON

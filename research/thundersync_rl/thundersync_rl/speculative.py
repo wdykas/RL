@@ -222,6 +222,16 @@ def _key(ids: torch.Tensor) -> tuple[int, ...]:
     return tuple(int(t) for t in ids.tolist())
 
 
+def _debug_forced_fresh(key: tuple[int, ...]) -> bool:
+    """Debug (THUNDERSYNC_DEBUG_FRESH_MOD=m): prompts whose token sum is 0 mod m ignore
+    their drafts and decode fresh on the engine at the current weights, so every step
+    has engine-sampled rows for the exactness checks (drafted rows carry the learner's
+    own log-probs). The choice depends on the prompt only, so outputs stay exact.
+    """
+    m = int(os.environ.get("THUNDERSYNC_DEBUG_FRESH_MOD", "0") or 0)
+    return m > 0 and sum(key) % m == 0
+
+
 def _drafted(res) -> tuple[list[int], bool, list[float] | None]:
     """(tokens, finished, engine log-probs or None) of one ``collect_drafts`` entry."""
     toks, done, *rest = res
@@ -1253,6 +1263,8 @@ class SpeculativeGeneration:
         horizon: a continued plan may stop at the horizon and then needs the
         refit engine at theta_k.
         """
+        if any(_debug_forced_fresh(_key(p)) for p in prompts):
+            return False  # forced fresh rows decode at the current weights
         if self._row_plans:
             # Multi-turn: drafted plans are paired with rows (``bind_rows``).
             return len(self._row_plans) == len(prompts) and all(
@@ -3233,8 +3245,13 @@ class SpeculativeGeneration:
         plen = int(datum["input_lengths"][0])
         prompt = datum["input_ids"][0, :plen]
         key = _key(prompt)
+        forced_fresh = _debug_forced_fresh(key)
+        if forced_fresh:
+            self.stats["debug/forced_fresh_rows"] = (
+                self.stats.get("debug/forced_fresh_rows", 0.0) + 1.0
+            )
         cv = getattr(self, "_plan_cv", None)
-        if cv is not None:
+        if cv is not None and not forced_fresh:
             # Chunked verification: wait until this trajectory's plan is published.
             async with cv:
                 while not self.plans.get(key) and self._pending.get(key, 0) > 0:
@@ -3243,7 +3260,7 @@ class SpeculativeGeneration:
                             "draft verification failed"
                         ) from self._verify_error
                     await cv.wait()
-        queue = self.plans.get(key)
+        queue = None if forced_fresh else self.plans.get(key)
         plan = (
             queue.pop(0)
             if queue
