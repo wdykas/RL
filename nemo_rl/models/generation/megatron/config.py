@@ -61,6 +61,9 @@ class MCoreGenerationSpecificArgs(TypedDict):
     ]
     # Token ceiling for captured prefill/mixed CUDA graphs. MCore default: 512.
     cuda_graph_max_tokens: NotRequired[int]
+    # Prefill/mixed CUDA graphs up to max_tokens (MCore InferenceConfig).
+    cuda_graph_all_prefills: NotRequired[bool]
+    cuda_graph_mixed_prefill_count: NotRequired[int]
     # Inference CUDA-graph scope. Options:
     # - 'none': inference runs in eager mode (no CUDA graphs).
     # - 'layer': graphs are owned at the per-layer boundary (TransformerLayer / MambaLayer).
