@@ -50,30 +50,41 @@ fi
 gcd() { local a=$1 b=$2; while (( b )); do set -- $b $(( a % b )); a=$1; b=$2; done; echo $a; }
 GPS=${GPUS_PER_SIDE:-$(( TP * EP / $(gcd $TP $EP) * PP ))}
 if (( GPS > 2 && GPS % 4 )); then echo "GPUS_PER_SIDE must be 1, 2 or a multiple of 4 (got $GPS)" >&2; exit 2; fi
+# Engine (generation) layout: GEN_EP (default EP) / GEN_PP (default PP) per engine replica of
+# GEN_GPS = lcm(TP, GEN_EP) * GEN_PP GPUs. LANES=2 (ThunderSync arms, thundersync.cohort_lanes):
+# two such engines, lane 1 built by run_thundersync_grpo.py outside cluster.* (learner + lane 0).
+# Equal-GPU A/B at EP8: one engine GEN_EP=8 (8 GPUs) vs LANES=2 GEN_EP=4 (2 x 4 GPUs).
+GEN_EP=${GEN_EP:-$EP} GEN_PP=${GEN_PP:-$PP} LANES=${LANES:-1}
+GEN_GPS=${GEN_GPUS:-$(( TP * GEN_EP / $(gcd $TP $GEN_EP) * GEN_PP ))}
+ENGINES=$([ "$LANES" = 2 ] && echo 2 || echo 1)
 if [ "$COLOCATED" = 1 ]; then
   GPUS=$GPS
   RES=(cluster.num_nodes=$(( GPS > 4 ? GPS / 4 : 1 )) cluster.gpus_per_node=$(( GPS > 4 ? 4 : GPS )))
-elif (( GPS <= 2 )); then
-  GPUS=$(( 2 * GPS ))
-  RES=(cluster.num_nodes=1 cluster.gpus_per_node=$GPUS
-       policy.generation.colocated.resources.num_nodes=1
-       policy.generation.colocated.resources.gpus_per_node=$GPS)
 else
-  GPUS=$(( 2 * GPS ))
-  RES=(cluster.num_nodes=$(( 2 * GPS / 4 )) cluster.gpus_per_node=4
-       policy.generation.colocated.resources.num_nodes=$(( GPS / 4 ))
-       policy.generation.colocated.resources.gpus_per_node=4)
+  GPUS=$(( GPS + ENGINES * GEN_GPS ))
+  CLUSTER_GPUS=$(( GPS + GEN_GPS ))  # learner + lane 0 (lane 1 outside cluster.*)
+  if (( GPUS <= 4 )); then
+    RES=(cluster.num_nodes=1 cluster.gpus_per_node=$CLUSTER_GPUS
+         policy.generation.colocated.resources.num_nodes=1
+         policy.generation.colocated.resources.gpus_per_node=$GEN_GPS)
+  else
+    (( GPS % 4 == 0 && GEN_GPS % 4 == 0 )) || {
+      echo "multi-node layouts need GPUS_PER_SIDE and the engine replica in whole 4-GPU nodes" >&2; exit 2; }
+    RES=(cluster.num_nodes=$(( CLUSTER_GPUS / 4 )) cluster.gpus_per_node=4
+         policy.generation.colocated.resources.num_nodes=$(( GEN_GPS / 4 ))
+         policy.generation.colocated.resources.gpus_per_node=4)
+  fi
 fi
-# LANES=2 (ThunderSync arms, thundersync.cohort_lanes): a second engine of the
-# same shape (one full TP/EP replica per lane) built by run_thundersync_grpo.py
-# outside cluster.* (learner + lane 0); the job must hold GPS more GPUs.
-LANES=${LANES:-1}
 if [ "$LANES" = 2 ]; then
   [ "$COLOCATED" = 0 ] || { echo "LANES=2 needs a split arm" >&2; exit 2; }
-  GPUS=$(( 3 * GPS ))
   LANE_ARGS=(++thundersync.cohort_lanes=2)
 else
   LANE_ARGS=()
+fi
+# Learner prefix-state cache (DESIGN 14p) for the ThunderSync arms at long caps: piece
+# verification without it grows with L^2 (0.6-2.0x of training time at 4k). PREFIX_CACHE=0|1 overrides.
+if [[ $ARM == ts_* ]] && [ "${PREFIX_CACHE:-$(( MAXLEN >= 4096 ? 1 : 0 ))}" = 1 ]; then
+  LANE_ARGS+=(++thundersync.learner_prefix_cache=true)
 fi
 SP=$([ "$TP" -gt 1 ] && echo true || echo false)
 PAR=(policy.megatron_cfg.tensor_model_parallel_size=$TP
@@ -81,9 +92,9 @@ PAR=(policy.megatron_cfg.tensor_model_parallel_size=$TP
      policy.megatron_cfg.expert_model_parallel_size=$EP
      policy.megatron_cfg.sequence_parallel=$SP
      ++policy.generation.mcore_generation_config.tensor_model_parallel_size=$TP
-     ++policy.generation.mcore_generation_config.pipeline_model_parallel_size=${GEN_PP:-$PP}
-     ++policy.generation.mcore_generation_config.expert_model_parallel_size=$EP)
-(( PP > 1 || ${GEN_PP:-$PP} > 1 )) && PAR+=(++policy.megatron_cfg.pipeline_dtype=float32)
+     ++policy.generation.mcore_generation_config.pipeline_model_parallel_size=$GEN_PP
+     ++policy.generation.mcore_generation_config.expert_model_parallel_size=$GEN_EP)
+(( PP > 1 || GEN_PP > 1 )) && PAR+=(++policy.megatron_cfg.pipeline_dtype=float32)
 # Micro-batch sizes (default: ab_base.yaml, 1 / 1 for long caps; the 1k-cap single-node runs use 8 / 4).
 [ -n "${MBS:-}" ] && PAR+=(policy.train_micro_batch_size=$MBS)
 [ -n "${LPBS:-}" ] && PAR+=(policy.logprob_batch_size=$LPBS)
@@ -93,7 +104,7 @@ mkdir -p "$OUT"
 rm -f "$OUT/history.json"
 echo "$ARM" > "$OUT/arm"
 echo "$GPUS" > "$OUT/gpus"  # GPUs the arm holds (summarizer: GPU-seconds per step)
-echo "[ab] ARM=$ARM TP=$TP PP=$PP EP=$EP GPS=$GPS GPUS=$GPUS COLOCATED=$COLOCATED LANES=$LANES STEPS=$STEPS PROMPTS=$PROMPTS G=$G MAXLEN=$MAXLEN PROMPT_CAP=$PROMPT_CAP MODEL=$MODEL" \
+echo "[ab] ARM=$ARM TP=$TP PP=$PP EP=$EP GPS=$GPS GEN_EP=$GEN_EP GEN_GPS=$GEN_GPS GPUS=$GPUS COLOCATED=$COLOCATED LANES=$LANES STEPS=$STEPS PROMPTS=$PROMPTS G=$G MAXLEN=$MAXLEN PROMPT_CAP=$PROMPT_CAP MODEL=$MODEL" \
   "RL_ROOT=$RL_ROOT @ $(git -C "$RL_ROOT" rev-parse --short HEAD) -> $OUT"
 timeout ${RUN_TIMEOUT:-14400} python $ENTRY --config $CFG --history-json "$OUT/history.json" \
   logger.log_dir="$OUT/logs" policy.model_name=$MODEL grpo.max_num_steps=$STEPS \
