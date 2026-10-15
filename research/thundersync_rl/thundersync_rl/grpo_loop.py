@@ -955,9 +955,14 @@ def validate_engine_verify_source(
     ):
         train_v = megatron_cfg.get(key, 1)
         gen_v = mcore_gen.get(key)
-        # Debug (THUNDERSYNC_ALLOW_EP_MISMATCH=1): run an engine EP different from
-        # the learner's (zero_train_gen_mismatch has the same override); the run's
-        # exactness checks decide whether the requirement holds.
+        # Measured (runs_1node/np-v2-lanes-ep, Nano L8, learner EP2, engine EP1,
+        # THUNDERSYNC_ALLOW_EP_MISMATCH=1): rows the engine samples plainly (step 0,
+        # fresh / undrafted rows) differ from the learner forward (max |dlogp| 0.89,
+        # exact_frac 2.5e-4); drafted rows are exact because their log-probs come
+        # from the learner's verification. So the engine's EP must equal the
+        # learner's until the MoE combine is EP-invariant (per-rank fp32 partials
+        # summed in rank order vs one rank's fixed-order sum). The override stays
+        # for debugging that fix.
         allow = os.environ.get("THUNDERSYNC_ALLOW_EP_MISMATCH") == "1"
         if gen_v is not None and gen_v != train_v and not allow:
             problems.append(

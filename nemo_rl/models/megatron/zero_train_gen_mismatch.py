@@ -265,8 +265,9 @@ def validate_batch_invariant_mode(config: PolicyConfig) -> ZeroTrainGenValidatio
             # Debug: a different expert-parallel size on the engine (e.g. cohort
             # lanes of EP4 under an EP8 learner). Per-token MoE math (row-local
             # expert GEMMs, top-k combine in routing order) is not expected to
-            # depend on EP, but that is untested; the run's exactness checks
-            # decide whether this field may be relaxed.
+            # depend on EP, but it does: runs_1node/np-v2-lanes-ep (learner EP2,
+            # engine EP1) has plainly sampled rows off by up to 0.89 in log-prob.
+            # Debug only, for working on an EP-invariant MoE combine.
             matching_fields = tuple(f for f in matching_fields if f != "expert_model_parallel_size")
         mismatched_fields = [
             field
