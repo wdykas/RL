@@ -24,10 +24,12 @@ import ray
 from omegaconf import OmegaConf
 from thundersync_rl.grpo_loop import (
     ThunderSyncMasterConfig,
+    check_multi_turn_template,
     configure_sticky_policy,
     thundersync_grpo_train,
 )
 from thundersync_rl.lanes import build_engine_lanes
+from thundersync_rl.run_state import load_state, resolve_resume
 from thundersync_rl.worker import WORKER_FQN
 
 from nemo_rl.algorithms.grpo import setup
@@ -76,12 +78,24 @@ def main() -> None:
     config.logger["log_dir"] = get_next_experiment_dir(config.logger["log_dir"])
     pprint.pprint(config)
 
+    # Resume is explicit: setup() below loads the latest checkpoint_dir/step_*
+    # whenever one exists; refuse that unless checkpointing is enabled and it
+    # is a ThunderSync checkpoint (run_state.resolve_resume).
+    ckpt_cfg = config.checkpointing
+    if not isinstance(ckpt_cfg, dict):
+        ckpt_cfg = dict(ckpt_cfg)
+    resume_path = resolve_resume(ckpt_cfg)
+    start_step = int(load_state(resume_path)["next_step"]) if resume_path else 0
+    if resume_path:
+        print(f"[thundersync] resuming from {resume_path} (next step {start_step})", flush=True)
+
     init_ray()
     tokenizer = get_tokenizer(config.policy["tokenizer"])
+    check_multi_turn_template(config, tokenizer)
     config.policy["generation"] = configure_generation_config(
         config.policy["generation"], tokenizer
     )
-    dataset, val_dataset, task_to_env, _ = setup_response_data(
+    dataset, val_dataset, task_to_env, val_task_to_env = setup_response_data(
         tokenizer, config.data, config.env
     )
     if args.toy_multi_turn_env is not None:
@@ -96,11 +110,11 @@ def main() -> None:
         _nemo_gym,
         clusters,
         dataloader,
-        _val_dataloader,
+        val_dataloader,
         loss_fn,
         logger,
-        _checkpointer,
-        _grpo_state,
+        checkpointer,
+        grpo_state,
         master_config,
         _teachers,
         _aliases,
@@ -130,6 +144,7 @@ def main() -> None:
             master_config.policy,
             tokenizer,
             num_lanes=master_config.thundersync.cohort_lanes,
+            start_step=start_step,
         )
 
     try:
@@ -144,6 +159,11 @@ def main() -> None:
             logger=logger,
             on_step=write_history,
             lanes=lanes,
+            checkpointer=checkpointer,
+            grpo_save_state=grpo_state,
+            val_dataloader=val_dataloader,
+            val_task_to_env=val_task_to_env,
+            resume_path=str(resume_path) if resume_path else None,
         )
     except BaseException:
         # A failed learner or engine rank can leave its peers blocked in a

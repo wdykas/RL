@@ -38,7 +38,10 @@ from thundersync_rl.prof import timed
 from thundersync_rl.block_verification import (
     acceptance_weights,
     band_exit,
+    check_emission,
     check_null_m,
+    check_stop_probabilities,
+    check_verification_inputs,
     zero_mass_below,
     emit_distribution,
     emitted_token,
@@ -120,6 +123,7 @@ def _emit(p_row, q_row, lse_p_tau, lse_q_tau, b_tau, generator, null_m=1.0):
     ``null_m`` > 1 only for the ⊥-BV root residual: ``NULL_TOKEN`` = BOT)."""
     q = None if q_row is None else _probs(q_row, lse_q_tau)
     dist = emit_distribution(_probs(p_row, lse_p_tau), q, b_tau, null_m)
+    check_emission(dist, "residual" if q_row is not None else "bonus")
     y = int(torch.multinomial((dist / dist.sum()).float(), 1, generator=generator))
     return emitted_token(y, p_row.shape[-1])
 
@@ -151,9 +155,11 @@ def block_verify_logits(
     ar = torch.arange(g, device=dev)
     lpx = p_logits[ar, draft].float() - lse_p[:g]
     lqx = q_logits[ar, draft].float() - lse_q
+    check_verification_inputs(lpx, lqx, lse_p, lse_q)
     b = acceptance_weights(lpx - lqx)  # [g+1]
     r = residual_masses(p_logits, q_logits, lse_p[:g], lse_q, b[:g])
     h = stop_probabilities(r, b)
+    check_stop_probabilities(h, "block_verify_logits")
     eta = torch.rand(g + 1, generator=generator, dtype=torch.float64, device=dev)
     tau = int(torch.nonzero(eta <= h).flatten().max())
     q_row = None if tau == g else q_logits[tau]
@@ -203,6 +209,7 @@ def block_verify_stats_lazy(
     """
     g = lpx.numel()
     check_null_m(null_m, g)
+    check_verification_inputs(lpx, lqx, lse_p, lse_q)
     dev = lse_p.device
     log_ratio = lpx - lqx
     t_exit = 0  # rows below this have target q
@@ -278,6 +285,7 @@ def block_verify_stats_lazy_grid(
     the per-envelope scan.
     """
     g = lpx.numel()
+    check_verification_inputs(lpx, lqx, lse_p, lse_q)
     dev = lse_p.device
     weights: dict[float, torch.Tensor] = {}
     tau: dict[float, int] = {}
@@ -352,7 +360,9 @@ def block_verify_stats_lazy_grid(
                 b_res = torch.where(root & nonone, bi / inv, bi)
                 r = residual_masses(P[sel], Q[sel], lse_p[c_d], lse_q[c_d], b_res)
                 r = torch.where(root & nonone, r + (1.0 - 1.0 / inv), r)
-                hit = (eta[c_d] <= stop_probability(r, bi)).cpu()
+                h_c = stop_probability(r, bi)
+                check_stop_probabilities(h_c, "grid scan")
+                hit = (eta[c_d] <= h_c).cpu()
                 a = 0
                 for M, c in parts:
                     hm = torch.nonzero(hit[a : a + c.numel()]).flatten()
@@ -379,6 +389,7 @@ def block_verify_stats_lazy_grid(
             q = None if t == g else _probs(row("q", t), lse_q[t])
             m = M if t == 0 and t < g else 1.0
             dist = emit_distribution(_probs(p_row, lse_p[t]), q, b[t], m)
+            check_emission(dist, f"M={M} tau={t} of g={g}")
             y = emitted_token(sample_by_inversion(dist, u), p_row.shape[-1])
             out[M] = (t, y, None if y < 0 else float(p_row[y].float() - lse_p[t]))
     return out, n_eval

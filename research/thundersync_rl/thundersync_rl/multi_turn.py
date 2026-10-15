@@ -233,6 +233,14 @@ def replay(
     }
     for k, v in named.items():
         state[k] = torch.tensor(v)
+    # The rebuilt row must be the sampled token sequence itself (prompt + prefix).
+    prompt = torch.cat([m["token_ids"].reshape(-1) for m in init["message_log"]])
+    flat = torch.cat([m["token_ids"].reshape(-1) for m in state["message_log"]])
+    check_row_extends(
+        torch.cat([prompt.cpu(), torch.tensor(prefix, dtype=prompt.dtype)]),
+        flat.cpu(),
+        f"row {row} drafted multi-turn replay",
+    )
     metrics = {
         "turn_count": len(turns),
         "total_tokens": sum(gen_tokens) + env_tokens,
@@ -249,6 +257,78 @@ def replay(
         "per_worker_token_counts": {0: sum(gen_tokens)},
     }
     return state, metrics
+
+
+class RowPrefixError(RuntimeError):
+    """A turn's context is not the previous turn's tokens extended (exactness bug).
+
+    Exactness (and sticky anchors) assume a multi-turn row is one token
+    sequence: every turn's input ids start with the previous turn's input +
+    generated ids. Re-rendering the history through a chat template (e.g. the
+    Nemotron template's ``truncate_history_thinking``, default True, strips
+    earlier reasoning) or retokenizing text (HTTP agents) breaks it silently:
+    q and p would come from one context and training from another.
+    """
+
+
+def check_row_extends(prev: torch.Tensor, ids: torch.Tensor, where: str) -> None:
+    """Raise ``RowPrefixError`` unless ``ids`` starts with ``prev`` (token ids)."""
+    n = prev.numel()
+    if ids.numel() < n or not torch.equal(ids[:n].to(prev.device), prev):
+        k = min(n, ids.numel())
+        diff = (ids[:k].to(prev.device) != prev[:k]).nonzero().flatten()
+        first = int(diff[0]) if diff.numel() else k
+        raise RowPrefixError(
+            f"{where}: the context ({ids.numel()} tokens) does not extend the previous "
+            f"turn's tokens ({n}); first difference at position {first}. Chat-template "
+            "re-rendering (set chat_template_kwargs.truncate_history_thinking=false) or "
+            "text retokenization changed earlier turns"
+        )
+
+
+class PrefixGuardGeneration:
+    """Per-rollout generation proxy asserting the row-is-a-prefix property (always on).
+
+    Every ``generate_async`` call of one rollout must get an input that starts
+    with the previous call's input + generated tokens; ``final_check`` checks
+    the rollout's final message log the same way. O(tokens) integer compares
+    per turn on the driver. Everything else is delegated.
+    """
+
+    def __init__(self, inner: Any, row: int) -> None:
+        self._inner = inner
+        self._row = row
+        self._prev: torch.Tensor | None = None
+        self.turns = 0
+        # A violation is re-raised by ``final_check``: the rollout loop catches
+        # generation errors per turn and would otherwise just end the rollout.
+        self.error: RowPrefixError | None = None
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    async def generate_async(self, data, greedy: bool = False, **kwargs):
+        n = int(data["input_lengths"][0])
+        ids = data["input_ids"][0, :n].cpu()
+        if self._prev is not None:
+            try:
+                check_row_extends(self._prev, ids, f"row {self._row} turn {self.turns}")
+            except RowPrefixError as exc:
+                self.error = exc
+                raise
+        self.turns += 1
+        async for idx, res in self._inner.generate_async(data, greedy=greedy, **kwargs):
+            gl = int(res["generation_lengths"][0])
+            self._prev = res["output_ids"][0, : n + gl].cpu()
+            yield idx, res
+
+    def final_check(self, message_log: list[dict[str, Any]]) -> None:
+        if self.error is not None:
+            raise self.error
+        if self._prev is None:
+            return
+        flat = torch.cat([m["token_ids"].reshape(-1).cpu() for m in message_log])
+        check_row_extends(self._prev, flat, f"row {self._row} final message log")
 
 
 def pair_rows(
@@ -268,4 +348,12 @@ def pair_rows(
     return out
 
 
-__all__ = ["TurnEnvironment", "TurnRecord", "pair_rows", "replay"]
+__all__ = [
+    "PrefixGuardGeneration",
+    "RowPrefixError",
+    "TurnEnvironment",
+    "TurnRecord",
+    "check_row_extends",
+    "pair_rows",
+    "replay",
+]

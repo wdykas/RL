@@ -229,6 +229,29 @@ def _draft_chunks(shard: _Shard, chunk: int) -> Iterator[tuple[slice, torch.Tens
         yield sl, draft.to(shard.target.dtype)
 
 
+def check_no_expert_bias_updates(model) -> None:
+    """Refuse momentum drafts when MoE expert-bias updates are enabled (not built yet).
+
+    ``load_draft`` writes theta_hat into the optimizer-owned parameters only;
+    ``expert_bias`` is a buffer updated in ``finalize_model_grads`` before the
+    optimizer step, so the staged drafting weights would carry the old bias
+    (not its predicted update) and ``EngineStage`` stages parameters only.
+    Staging the bias buffer is not built yet: the combination is an error.
+    """
+    chunks = model if isinstance(model, (list, tuple)) else [model]
+    for chunk in chunks:
+        for name, mod in chunk.named_modules():
+            cfg = getattr(mod, "config", None)
+            rate = getattr(cfg, "moe_router_bias_update_rate", 0.0) or 0.0
+            enabled = getattr(cfg, "moe_router_enable_expert_bias", False)
+            if getattr(mod, "expert_bias", None) is not None and enabled and rate:
+                raise NotImplementedError(
+                    f"draft_weights=momentum with expert-bias updates "
+                    f"(moe_router_bias_update_rate={rate}, {name}.expert_bias): the "
+                    "momentum stage does not stage the expert_bias buffer (not built yet)"
+                )
+
+
 @dataclass
 class DraftSwap:
     """Training weights temporarily replaced by draft weights (see ``load_draft``)."""

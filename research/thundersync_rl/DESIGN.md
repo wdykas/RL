@@ -3002,6 +3002,133 @@ with mixed starts vs the whole rows, logits compared with torch.equal).
   ~0.25 s (average 16k) ~ 60 s of learner work without the cache, ~1-2 s with it. The per-call cost is shared by all
   rows batched in one verification call and is not changed by the cache; it needs its own fix (profile first).
 
+## 14s. Run readiness: checkpoints, resume, epochs, validation, always-on guards (branch ts-run-ready)
+
+Before this the loop could not run a long job (`research/future_training_dynamics_issues.md` issues 1-4,
+10-12, 14-15): no checkpoint, step counter hard-coded to 0, a stale NeMo-RL checkpoint loaded silently,
+one epoch, no validation, verification seeds reused after a restart. Code: `run_state.py`,
+`sentinel.py`, `grpo_loop.py` (`thundersync_grpo_train`), `run_thundersync_grpo.py`.
+
+**Quiescent boundaries.** Checkpoints and validation run only at step boundaries where nothing
+speculative is in flight: the step before a boundary drafts nothing past it (`Boundaries.draft_limit`
+replaces `max_steps` in every drafting decision, lookahead > 1 included), so no draft, plan, anchor,
+⊥-BV pool, lane pin or staged momentum weight crosses it. The step after a boundary decodes every rollout
+fresh at θ_k (exact, as at step 0); an uninterrupted run with the same `save_period` does the same, so a
+resumed run continues exactly as the saving run would have. Cost: one unspeculated step per checkpoint /
+validation. Boundaries are `save_period` multiples, `val_period` multiples (from `val_start_at`), the
+last step, and a timeout save (`checkpoint_must_save_by`) requested one step ahead. Leftover plans are
+dropped at every step end (`SpeculativeGeneration.end_step`): a later row with the same prompt tokens
+(duplicates, next epoch) must never claim a plan verified against an older version; ⊥-BV prompt selection
+is reset with them. Scope of that hazard: plans are keyed by prompt tokens and are otherwise cleared
+only when the next verification starts (`_finish_verify`, `_finish_verify_null`, `_verify_chunked`), so
+a stale plan can be claimed only by a row of a step that runs no verification before its rollouts, with
+the same prompt tokens. Before boundaries every step >= 1 verified first (drafts always exist; lanes
+clear the cohort lane's wrapper at its `begin_sticky`; lookahead > 1 gives every step a cohort), so
+the frozen snapshot RL-nano-perf-scale 5b3530de is not affected. With boundaries (no drafts for the
+step after) it would be an exactness bug: DAPO-Math-17k has 1,791,700 rows but 17,398 distinct prompts
+(up to 400 copies), so a 64-prompt batch shares a prompt with the previous one with probability ~0.2.
+
+**What a checkpoint holds** (exact continuation):
+- weights + optimizer + LR scheduler: NeMo-RL `policy.save_checkpoint`, Megatron distributed checkpoint
+  (`fully_parallel_save`, every rank writes its own shards; no rank-0 gather; async save supported via
+  `finalize_async_save`). The momentum draft θ̂ is a function of (θ, m, v, step, lr) only: nothing extra.
+- `thundersync_state.pt` (driver, a few KB): next step; data position = (dataloader `state_dict` taken
+  *before* the next untrained batch was fetched, epoch, prompt-drop re-batching carry) — the prefetch
+  deque (`draft_lookahead + 1` batches) is rewound by construction; verification / draft seed counters
+  per speculative wrapper (lane); lane versions; a config fingerprint (seed, batch shape, epochs,
+  save_period, speculation knobs; a changed value refuses the resume). `train_dataloader.pt` is written
+  too (same state, NeMo-RL format).
+- Not saved (dropped at the boundary by construction): drafts, plans, anchors/routes, ⊥-BV pools,
+  hidden-state blocks, the momentum host stage, learner prefix cache. Learner RNG: not used (no dropout).
+
+**Resume is explicit** (`run_state.resolve_resume`, before `setup()`): NeMo-RL's setup loads the latest
+`checkpoint_dir/step_*` whether or not checkpointing is enabled. Checkpointing disabled + a checkpoint
+present = error; enabled + a checkpoint without `thundersync_state.pt` (not a ThunderSync boundary) =
+error; enabled + ThunderSync checkpoint = resume at its step (lanes start at ("theta", step)).
+
+**Epochs.** `PromptStream` iterates `grpo.max_num_epochs` passes of the StatefulDataLoader (new shuffle
+per epoch), each batch tagged with its resume state; the prefetch deque spans epoch boundaries; the run
+ends at `max_num_steps` or when the last epoch is exhausted. Unit test: resuming from every tagged
+position (with and without re-batching) reproduces the remaining sequence.
+
+**Validation** (`grpo.val_period`, `val_at_start`, `val_at_end`; NeMo-RL `validate`) at boundaries
+only: the engine (non-lanes) or the next cohort lane is refit to θ_{k+1} (the next step then needs no
+refit), checked by the weight sentinel, and the raw engine runs the eval: plain top-k routing (eval
+requests never pass the speculative wrapper, carry no anchors, and the engine applies anchors only to
+requests that carry them).
+
+**Verification seeds** (`run_state.SeedStream`): seed = hash(grpo.seed, stream, step, counter); stream =
+"verify/<lane>" or "draft/<lane>"; counters checkpointed. Two lanes no longer share η streams (both
+counted from 1 before), two seeds no longer share η, a resume never reuses η.
+
+**Always-on weight sentinel** (`sentinel.py`, `thundersync.weight_sentinel: true`; runs with CHECKS=0):
+after every refit — initial weights at step 0 / resume, θ_k, θ̂_{k+1} (inside `stage_draft_weights`,
+while the learner holds θ̂), drafter lane refits, validation refits — every engine rank digests its
+weights and every learner rank digests the same tensors cast to the engine's storage dtype (fp16 GEMM
+weights); per tensor two 64-bit sums over the raw bits (plain and position-weighted). Names are made
+layout-independent (wrappers stripped, global layer numbers, global expert indices = EP rank × local
+experts + local index), so engine and learner EP/PP may differ. Replicas within a side must agree;
+across sides every common tensor must agree bitwise, else `WeightSentinelError` names the tensors. Also:
+the momentum host stage reloaded = the θ̂ digest; the stashed LM head = the live θ̂ head (the head the
+engine drafted with); `expert_bias` buffers included and must never change on the learner.
+Compute tensors, not only parameters: the engine digests the storage its kernels read — the
+concatenated / fp16 expert buffers `_fc1_weight` / `_fc2_weight` [E, N, K] per expert as
+`<param>#buf` (compared with the learner's parameter cast to the buffer dtype; a buffer that stopped
+aliasing its parameter, or a raw-byte refit that wrote bf16 bits into fp16 storage, is caught by
+name) — and its fp16-held GEMM / router / LM-head weights in their fp16 storage. On the learner, the
+fp16 expert-weight cache (`fp16_moe._WEIGHT_CACHE`, keyed by identity + pointer, not value) is checked
+against the parameters at every θ check (not while θ̂ is loaded: it keeps θ_k's casts by design).
+Not checked (printed with the coverage): per-call casts that are never stored (bf16 parameters cast
+inside each GEMM when the engine does not hold fp16 weights, e.g. `refit_transport` mcore/m2n — a
+deterministic function of a checked tensor), the hi/lo split of the fp32 head (activation side; no
+cached weight copy exists on this tree), KV / Mamba state and CUDA-graph activation buffers. The
+coverage list (pairs, compute buffers and how many alias their parameter, fp16-held parameters,
+learner cache slices, engine-only / learner-only names) is printed at the first check and counters
+are logged per step (`sentinel/*`); zero common tensors is an error (vacuous). Per rank: O(params/rank) reads, no gather, a dict of
+(name -> 4 ints) to the driver per refit. Untested on GPU yet (queued).
+
+**Non-finite verification** (`block_verification.check_verification_inputs`, all verify paths): a
+drafted token with engine log q = -inf (q = 0: the logged q is not the sampling law), NaN/+inf learner log
+p, a non-finite row logsumexp, a non-finite stop probability or an emission law without positive finite
+mass raises `NonFiniteVerification` with the row, step seed, segments and weights version (counted,
+printed). log p = -inf alone is legitimate (rejected with probability 1; counted). Before: the draft was
+silently cut through a NaN, or `multinomial` hit a device assert.
+
+**Draft collection never uses streamed frames** (`worker.collect_drafts` / `peek_drafts`): a running
+draft without an engine record finished (or failed) in the engine after the records were read; its
+frames may skip tokens after an eviction. The collector now waits for its final frame (the merged record)
+before taking any record content (no late frame can land after), aborts nothing finished, treats an
+empty unrecorded stream as the empty prefix (no record and no token at the cut), and raises if the final
+frame does not come (`THUNDERSYNC_COLLECT_FINAL_TIMEOUT_S`, 30 s). Counted: `spec/collect_unrecorded`,
+`spec/collect_waited_final`, `spec/collect_unrecorded_empty`.
+
+**Expert-bias updates + momentum drafts** are refused (config validation and at `load_draft_weights`):
+the momentum stage stages parameters only, not the `expert_bias` buffer (not built yet).
+
+**Multi-turn rows are prefix extensions** (always on): `PrefixGuardGeneration` checks per turn that the
+context starts with the previous turn's input + generated ids (and the final message log), the drafted
+multi-turn replay checks prompt + prefix; a violation is `RowPrefixError` (re-raised after the rollout
+loop, which swallows per-turn generation errors). Templates with `truncate_history_thinking` (Nemotron;
+default True) are refused for multi-turn unless `chat_template_kwargs.truncate_history_thinking=false`
+(set in `ab_base.yaml` and the multi-turn scripts).
+
+**Not built yet** (validation refuses): checkpoints with `rollout_lag=1`, with
+`data.use_multiple_dataloader`, with `ft_save_period`; checkpoints / validation on the non-streaming
+lanes loop (`stream_training_over_tails=false`); validation with `rollout_lag=1`.
+
+**Tests.** CPU: `tests/unit/test_run_state.py` (seeds, epochs, every-position data resume, boundaries,
+explicit resume, fingerprint, run-control validation), `tests/unit/test_run_ready_guards.py` (sentinel
+digests / names / dtype cast / replicas / expert_bias, non-finite inputs, collect without frame
+fallback, prefix guard, template check, expert-bias guard). GPU kill-and-resume on Nano L8:
+`thundersync_work/research/run_ready/resume_exact.sh` — (S) sync arm with reproducible rollouts
+(`THUNDERSYNC_DEBUG_KEYED_FRESH`: keyed engine sampling, exact, independent of batch composition) and
+deterministic training: 4 steps vs 2 + resume 2, per-step params / optimizer / rollout / learner log-prob
+digests bitwise; (T) ts_por (sticky + momentum + ⊥-BV) with validation: boundary digest (params,
+optimizer, θ̂, next prompts, seed counters) saved = loaded (enforced in-run with
+`THUNDERSYNC_RESUME_DIGEST`), exactness checks after the resume, sentinel; (X) stale-checkpoint refusal.
+A speculative run is not bitwise reproducible run to run (engine sampler and deadline cuts), so (T)
+compares state, not trajectories.
+
 ## 15. Open work
 
 - **Stragglers.** About one rejected draft per step decodes its remainder at about 3 ms

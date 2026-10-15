@@ -27,7 +27,8 @@ INNER=${INNER:-sticky_moe.sh}
 export TAG=${TAG:-mt$TURNS-t$TURN_TOKENS-$(basename "${MODEL:-tiny-qwen3-moe-d2048}")}
 # Streaming training over multi-turn / horizon tails is not built yet (grpo_loop.validate_sticky_routing).
 export STREAM=0
-export ARGS="--toy-multi-turn-env $TURNS grpo.max_rollout_turns=$TURNS policy.generation.max_new_tokens=$TURN_TOKENS ${ARGS:-}"
+# truncate_history_thinking=false: re-rendered history would not be a prefix of the row (multi_turn.PrefixGuardGeneration).
+export ARGS="--toy-multi-turn-env $TURNS grpo.max_rollout_turns=$TURNS policy.generation.max_new_tokens=$TURN_TOKENS ++policy.tokenizer.chat_template_kwargs.truncate_history_thinking=false ${ARGS:-}"
 bash "$HERE/$INNER"
 rc=$?
 OUT=$W/$RUNS/$TAG

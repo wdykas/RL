@@ -50,6 +50,7 @@ from thundersync_rl import engine_prof
 from thundersync_rl.draft_weights import (
     DraftSwap,
     EngineStage,
+    check_no_expert_bias_updates,
     load_draft,
     restore_training,
 )
@@ -433,6 +434,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         _call_log(self, "load_draft_weights")
         if getattr(self, "_draft_swap", None) is not None:
             raise RuntimeError("draft weights already loaded")
+        check_no_expert_bias_updates(self.model)
         self._weights_version += 1
         self._draft_swap: Optional[DraftSwap] = load_draft(self.optimizer, kind)
         self._log_mem(f"load_draft_weights {kind}")
@@ -468,6 +470,137 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         return stage.load(
             self.model, checksum=bool(os.environ.get("THUNDERSYNC_MISMATCH_CHECK"))
         )
+
+    @torch.no_grad()
+    def sentinel_weight_digest(
+        self,
+        dtypes: Optional[dict[str, str]] = None,
+        learner: bool = False,
+        caches: bool = False,
+    ) -> tuple[int, dict, dict]:
+        """(tensor-parallel rank, {canonical name: digest}, coverage) of this rank now.
+
+        Engine and learner ranks both run it (``sentinel.WeightSentinel``).
+        Engine: the generation model's parameters (fp16-held GEMM / router / head
+        weights in their fp16 storage), ``expert_bias`` buffers, and the tensors
+        the expert kernels actually read (concatenated / fp16 expert buffers,
+        ``<param>#buf``). Learner (``learner=True``): the same names, each cast
+        to the engine's storage dtype (``dtypes``), compute aliases digested from
+        their source parameter; ``expert_bias`` must equal its first digest on
+        this rank; ``caches``: also check the fp16 expert-weight cache against
+        the parameters (only while the learner holds its training weights).
+        """
+        from megatron.core import parallel_state as ps
+
+        from thundersync_rl.sentinel import (
+            WeightSentinelError,
+            canonical_named_tensors,
+            check_expert_weight_cache,
+            compute_tensors,
+            digest_named,
+            tensor_digest,
+        )
+
+        ep = ps.get_expert_model_parallel_rank() if ps.model_parallel_is_initialized() else 0
+        tp = ps.get_tensor_model_parallel_rank() if ps.model_parallel_is_initialized() else 0
+        model = self.model
+        if not learner and getattr(self, "_gen_model", None) is not None:
+            model = self._gen_model()  # the engine's (inference-layout) model
+        named = list(canonical_named_tensors(model, ep_rank=ep))
+        out = digest_named(named, dtypes)
+        cov = {
+            "params": sum(1 for n, _ in named if not n.endswith("expert_bias")),
+            "fp16_params": sum(1 for _, t in named if t.dtype == torch.float16),
+            "expert_bias": sum(1 for n, _ in named if n.endswith("expert_bias")),
+        }
+        if not learner:
+            comp = list(compute_tensors(model, ep_rank=ep))
+            for key, t, _ in comp:
+                out[key] = tensor_digest(t)
+            cov["compute_buffers"] = len(comp)
+            cov["compute_buffers_aliased"] = sum(1 for *_, a in comp if a)
+        if learner:
+            bias = {k: v for k, v in out.items() if k.endswith("expert_bias")}
+            ref = self.__dict__.setdefault("_sentinel_expert_bias", dict(bias))
+            moved = sorted(k for k in bias if ref.get(k) != bias[k])
+            if moved:
+                raise WeightSentinelError(
+                    f"weight sentinel: learner rank {self.rank} expert_bias changed "
+                    f"during training: {moved[:10]} (bias updates are not supported)"
+                )
+            if caches:
+                cov["learner_fp16_expert_cache"] = check_expert_weight_cache(self.model)
+        return tp, out, cov
+
+    @torch.no_grad()
+    def sentinel_head_stash_check(self, version: int) -> bool:
+        """Learner: the LM head stashed as ``version`` is bitwise the live head now.
+
+        Called while the drafting weights are loaded (right after the stash and
+        the refit that the weight sentinel compared with the engine), so the
+        stash q rows are rebuilt with equals the engine's drafting head.
+        """
+        from thundersync_rl.sentinel import WeightSentinelError
+
+        head = self._lm_head()
+        if head is None:
+            return True
+        live = head[1]
+        stash = getattr(self, "_head_stash", {}).get(version)
+        if stash is None or stash.shape != live.shape or not torch.equal(stash, live.detach()):
+            raise WeightSentinelError(
+                f"weight sentinel: learner rank {self.rank} LM-head stash of version "
+                f"{version} differs from the drafting head the engine was refit with"
+            )
+        return True
+
+    @torch.no_grad()
+    def resume_state_digest(self) -> dict[str, Any]:
+        """Debug (resume tests): bitwise digests of this rank's training state.
+
+        Parameters, optimizer state (fp32 masters, Adam moments, step and lr of
+        every group) and the momentum draft theta_hat it implies (computed, not
+        written). Equal at a checkpoint save and right after loading it.
+        """
+        import hashlib
+
+        from megatron.core import parallel_state as ps
+
+        from thundersync_rl.draft_weights import CHUNK_ELEMS, _adam_state, _draft_chunks, _shards
+        from thundersync_rl.sentinel import canonical_named_tensors, tensor_digest
+
+        def fold(items) -> str:
+            h = hashlib.blake2b(digest_size=8)
+            for x in items:
+                h.update(repr(x).encode())
+            return h.hexdigest()
+
+        ep = ps.get_expert_model_parallel_rank()
+        params = fold(
+            (n, tensor_digest(t)) for n, t in sorted(
+                canonical_named_tensors(self.model, ep_rank=ep), key=lambda x: x[0]
+            )
+        )
+        out: dict[str, Any] = {"rank": self.rank, "params": params}
+        try:
+            shards = list(_shards(self.optimizer))
+        except NotImplementedError as exc:
+            out["optimizer"] = f"n/a ({exc})"
+            return out
+        opt, draft, groups = [], [], []
+        for sh in shards:
+            m, v = _adam_state(sh.inner, sh.key)
+            main = sh.main if sh.main is not None else sh.key
+            opt.append((tensor_digest(main), tensor_digest(m), tensor_digest(v)))
+            for _, d in _draft_chunks(sh, CHUNK_ELEMS):
+                draft.append(tensor_digest(d))
+            g = sh.group
+            groups.append((int(g.get("step", 0)), float(g["lr"]), float(g["weight_decay"])))
+        out["optimizer"] = fold(opt)
+        out["theta_hat"] = fold(draft)
+        out["groups"] = fold(groups)
+        out["first_group"] = groups[0] if groups else None
+        return out
 
     @torch.no_grad()
     def engine_weight_checksum(self) -> float:
@@ -1330,6 +1463,10 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 rec = None
                 if not done[i] and i in streams:
                     rec = (records or {}).get(int(streams[i].request_id))
+                    if rec is None:
+                        # Finished in the engine after its record was read: its
+                        # final frame (the merged record) is in flight.
+                        await self._await_final_frame(i, done, tokens, "peek")
                 if rec is None:
                     out += snapshot_drafts([tokens[i]], [logprobs[i]], [done[i]])
                     continue
@@ -1399,6 +1536,42 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
 
         return asyncio.run_coroutine_threadsafe(read(), loop).result()
 
+    async def _await_final_frame(self, i: int, done, tokens, where: str) -> None:
+        """Wait (on the engine loop) for draft ``i``'s final frame; raise on timeout.
+
+        Called only for an unfinished stream whose request has no engine record
+        (finished in the engine; final reply in flight). An empty stream needs
+        no wait (no frame arrived, nothing can be skipped). Counted in
+        ``draft_collect_stats``.
+        """
+        import asyncio
+
+        st = self.__dict__.setdefault(
+            "_collect_stats", {"unrecorded": 0, "unrecorded_empty": 0, "waited_final": 0, "wait_s": 0.0}
+        )
+        st["unrecorded"] += 1
+        if not tokens[i]:
+            st["unrecorded_empty"] += 1
+            return
+        timeout = float(os.environ.get("THUNDERSYNC_COLLECT_FINAL_TIMEOUT_S", "30"))
+        t0 = time.perf_counter()
+        while not done[i]:
+            if time.perf_counter() - t0 > timeout:
+                raise RuntimeError(
+                    f"{where}_drafts: draft {i} has no engine record and its final "
+                    f"frame did not arrive within {timeout:.0f} s; its streamed frames "
+                    f"({len(tokens[i])} tokens) may skip tokens after an eviction, so "
+                    "they are not used (THUNDERSYNC_COLLECT_FINAL_TIMEOUT_S)"
+                )
+            await asyncio.sleep(0.002)
+        st["waited_final"] += 1
+        st["wait_s"] += time.perf_counter() - t0
+
+    def draft_collect_stats(self) -> dict[str, float]:
+        """Rank 0: record-fallback counters since the last call (then reset)."""
+        st = self.__dict__.pop("_collect_stats", None) or {}
+        return {k: float(v) for k, v in st.items()}
+
     def collect_drafts(
         self,
         records: dict[int, tuple] | None = None,
@@ -1424,12 +1597,29 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         async def abort_and_snapshot():
             # Snapshot on the loop thread so no frame is half-applied.
             stats = {"from_record": 0, "fallback": 0, "differed": 0}
+            # Phase 1 (may yield to the loop): streams without an engine record
+            # finished (or failed) in the engine after the records were read
+            # (``engine.requests`` drops a request only then). Their streamed
+            # frames may skip tokens after an eviction, so they are never used:
+            # wait for the final frame, which carries the merged record (raises
+            # on timeout). Done before any content is replaced below, so no late
+            # frame can land on a draft after its record content was taken.
+            for i, stream in list(streams.items()):
+                if not done[i] and (records or {}).get(int(stream.request_id)) is None:
+                    stats["fallback"] += 1
+                    await self._await_final_frame(i, done, tokens, "collect")
+            # Phase 2 (no await): record contents, then abort.
             for i, stream in list(streams.items()):
                 if done[i]:
                     continue
                 rec = (records or {}).get(int(stream.request_id))
                 if rec is None:
-                    stats["fallback"] += 1
+                    # Unrecorded and still running: it had no record and no frame
+                    # at the cut (not admitted yet). Frames that arrived during
+                    # phase 1 are after the cut: the draft is the empty prefix.
+                    del tokens[i][:]
+                    if logprobs[i] is not None:
+                        logprobs[i] = []
                 else:
                     toks, lps = rec
                     toks = [int(t) for t in toks]
@@ -2948,7 +3138,7 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         """
         _call_log(self, "verify_drafts_block_engine")
         from megatron.core import parallel_state as ps
-        from thundersync_rl.block_verification import banded_log_weight
+        from thundersync_rl.block_verification import banded_log_weight, nonfinite_context
         from thundersync_rl.engine_q import (
             GatheredLogprobRows,
             HiddenPrefetch,
@@ -3124,45 +3314,50 @@ class ThunderSyncMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                         out[j] = lp[k]
                 return torch.stack(out)
 
-            if null_envelopes is not None:
-                # Banded IS is rejected with null_bv by validation (§14e).
-                assert band is None, "banded IS does not compose with pooled null_bv"
-                with timed("grid_scan_total"):
-                    grid, lpx, n_eval = verify_engine_q_grid(
-                        p_lp, draft, lq, q_rows, gen, tuple(null_envelopes[i])
+            with nonfinite_context(
+                rank=self.rank, row=i, prompt_len=prompt_lens[i], g=g,
+                seed=seed, segments=segments[i],
+                weights_version=getattr(self, "_weights_version", None),
+            ):
+                if null_envelopes is not None:
+                    # Banded IS is rejected with null_bv by validation (§14e).
+                    assert band is None, "banded IS does not compose with pooled null_bv"
+                    with timed("grid_scan_total"):
+                        grid, lpx, n_eval = verify_engine_q_grid(
+                            p_lp, draft, lq, q_rows, gen, tuple(null_envelopes[i])
+                        )
+                    tau = max(t for t, _, _ in grid.values())
+                    # log W* = max_t log prod_{u<=t} p/q over the draft (drop-IS weights).
+                    lr = torch.cumsum(lpx.double() - lq.to(lpx.device).double(), 0)
+                    d_lr = lpx.double() - lq.to(lpx.device).double()
+                    res = {
+                        "null_grid": grid,
+                        "null_log_wstar": float(lr.max()) if lr.numel() else 0.0,
+                        # Per-token log p/q moments over the draft (the ⊥-BV
+                        # policy's calibration of later steps, null_bv.py).
+                        "null_lr_moments": (
+                            int(d_lr.numel()), float(d_lr.sum()), float((d_lr * d_lr).sum())
+                        ),
+                        "token_logprobs": lpx[:tau].tolist(),
+                        "draft_logq": lq[:tau].tolist(),
+                    }
+                    n_rows += n_eval
+                else:
+                    tau, y, logp, n_eval = verify_engine_q(
+                        p_lp, draft, lq, q_rows, gen, 1.0, band
                     )
-                tau = max(t for t, _, _ in grid.values())
-                # log W* = max_t log prod_{u<=t} p/q over the draft (drop-IS weights).
-                lr = torch.cumsum(lpx.double() - lq.to(lpx.device).double(), 0)
-                d_lr = lpx.double() - lq.to(lpx.device).double()
-                res = {
-                    "null_grid": grid,
-                    "null_log_wstar": float(lr.max()) if lr.numel() else 0.0,
-                    # Per-token log p/q moments over the draft (the ⊥-BV
-                    # policy's calibration of later steps, null_bv.py).
-                    "null_lr_moments": (
-                        int(d_lr.numel()), float(d_lr.sum()), float((d_lr * d_lr).sum())
-                    ),
-                    "token_logprobs": lpx[:tau].tolist(),
-                    "draft_logq": lq[:tau].tolist(),
-                }
-                n_rows += n_eval
-            else:
-                tau, y, logp, n_eval = verify_engine_q(
-                    p_lp, draft, lq, q_rows, gen, 1.0, band
-                )
-                res = {
-                    "accepted": tau,
-                    "next": y,
-                    "logprobs": logp.tolist(),
-                    "draft_logq": lq[:tau].tolist(),
-                }
-                if band is not None:
-                    # logp[:tau] are the log p of the kept draft tokens the scan used.
-                    log_w, exited = banded_log_weight(logp[:tau] - lq[:tau], band)
-                    res["band_log_weight"] = log_w
-                    res["band_exited"] = exited
-                n_rows += n_eval + (tau < g)
+                    res = {
+                        "accepted": tau,
+                        "next": y,
+                        "logprobs": logp.tolist(),
+                        "draft_logq": lq[:tau].tolist(),
+                    }
+                    if band is not None:
+                        # logp[:tau] are the log p of the kept draft tokens the scan used.
+                        log_w, exited = banded_log_weight(logp[:tau] - lq[:tau], band)
+                        res["band_log_weight"] = log_w
+                        res["band_exited"] = exited
+                    n_rows += n_eval + (tau < g)
             # What the scan needed (not the check): nominal and storage bytes,
             # and the time the scan waited for blocks.
             fetched = h.fetched_bytes
