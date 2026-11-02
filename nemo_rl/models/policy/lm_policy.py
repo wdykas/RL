@@ -654,6 +654,25 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         )
 
     # ── DP-shard helpers ────────────────────────────────────────────────
+    def _pad_for_dp(
+        self, data: BatchedDataDict[Any]
+    ) -> tuple[BatchedDataDict[Any], int]:
+        """Pad ``data`` so it splits evenly across data-parallel ranks.
+
+        Returns the padded data and the original number of rows, which the caller uses
+        with ``_trim_padding`` to drop the padded rows from the output.
+        """
+        num_rows = data.size
+        padded, _ = data.pad_to_multiple(self.data_parallel_size)
+        return padded, num_rows
+
+    @staticmethod
+    def _trim_padding(result: BatchedDataDict[Any], num_rows: int) -> BatchedDataDict[Any]:
+        """Drop rows added by ``_pad_for_dp`` (they sit after the original rows)."""
+        if result.size == num_rows:
+            return result
+        return result.select_indices(list(range(num_rows)))
+
     # DRY for Policy's logprob/train methods only. The data-plane sibling
     # TQPolicy shards KVBatchMeta via ``shard_meta_for_dp``; the
     # driver-on-data vs driver-on-meta split is by design.
@@ -808,6 +827,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
           We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
           The logprob of input token i is specified at position i in the output logprobs tensor.
         """
+        data, num_rows = self._pad_for_dp(data)
         with timer.time("get_logprobs/shard_data") if timer else nullcontext():
             sharded_data, unsorted_data_indices = self._shard_for_logprob(data)
         self._report_sharded_payload(sharded_data, "policy_get_logprobs")
@@ -841,7 +861,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         if unsorted_data_indices is not None:
             logprobs.reorder_data(unsorted_data_indices)
 
-        return logprobs
+        return self._trim_padding(logprobs, num_rows)
 
     def get_reference_policy_logprobs(
         self,
@@ -853,6 +873,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         Returns: Identical to get_logprobs.
         """
+        data, num_rows = self._pad_for_dp(data)
         with (
             timer.time("get_reference_policy_logprobs/shard_data")
             if timer
@@ -895,7 +916,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         if unsorted_data_indices is not None:
             logprobs.reorder_data(unsorted_data_indices)
 
-        return logprobs
+        return self._trim_padding(logprobs, num_rows)
 
     def get_topk_logits(
         self,
@@ -905,6 +926,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         timer: Optional[Timer] = None,
     ) -> BatchedDataDict[TopkLogitsOutputSpec]:
         """Dispatch get_topk_logits to workers (no CP/packed support initially)."""
+        data, num_rows = self._pad_for_dp(data)
         with timer.time("get_topk_logits/shard_data") if timer else nullcontext():
             sharded_data, unsorted_data_indices = self._shard_for_logprob(data)
 
@@ -942,7 +964,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         if unsorted_data_indices is not None:
             stacked.reorder_data(unsorted_data_indices)
 
-        return stacked
+        return self._trim_padding(stacked, num_rows)
 
     def get_full_logits_ipc(
         self,

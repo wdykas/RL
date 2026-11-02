@@ -1195,6 +1195,28 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 )
         return selected_batch
 
+    def pad_to_multiple(self, multiple: int) -> tuple[Self, int]:
+        """Pads the batch by repeating its last row until its size divides ``multiple``.
+
+        ``shard_by_batch_size`` needs equal shards. Unequal shards would give data-parallel
+        ranks different microbatch counts, which hangs collectives that span those ranks
+        (for example expert-parallel all-to-all). Repeating a real row keeps every field
+        well formed, and the caller drops the padded rows from the output.
+
+        Args:
+            multiple: The size the padded batch must be a multiple of.
+
+        Returns:
+            A tuple of the padded batch and the number of rows added. The original batch
+            is returned unchanged when no rows are needed.
+        """
+        assert multiple > 0, f"multiple must be positive, got {multiple}"
+        size = self.size
+        num_pad = (-size) % multiple
+        if size == 0 or num_pad == 0:
+            return self, 0
+        return self.select_indices(list(range(size)) + [size - 1] * num_pad), num_pad
+
     def get_dict(self) -> dict[Any, Any]:
         """Get the underlying data dictionary."""
         return self.data

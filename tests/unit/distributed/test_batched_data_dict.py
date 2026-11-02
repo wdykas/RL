@@ -1593,3 +1593,45 @@ def test_multimodal_sharing_tolerates_dict_valued_type_key():
     }
     shared = _prepare_multimodal_sharing(tool_schema_row)
     assert isinstance(shared, dict)
+
+
+def test_pad_to_multiple_makes_batch_shardable():
+    """A batch that does not divide the shard count is padded with copies of its last row."""
+    batch = BatchedDataDict(
+        {
+            "ids": torch.arange(10).reshape(5, 2),
+            "tags": ["a", "b", "c", "d", "e"],
+        }
+    )
+    with pytest.raises(AssertionError, match="Batch size.*is not a multiple of shards"):
+        batch.shard_by_batch_size(shards=4)
+
+    padded, num_pad = batch.pad_to_multiple(4)
+
+    assert num_pad == 3
+    assert padded.size == 8
+    assert torch.equal(padded["ids"][:5], batch["ids"])
+    assert torch.equal(padded["ids"][5:], batch["ids"][4:5].expand(3, -1))
+    assert padded["tags"] == ["a", "b", "c", "d", "e", "e", "e", "e"]
+    assert batch.size == 5  # the input is not modified
+
+    shards = padded.shard_by_batch_size(shards=4)
+    assert [s.size for s in shards] == [2, 2, 2, 2]
+
+
+@pytest.mark.parametrize("size", [0, 8, 16])
+def test_pad_to_multiple_is_a_noop_when_already_divisible(size):
+    batch = BatchedDataDict({"ids": torch.arange(size)})
+    padded, num_pad = batch.pad_to_multiple(8)
+    assert num_pad == 0
+    assert padded is batch
+
+
+def test_pad_to_multiple_handles_the_reported_shape():
+    """4720 rows over 64 data-parallel ranks pads to 4736 and shards evenly."""
+    batch = BatchedDataDict({"ids": torch.arange(4720)})
+    padded, num_pad = batch.pad_to_multiple(64)
+    assert (padded.size, num_pad) == (4736, 16)
+    shards = padded.shard_by_batch_size(shards=64)
+    assert {s.size for s in shards} == {74}
+    assert torch.equal(torch.cat([s["ids"] for s in shards])[:4720], batch["ids"])
