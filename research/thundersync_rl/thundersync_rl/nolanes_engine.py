@@ -265,7 +265,7 @@ class NolanesEngineMixin:
             engine, W=w, D=d, t_max=64, ref_cap=ref_cap, node_cap=rows, sample_rows=self._nl_tree_sample,
             key_check=getattr(self, "_wide_key_check", None), keyreg=nl["keyreg"],
             key_ids=lambda rids: self._nl_key_ids(engine, rids),
-            scores_rows=self._nl_tree_scores, uniform_rows=self._nl_tree_uniform,
+            scores_rows=self._nl_tree_scores, uniform_rows=self._nl_tree_uniform, top2_rows=self._nl_tree_top2,
         )
         print(f"[nolanes engine] rank={getattr(self, 'rank', '?')} tail_tree W={w} D={d} rows/step={rows} "
               f"ref tokens={ref_cap}", flush=True)
@@ -296,6 +296,9 @@ class NolanesEngineMixin:
             num_kv_heads=int(cfg.num_query_groups or cfg.num_attention_heads), head_dim=int(cfg.kv_channels),
             eps=float(cfg.layernorm_epsilon),
         )
+        if tree_mtp.hidden_buffer().shape[1] != head.in_width:
+            raise RuntimeError(f"[nolanes engine] tail_tree_mtp: the capture holds {tree_mtp.hidden_buffer().shape[1]} "
+                               f"columns, the head reads {head.in_width} (feature layers {head.feat_layers})")
         self._nl_tree.attach_mtp(head)
         print(f"[nolanes engine] rank={getattr(self, 'rank', '?')} tail_tree MTP head {path} slots={slots} "
               f"KV {2 * head.kc.numel() * 2 / 2**20:.0f} MiB", flush=True)
@@ -344,6 +347,26 @@ class NolanesEngineMixin:
         rows = logits if logits.stride(-1) == 1 else logits.contiguous()
         return keyed_scores(rows, kid_d, pos.to(device=logits.device, dtype=torch.int64),
                             temp.clamp(min=_min_sampling_temperature()), self._wide_salt)
+
+    def _nl_tree_top2(self, logits, kid_dev, pos_dev, temp):
+        """Proposals only (tree_spec's MTP depth-1 sibling): the runner-up of each row's keyed race (S's keys and
+        noise, fp32 scores), -1 where none. Device key ids and positions; fixed shapes (graph-capturable)."""
+        import torch
+
+        from thundersync_rl import keyed_sampling_s as s_mod
+        from thundersync_rl.worker import _min_sampling_temperature
+
+        rows = logits if logits.stride(-1) == 1 else logits.contiguous()
+        n, v = rows.shape
+        need = s_mod.top2_workspace_bytes(n, v)
+        ws = self.__dict__.get("_nl_top2_ws")
+        if ws is None or ws.numel() < need:
+            ws = self._nl_top2_ws = torch.empty(max(need, 1), dtype=torch.uint8, device=rows.device)
+        o1 = torch.empty(n, dtype=torch.int64, device=rows.device)
+        o2 = torch.empty(n, dtype=torch.int64, device=rows.device)
+        s_mod.keyed_top2(rows, kid_dev.to(torch.int64), pos_dev.to(torch.int64),
+                         temp.clamp(min=_min_sampling_temperature()), self._wide_salt, out1=o1, out2=o2, workspace=ws)
+        return o2
 
     def _nl_tree_uniform(self, kid_dev, pos_dev):
         from thundersync_rl.keyed_scores import keyed_uniform
@@ -482,19 +505,28 @@ class NolanesEngineMixin:
         nl["tags"].record(keys, ts, self._nl_tag_version())
 
     def _nl_key_ids(self, engine: Any, rids: np.ndarray) -> np.ndarray:
-        """Noise-key request ids of the sampled rows (the engine id; a key_reuse negative's override)."""
+        """Noise-key request ids of the sampled rows: the engine request id, or the request's KEY_RID_ATTR override
+        when it carries one (a consumer continuing a row under the original row's keys, e.g. a keyed check's
+        in-place continuation; INTERFACE.md). nolanes' own requests carry it only under the key_reuse negative, so its
+        fresh-key rule (E4) is unchanged; the negative's tokens are counted."""
         nl = self.__dict__.get("_nl")
-        if nl is None or nl["neg"] != "key_reuse":
-            return rids
+        cache = self.__dict__.setdefault("_nl_kid_cache", {})  # rid -> override or None (attributes are immutable)
+        if len(cache) > 1 << 16:
+            cache.clear()
         out = rids.copy()
         for i, rid in enumerate(rids.tolist()):
-            entry = engine.requests.get(int(rid))
-            if entry is None:
-                continue
-            k = getattr(entry.record[-1].sampling_params, KEY_RID_ATTR, None)
+            if rid in cache:
+                k = cache[rid]
+            else:
+                entry = engine.requests.get(int(rid))
+                if entry is None:
+                    continue
+                k = getattr(entry.record[-1].sampling_params, KEY_RID_ATTR, None)
+                cache[rid] = k
             if k is not None:
                 out[i] = int(k)
-                nl["neg_tokens"] += 1
+                if nl is not None and nl["neg"] == "key_reuse":
+                    nl["neg_tokens"] += 1
         return out
 
     def _nl_observe_keys(self, key_ids: np.ndarray, pos: Optional[np.ndarray]) -> None:

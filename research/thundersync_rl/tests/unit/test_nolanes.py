@@ -1095,6 +1095,7 @@ def _tree_valid():
     c = copy.deepcopy(_valid())
     c["thundersync"].update(tail_tree=32, tail_tree_depth=4, tail_tree_rows=48)
     c["policy"]["generation"]["mcore_generation_config"]["async_sched_mode"] = "async"
+    c["async_rl"]["sampler"]["max_lookahead_versions"] = 1  # tail_tree in loop: lag <= 1 until lag-K is gated
     return c
 
 
@@ -1108,6 +1109,7 @@ def test_tail_tree_validator():
         ("thundersync.tail_tree", 65, "1..64"),
         ("thundersync.tail_tree_depth", 8, "1..7"),
         ("thundersync.tail_tree_rows", 16, "tail_tree..256"),
+        ("async_rl.sampler.max_lookahead_versions", 2, "max_lookahead_versions <= 1"),
         ("policy.generation.mcore_generation_config.async_sched_mode", "legacy", "async_sched_mode async"),
         ("policy.generation.mcore_generation_config.cache_mla_latents", True, "MLA"),
         ("policy.generation.mcore_generation_config.kv_cache_dtype", "fp8", "bf16 K / V"),

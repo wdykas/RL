@@ -1008,8 +1008,10 @@ class MegatronGenerationMixin:
                     from nemo_rl.models.generation.megatron import tree_mtp
 
                     gcfg = self.cfg["generation"]["mcore_generation_config"]
+                    head = os.environ["THUNDERSYNC_TAIL_TREE_MTP"].strip().rsplit(":", 1)[0]
                     tree_mtp.install_hidden_capture(
-                        engine_model, int(gcfg["max_tokens"]), int(engine_model.config.hidden_size)
+                        engine_model, int(gcfg["max_tokens"]), int(engine_model.config.hidden_size),
+                        feat_layers=tree_mtp.head_feature_layers(head),
                     )
         install_engine_latency_levers(
             engine_model, engine_only=self.is_refit_destination and not self.is_generation_colocated

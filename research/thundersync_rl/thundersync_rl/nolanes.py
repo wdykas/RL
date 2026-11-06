@@ -352,6 +352,9 @@ def config_problems(config: Any) -> list[str]:
             p.append("thundersync.tail_tree_depth must be in 1..7")
         if not int(cfg.tail_tree) <= int(cfg.tail_tree_rows) <= 256:
             p.append("thundersync.tail_tree_rows must be in tail_tree..256")
+        if int(_get(config, "async_rl.sampler.max_lookahead_versions", 1) or 0) > 1:
+            p.append("thundersync.tail_tree needs async_rl.sampler.max_lookahead_versions <= 1 in loop (lag K > 1 is "
+                     "not gated with a lag-K verify stage yet; reviewer batch 48)")
         if not _get(mcfg, "batch_invariant_mode", False):
             p.append("thundersync.tail_tree needs the batch-invariant engine (policy.megatron_cfg.batch_invariant_mode)")
         if int(_get(mcore, "pipeline_model_parallel_size") or 1) != 1:

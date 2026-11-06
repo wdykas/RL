@@ -112,3 +112,72 @@ def wide_sample(logits, request_ids, positions, temperature, salt, *, vocab_limi
                                      salt_lo, salt_hi, BLOCK=BLK, num_warps=4)
     _race_kernel[(n,)](logits, logits.stride(0), logits.stride(1), rid, pos, temp, lm, out, vocab, nblk, salt_lo,
                        salt_hi, BLOCK=BLK, NB_POW2=max(triton.next_power_of_2(max(nblk, 1)), 2), num_warps=8)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# keyed top-2 (proposals only: tree_spec's MTP depth-1 sibling). The fp32 race of S's pass 1 (same keys, same noise),
+# top two columns per row; ties / fp32-vs-fp64 near-ties may order differently from S's exact race, which is fine for
+# a proposal (verification decides what is emitted).
+
+
+@triton.jit(do_not_specialize=["salt_lo", "salt_hi"])
+def _block_top2_kernel(logits_ptr, stride, cstride, rid_ptr, pos_ptr, temp_ptr, val_ptr, idx_ptr, vocab, nblk, salt_lo,
+                       salt_hi, BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    b = tl.program_id(1)
+    key, key2 = _keys(rid_ptr, pos_ptr, row, salt_lo, salt_hi)
+    temp = tl.load(temp_ptr + row).to(tl.float32)
+    cols = b * BLOCK + tl.arange(0, BLOCK)
+    mask = cols < vocab
+    lg = tl.load(logits_ptr + row.to(tl.int64) * stride + cols.to(tl.int64) * cstride, mask=mask,
+                 other=float("-inf")).to(tl.float32)
+    s32 = tl.where(mask, lg / temp + _neg_log_exp53_f32_kw(cols.to(tl.uint32), key, key2, True), float("-inf"))
+    m1 = tl.max(s32, axis=0)
+    i1 = tl.min(tl.where(s32 == m1, cols, 2147483647), axis=0)
+    s2 = tl.where(cols == i1, float("-inf"), s32)
+    m2 = tl.max(s2, axis=0)
+    i2 = tl.min(tl.where(s2 == m2, cols, 2147483647), axis=0)
+    base = (row.to(tl.int64) * nblk + b) * 2
+    tl.store(val_ptr + base, m1)
+    tl.store(val_ptr + base + 1, m2)
+    tl.store(idx_ptr + base, i1)
+    tl.store(idx_ptr + base + 1, i2)
+
+
+@triton.jit
+def _top2_reduce_kernel(val_ptr, idx_ptr, out1_ptr, out2_ptr, nblk, NC_POW2: tl.constexpr):
+    row = tl.program_id(0)
+    c = tl.arange(0, NC_POW2)
+    mc = c < nblk * 2
+    v = tl.load(val_ptr + row.to(tl.int64) * nblk * 2 + c, mask=mc, other=float("-inf"))
+    ix = tl.load(idx_ptr + row.to(tl.int64) * nblk * 2 + c, mask=mc, other=2147483647)
+    m1 = tl.max(v, axis=0)
+    i1 = tl.min(tl.where(v == m1, ix, 2147483647), axis=0)
+    v2 = tl.where(ix == i1, float("-inf"), v)
+    m2 = tl.max(v2, axis=0)
+    i2 = tl.min(tl.where(v2 == m2, ix, 2147483647), axis=0)
+    tl.store(out1_ptr + row, tl.where(m1 > float("-inf"), i1, -1).to(tl.int64))
+    tl.store(out2_ptr + row, tl.where(m2 > float("-inf"), i2, -1).to(tl.int64))
+
+
+def top2_workspace_bytes(rows: int, vocab: int) -> int:
+    return int(rows) * triton.cdiv(int(vocab), BLK) * 2 * 8
+
+
+def keyed_top2(logits, request_ids, positions, temperature, salt, *, out1, out2, workspace) -> None:
+    """The two best columns of each row's keyed race (fp32 scores, S's keys and noise): out1 ~ S's draw, out2 its
+    runner-up (-1 if the row has fewer than two finite scores). Proposals only; fixed shapes (graph-capturable)."""
+    n, vocab = logits.shape
+    if n == 0:
+        return
+    nblk = triton.cdiv(vocab, BLK)
+    val = workspace[: n * nblk * 2 * 4].view(torch.float32)
+    idx = workspace[n * nblk * 2 * 4: n * nblk * 2 * 8].view(torch.int32)
+    rid = request_ids if request_ids.is_contiguous() else request_ids.contiguous()
+    pos = positions if positions.is_contiguous() else positions.contiguous()
+    temp = temperature if (temperature.dtype == torch.float32 and temperature.is_contiguous()) else \
+        temperature.float().contiguous()
+    salt_lo, salt_hi = int(salt) & 0x7FFFFFFF, (int(salt) >> 31) & 0x7FFFFFFF
+    _block_top2_kernel[(n, nblk)](logits, logits.stride(0), logits.stride(1), rid, pos, temp, val, idx, vocab, nblk,
+                                  salt_lo, salt_hi, BLOCK=BLK, num_warps=4)
+    _top2_reduce_kernel[(n,)](val, idx, out1, out2, nblk, NC_POW2=max(triton.next_power_of_2(nblk * 2), 2))

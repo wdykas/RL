@@ -50,10 +50,17 @@ def _ref_layer(sd, emb, out, h, tok_next):
     """Dense MCore MTP layer over one sequence: position i reads (h_i, x_{i+1}); causal attention, grouped QKV
     (per KV group: its query heads, then k, then v), squared-ReLU MLP, final norm, output layer. fp32 attention."""
     g = lambda k: sd[k].cuda()  # noqa: E731
-    p, a, f = "mtp.layers.0.", "mtp.layers.0.mtp_model_layer.layers.0.self_attention.", \
-        "mtp.layers.0.mtp_model_layer.layers.1.mlp."
+    p = "mtp.layers.0."
     e = _rms(emb[tok_next], g(p + "enorm.weight"))
     u = torch.cat([e, _rms(h, g(p + "hnorm.weight"))], -1) @ g(p + "eh_proj.weight").t()
+    return _ref_body(sd, out, u)
+
+
+def _ref_body(sd, out, u):
+    """The dense layer after eh_proj: causal attention, MLP, final norm, output layer."""
+    g = lambda k: sd[k].cuda()  # noqa: E731
+    a, f = "mtp.layers.0.mtp_model_layer.layers.0.self_attention.", "mtp.layers.0.mtp_model_layer.layers.1.mlp."
+    p = "mtp.layers.0."
     n = u.shape[0]
     gq = NH // NKV
     x = (_rms(u, g(a + "linear_qkv.layer_norm_weight")) @ g(a + "linear_qkv.weight").t()).view(n, NKV, gq + 2, HD)
@@ -137,3 +144,45 @@ def test_slot_start_masks_positions_without_kv(tmp_path):
     rh, rl = _ref_layer(sd, emb, out, h[s0:], tok[s0:])
     torch.testing.assert_close(hf[0].float(), rh[-1].float(), atol=3e-2, rtol=3e-2)
     torch.testing.assert_close(logits[0].float(), rl[-1].float(), atol=3e-2, rtol=3e-2)
+
+
+@cuda
+def test_v2_feature_head_rows_equal_dense_layer(tmp_path):
+    """Input contract v2 (draft-head2): rows carry [h | f_0 | f_1]; eh_proj reads [enorm(e) | hnorm(h) | fnorm_0(f_0) |
+    fnorm_1(f_1)]. The incremental row forward equals the dense layer on the same inputs; chain_input keeps the base
+    position's features next to the previous depth's output."""
+    from nemo_rl.models.generation.megatron import tree_mtp
+
+    gen = torch.Generator().manual_seed(2)
+    sd = _sd(gen)
+    p = "mtp.layers.0."
+    sd[p + "eh_proj.weight"] = (torch.randn(HID, 4 * HID, generator=gen) * 0.05).to(torch.bfloat16)
+    for i in range(2):
+        sd[p + f"fnorm{i}.weight"] = (1.0 + 0.1 * torch.randn(HID, generator=gen)).to(torch.bfloat16)
+    sd["draft_head2.feats"] = torch.tensor([17, 34], dtype=torch.int32)
+    path = tmp_path / "head_v2.pt"
+    torch.save(sd, path)
+    assert tree_mtp.head_feature_layers(str(path)) == [17, 34]
+    emb = (torch.randn(V, HID, generator=gen) * 0.5).to(torch.bfloat16).cuda()
+    out = (torch.randn(V, HID, generator=gen) * 0.05).to(torch.bfloat16).cuda()
+    head = tree_mtp.MTPHead(str(path), emb, out, slots=1, max_seq=128, num_heads=NH, num_kv_heads=NKV, head_dim=HD,
+                            eps=EPS)
+    assert head.in_width == 3 * HID and head.feat_layers == [17, 34]
+    n = 40
+    rows = torch.randn(n, 3 * HID, generator=gen).to(torch.bfloat16).cuda()
+    tok = torch.randint(0, V, (n,), generator=gen).cuda()
+    sl = torch.zeros(n - 1, dtype=torch.long, device="cuda")
+    head.append_kv(sl, torch.arange(n - 1, device="cuda"), rows[: n - 1], tok[: n - 1])
+    hf, logits = head.forward_rows(torch.tensor([0], device="cuda"), torch.tensor([n - 1], device="cuda"),
+                                   rows[n - 1:], tok[n - 1:])
+    # dense reference: eh_proj's v2 input built explicitly, then the same layer body
+    g = lambda k: sd[k].cuda()  # noqa: E731
+    x = torch.cat([_rms(emb[tok], g(p + "enorm.weight")), _rms(rows[:, :HID], g(p + "hnorm.weight")),
+                   _rms(rows[:, HID: 2 * HID], g(p + "fnorm0.weight")),
+                   _rms(rows[:, 2 * HID:], g(p + "fnorm1.weight"))], -1)
+    u = x @ g(p + "eh_proj.weight").t()
+    rh, rl = _ref_body(sd, out, u)
+    torch.testing.assert_close(hf[0].float(), rh[-1].float(), atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(logits[0].float(), rl[-1].float(), atol=3e-2, rtol=3e-2)
+    ci = head.chain_input(hf, rows[n - 1:])
+    assert ci.shape == (1, 3 * HID) and torch.equal(ci[:, :HID], hf) and torch.equal(ci[:, HID:], rows[n - 1:, HID:])

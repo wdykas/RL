@@ -49,26 +49,46 @@ SPLIT = 512  # positions per attention split (flash decoding: a long context spr
 _HID: dict = {}  # decoder-output capture: {"buf": [max_tokens, hidden] bf16, "n": rows of the last forward}
 
 
-def install_hidden_capture(model, max_tokens: int, hidden: int) -> None:
-    """Copy the decoder's final-norm output of every forward into a fixed buffer (before the engine is built: if the
-    final norm runs inside a captured graph, the copy is captured with it)."""
+def head_feature_layers(path: str) -> list:
+    """Decoder layers whose outputs a head reads besides the final-norm output (input contract v2: checkpoint key
+    ``draft_head2.feats``, int32 layer indices; none for a v1 head)."""
+    sd = torch.load(path, map_location="cpu")
+    if "state_dict" in sd:
+        sd = sd["state_dict"]
+    f = sd.get("draft_head2.feats")
+    return [] if f is None else [int(x) for x in torch.as_tensor(f).reshape(-1).tolist()]
+
+
+def install_hidden_capture(model, max_tokens: int, hidden: int, feat_layers=()) -> None:
+    """Copy, for every engine forward, the decoder's final-norm output and the outputs of ``feat_layers`` (residual
+    stream, cast to bf16) into one fixed buffer [max_tokens, hidden x (1 + len(feat_layers))]: columns
+    [h | f_0 | f_1 ...], one row per token, so every consumer gathers a row's hidden and features together. Installed
+    before the engine is built: hooks that run inside a captured graph are captured with it."""
     if _HID:
+        if list(_HID.get("feats", [])) != [int(x) for x in feat_layers]:
+            raise RuntimeError(f"tree_mtp: hidden capture already installed for feature layers {_HID.get('feats')}")
         return
-    dev = torch.device("cuda", torch.cuda.current_device())
-    _HID["buf"] = torch.zeros(int(max_tokens), int(hidden), dtype=torch.bfloat16, device=dev)
     from megatron.core.utils import unwrap_model
 
+    feat_layers = [int(x) for x in feat_layers]
+    hidden = int(hidden)
+    dev = torch.device("cuda", torch.cuda.current_device())
+    _HID["buf"] = torch.zeros(int(max_tokens), hidden * (1 + len(feat_layers)), dtype=torch.bfloat16, device=dev)
+    _HID["feats"], _HID["hidden"] = feat_layers, hidden
     m = unwrap_model(model)
-    norm = m.decoder.final_norm
 
-    def hook(_mod, _inp, out):
-        o = out[0] if isinstance(out, tuple) else out
-        flat = o.reshape(-1, o.shape[-1])
-        n = min(flat.shape[0], _HID["buf"].shape[0])
-        _HID["buf"][:n].copy_(flat[:n])
-        return None
+    def make_hook(col):
+        def hook(_mod, _inp, out):
+            o = out[0] if isinstance(out, tuple) else out
+            flat = o.reshape(-1, o.shape[-1])
+            n = min(flat.shape[0], _HID["buf"].shape[0])
+            _HID["buf"][:n, col * hidden: (col + 1) * hidden].copy_(flat[:n])
+            return None
+        return hook
 
-    norm.register_forward_hook(hook)
+    m.decoder.final_norm.register_forward_hook(make_hook(0))
+    for i, layer in enumerate(feat_layers):
+        m.decoder.layers[layer].register_forward_hook(make_hook(1 + i))
 
 
 def hidden_buffer() -> Optional[torch.Tensor]:
@@ -185,6 +205,17 @@ class MTPHead:
         self.ln_fc1, self.w_fc1, self.w_fc2 = g(f + "linear_fc1.layer_norm_weight"), g(f + "linear_fc1.weight"), \
             g(f + "linear_fc2.weight")
         self.final = g(p + "final_layernorm.weight")
+        # input contract v2 (draft-head2): features of decoder layers draft_head2.feats, each RMS-normed by its own
+        # fnorm_i, appended to eh_proj's input after hnorm(h); the chain reuses the base position's features
+        feats = sd.get("draft_head2.feats")
+        self.feat_layers = [] if feats is None else [int(x) for x in torch.as_tensor(feats).reshape(-1).tolist()]
+        self.fnorm = [g(p + f"fnorm{i}.weight") for i in range(len(self.feat_layers))]
+        hid = self.enorm.numel()
+        if self.eh.shape[1] != hid * (2 + len(self.feat_layers)):
+            raise RuntimeError(f"tree_mtp: eh_proj {tuple(self.eh.shape)} does not match {len(self.feat_layers)} "
+                               f"feature layers")
+        self.hidden = hid
+        self.in_width = hid * (1 + len(self.feat_layers))  # the rows the head reads: [h | f_0 | f_1 ...]
         self.emb, self.out = embedding, output  # the main model's (TP 1: full vocab)
         assert self.emb.shape[0] == self.out.shape[0], "tree_mtp needs the full vocabulary on the rank (TP 1)"
         self.nh, self.nkv, self.hd, self.eps = num_heads, num_kv_heads, head_dim, eps
@@ -200,12 +231,22 @@ class MTPHead:
 
     # ---- the layer, in pieces -------------------------------------------------------------------------------------
     def _u(self, h, tok):
-        """eh_proj([enorm(emb(tok)), hnorm(h)])."""
-        hid = h.shape[-1]
-        x = torch.empty(h.shape[0], 2 * hid, dtype=torch.bfloat16, device=h.device)  # [enorm(e) | hnorm(h)], no cat
+        """eh_proj([enorm(emb(tok)) | hnorm(h) | fnorm_0(f_0) | ...]); ``h`` rows are [h | f_0 | ...] (in_width)."""
+        hid = self.hidden
+        nf = len(self.feat_layers)
+        assert h.shape[-1] == hid * (1 + nf), (tuple(h.shape), hid, nf)
+        x = torch.empty(h.shape[0], hid * (2 + nf), dtype=torch.bfloat16, device=h.device)  # no cat
         _rms(self.emb.index_select(0, tok.clamp(min=0)), self.enorm, self.eps, out=x[:, :hid])
-        _rms(h, self.hnorm, self.eps, out=x[:, hid:])
+        _rms(h[:, :hid], self.hnorm, self.eps, out=x[:, hid: 2 * hid])
+        for i in range(nf):
+            _rms(h[:, (1 + i) * hid: (2 + i) * hid], self.fnorm[i], self.eps, out=x[:, (2 + i) * hid: (3 + i) * hid])
         return x @ self.eh.t()
+
+    def chain_input(self, hf, base):
+        """Depth k >= 2 input rows: the previous depth's output hf with the BASE position's features (contract v2)."""
+        if not self.feat_layers:
+            return hf
+        return torch.cat([hf, base[:, self.hidden:]], dim=-1)
 
     def _qkv(self, u):
         """MCore's grouped QKV layout: per KV group, its query heads, then k, then v."""
