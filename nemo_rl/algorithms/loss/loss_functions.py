@@ -101,6 +101,74 @@ def _scalar(t: torch.Tensor):
     return t.detach() if _DEFER_SCALARS[0] else t.item()
 
 
+# ThunderSync IS-RLOO learner row weights (ClippedPGLossConfig.is_row_clip): raw per-step sums over rows / tokens.
+IS_ROW_METRICS = (
+    "is_rows",  # rows weighted
+    "is_s_sum",  # sum s_r
+    "is_s2_sum",  # sum s_r^2
+    "is_w_sum",  # sum w_r (clipped)
+    "is_w2_sum",  # sum w_r^2 (clipped)
+    "is_e_sum",  # sum e^{s_r} (raw)
+    "is_e2_sum",  # sum e^{2 s_r} (raw)
+    "is_excess_sum",  # sum (e^{s_r} - C)^+ (eps_hat numerator)
+    "is_clipped",  # rows with e^{s_r} > C
+    "is_nonfinite",  # rows whose s_r is not finite (a non-finite log-prob; the driver raises)
+    "is_old_tok",  # trained tokens not sampled under the trained weights
+    "is_audit_tok",  # CHECKS: trained tokens compared with the engine's rescore
+    "is_audit_inexact",  # CHECKS: of those, training log-prob != engine log-prob (bitwise)
+)
+
+
+def is_row_weights(
+    curr_logprobs: torch.Tensor,
+    generation_logprobs: torch.Tensor,
+    mask: torch.Tensor,
+    old_tokens: torch.Tensor,
+    clip: float,
+    audit_logprobs: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor, dict]:
+    """Row weights of IS-RLOO from this forward (research/thundersync_rl/thundersync_rl/isspr.py, learner s).
+
+    ``curr_logprobs`` / ``generation_logprobs`` / ``mask`` are ``[B, S - 1]`` (the loss's shifted views), one row
+    per sample. s_r = sum over row r's trained tokens of (log p - log q), detached, in float64; w_r = min(C, e^{s_r}).
+    A row's first ``old_tokens[r]`` trained tokens were sampled under older weights; the rest under these, so the
+    train-lp sentinel covers only them (returned mask). ``audit_logprobs`` (``[B, S]``, CHECKS): the engine's
+    rescore of every token under these weights, compared bitwise over every trained token.
+    Returns (w ``[B]``, sentinel mask ``[B, S - 1]``, metrics).
+    """
+    live = mask.bool()
+    d = torch.where(live, curr_logprobs.detach().double() - generation_logprobs.double(), 0.0)
+    s = d.sum(dim=-1)
+    e = torch.exp(torch.clamp(s, max=700.0))
+    w = torch.clamp(e, max=clip)
+    rows = mask.sum(dim=-1) > 0
+    position = torch.cumsum(live.to(torch.int64), dim=-1)  # 1-based index among the row's trained tokens
+    fresh = live & (position > old_tokens.to(position.device, torch.int64).unsqueeze(-1))
+    rows_f = rows.double()
+    metrics = {
+        "is_rows": _scalar(rows_f.sum()),
+        "is_s_sum": _scalar((s * rows_f).sum()),
+        "is_s2_sum": _scalar((s * s * rows_f).sum()),
+        "is_w_sum": _scalar((w * rows_f).sum()),
+        "is_w2_sum": _scalar((w * w * rows_f).sum()),
+        "is_e_sum": _scalar((e * rows_f).sum()),
+        "is_e2_sum": _scalar((e * e * rows_f).sum()),
+        "is_excess_sum": _scalar((torch.clamp(e - clip, min=0.0) * rows_f).sum()),
+        "is_clipped": _scalar(((e > clip) & rows).double().sum()),
+        "is_nonfinite": _scalar((~torch.isfinite(s) & rows).double().sum()),
+        "is_old_tok": _scalar((live & ~fresh).double().sum()),
+        "is_audit_tok": _scalar(torch.zeros((), dtype=torch.float64, device=d.device)),
+        "is_audit_inexact": _scalar(torch.zeros((), dtype=torch.float64, device=d.device)),
+    }
+    if audit_logprobs is not None:
+        audit = audit_logprobs[:, 1:].to(curr_logprobs.device)
+        metrics["is_audit_tok"] = _scalar(live.double().sum())
+        metrics["is_audit_inexact"] = _scalar(
+            (live & (curr_logprobs.detach().float() != audit.float())).double().sum()
+        )
+    return w, fresh.to(mask.dtype), metrics
+
+
 def resolve_metric_scalars(metric_dicts) -> None:
     """Replace 0-dim device tensors in the given metric dicts by ``.item()`` values, in place.
 
@@ -226,6 +294,11 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     # Exactness sentinel: report the training forward's log-probs against every trained
     # token's generation log-prob (train_gen_lp_*), on both ratio paths.
     train_lp_check: bool = False
+    # ThunderSync IS-RLOO, row weights from the learner (research/thundersync_rl/thundersync_rl/isspr.py): the clip C
+    # of w_r = min(C, e^{s_r}), s_r = sum over row r's response tokens of (this forward's log-prob - generation
+    # log-prob), detached. Rows carry ``is_old_tokens``: their leading tokens not sampled under the trained weights
+    # (outside the train_lp_check sentinel). None: off.
+    is_row_clip: Optional[float] = None
 
     # --- Clipping ---
     ratio_clip_min: float = 0.2
@@ -436,6 +509,7 @@ class ClippedPGLossFn(LossFunction):
         # train_gen_lp_tokens (counts). Device scalars only. (BUGS #15: gating this on
         # force_on_policy_ratio left the stock-loss config, nl_base, without the sentinel.)
         self.train_lp_check = bool(cfg.train_lp_check)
+        self.is_row_clip = cfg.is_row_clip
 
         # Whether to compute importance weights per-sequence instead of per-token.
         self.sequence_level_importance_ratios = cfg.sequence_level_importance_ratios
@@ -601,6 +675,11 @@ class ClippedPGLossFn(LossFunction):
                     "train_gen_lp_tokens": MetricNormalizer.NONE,
                 }
             )
+        if self.is_row_clip is not None:
+            # Raw sums over the step's rows (the driver forms ESS / var / eps_hat from them).
+            self.metric_normalizations.update(
+                {name: MetricNormalizer.NONE for name in IS_ROW_METRICS}
+            )
         if self.truncated_importance_sampling_type is not None:
             # Keyed on the TIS type, NOT loss_type: seq-mask-tis masks whole
             # sequences (÷ global_valid_seqs); tis/icepop are token-level.
@@ -693,22 +772,31 @@ class ClippedPGLossFn(LossFunction):
         token_mask = data["token_mask"][:, 1:]
         sample_mask = data["sample_mask"]
         advantages = data["advantages"][:, 1:]
+        generation_logprobs = data["generation_logprobs"][:, 1:]
+        mask = token_mask * sample_mask.unsqueeze(-1)
         if "is_weight" in data:
             # ThunderSync IS-SPR (research/thundersync_rl/thundersync_rl/isspr.py): the group's clipped likelihood
-            # ratio W_g against the trained weights (detached, one per row, equal within a group) scales its advantages.
+            # ratio W_g against the trained weights (detached, one per row, equal within a group) scales its advantages
+            # (with the row unit from the learner: the row's length coefficient only, w_r follows).
             advantages = advantages * data["is_weight"].to(advantages.dtype).unsqueeze(-1)
+        is_metrics = {}
+        sentinel_mask = mask
+        if self.is_row_clip is not None:
+            w_r, sentinel_mask, is_metrics = is_row_weights(
+                curr_logprobs, generation_logprobs, mask, data["is_old_tokens"],
+                float(self.is_row_clip), data.get("is_audit_logprobs"),
+            )
+            advantages = advantages * w_r.to(advantages.dtype).unsqueeze(-1)
         # Skip loading prev_logprobs when force_on_policy_ratio=True (will use curr_logprobs instead)
         prev_logprobs = (
             None if self.force_on_policy_ratio else data["prev_logprobs"][:, 1:]
         )
-        generation_logprobs = data["generation_logprobs"][:, 1:]
         if self.reference_policy_kl_penalty != 0:
             reference_policy_logprobs = data["reference_policy_logprobs"][:, 1:]
             curr_logprobs_unfiltered = data.get(
                 "curr_logprobs_unfiltered", curr_logprobs
             )
 
-        mask = token_mask * sample_mask.unsqueeze(-1)
         full_metrics = self.metrics_level == "full"
         need_importance_weights = (
             full_metrics or self.use_importance_sampling_correction
@@ -720,7 +808,7 @@ class ClippedPGLossFn(LossFunction):
         if self.train_lp_check:
             # The training forward's own log-probs against the rollout's (must be bitwise
             # equal on an exact run), on either ratio path (before a forced ratio hides it).
-            live = mask.bool()
+            live = sentinel_mask.bool()
             d = torch.where(
                 live, (curr_logprobs.detach().float() - generation_logprobs.float()).abs(), 0.0
             )
@@ -1093,6 +1181,7 @@ class ClippedPGLossFn(LossFunction):
             **scalars,
             **seq_error_metrics,
             **train_lp_metrics,
+            **is_metrics,
         }
 
     def _opd_full_call(

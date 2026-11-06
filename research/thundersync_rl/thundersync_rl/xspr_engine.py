@@ -48,6 +48,7 @@ CHECK_ATTR = "ts_xspr_check"  # L: the last L prompt tokens are the row's candid
 CONTINUE_ATTR = "ts_xspr_continue"  # the check request decodes on after its prefill: 1 unless a token mismatched, 2 always
 RESULT_ATTR = "ts_xspr_result"  # {"tau", "lps", "y"} of a check request (engine rank)
 NOCACHE_ATTR = "ts_xspr_nocache"  # the request matches no prefix-cache block (an independent reference prefill)
+WAKE_AT_ATTR = "ts_xspr_wake_at"  # generated-token counts of the request at each wake it was in flight across
 
 
 def check_rows(
@@ -239,7 +240,7 @@ def check_capture(overflow_before: int, overflow_after: int) -> None:
 def record_failure(xs: dict, err: Exception) -> None:
     """A guard failed on the engine loop thread: keep the first failure for raise_failure (printing it once)."""
     if "error" not in xs:
-        xs["error"] = str(err)
+        xs["error"] = f"{type(err).__name__}: {err}"
         print(f"[xspr engine] FAILURE (raised on the worker's next result / stats / wake call): {err}", flush=True)
 
 
@@ -258,6 +259,24 @@ def prefill_one_epoch(seen: dict, rids, epoch: int, is_cut: Callable[[int], bool
         if first != epoch and not is_cut(int(rid)):
             raise RuntimeError(f"[xspr engine] request {int(rid)}: its prefill ran under weight epochs {first} and "
                                f"{epoch} (a chunked prefill across a wake that the cut missed)")
+
+
+def mark_wake(engine: Any) -> int:
+    """At a wake (engine suspended, before the resume): append every in-flight xspr request's generated-token count
+    to its ``WAKE_AT_ATTR`` list (returned with its result): the tokens it samples after that count are the new
+    weights'. With the wake cut no request runs on (a cut request appends no token); without it (the stale-KV
+    negative) the driver still knows which of a row's tokens the new weights sampled. Returns the number marked."""
+    n = 0
+    for entry in list(engine.requests.values()):
+        sp = entry.record[-1].sampling_params
+        if sp is None or getattr(sp, KEY_RID_ATTR, None) is None:
+            continue
+        at = list(getattr(sp, WAKE_AT_ATTR, None) or ()) + [sum(len(r.generated_tokens) for r in entry.record.requests)]
+        for r in entry.record.requests:
+            if getattr(r, "sampling_params", None) is not None:
+                r.sampling_params.add_attributes({WAKE_AT_ATTR: at})
+        n += 1
+    return n
 
 
 def cut_touched(engine: Any, stats: Optional[dict] = None, prefill_cut: bool = True) -> int:
@@ -417,7 +436,7 @@ class XsprEngineMixin:
             if selected.shape[0] == n and not bool(torch.isfinite(selected).all()):
                 try:
                     nonfinite_dump(self, engine, logits, new_tokens, selected, dump_dir)
-                except RuntimeError as err:  # the engine loop thread: recorded, raised on the worker path
+                except Exception as err:  # the engine loop thread: recorded, raised on the worker path
                     record_failure(self._xspr, err)
             return selected, log_probs
 
@@ -456,14 +475,15 @@ class XsprEngineMixin:
         xs = self.__dict__.get("_xspr")
         raise_failure(xs)
         engine = getattr(self, "dynamic_inference_engine", None)
-        if (xs is not None and xs["wake_cut"] and engine is not None and getattr(self, "is_generation_colocated", False)
+        if (xs is not None and engine is not None and getattr(self, "is_generation_colocated", False)
                 and getattr(self, "_inference_engine_asleep", False)):
             import asyncio
 
             import torch
 
             async def mark() -> int:
-                return cut_touched(engine, xs["cut_stats"], xs["prefill_cut"])
+                mark_wake(engine)
+                return cut_touched(engine, xs["cut_stats"], xs["prefill_cut"]) if xs["wake_cut"] else 0
 
             xs["cut"] += asyncio.run_coroutine_threadsafe(mark(), self._inference_loop).result()
             torch.distributed.barrier()
@@ -514,7 +534,8 @@ class XsprEngineMixin:
         out = super()._parse_result_to_batched_data_dict(data, result)
         out["xspr"] = [
             {"cut": int(getattr(r.sampling_params, CUT_ATTR, 0) or 0),
-             "check": getattr(r.sampling_params, RESULT_ATTR, None)}
+             "check": getattr(r.sampling_params, RESULT_ATTR, None),
+             "wake_at": [int(x) for x in (getattr(r.sampling_params, WAKE_AT_ATTR, None) or ())]}
             for r in result
         ]
         return out
@@ -707,14 +728,14 @@ class XsprEngineMixin:
             if "error" not in xs:
                 try:
                     picked = select()
-                except RuntimeError as err:
+                except Exception as err:  # any error on the engine loop thread would kill it: record, raise later
                     record_failure(xs, err)
             ovf0 = cap["overflow"][0]
             out = orig(*args, **kwargs)
             if picked is not None:
                 try:
                     score(*picked, ovf0)
-                except RuntimeError as err:
+                except Exception as err:
                     record_failure(xs, err)
             if len(tags.by_rid) > 1024:
                 tags.prune()

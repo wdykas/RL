@@ -133,6 +133,8 @@ def configure_driver(config: dict) -> ColoConfig:
     # Plain top-k routing: with one weight version per step there is nothing to verify, so theta-only routing needs
     # no cross-fade band (MODEL.md §1, XS).
     mcfg["crossfade_routing_m"] = None
+    # Resident learner across the engine phase, as before (worker.py offload_before_refit).
+    mcfg["resident_learner"] = True
     # Always-on sentinel: the loss reports every trained token's training log-prob against its generation log-prob.
     config.setdefault("loss_fn", {})["train_lp_check"] = True
     if os.environ.get(SKIP_RESHARD_ENV) == "1":

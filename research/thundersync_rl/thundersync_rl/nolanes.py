@@ -617,6 +617,8 @@ def configure_driver(config: dict) -> NolanesConfig:
     config["policy"]["worker_extension_cls_fqn"] = WORKER_FQN
     mcfg = config["policy"]["megatron_cfg"]
     apply_crossfade(cfg, mcfg)
+    # The verify stage reads the learner after the stand-down: its grad buffers stay resident (worker.py).
+    mcfg["resident_learner"] = True
     # Always-on sentinel (R29 item 4): the loss reports the TRAINING forward's log-probs against every trained
     # token's generation log-prob (train_gen_lp_*; force_on_policy_ratio would otherwise hide a difference); the
     # SC loop raises on any inexact token (VerifyStage.check_train_lp). A loss config field.

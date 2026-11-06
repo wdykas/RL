@@ -666,7 +666,8 @@ class ThunderSyncMegatronPolicyWorker(XsprEngineMixin, NolanesEngineMixin, Megat
         # master shard are allocated before the hook, in stock segments, as before.
         # Colocated generation (research/colo/MODEL.md v2 §11): the learner process is also the engine, so it keeps
         # the stock allocator, as stock colocated does. Its state is RESIDENT (the colo validators require
-        # policy.offload_optimizer_for_refit=false; offload_before_refit below moves nothing). Expandable segments are
+        # policy.offload_optimizer_for_refit=false; offload_before_refit below keeps the grad buffers where
+        # megatron_cfg.resident_learner is set). Expandable segments are
         # off here because the colocated cycle still swaps the training parameters around the dedicated inference
         # model every step, and through expandable segments that churn remaps pages under training: Super-L8
         # policy_training 7.0 s (stock allocator) vs 30 s, and the speculative arm still OOMed with them,
@@ -910,9 +911,11 @@ class ThunderSyncMegatronPolicyWorker(XsprEngineMixin, NolanesEngineMixin, Megat
             )
 
     def offload_before_refit(self, *args, **kwargs):
-        if getattr(self, "is_generation_colocated", False) and not getattr(self, "offload_optimizer_for_refit", True):
-            # Resident colocated learner: optimizer state and grad buffers stay on the device across the engine phase
-            # (the engine's KV / state buffer is sized by rule beside them, research/colo/jobs/engine_buf.py).
+        mcfg = (getattr(self, "cfg", None) or {}).get("megatron_cfg") or {}
+        if getattr(self, "is_generation_colocated", False) and mcfg.get("resident_learner", False):
+            # Resident colocated learner (policy.megatron_cfg.resident_learner, set by the modes whose stages read the
+            # learner after the stand-down: nolanes verify, colo): grad buffers stay on the device across the engine
+            # phase. Every other mode (xspr, isspr) offloads as stock / SPR-BI does.
             self.finalize_async_save()
             return None
         return super().offload_before_refit(*args, **kwargs)

@@ -232,6 +232,12 @@ def test_negative_stale_state_is_biased():
 # -- the weight log --------------------------------------------------------------------------------------------------
 
 
+def test_clipped_weights_refuse_nan():
+    assert isspr.clipped_weights([0.0, 10.0], 5.0) == [1.0, 5.0]
+    with pytest.raises(RuntimeError, match="non-finite"):
+        isspr.clipped_weights([float("nan")], 5.0)
+
+
 def test_weight_stats():
     st = isspr.weight_stats([0.0] * 64, 5.0)
     assert st["ess"] == 1.0 and st["ess_clip"] == 1.0 and st["eps_hat"] == 0.0 and st["s_var"] == 0.0
@@ -381,6 +387,32 @@ def test_loss_problems():
     assert len(gen_probs({"mcore_generation_config": {"num_speculative_tokens": 2}})) == 1
 
 
+def test_learner_resident_only_where_a_mode_sets_it():
+    """xspr / isspr offload before the refit as stock / SPR-BI (the K = 4 isspr arms OOMed at the TMS resume with
+    the grad buffers resident); colo / nolanes set megatron_cfg.resident_learner and keep them."""
+    import thundersync_rl.worker as w
+
+    calls = []
+    stock = w.MegatronPolicyWorkerImpl.offload_before_refit
+    w.MegatronPolicyWorkerImpl.offload_before_refit = lambda self: calls.append("stock")
+    try:
+        cls = w.ThunderSyncMegatronPolicyWorker.__ray_metadata__.modified_class  # the class behind the Ray actor
+
+        def worker(**mcfg):
+            obj = object.__new__(cls)  # no constructor: only the attributes it reads
+            obj.__dict__.update(is_generation_colocated=True, cfg={"megatron_cfg": mcfg},
+                                finalize_async_save=lambda: calls.append("finalize"))
+            return obj
+
+        cls.offload_before_refit(worker(engine_verify=True))
+        assert calls == ["stock"]
+        calls.clear()
+        cls.offload_before_refit(worker(resident_learner=True))
+        assert calls == ["finalize"]
+    finally:
+        w.MegatronPolicyWorkerImpl.offload_before_refit = stock
+
+
 def test_advantages_must_be_group_local():
     from types import SimpleNamespace
 
@@ -395,14 +427,15 @@ def test_advantages_must_be_group_local():
         isspr.require_group_local(stage_cfg("gae", False, is_ppo=True))
 
 
-def _fake_sc(shardable=True):
+def _fake_sc(shardable=True, rloo=False):
     from types import SimpleNamespace
 
     impl = SimpleNamespace(_generate_response=None)
+    est = SimpleNamespace(name="grpo", normalize_rewards=not rloo, use_leave_one_out_baseline=True)
     return SimpleNamespace(
         _algo_cfg=SimpleNamespace(seed=42, num_generations_per_prompt=8),
         _advantage_stage_config=SimpleNamespace(is_ppo=False, shardable=shardable,
-                                                algo=SimpleNamespace(adv_estimator=SimpleNamespace(name="grpo"))),
+                                                algo=SimpleNamespace(adv_estimator=est)),
         _rollout_manager=SimpleNamespace(_impl=impl, weight_version=lambda: 0, nl_record_sink=None),
     )
 
@@ -436,15 +469,16 @@ def test_stage_builds_with_its_row_loop_and_negative():
 # -- the row loop on exact SPR's toy engine --------------------------------------------------------------------------
 
 
-def _run(world, target, n_rows=6, neg="", start_version=0, void_first_check=False):
+def _run(world, target, n_rows=6, neg="", start_version=0, void_first_check=False, learner_s=False):
     """``void_first_check``: each row's first check request comes back cut mid-prefill (chunked prefill across a
-    wake: no result, no new token), as the engine voids it."""
+    wake: no result, no new token), as the engine voids it. ``learner_s``: the row unit's loop (no rescore)."""
     from test_xspr import PROMPT, FakeImpl
 
     from nemo_rl.experience.rollout_manager import ROLLOUT_TARGET_STEP
 
     world.version = start_version
     rows = isspr.IsRows(seed=7, stream="t", max_new_tokens=world.cap, version_fn=lambda: world.version, neg=neg)
+    rows.learner_s = learner_s
     q_of: dict[int, dict[int, float]] = {}  # key -> {position: log-prob the token was decoded with}
 
     class Recording(FakeImpl):
@@ -456,7 +490,7 @@ def _run(world, target, n_rows=6, neg="", start_version=0, void_first_check=Fals
                 self.voided.add(data["xspr_key"])
                 await self.w.step()
                 msg = self._msg(list(forced["prefix"]), list(forced["prefix_logprobs"]))
-                msg["xspr"] = {"cut": 1, "check": None}
+                msg["xspr"] = {"cut": 1, "check": None, "wake_at": []}
                 return msg, torch.tensor([len(message_log[0]["token_ids"])]), {}
             msg, in_len, m = await super()._generate_response(message_log, stop_strings, native_generation_data, forced)
             if not (data.get("xspr_check") and not data.get("xspr_continue")):  # check-only: no kept token
@@ -571,3 +605,256 @@ def test_negative_stale_kv_keeps_q():
     p1 = [np.float32([_lp(w, 1, PROMPT + t[:i], t[i]) for i in range(len(t))]) for t, _, _, _ in res]
     off = sum(int(not np.array_equal(np.float32(lps), p)) for (_, lps, _, _), p in zip(res, p1))
     assert off > 0
+
+
+# -- row weights from the learner (learner s) ------------------------------------------------------------------------
+
+
+def test_old_after_from_labels_and_wake_marks():
+    # a segment that ends below theta_target leaves every token so far old
+    assert isspr._old_after(0, 0, 7, 0, {"wake_at": []}, 1) == 7
+    assert isspr._old_after(3, 5, 9, 0, {"wake_at": [2, 6]}, 3) == 9
+    # sent at theta_target: nothing new is old
+    assert isspr._old_after(4, 4, 9, 1, {"wake_at": []}, 1) == 4
+    # in flight across the wake that installed theta_target (no cut): its tokens before the mark are old
+    assert isspr._old_after(0, 0, 9, 0, {"wake_at": [5]}, 1) == 5
+    assert isspr._old_after(0, 3, 9, 0, {"wake_at": [1, 4]}, 2) == 7
+    with pytest.raises(RuntimeError, match="version 2"):
+        isspr._old_after(0, 0, 9, 1, {"wake_at": [5]}, 1)
+
+
+def _learner_rows(world, target, **kw):
+    """Rows of the learner-s loop: q kept, no rescore, and the tokens after old_tokens sampled under theta_target from
+    theta_target's state (the toy decodes from the context: exactly theta_target's log-probs)."""
+    from test_xspr import PROMPT
+
+    w, res = _run(world, target, learner_s=True, **kw)
+    for toks, lps, cert, q_at in res:
+        assert cert.version == target and cert.rescores == 0 and cert.only_tokens == 0 and math.isnan(cert.s)
+        assert lps == [q_at[t] for t in range(len(toks))]  # the generation log-probs stay q
+        assert 0 <= cert.old_tokens <= len(toks)
+        for t in range(cert.old_tokens, len(toks)):
+            assert np.float32(lps[t]) == np.float32(_lp(w, target, PROMPT + toks[:t], toks[t]))
+    return w, res
+
+
+def test_learner_s_finished_rows_not_rescored_cut_rows_resumed():
+    from test_xspr import World
+
+    _, res = _learner_rows(World(wakes={400: 1}), target=1)  # every row finished under theta_0
+    assert all(c.old_tokens == len(t) and c.resume_tokens == 0 for t, _, c, _ in res)
+    _, res = _learner_rows(World(wakes={20: 1}), target=1)  # rows cut at the wake resume by a plain prefill
+    assert any(c.resume_tokens > 0 for _, _, c, _ in res)
+    assert any(0 < c.old_tokens < len(t) for t, _, c, _ in res)
+    _, res = _learner_rows(World(wakes={6: 1, 30: 2}), target=2, n_rows=8)
+    assert any(c.resume_tokens > 0 for _, _, c, _ in res)
+
+
+def test_learner_s_without_the_wake_cut_marks_the_new_tokens():
+    # The stale-KV negative's engine (no wake cut): a row in flight across the wake keeps decoding; the wake mark
+    # puts its post-wake tokens inside the sentinel (where the real engine's stale state differs from the learner).
+    from test_xspr import PROMPT, World
+
+    w, res = _run(World(wakes={20: 1}, cut=False), target=1, neg=isspr.NEG_STALE_KV, learner_s=True)
+    straddled = [(t, c) for t, _, c, _ in res if 0 < c.old_tokens < len(t)]
+    assert straddled
+    for toks, c in straddled:
+        assert c.rescores == 0 and c.resume_tokens == 0
+
+
+def test_mark_wake_appends_generated_counts():
+    from thundersync_rl.nolanes_engine import KEY_RID_ATTR
+    from thundersync_rl.xspr_engine import WAKE_AT_ATTR, mark_wake
+
+    class SP:
+        def add_attributes(self, d):
+            for k, v in d.items():
+                setattr(self, k, v)
+
+    from types import SimpleNamespace
+
+    class Rec(SimpleNamespace):
+        def __getitem__(self, i):
+            return self.requests[i]
+
+    def entry(keyed, gens):
+        sp = SP()
+        if keyed:
+            setattr(sp, KEY_RID_ATTR, 1)
+        return SimpleNamespace(record=Rec(requests=[SimpleNamespace(sampling_params=sp, generated_tokens=[0] * g)
+                                                    for g in gens])), sp
+
+    (a, spa), (b, spb), (c, spc) = entry(True, [3, 2]), entry(True, []), entry(False, [4])
+    engine = SimpleNamespace(requests={1: a, 2: b, 3: c})
+    assert mark_wake(engine) == 2
+    assert mark_wake(engine) == 2
+    assert getattr(spa, WAKE_AT_ATTR) == [5, 5] and getattr(spb, WAKE_AT_ATTR) == [0, 0]
+    assert not hasattr(spc, WAKE_AT_ATTR)
+
+
+def _row_data(lengths, old, gen_shift=0.0, audit_shift=None):
+    from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+    b, s = len(lengths), max(lengths) + 1
+    tm = torch.zeros(b, s)
+    for i, n in enumerate(lengths):
+        tm[i, 1:n + 1] = 1.0
+    lp = torch.full((b, s), -1.0)
+    gen = lp.clone()
+    for i, n in enumerate(lengths):  # the first old[i] tokens were sampled under older weights: log q differs
+        gen[i, 1:1 + old[i]] = -1.0 - gen_shift * (i + 1)
+    data = BatchedDataDict({
+        "input_ids": torch.zeros(b, s, dtype=torch.long), "token_mask": tm, "sample_mask": torch.ones(b),
+        "advantages": torch.arange(1, b + 1, dtype=torch.float32).unsqueeze(-1).expand(b, s).clone(),
+        "generation_logprobs": gen, "prev_logprobs": lp.clone(),
+        "is_weight": torch.ones(b), "is_old_tokens": torch.tensor(old, dtype=torch.int64),
+    })
+    if audit_shift is not None:
+        audit = lp.clone()
+        audit[0, 1] += audit_shift
+        data["is_audit_logprobs"] = audit
+    return data, lp, tm
+
+
+def test_is_row_weights_from_the_forward():
+    from nemo_rl.algorithms.loss.loss_functions import is_row_weights
+
+    data, lp, tm = _row_data([3, 5, 2], old=[2, 0, 2], gen_shift=0.25, audit_shift=0.0)
+    curr = lp[:, 1:]
+    w, fresh, m = is_row_weights(curr, data["generation_logprobs"][:, 1:], tm[:, 1:], data["is_old_tokens"], 5.0,
+                                 data["is_audit_logprobs"])
+    s = torch.tensor([2 * 0.25, 0.0, 2 * 0.75], dtype=torch.float64)  # sum (log p - log q) over the old tokens
+    assert torch.allclose(w, torch.clamp(torch.exp(s), max=5.0))
+    assert fresh.sum().item() == (3 - 2) + 5 + 0  # the sentinel's tokens: those sampled under these weights
+    assert m["is_rows"] == 3 and m["is_old_tok"] == 4 and m["is_clipped"] == 0
+    assert math.isclose(m["is_s_sum"], 2.0) and m["is_audit_tok"] == 10 and m["is_audit_inexact"] == 0
+    # clip, and an audit that differs in one token
+    data, lp, tm = _row_data([3], old=[3], gen_shift=1.0, audit_shift=1e-3)
+    w, _, m = is_row_weights(lp[:, 1:], data["generation_logprobs"][:, 1:], tm[:, 1:], data["is_old_tokens"], 5.0,
+                             data["is_audit_logprobs"])
+    assert w.item() == 5.0 and m["is_clipped"] == 1 and math.isclose(m["is_excess_sum"], math.exp(3.0) - 5.0)
+    assert m["is_audit_inexact"] == 1
+    # lr 0: the forward is the sampling law: s = 0, w = 1
+    data, lp, tm = _row_data([4, 2], old=[4, 1])
+    w, _, m = is_row_weights(lp[:, 1:], data["generation_logprobs"][:, 1:], tm[:, 1:], data["is_old_tokens"], 5.0)
+    assert torch.equal(w, torch.ones(2, dtype=torch.float64)) and m["is_s2_sum"] == 0.0 and m["is_nonfinite"] == 0
+    # a non-finite log-prob is counted (the stage raises on it), never mapped to a weight
+    curr = lp[:, 1:].clone()
+    curr[1, 0] = float("nan")
+    _, _, m = is_row_weights(curr, data["generation_logprobs"][:, 1:], tm[:, 1:], data["is_old_tokens"], 5.0)
+    assert m["is_nonfinite"] == 1
+
+
+def test_loss_learner_row_weights_scale_gradients_and_narrow_the_sentinel():
+    from nemo_rl.algorithms.loss.loss_functions import ClippedPGLossConfig, ClippedPGLossFn
+
+    def fn(clip):
+        return ClippedPGLossFn(ClippedPGLossConfig(
+            token_level_loss=False, force_on_policy_ratio=True, reference_policy_kl_penalty=0.0,
+            use_importance_sampling_correction=True, ratio_clip_min=0.2, ratio_clip_max=0.28, metrics_level="minimal",
+            train_lp_check=True, is_row_clip=clip))
+
+    lengths, old = [3, 5, 2, 4], [2, 0, 1, 4]
+    data, lp, tm = _row_data(lengths, old, gen_shift=0.2)
+    grads = []
+    for clip in (None, 5.0):
+        d = data.copy() if hasattr(data, "copy") else data
+        curr = lp[:, 1:].clone().requires_grad_(True)
+        loss, metrics = fn(clip)(curr, d, global_valid_seqs=torch.tensor(4.0), global_valid_toks=tm[:, 1:].sum())
+        loss.backward()
+        grads.append(curr.grad.clone())
+        if clip is None:
+            assert metrics["train_gen_lp_inexact_tokens"] == sum(old)  # old tokens' q differs from the forward
+        else:
+            assert metrics["train_gen_lp_inexact_tokens"] == 0 and metrics["train_gen_lp_tokens"] == sum(
+                n - o for n, o in zip(lengths, old))
+    s = [0.2 * (i + 1) * o for i, o in enumerate(old)]
+    for i, n in enumerate(lengths):
+        assert torch.allclose(grads[1][i, :n], grads[0][i, :n] * min(5.0, math.exp(s[i])), rtol=1e-6, atol=0)
+
+
+def test_stage_learner_s_fields():
+    import os
+    from types import SimpleNamespace
+
+    from thundersync_rl.isspr_stage import IsSprStage
+
+    mc = SimpleNamespace(policy={"generation": {"max_new_tokens": 64}}, logger=SimpleNamespace(log_dir="/tmp/isspr-test"))
+    old = os.environ.pop("THUNDERSYNC_NL_NEG", None)
+    try:
+        cfg = isspr.IsSprConfig.from_config({"thundersync": {"mode": "isspr", "weight": "auto",
+                                                            "length_normalizer": "constant"},
+                                             "async_rl": {"sampler": {"max_lookahead_versions": 2}},
+                                             "policy": {"generation": {"max_new_tokens": 64}}})
+        st = IsSprStage(_fake_sc(rloo=True), mc, cfg)
+        assert st.learner_s and st.rows.learner_s
+        assert {isspr.IS_WEIGHT_FIELD, isspr.IS_OLD_FIELD} <= set(st.extra_train_fields)
+        st = IsSprStage(_fake_sc(), mc, isspr.IsSprConfig())  # group unit: the engine rescore
+        assert not st.learner_s and not st.rows.learner_s and st.extra_train_fields == (isspr.IS_WEIGHT_FIELD,)
+    finally:
+        if old is not None:
+            os.environ["THUNDERSYNC_NL_NEG"] = old
+
+
+def test_nonfinite_learner_step_dumps_its_rows():
+    import json
+    import os
+    import tempfile
+    from types import SimpleNamespace
+
+    from thundersync_rl.isspr_stage import IsSprStage
+
+    d = tempfile.mkdtemp()
+    mc = SimpleNamespace(policy={"generation": {"max_new_tokens": 64}}, logger=SimpleNamespace(log_dir=d))
+    old = os.environ.pop("THUNDERSYNC_NL_NEG", None)
+    try:
+        st = IsSprStage(_fake_sc(), mc, isspr.IsSprConfig())
+    finally:
+        if old is not None:
+            os.environ["THUNDERSYNC_NL_NEG"] = old
+    comp = SimpleNamespace(message_log=[{"role": "user", "token_ids": torch.tensor([1, 2])},
+                                        {"role": "assistant", "token_ids": torch.tensor([5, 6, 7]),
+                                         "generation_logprobs": torch.tensor([-0.5, -1.0, -2.0])}])
+    rec = SimpleNamespace(prompt_idx=11, completions=[comp, comp])
+    st._step_rows = (3, [({"message_log": [{"token_ids": torch.tensor([1, 2])}]}, rec)])
+    try:
+        st.check_train_lp({"grad_norm": float("nan"), "loss": 0.1}, 3)
+        raise AssertionError("a non-finite step must raise")
+    except RuntimeError as e:
+        assert "non-finite (grad_norm)" in str(e)
+        path = str(e).split("dumped to ")[-1].split(" for")[0]
+    rows = [json.loads(l) for l in open(path)]
+    assert len(rows) == 2 and rows[1]["sample"] == 1 and rows[0]["token_ids"] == [5, 6, 7]
+    assert rows[0]["prompt_token_ids"] == [1, 2] and rows[0]["key"] == st.rows.key_of(3, 11, 0)
+
+
+def test_learner_rows_counted_once_and_cp_refused():
+    import os
+    import tempfile
+    from types import SimpleNamespace
+
+    from thundersync_rl.isspr_stage import IsSprStage
+
+    mc = SimpleNamespace(policy={"generation": {"max_new_tokens": 64}},
+                         logger=SimpleNamespace(log_dir=tempfile.mkdtemp()))
+    full = {"thundersync": {"mode": "isspr", "weight": "auto", "length_normalizer": "constant"},
+            "async_rl": {"sampler": {"max_lookahead_versions": 2}}, "policy": {"generation": {"max_new_tokens": 64}}}
+    old = os.environ.pop("THUNDERSYNC_NL_NEG", None)
+    try:
+        st = IsSprStage(_fake_sc(rloo=True), mc, isspr.IsSprConfig.from_config(full))
+    finally:
+        if old is not None:
+            os.environ["THUNDERSYNC_NL_NEG"] = old
+    comp = SimpleNamespace(message_log=[{"role": "assistant", "token_ids": torch.tensor([5, 6, 7]),
+                                         "generation_logprobs": torch.zeros(3)}])
+    st._step_rows = (2, [({"message_log": []}, SimpleNamespace(prompt_idx=1, completions=[comp, comp]))])
+    m = {"is_rows": 2.0, "is_s_sum": 0.0, "is_s2_sum": 0.0, "is_w_sum": 2.0, "is_w2_sum": 2.0, "is_e_sum": 2.0,
+         "is_e2_sum": 2.0, "is_excess_sum": 0.0, "is_clipped": 0.0, "is_nonfinite": 0.0, "is_old_tok": 0.0,
+         "train_gen_lp_tokens": 6.0, "train_gen_lp_inexact_tokens": 0.0, "train_gen_lp_abs_diff_max": 0.0}
+    st.check_train_lp(dict(m), 2)
+    with pytest.raises(RuntimeError, match="weighted 4 rows, the step trained 2"):
+        st.check_train_lp(dict(m, is_rows=4.0), 2)  # a TP / CP duplicate
+    cp = dict(full, policy={"generation": {"max_new_tokens": 64}, "megatron_cfg": {"context_parallel_size": 2}})
+    assert any("context_parallel_size" in x for x in isspr.estimator_problems(cp))
+    grp = dict(cp, async_rl={"sampler": {"max_lookahead_versions": 1}})  # auto at K 1: group, no row weights
+    assert not any("context_parallel_size" in x for x in isspr.estimator_problems(grp))

@@ -37,8 +37,29 @@ Rule.
      rows share one engine, so a row's pause point depends on its siblings' lengths, and the siblings' version mix on
      the row's content; then even RLOO keeps a timing-coupling cross term (sized in test_isspr's coupled enumeration).
      Both units' ESS / var and every s_r are logged in either mode.
+   - ``weight: auto`` (IS-RLOO, user 11-06): group at lag K <= 1, row at lag K >= 2 (EARLY_LATE.md: the group product's
+     ESS falls to 0.2-0.57 with 4-26 % clip mass from K = 2; row weights hold to K = 2-3). See "IS-RLOO" below.
    Either way minus the clip's share, E_q[(e^s - C)^+ f], estimated without bias by eps_hat = mean (e^s - C)^+ and
    logged every step with mean / var of s and the ESS. Not exact in law.
+IS-RLOO (``weight: row`` or ``auto``; FIRSTPRINCIPLES_C §3.2; tests/unit/test_isspr_rloo.py). Row weights are exact
+only for a statistic whose dependence on row r's content is through its own score with a baseline that does not involve
+Y_r, and only if that score has mean 0 under p. The validator therefore pins the objective whenever row weights can be
+used (``row``, ``auto``):
+   - advantage A_r = R_r - mean_{j != r} R_j (RLOO: grpo.adv_estimator use_leave_one_out_baseline true,
+     normalize_rewards false). GRPO's std is DROPPED, not replaced by the leave-one-out std: 1 / std_{-r} is a function
+     of the siblings, which the row weight leaves at q's law, so with it E_q[w_r f_r] = sum_x E_q[1 / std_{-r}] grad J_x
+     against on-policy's E_p[1 / std_{-r}]: a per-prompt scale bias of O(dp) (2-5 % at p = 0.05-0.1 for dp = 0.01),
+     and no estimand is exactly the on-policy one. Without std the estimator is G grad J / L_c exactly.
+   - constant length normalizer (``length_normalizer: constant``): row r's loss is sum_t (...) / L_c with
+     L_c = policy.generation.max_new_tokens, a constant. The per-row token mean (token_level_loss false) divides by
+     l_r, a function of Y_r: then h_r = score_r / l_r has E_p[h_r] != 0 and the baseline term leaves
+     (E_q[mean_{-r} R] - E_p[mean_{-r} R]) E_p[h_r], an O(dp) bias. Implemented without a loss change: the loss keeps
+     the per-row token mean and the ``is_weight`` column carries w_r * l_r / L_c (``train_coefficients``); l_r is the
+     row's trained token count. The weight log (ESS, var, eps_hat) is of w alone.
+   With K = 1 under ``auto`` the group weight is used with the same objective (the group product is exact for it).
+   Residual (R1, REVIEW batch 20): rows of a group share one engine, so a row's pause point can depend on its siblings'
+   content; then E_q[w_r f_r] keeps a timing-coupling cross term (test_isspr's coupled enumeration: 0.038 vs max |grad|
+   1.18), which the group weight does not have. Its size at Nano is being simulated (CPU); dp_hat is logged.
 Conditions (validated): q is the sampling law (temperature 1, one token per step), ghat is group-local (a
 shard-invariant advantage estimator), the loss is a sum of row terms (constant normalizer, ratio forced to 1, no KL).
 
@@ -46,6 +67,16 @@ What the checks cover: p (every trained token's log-prob is theta_target's) is c
 every step and by the CHECKS rescore audit. q is the engine's decode log-prob of the sampled token, the same value the
 exact-SPR T1 / P1 checks pin to the engine prefill and the learner bitwise; no IS-SPR check recomputes q under the
 version that sampled it (that version's weights are gone after the wake).
+
+Row weights from the learner (11-06, lead-approved; next/isspr-learner-s.md). With the row unit, s_r needs no engine
+rescore: the learner's training forward at theta_target computes log p_target of every trained token, bitwise the
+engine's under batch invariance, and w_r = min(C, e^{s_r}) depends on row r alone, so the loss forms it from its own
+detached log-probs (``is_old_tokens``; loss_functions.py). The engine then re-prefills only rows that continue (their
+KV / SSM state, a plain resume with no check); a row that finished under older weights is not touched again, and its
+generation log-probs stay q. The learner sentinel covers the tokens sampled under theta_target (each row's suffix after
+its ``old_tokens``, from the version labels and the engine's per-request wake marks, WAKE_AT_ATTR), so the stale-KV
+negative still fails there. The group unit (K <= 1 under auto) keeps the engine rescore: W_g needs every row of the
+group before any row's weighted loss.
 """
 
 from __future__ import annotations
@@ -60,6 +91,8 @@ from thundersync_rl import xspr
 
 MODE = "isspr"
 IS_WEIGHT_FIELD = "is_weight"
+IS_OLD_FIELD = "is_old_tokens"  # learner s: each row's leading tokens not sampled under the trained weights
+IS_AUDIT_FIELD = "is_audit_logprobs"  # learner s, CHECKS: the engine's from-scratch rescore of every token
 NEG_STALE_KV = "isspr_stale_kv"  # no wake cut / rescore: paused rows resume on stale state, generation lps = q
 NEG_STALE_CACHE = "isspr_stale_cache"  # rescore requests hit the previous weight epoch's prefix-cache KV
 NEG_NO_PREFILL_CUT = "isspr_no_prefill_cut"  # the wake cut skips requests part-way through a chunked prefill
@@ -75,9 +108,13 @@ class IsSprConfig:
 
     mode: Literal["isspr"] = MODE
     seed_stream: str = "isspr"
-    # The importance-weighted unit: "group" (W_g = min(C, e^{s_g}); the approved estimator: the on-policy GRPO
-    # gradient up to the logged clip) or "row" (RIS, opt-in: w_r = min(C, e^{s_r}); estimand in the module docstring).
-    weight: Literal["row", "group"] = "group"
+    # The importance-weighted unit: "group" (W_g = min(C, e^{s_g}); the on-policy gradient of any group statistic up to
+    # the logged clip), "row" (IS-RLOO: w_r = min(C, e^{s_r}) with the RLOO objective the validator pins) or "auto"
+    # (IS-RLOO at lag K: group at K <= 1, row at K >= 2, same objective). Module docstring.
+    weight: Literal["row", "group", "auto"] = "group"
+    # Row loss normalizer: "row" (stock per-row token mean, 1 / l_r) or "constant" (1 / L_c, L_c =
+    # policy.generation.max_new_tokens; folded into the is_weight column). Row weights require "constant".
+    length_normalizer: Literal["row", "constant"] = "row"
     # The clip C (TAIL_FLOOR §5.5: 5).
     clip_c: float = 5.0
     # Rescore positions whose logits exist at once (each [V] fp32).
@@ -93,20 +130,35 @@ class IsSprConfig:
     crossfade_off_reason: Optional[str] = None
     # Exact SPR's fork dump (XsprStage reads it at init): IS-SPR keeps every token, so it has no forks. Not a key.
     row_dump_dir: ClassVar[None] = None
+    # Resolved from the rest of the config by from_config (not keys): the sampler's lag K and L_c.
+    lag: int = field(default=0, init=False)
+    max_new_tokens: int = field(default=0, init=False)
+
+    @property
+    def unit(self) -> str:
+        """The weighted unit actually used: ``auto`` resolves to group at lag <= 1 and row at lag >= 2."""
+        if self.weight == "auto":
+            return "row" if self.lag >= 2 else "group"
+        return self.weight
 
     @classmethod
     def from_config(cls, config: Any) -> "IsSprConfig":
         block = xspr._get(config, "thundersync") or {}
         block = dict(block)
-        known = {f.name for f in fields(cls)}
+        known = {f.name for f in fields(cls) if f.init}
         unknown = sorted(set(block) - known)
         if unknown:
             raise ValueError(f"thundersync (mode=isspr): unknown keys {unknown} (known: {sorted(known)})")
         out = cls(**block)
         if out.mode != MODE:
             raise ValueError(f"thundersync.mode must be {MODE!r} (got {out.mode!r})")
-        if out.weight not in ("row", "group"):
-            raise ValueError(f"thundersync.weight must be 'row' or 'group' (got {out.weight!r})")
+        if out.weight not in ("row", "group", "auto"):
+            raise ValueError(f"thundersync.weight must be 'row', 'group' or 'auto' (got {out.weight!r})")
+        if out.length_normalizer not in ("row", "constant"):
+            raise ValueError(
+                f"thundersync.length_normalizer must be 'row' or 'constant' (got {out.length_normalizer!r})")
+        out.lag = _lag(config)
+        out.max_new_tokens = int(xspr._get(config, "policy.generation.max_new_tokens", 0) or 0)
         if not float(out.clip_c) > 1.0:
             raise ValueError("thundersync.clip_c must be > 1")
         if int(out.check_chunk_rows) < 1:
@@ -128,6 +180,7 @@ def config_problems(config: Any) -> list[str]:
         p.append("loss_fn.truncated_importance_sampling_ratio must be null (W_g is the only off-policy weight)")
     if xspr._get(config, "grpo.overlong_filtering", False):
         p.append("grpo.overlong_filtering must be false (a dropped row changes the group statistic)")
+    p += estimator_problems(config)
     gen = xspr._get(config, "policy.generation") or {}
     if float(xspr._get(gen, "temperature", 1.0)) != 1.0:
         p.append("policy.generation.temperature must be 1 (q and p are raw log-probs: the law the engine samples from "
@@ -138,6 +191,59 @@ def config_problems(config: Any) -> list[str]:
     return p
 
 
+def _lag(config: Any) -> int:
+    return int(xspr._get(config, "async_rl.sampler.max_lookahead_versions", 0) or 0)
+
+
+def estimator_problems(config: Any) -> list[str]:
+    """IS-RLOO's objective (module docstring): with row weights possible (weight row / auto) the advantage is RLOO
+    (LOO mean, no std) and the row normalizer is a constant; a constant normalizer needs L_c."""
+    ts = xspr._get(config, "thundersync") or {}
+    weight = xspr._get(ts, "weight", "group")
+    norm = xspr._get(ts, "length_normalizer", "row")
+    p: list[str] = []
+    if weight in ("row", "auto"):
+        why = f"thundersync.weight {weight} (row weights are exact only for RLOO with a constant normalizer)"
+        adv = xspr._get(config, "grpo.adv_estimator") or {}
+        name = xspr._get(adv, "name", "grpo")
+        if name != "grpo":
+            p.append(f"grpo.adv_estimator.name must be grpo (got {name!r}): {why}")
+        # the estimator reads only this block (AdvEstimatorConfig defaults: both true), never the flat grpo.* keys
+        loo = xspr._get(adv, "use_leave_one_out_baseline", True)
+        std = xspr._get(adv, "normalize_rewards", True)
+        if not loo:
+            p.append(f"grpo.adv_estimator.use_leave_one_out_baseline must be true: {why}")
+        if std:
+            p.append(f"grpo.adv_estimator.normalize_rewards must be false (GRPO's std dropped): {why}")
+        if norm != "constant":
+            p.append(f"thundersync.length_normalizer must be constant: {why}")
+    row_unit = weight == "row" or (weight == "auto" and _lag(config) >= 2)
+    cp = int(xspr._get(config, "policy.megatron_cfg.context_parallel_size", 1) or 1)
+    if row_unit and cp > 1:
+        # Row weights are formed in the loss from each row's log-probs (loss_functions.is_row_weights): the
+        # Megatron loss path all-gathers them over CP (full rows on every rank), but no CP = 2 run has shown s_r
+        # bitwise equal to CP = 1 yet (REVIEW batch 50 L1).
+        p.append(f"row weights (thundersync.weight {weight}) need policy.megatron_cfg.context_parallel_size 1 "
+                 f"(got {cp}) until a CP = 2 run shows the learner's s_r bitwise equal to CP = 1")
+    if norm == "constant" and int(xspr._get(config, "policy.generation.max_new_tokens", 0) or 0) <= 0:
+        p.append("policy.generation.max_new_tokens must be set (> 0): it is L_c of length_normalizer constant")
+    return p
+
+
+def train_coefficients(w: Sequence[float], lengths: Sequence[int], cfg: "IsSprConfig") -> list[float]:
+    """The is_weight column: the clipped weight w_r of each trained row, times l_r / L_c under the constant normalizer
+    (the loss divides row r by its token count l_r; this turns it into 1 / L_c). l_r must be in [1, L_c]."""
+    if len(w) != len(lengths):
+        raise RuntimeError(f"[isspr] {len(w)} weights for {len(lengths)} rows")
+    if cfg.length_normalizer == "row":
+        return [float(x) for x in w]
+    lc = int(cfg.max_new_tokens)
+    bad = [n for n in lengths if not 1 <= int(n) <= lc]
+    if bad:
+        raise RuntimeError(f"[isspr] trained token counts {bad[:5]} outside [1, L_c = {lc}]")
+    return [float(x) * int(n) / lc for x, n in zip(w, lengths)]
+
+
 def require_group_local(advantage_stage_config: Any) -> None:
     """W_g is unbiased for a statistic of group g's rows only: the advantage estimator must be group-local
     (shard-invariant, as the stage's sharding rule decides); a batch-level normalization or a cross-group baseline
@@ -145,6 +251,18 @@ def require_group_local(advantage_stage_config: Any) -> None:
     if advantage_stage_config.is_ppo or not advantage_stage_config.shardable:
         raise RuntimeError(f"[isspr] the advantage estimator {advantage_stage_config.algo.adv_estimator.name!r} is not "
                            "group-local (needs a shard-invariant GRPO estimator)")
+
+
+def require_rloo(advantage_stage_config: Any, cfg: "IsSprConfig") -> None:
+    """Row weights (weight row / auto) are exact only for RLOO: check the estimator the advantage stage was built
+    from (the resolved AdvEstimatorConfig), not the YAML the validator saw."""
+    if cfg.weight == "group":
+        return
+    est = advantage_stage_config.algo.adv_estimator
+    if est.name != "grpo" or est.normalize_rewards or not est.use_leave_one_out_baseline:
+        raise RuntimeError(f"[isspr] weight {cfg.weight} needs the RLOO advantage; the advantage stage runs {est.name!r} "
+                           f"with normalize_rewards={est.normalize_rewards} "
+                           f"use_leave_one_out_baseline={est.use_leave_one_out_baseline}")
 
 
 def validate_config(config: Any) -> IsSprConfig:
@@ -162,9 +280,14 @@ def configure_driver(config: dict) -> IsSprConfig:
     cfg = validate_config(config)
     nolanes.derive_layout_fields(config)
     xspr.configure_worker(config, cfg)
+    if cfg.unit == "row":
+        # Row weights from the learner's forward (module docstring; loss_functions.is_row_weights).
+        config.setdefault("loss_fn", {})["is_row_clip"] = float(cfg.clip_c)
     neg = nolanes.negative()
     lag = int(xspr._get(config, "async_rl.sampler.max_lookahead_versions", 0) or 0)
-    print(f"[isspr] mode=isspr lag={lag} weight={cfg.weight} clip_c={cfg.clip_c} crossfade_m={cfg.crossfade_routing_m} "
+    print(f"[isspr] mode=isspr lag={lag} weight={cfg.weight} unit={cfg.unit} length_normalizer={cfg.length_normalizer} "
+          f"L_c={cfg.max_new_tokens} clip_c={cfg.clip_c} s={'learner' if cfg.unit == 'row' else 'engine'} "
+          f"crossfade_m={cfg.crossfade_routing_m} "
           f"check_chunk_rows={cfg.check_chunk_rows} "
           f"checks={int(nolanes.checks_on())}" + (f" MUTATION {neg}" if neg else ""), flush=True)
     return cfg
@@ -187,7 +310,11 @@ def row_log_ratio(p: Sequence[float], q: Sequence[float]) -> float:
 
 
 def clipped_weights(s: Sequence[float], clip_c: float) -> list[float]:
-    """min(C, exp(s)) of each log ratio."""
+    """min(C, exp(s)) of each log ratio. A non-finite s raises (min(NaN, 700) is NaN's first argument: it would map
+    to C silently)."""
+    bad = [x for x in s if not math.isfinite(float(x))]
+    if bad:
+        raise RuntimeError(f"[isspr] non-finite log ratio {bad[0]!r} ({len(bad)} of {len(s)})")
     return [min(float(clip_c), math.exp(min(float(x), 700.0))) for x in s]
 
 
@@ -279,11 +406,31 @@ class IsCert:
     first_version: int = -1  # version label of the row's first request: its oldest tokens are at most this old
     log_ratios: Any = field(default=None, repr=False)  # float64 [rescored_tokens]: p - q of the rescored tokens
     prefill_tokens: int = 0  # rescore + resume prefill tokens over the row's life
+    only_tokens: int = 0  # tokens re-prefilled only to rescore a finished row ("only" checks)
+    resume_tokens: int = 0  # tokens re-prefilled to resume a cut row (its KV / SSM state)
+    old_tokens: int = 0  # leading tokens not sampled under theta_target (learner s: outside the sentinel)
+
+
+def _old_after(old: int, start: int, end: int, label: int, info: dict, target: int) -> int:
+    """The row's leading tokens not sampled under theta_target after a segment that sampled tokens [start, end) from
+    version ``label`` (conservative: at most the version that ran it). The engine marked the segment's generated
+    count at every wake it was in flight across (``wake_at``; one version per wake): tokens after the last mark are
+    version label + marks'. A segment that ends below theta_target leaves every token so far old."""
+    marks = info.get("wake_at") or []
+    last = int(label) + len(marks)
+    if last > int(target):
+        raise RuntimeError(f"[isspr] a segment of a batch-{target} row ran under version {last}")
+    if last < int(target):
+        return end
+    return max(old, start + max(marks)) if marks else old
 
 
 class IsRows(xspr.ExactRows):
     """The row loop of IS-SPR (AsyncRolloutImpl._run_single_rollout calls ``respond`` for each row). Exact SPR's
     engine primitives (``_segment``: decode / rescore requests with the row's key), without its keyed check."""
+
+    # Row unit: s_r from the learner's forward (module docstring); set by the stage from IsSprConfig.unit.
+    learner_s = False
 
     async def respond(self, impl, message_log, stop_strings, native, input_sample, traj_idx: int):
         """One row of batch ``target``, its log-probs theta_target's, its s recorded for the group weight."""
@@ -305,11 +452,14 @@ class IsRows(xspr.ExactRows):
         tokens = [int(t) for t in msg["token_ids"].tolist()]
         q = [float(x) for x in msg["generation_logprobs"].tolist()]
         p = list(q)
+        old = _old_after(0, 0, len(tokens), label, info, target)
         self.ledger.draw(key, 0, len(tokens))
         cut = bool(info["cut"])
         stale = self.neg == NEG_STALE_KV
         while (cut or label != target) and not stale:
             if not cut:
+                if self.learner_s:
+                    break  # finished under older weights: its log p_target come from the learner's forward
                 # Finished under older weights (D1): rescored once theta_target is installed.
                 await self.wait_version(target)
             n = len(tokens)
@@ -317,19 +467,25 @@ class IsRows(xspr.ExactRows):
                 label = target  # nothing sampled before the wake
                 continue
             # One request: a cut row is rescored and resumed by the same prefill (its state is then the new
-            # weights'); a finished row is only rescored. A row cut before its first token just decodes.
-            mode = (RESCORE_RESUME if cut else "only") if n else ""
+            # weights'); a finished row is only rescored. A row cut before its first token just decodes. Learner s:
+            # a cut row is resumed by a plain prefill (no check: its s is the learner's).
+            mode = "" if self.learner_s else (RESCORE_RESUME if cut else "only") if n else ""
             res, in_len, metrics, info, checked = await self._segment(impl, message_log, native, key, tokens, p,
                                                                         check=mode)
-            if n and info["check"] is None:
+            if mode and n and info["check"] is None:
                 continue  # cut mid-prefill by a wake (chunked prefill): nothing rescored, redone under the new weights
             label = checked
             if n:
-                p = [float(x) for x in info["check"]["lps"]]
-                if len(p) != n:
-                    raise RuntimeError(f"[isspr] rescore of key {key}: {len(p)} log-probs for {n} tokens")
-                cert.rescores += 1
-                cert.rescored_tokens = n
+                if mode:
+                    p = [float(x) for x in info["check"]["lps"]]
+                    if len(p) != n:
+                        raise RuntimeError(f"[isspr] rescore of key {key}: {len(p)} log-probs for {n} tokens")
+                    cert.rescores += 1
+                    cert.rescored_tokens = n
+                if cut:
+                    cert.resume_tokens += n
+                else:
+                    cert.only_tokens += n
                 cert.prefill_tokens += int(in_len) + n
             if not cut:
                 continue
@@ -340,15 +496,30 @@ class IsRows(xspr.ExactRows):
             new_lps = [float(x) for x in msg["generation_logprobs"].tolist()]
             q += new_lps[n:]
             p += new_lps[n:]
+            old = _old_after(old, n, len(new), label, info, target)
             self.ledger.draw(key, n, len(new))
             tokens = new
             cut = bool(info["cut"])
         self.ledger.close(key)
+        cert.old_tokens = old
+        if self.learner_s:
+            # q stays the row's generation log-probs; s_r, w_r and their log are the learner's (loss metrics).
+            cert.version, cert.tokens, cert.s = int(target), len(tokens), float("nan")
+            self.certs[(int(target), idx, int(traj_idx))] = cert
+            out = dict(msg)
+            out["token_ids"] = torch.tensor(tokens, dtype=msg["token_ids"].dtype)
+            out["generation_logprobs"] = torch.tensor(q, dtype=torch.float32)
+            out["content"] = impl._tokenizer.decode(out["token_ids"], skip_special_tokens=True)
+            return out, in_len, metrics
         try:
             cert.s = row_log_ratio(p, q)
         except RuntimeError as e:
+            path = self.dump_row(key, "nonfinite_ratio",
+                                 [int(t) for m in message_log for t in m["token_ids"]], tokens, {"p": p, "q": q},
+                                 target=int(target), prompt_idx=str(idx), sample=int(traj_idx))
             raise RuntimeError(f"{e}; row key {key}, target {target}, prompt {idx}, sample {traj_idx}, "
-                               f"{cert.rescored_tokens} rescored tokens, {cert.rescores} rescores") from e
+                               f"{cert.rescored_tokens} rescored tokens, {cert.rescores} rescores; row dumped to "
+                               f"{path or '(no dump dir)'}") from e
         cert.log_ratios = np.asarray(p[: cert.rescored_tokens], dtype=np.float64) - np.asarray(
             q[: cert.rescored_tokens], dtype=np.float64)
         cert.version, cert.tokens = int(label), len(tokens)

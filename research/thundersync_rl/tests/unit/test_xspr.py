@@ -56,8 +56,9 @@ def log_softmax(z: np.ndarray) -> np.ndarray:
 
 class World:
     """A toy keyed engine: token at absolute position p of row key k = argmax(logits_v(context) + g(k, p)), with v
-    the version installed when it is decoded. ``wakes`` {tick: version}: at that decode tick the version moves and
-    every in-flight request that has decoded a token is cut (as the engine's wake cut)."""
+    the version installed when it is decoded. ``wakes`` {tick: version}: at that decode tick the version moves, every
+    in-flight request gets its generated count appended to its wake marks (xspr_engine.mark_wake) and, with ``cut``,
+    every one that has decoded a token is cut (as the engine's wake cut)."""
 
     def __init__(self, logits=drift_logits, wakes=None, cap=12, cut=True):
         self.logits = logits
@@ -75,6 +76,7 @@ class World:
         if self.tick in self.wakes:
             self.version = self.wakes[self.tick]
             for r in self.inflight:
+                r.wake_at.append(r.gen)
                 if r.touched and self.cut:
                     r.cut = True
 
@@ -108,7 +110,7 @@ class FakeImpl:
         data = forced["generation_data"]
         key = int(data["xspr_key"])
         check = None
-        req = SimpleNamespace(cut=False, touched=False)
+        req = SimpleNamespace(cut=False, touched=False, wake_at=[], gen=0)
         w.inflight.append(req)
         out, lps = list(prefix), list(plps)
         try:
@@ -138,12 +140,13 @@ class FakeImpl:
                 t, lp = w.sample(w.version, prompt + out, key)
                 out.append(t), lps.append(lp)
                 req.touched = True
+                req.gen += 1
                 if t == EOS:
                     break
         finally:
             w.inflight = [r for r in w.inflight if r is not req]  # by identity (namespaces compare by value)
         msg = self._msg(out, lps)
-        msg["xspr"] = {"cut": int(req.cut), "check": check}
+        msg["xspr"] = {"cut": int(req.cut), "check": check, "wake_at": list(req.wake_at)}
         return msg, torch.tensor([len(prompt)]), {}
 
     @staticmethod
@@ -748,6 +751,43 @@ def test_engine_thread_failures_are_recorded_then_raised():
     raise_failure(None)
     record_failure(xs, RuntimeError("first"))
     record_failure(xs, RuntimeError("second"))  # the first failure is the one reported
-    with pytest.raises(RuntimeError, match="^first$"):
+    with pytest.raises(RuntimeError, match="^RuntimeError: first$"):
+        raise_failure(xs)
+    xs = {}
+    record_failure(xs, IndexError("list index out of range"))  # any exception type, named in the report
+    with pytest.raises(RuntimeError, match="^IndexError: list index out of range$"):
         raise_failure(xs)
 
+
+
+def test_nonfinite_row_is_dumped_for_replay():
+    import json
+    import tempfile
+
+    from nemo_rl.experience.rollout_manager import ROLLOUT_TARGET_STEP
+
+    def nan_late(v, ctx):  # the law turns NaN once the context reaches 6 tokens
+        z = drift_logits(v, ctx)
+        return z * np.nan if len(ctx) >= 6 else z
+
+    world = World(logits=nan_late)
+    rows = xspr.ExactRows(seed=7, stream="t", max_new_tokens=world.cap, version_fn=lambda: world.version)
+    rows.dump_dir = tempfile.mkdtemp()
+    impl = FakeImpl(world)
+
+    async def drive():
+        ROLLOUT_TARGET_STEP.set(0)
+        task = asyncio.ensure_future(rows.respond(impl, [{"token_ids": PROMPT}], None, None, {"idx": 11}, 0))
+        while not task.done():
+            await world.step()
+        return task.result()
+
+    try:
+        asyncio.run(drive())
+        raise AssertionError("a non-finite row must raise")
+    except RuntimeError as e:
+        assert "row dumped to" in str(e)
+        path = str(e).split("row dumped to ")[-1].split(")")[0].strip()
+    d = json.loads(open(path).read())
+    assert d["prompt_token_ids"] == PROMPT and d["key"] == rows.key_of(0, 11, 0) and d["key"] in d["open_keys"]
+    assert len(d["token_ids"]) == len(d["logprobs"]["generation"]) and not math.isfinite(d["logprobs"]["generation"][-1])
