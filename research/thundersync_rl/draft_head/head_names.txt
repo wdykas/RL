@@ -1,0 +1,11 @@
+# tree_mtp.MTPHead / Megatron-Core names (HybridModel mtp_num_layers=1 '*-', TP1), bf16
+mtp.layers.0.enorm.weight	(2688,)	torch.bfloat16
+mtp.layers.0.hnorm.weight	(2688,)	torch.bfloat16
+mtp.layers.0.eh_proj.weight	(2688, 5376)	torch.bfloat16
+mtp.layers.0.mtp_model_layer.layers.0.self_attention.linear_qkv.layer_norm_weight	(2688,)	torch.bfloat16
+mtp.layers.0.mtp_model_layer.layers.0.self_attention.linear_qkv.weight	(4608, 2688)	torch.bfloat16
+mtp.layers.0.mtp_model_layer.layers.0.self_attention.linear_proj.weight	(2688, 4096)	torch.bfloat16
+mtp.layers.0.mtp_model_layer.layers.1.mlp.linear_fc1.layer_norm_weight	(2688,)	torch.bfloat16
+mtp.layers.0.mtp_model_layer.layers.1.mlp.linear_fc1.weight	(1856, 2688)	torch.bfloat16
+mtp.layers.0.mtp_model_layer.layers.1.mlp.linear_fc2.weight	(2688, 1856)	torch.bfloat16
+mtp.layers.0.final_layernorm.weight	(2688,)	torch.bfloat16
