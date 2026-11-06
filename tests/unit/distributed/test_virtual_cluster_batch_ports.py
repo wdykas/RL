@@ -150,3 +150,21 @@ class TestRayVirtualClusterBatchPorts:
             ("ref-1", cluster.port_range_low, cluster.port_range_high),
             ("ref-2", cluster.port_range_low, cluster.port_range_high),
         ]
+
+
+def test_refit_store_port_candidates_preferred_first_distinct_in_range():
+    import random
+
+    from nemo_rl.distributed.virtual_cluster import refit_store_port_candidates
+
+    c = refit_store_port_candidates(1400, 1999, 1876, 64, rng=random.Random(0))
+    assert c[0] == 1876
+    assert len(c) == 64 == len(set(c))
+    assert all(1400 <= p < 1999 for p in c)
+    # Out-of-range preference is ignored; attempts are capped by the range size.
+    c = refit_store_port_candidates(1400, 1410, 5000, 64, rng=random.Random(0))
+    assert sorted(c) == list(range(1400, 1410))
+    # Two lanes/processes draw different tails (private OS-seeded RNG).
+    assert refit_store_port_candidates(1400, 1999, None, 16) != (
+        refit_store_port_candidates(1400, 1999, None, 16)
+    )

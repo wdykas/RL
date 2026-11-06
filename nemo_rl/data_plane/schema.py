@@ -203,3 +203,11 @@ def fields_with_optional_opd_full(
     if teacher_index_field is not None and teacher_index_field not in out:
         out.append(teacher_index_field)
     return out
+
+
+# Per-row tag carrying a trajectory-streaming gradient bucket:
+# ``[group_id, reward]`` for rows of a still-open group, None for final rows.
+STREAM_BUCKET_TAG = "stream_bucket"
+# Per-row tag with the trajectory's reward, stamped when trajectories are
+# published individually, so the trainer can bucket rows without a fetch.
+STREAM_REWARD_TAG = "stream_reward"

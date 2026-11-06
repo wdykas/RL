@@ -60,6 +60,10 @@ from nemo_rl.data_plane.interfaces import (
     storage_unit_placement,
 )
 from nemo_rl.distributed.virtual_cluster import _reserve_data_plane_ports
+from nemo_rl.utils.tq_physical_cores import (
+    pin_tq_physical_core_count,
+    pin_tq_storage_unit_core_count,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -505,6 +509,10 @@ def _patch_scalar_field_schema() -> None:
 # without ever running __init__, so import is the earliest point that covers
 # every user of this module.
 _patch_scalar_field_schema()
+# Same reason: every TQ client put / get re-reads the physical core count and
+# crashes on the None psutil returns while the sysfs walk fails (BUGS #13).
+# Storage units are covered in _init_tq.
+pin_tq_physical_core_count()
 
 
 def _patch_mooncake_staging_buffers(max_bytes: int) -> None:
@@ -862,6 +870,10 @@ def _init_tq(
         }
         if storage_unit_node_ids is not None:
             _pin_simple_storage_units(storage_unit_node_ids)
+        # The units run TQ's own class in their own processes, which never
+        # import this adapter: start them from a subclass that fixes the core
+        # count there (BUGS #13).
+        pin_tq_storage_unit_core_count()
         ssd = simple_cfg.ssd_offload
         if ssd.enabled:
             overlay["backend"]["SimpleStorage"]["ssd_offload"] = ssd.model_dump()

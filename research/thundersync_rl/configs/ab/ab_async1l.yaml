@@ -1,0 +1,11 @@
+# Arm "async1l": lanes-k async GRPO (thundersync.async_lanes, async_lanes.py; research/lanesk/README.md),
+# k = 1 on the lanes-k path (one lane = the setup engine): the async1 version schedule (cohort j at theta_{j-1}); the a1 equivalence gate (with THUNDERSYNC_DEBUG_KEYED_FRESH=1 + THUNDERSYNC_STEP_DIGEST=1 it must reproduce arm async1 bitwise: digest/rollouts, digest/params, reward, grad_norm per step).
+# Everything else is arm async1 (defaults below): same learner path, micro-batching, recipe, wide keyed engine
+# sampler, group granularity, loss and token IS correction exp(log pi_theta_k - generation log-prob); only the lag
+# (and the engine split into k lanes: run_ab_arm.sh LANES=1, GEN_GPUS = engine GPUs / 1) differs.
+defaults: ab_async1.yaml
+
+thundersync:
+  rollout_lag: 1
+  async_lanes: true
+  cohort_lanes: 1

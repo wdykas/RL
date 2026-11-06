@@ -1,0 +1,11 @@
+# Arm "async4": lanes-k async GRPO (thundersync.async_lanes, async_lanes.py; research/lanesk/README.md),
+# fixed age 4: lane j % 4 generates batch j + 4 from theta_j (4 engine lanes, one weight version each; the first 4 batches at theta_0).
+# Everything else is arm async1 (defaults below): same learner path, micro-batching, recipe, wide keyed engine
+# sampler, group granularity, loss and token IS correction exp(log pi_theta_k - generation log-prob); only the lag
+# (and the engine split into k lanes: run_ab_arm.sh LANES=4, GEN_GPUS = engine GPUs / 4) differs.
+defaults: ab_async1.yaml
+
+thundersync:
+  rollout_lag: 4
+  async_lanes: true
+  cohort_lanes: 4

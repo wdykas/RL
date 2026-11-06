@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import asyncio
+import concurrent.futures
+from contextlib import nullcontext
 import gc
 import importlib
 import logging
@@ -55,6 +57,8 @@ from megatron.core.resharding.refit import (
     prepare_swap_model_weights,
     swap_model_weights,
 )
+from megatron.core.resharding.transforms import MXFP8ReshardTransform
+from megatron.core.resharding.utils import get_refit_tensor_dict
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.cuda_graph_config import (
     normalize_inference_cuda_graph_scope,
@@ -90,17 +94,25 @@ from nemo_rl.models.generation.megatron.config import (
     MultimodalPromptConfigOverrides,
     resolve_refit_execution_batch_bytes,
 )
+from nemo_rl.models.generation.megatron.progress import (
+    GenerationProgressMonitor,
+    with_generated_token_counter,
+)
 from nemo_rl.models.generation.megatron.utils import (
     build_image_preprocessing_config,
     build_prompt_and_multimodal_data,
     build_video_preprocessing_config,
     log_gpu_memory,
+    resolve_mamba_conv_states_dtype,
     resolve_torch_dtype,
     sample_vision_tensors,
 )
 from nemo_rl.models.megatron.memory_saver import (
     HAVE_TORCH_MEMORY_SAVER,
+    WEIGHT_OFFLOAD_STATS,
+    pause_engine_scratch,
     pause_inference_weights,
+    resume_engine_scratch,
     resume_inference_weights,
 )
 from nemo_rl.models.megatron.zero_train_gen_mismatch import (
@@ -119,6 +131,85 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
 )
 
 
+class Fp16HeldWeightReceive(MXFP8ReshardTransform):
+    """Native MCore refit into engine weights held in fp16 (receiver-side cast).
+
+    Under the fp16 GEMM recipe the engine holds its dense GEMM weights
+    (``fp16_gemm.hold_fp16_weights``) and expert weights (``fp16_moe``) in fp16,
+    while the learner's parameters, and therefore the plan's wire dtype, are bf16
+    (the plan is built at ``init_collective``, before the engine converts). fp16
+    and bf16 have the same width, so a direct receive into the fp16 storage would
+    reinterpret the bits silently. Every tensor whose current dtype is fp16 is
+    received into a bf16 buffer instead and written with ``copy_``: the same
+    bf16 -> fp16 rounding the packed collective refit's ``copy_`` applies, so the
+    engine ends with bitwise the same weights. Other tensors keep the direct
+    receive. Receiver-only: the sender transmits bf16 with no transform.
+
+    Subclasses ``MXFP8ReshardTransform`` only because ``NCCLM2NCopyService``
+    accepts that type for receiver-side conversion; no MXFP8 state is used.
+    """
+
+    def __init__(self, core: torch.nn.Module):
+        # No super().__init__: it validates MXFP8 persistent buffers.
+        self.core = core
+        self.convertible_params: set[str] = set()
+        self.persistent_buffers: dict = {}
+        self.buffer_key_prefix = ""
+        self.convert_on_send = False
+        self.backend = None
+        self._pending_1d: dict = {}
+
+    @property
+    def tensors(self) -> dict[str, torch.Tensor]:
+        # The refit executor's own name -> tensor map of the destination model
+        # (cached on the module; rebuilt when MCore replaces a buffer).
+        return get_refit_tensor_dict(self.core)
+
+    def should_transform(self, param_name: str) -> bool:
+        from nemo_rl.models.megatron.fp16_moe import FP16_EXPERT_ATTR
+
+        tensor = self.tensors.get(param_name)
+        # fp16 expert parameters (fp16_expert_params) are fp16 on both sides when the plan is
+        # built: the wire is fp16 and the receive is direct.
+        return (
+            tensor is not None
+            and tensor.dtype == torch.float16
+            and not getattr(tensor, FP16_EXPERT_ATTR, False)
+        )
+
+    def prepare_send(self, param_name, src_slice, src_param):
+        raise RuntimeError("Fp16HeldWeightReceive is a receiver-side transform")
+
+    def prepare_recv(self, param_name, dst_slice):
+        dst = self.tensors[param_name].data[dst_slice]
+        return [torch.empty(dst.shape, dtype=torch.bfloat16, device=dst.device)]
+
+    def finalize_recv(self, param_name, dst_slice, recv_buffers):
+        dst = self.tensors[param_name].data[dst_slice]
+        with torch.inference_mode() if dst.is_inference() else torch.no_grad():
+            dst.copy_(recv_buffers[0])
+
+
+class Fp16HeldLocalReshard(Fp16HeldWeightReceive):
+    """``Fp16HeldWeightReceive`` for the colocated wake reshard (sender and receiver in one process).
+
+    The colocated dedicated inference model holds its dense GEMM weights in fp16 (``_prepare_engine_numerics``)
+    from its first engine initialization on, so every later wake reshards bf16 training parameters into fp16
+    storage. MCore asks the transform about both sides of every op by parameter name, so the SEND of a tensor
+    the receiver holds in fp16 also lands here: it sends the training parameter's bf16 slice unchanged (what the
+    untransformed send does), and the receive stages bf16 and writes it with ``copy_`` (the RN cast the per-call
+    cast applies). Port of ts-syncuni c7f370c2 (su-l8b: the receiver-only class raised on the second wake).
+    """
+
+    def prepare_send(self, param_name, src_slice, src_param):
+        return [src_param.data[src_slice]]
+
+
+def _refit_core(model: Any) -> torch.nn.Module:
+    """The module MCore's refit walks (``refit._unwrap_model_cores``)."""
+    return unwrap_model(model[0] if isinstance(model, (list, tuple)) else model)
+
+
 def _inference_optimized_transformer_layer_spec(config: Any) -> Any:
     """Build the generic GPT layer spec backed by MCore inference linears."""
     return get_gpt_layer_with_inference_spec(
@@ -131,6 +222,79 @@ def _inference_optimized_transformer_layer_spec(config: Any) -> Any:
             config, "moe_use_legacy_grouped_gemm", False
         ),
     )
+
+
+def _pin_rotary_tables(lang_module: Any) -> None:
+    """Memoize ``lang_module.rotary_pos_emb.forward`` per module, without eviction.
+
+    ``RotaryEmbedding.forward`` is an ``lru_cache(maxsize=32)`` shared by every
+    instance in the process. Inference CUDA graphs bake in the address of the
+    cached RoPE table, so an eviction (any other model's RoPE calls) or a
+    ``cache_clear()`` frees memory the graphs keep reading, and later
+    allocations overwrite it (wrong logits, eventually NaN). The per-instance
+    memo keeps every table alive as long as the module; it has no
+    ``cache_parameters``, so the ``cache_clear()`` sites below skip it.
+    """
+    import types
+
+    rope = getattr(lang_module, "rotary_pos_emb", None)
+    forward = getattr(rope, "forward", None)
+    if rope is None or not hasattr(forward, "cache_parameters"):
+        return
+    # Megatron-LM #8358 (graph-owned capture constants): forward is no longer an lru_cache; it keeps a
+    # class-level cache and hands the tables a graph captures to that graph, which keeps them alive until
+    # it is destroyed. ``cache_parameters`` / ``cache_clear`` remain as compatibility attributes only, and
+    # there is nothing to pin.
+    compute = getattr(type(rope).forward, "__wrapped__", None)
+    if compute is None:
+        return
+    tables: dict[tuple, Any] = {}
+
+    def pinned_forward(self, max_seq_len, offset=0, packed_seq=False, cp_group=None):
+        key = (max_seq_len, offset, packed_seq, cp_group)
+        if key not in tables:
+            tables[key] = compute(self, max_seq_len, offset, packed_seq, cp_group)
+        return tables[key]
+
+    rope.forward = types.MethodType(pinned_forward, rope)
+
+
+def install_engine_latency_levers(engine_model: Any, engine_only: bool = True) -> dict[str, bool]:
+    """Engine-only decode-latency levers (research/engine_latency; every one bitwise today's engine, default off).
+
+    - ``NEMO_RL_ENGINE_SYMM_TP=1``: one-shot ordered TP reduce-scatter / all-gather over symmetric memory for the
+      fp16-GEMM forward's sequence-parallel row collectives (``engine_symm_tp``).
+    - ``NEMO_RL_ENGINE_FAST_LOGSOFTMAX=1``: multi-program batch-invariant log-softmax (``engine_fast_ops``), the
+      engine's raw log-probs.
+    Call before the inference context captures its CUDA graphs.
+    """
+    from megatron.core.utils import get_attr_wrapped_model
+
+    from nemo_rl.models.megatron import engine_fast_ops, engine_symm_tp, fp16_gemm
+
+    out = {"symm_tp": False, "fast_logsoftmax": False}
+    wanted = engine_symm_tp.enabled_by_env() or engine_fast_ops.fast_logsoftmax_by_env()
+    if wanted and not engine_only:
+        # Both levers patch process-wide functions: a learner process (colocated engine) would route its own
+        # forwards through them. Engine processes only (R27 review).
+        raise RuntimeError(
+            "NEMO_RL_ENGINE_SYMM_TP / NEMO_RL_ENGINE_FAST_LOGSOFTMAX are engine-only levers; this generation engine "
+            "shares its process with the learner (colocated)"
+        )
+    if engine_symm_tp.enabled_by_env() and fp16_gemm.enabled():
+        pg = get_attr_wrapped_model(engine_model, "pg_collection", allow_none=True)
+        group = getattr(pg, "tp", None) if pg is not None else None
+        if group is None:
+            from megatron.core import parallel_state
+
+            group = parallel_state.get_tensor_model_parallel_group()
+        out["symm_tp"] = fp16_gemm.enable_engine_symm_tp(group)
+        if out["symm_tp"]:
+            # Double-buffered staging: each model forward restarts the region parities (engine_symm_tp docstring).
+            engine_symm_tp.register_forward_start(engine_model)
+    if engine_fast_ops.fast_logsoftmax_by_env():
+        out["fast_logsoftmax"] = engine_fast_ops.install_fast_logsoftmax()
+    return out
 
 
 def _configure_inference_optimized_layer_spec(model_provider: Any) -> None:
@@ -269,11 +433,25 @@ def _apply_optional_inference_config_kwargs(
     }
     cast_fields = {
         "cuda_graph_max_tokens": int,
+        # Prefill/mixed CUDA graphs up to max_tokens (exponential sizes) instead of
+        # cuda_graph_max_tokens: removes the eager prefill-step floor (engine-side
+        # verification's small piece prefills, restart prefills).
+        "cuda_graph_all_prefills": bool,
+        "cuda_graph_mixed_prefill_count": int,
         "vision_embedding_cache_max_bytes": int,
         "allow_stale_multimodal_embeddings": bool,
         "prefix_cache_ttl_seconds": float,
         "prefix_caching_routing_alpha": float,
+        # Hybrid models: share of buffer_size_gb for Mamba states (per-request SSM /
+        # conv state + batch-invariant replay buffers). The default (0.1) admits only
+        # ~8 requests per rank at full Nemotron-3-Nano with a 10 GB buffer.
+        "mamba_memory_ratio": float,
         "logging_step_interval": int,
+        # Lookup (n-gram) speculative decoding; forwarded only when set, so
+        # Megatron versions without it are unaffected.
+        "speculative_method": str,
+        "lookup_ngram_max": int,
+        "lookup_ngram_min": int,
     }
     for key, enum_type in enum_fields.items():
         if key in mcore_generation_config:
@@ -299,6 +477,11 @@ def _apply_inference_cuda_graph_scope(
 
 if TYPE_CHECKING:
     from nemo_rl.data_plane.interfaces import DataPlaneConfig
+
+
+# How often a caller waiting on generation checks that the engine loop is still alive
+# (source: rl-determinism 90e78222). A dead engine loop never resolves pending requests.
+_ENGINE_LIVENESS_POLL_S = 5.0
 
 
 class MegatronGenerationMixin:
@@ -609,13 +792,11 @@ class MegatronGenerationMixin:
                 mamba_inference_state_config.ssm_states_dtype = resolve_torch_dtype(
                     mcore_generation_config["mamba_inference_ssm_states_dtype"]
                 )
-            if (
-                mcore_generation_config.get("mamba_inference_conv_states_dtype")
-                is not None
-            ):
-                mamba_inference_state_config.conv_states_dtype = resolve_torch_dtype(
-                    mcore_generation_config["mamba_inference_conv_states_dtype"]
-                )
+            conv_states_dtype = resolve_mamba_conv_states_dtype(
+                mcore_generation_config, self.cfg["megatron_cfg"]
+            )
+            if conv_states_dtype is not None:
+                mamba_inference_state_config.conv_states_dtype = conv_states_dtype
 
         # flashinfer's fused-RoPE kernel only dispatches fp16/bf16 q/k.
         use_flashinfer_fused_rope = model_config.params_dtype in (
@@ -625,8 +806,20 @@ class MegatronGenerationMixin:
         # Batch-invariant mode needs the policy's RoPE bits, and MCore rejects
         # an explicit True there.
         if getattr(model_config, "batch_invariant_mode", False):
+            if getattr(model_config, "inference_fuse_tp_communication", False):
+                # Under batch invariance the fused reduce-scatter falls back to
+                # NCCL, but the next layer still skips its norm + all-gather and
+                # reads the (stale) symmetric buffer.
+                raise ValueError(
+                    "batch_invariant_mode=True requires "
+                    "inference_fuse_tp_communication=False on the generation model."
+                )
             use_flashinfer_fused_rope = False
             allow_installed_flash_attn_4()
+            # Without flashinfer RoPE the engine reads its RoPE table from
+            # RotaryEmbedding.forward's process-wide lru_cache; CUDA graphs
+            # capture that tensor's address, so it must never be evicted/freed.
+            _pin_rotary_tables(unwrap_model(self._gen_model()))
 
         image_preprocessing_config = self._build_image_preprocessing_config(
             mcore_generation_config
@@ -683,8 +876,13 @@ class MegatronGenerationMixin:
             "pg_collection": pg_collection,
             "mamba_inference_state_config": mamba_inference_state_config,
             # Reserve more KV-cache space when speculative decoding is enabled.
+            # With max_requests set, MCore sizes the Mamba region for exactly that
+            # many requests and gives the rest to KV (the fixed ratio would cap
+            # the request count at ratio * buffer / state bytes instead).
             "mamba_memory_ratio": (
-                0.1 + 0.1 * num_speculative_tokens if is_hybrid_model else None
+                0.1 + 0.1 * num_speculative_tokens
+                if is_hybrid_model and max_requests is None
+                else None
             ),
             "num_speculative_tokens": num_speculative_tokens,
             "logprobs_mode": mcore_generation_config["logprobs_mode"],
@@ -700,10 +898,27 @@ class MegatronGenerationMixin:
         inference_config = InferenceConfig(**inference_config_kwargs)
 
         _apply_inference_cuda_graph_scope(engine_model, mcore_generation_config)
+        if engine_model.config.pipeline_model_parallel_size > 1:
+            from nemo_rl.models.megatron import inference_pp_cuda_graph
 
+            inference_pp_cuda_graph.install()
+
+        self._prepare_engine_numerics(engine_model)
         self.inference_context = DynamicInferenceContext(
             engine_model.config, inference_config
         )
+        # fp16_moe_dk's expert row workspace at the gathered buffer's worst case, before the graphs capture it
+        # (engine scratch: released while a colocated learner trains, with torch_memory_saver).
+        from nemo_rl.models.megatron import fp16_moe_dk
+
+        ws_bytes, ws_chunk = fp16_moe_dk.reserve_engine_row_workspace(
+            engine_model, self.inference_context, colocated=bool(self.is_generation_colocated)
+        )
+        if ws_bytes and self.rank == 0:
+            print(
+                f"[Rank 0] engine expert row workspace {ws_bytes / 2**30:.2f} GiB, fc2 {ws_chunk} columns / pass"
+                f" (released during training: {HAVE_TORCH_MEMORY_SAVER})"
+            )
         if media_model is None:
             self.inference_wrapped_model = GPTInferenceWrapper(
                 engine_model, self.inference_context
@@ -720,13 +935,101 @@ class MegatronGenerationMixin:
             inference_wrapped_model=self.inference_wrapped_model,
             tokenizer=self.megatron_tokenizer,
         )
-        self.dynamic_inference_engine = DynamicInferenceEngine(
-            text_generation_controller, self.inference_context
-        )
+        self.dynamic_inference_engine = with_generated_token_counter(
+            DynamicInferenceEngine
+        )(text_generation_controller, self.inference_context)
+        self._start_generation_progress_monitor(mcore_generation_config)
 
         self._inference_engine_initialized = True
         self._inference_engine_asleep = True
         print(f"[Rank {self.rank}] Initialized persistent inference engine")
+
+    def _prepare_engine_numerics(self, engine_model: Any) -> None:
+        """Engine-only numerics setup, before the context is sized and graphs captured.
+
+        - fp16 GEMM forward: hold the dense GEMM weights in fp16 (``hold_fp16_weights``)
+          on a dedicated inference model whose refits write through ``copy_``: the
+          packed collective (``refit_transport: null``) and the native MCore refit
+          (``refit_transport: mcore``), which receives every fp16-held tensor through
+          ``Fp16HeldWeightReceive`` (bf16 on the wire, ``copy_`` into the fp16 storage).
+          The nccl_reshard M-to-N refit receives raw bytes in the sender's dtype, so it
+          keeps the per-call cast.
+        - batch-invariant Mamba: decode without the z replay buffer through the batch-invariant
+          decode step (``mamba_bi_fused_decode``) and count the replay buffers in the inference
+          memory budget (``mamba_bi_decode``).
+        """
+        from nemo_rl.models.megatron import fp16_gemm
+
+        refit_transport = self.cfg["generation"].get("refit_transport")
+        # Colocated generation with a dedicated inference model (its transformer_impl or layout differs from
+        # training's, e.g. the BI engine's inference_optimized): hold those weights in fp16 too. Its wake reshard
+        # writes through Fp16HeldLocalReshard (bf16 slice, copy_ = the RN cast). Without the hold every decode step
+        # re-casts every dense GEMM weight inside the captured graphs (ts-syncuni: 5.68 vs 1.34 ms per decode step at
+        # full Nano EP4). A reshardless colocated engine shares the training model and keeps the per-call cast.
+        dedicated_colocated = self.is_generation_colocated and self.inference_model is not None
+        if (
+            fp16_gemm.enabled()
+            and (
+                (self.is_refit_destination and not self.is_generation_colocated)
+                or dedicated_colocated
+            )
+            and refit_transport in (None, "mcore")
+        ):
+            n = fp16_gemm.hold_fp16_weights(self._gen_model())
+            if self.rank == 0:
+                print(
+                    f"[fp16_gemm] engine holds {n} dense GEMM weights in fp16",
+                    flush=True,
+                )
+        if getattr(engine_model.config, "batch_invariant_mode", False):
+            from nemo_rl.models.megatron import mamba_bi_decode
+
+            mamba_bi_decode.install()
+            # Multi-token tail decode (ThunderSync thundersync.tail_mtd; env set by its driver): lookahead decode rows
+            # in the batch-invariant Mamba layers, sized before the context allocates its Mamba states.
+            mtd = os.environ.get("THUNDERSYNC_TAIL_MTD", "").strip()
+            if mtd:
+                from nemo_rl.models.megatron import mamba_bi_lookahead
+
+                mamba_bi_lookahead.install(int(mtd.split(":")[1]))
+            # Tree speculation (thundersync.tail_tree, tree_spec): node rows in the Mamba layers (scratch conv and
+            # replay rows) and the private-block KV gather, both before the context is sized and the graphs captured.
+            tree = os.environ.get("THUNDERSYNC_TAIL_TREE", "").strip()
+            if tree:
+                from nemo_rl.models.generation.megatron import tree_kv
+                from nemo_rl.models.megatron import mamba_bi_lookahead
+
+                rows = int(tree.split(":")[2])
+                mamba_bi_lookahead.install(rows, tree=True)
+                tree_kv.install(rows)
+                # MTP draft source (thundersync.tail_tree_mtp): the decoder output of every engine forward, captured
+                # into a fixed buffer by a hook on the final norm (inside the graphs once they are captured).
+                if os.environ.get("THUNDERSYNC_TAIL_TREE_MTP", "").strip():
+                    from nemo_rl.models.generation.megatron import tree_mtp
+
+                    gcfg = self.cfg["generation"]["mcore_generation_config"]
+                    tree_mtp.install_hidden_capture(
+                        engine_model, int(gcfg["max_tokens"]), int(engine_model.config.hidden_size)
+                    )
+        install_engine_latency_levers(
+            engine_model, engine_only=self.is_refit_destination and not self.is_generation_colocated
+        )
+
+    def _start_generation_progress_monitor(self, mcore_generation_config: dict) -> None:
+        """Progress log + stall watchdog over this rank's engine counters (progress.py)."""
+        interval = mcore_generation_config.get("progress_log_interval_s")
+        if interval is None:
+            return
+        rank = torch.distributed.get_rank()
+        stall = mcore_generation_config.get("stall_timeout_s")
+        self._generation_progress = GenerationProgressMonitor(
+            self.dynamic_inference_engine,
+            rank,
+            interval_s=float(interval),
+            stall_timeout_s=float(stall) if stall is not None else 0.0,
+            log=rank == 0
+            or bool(mcore_generation_config.get("progress_log_all_ranks")),
+        ).start()
 
     async def _start_inference_coordinator(self):
         """Start the inference coordinator and engine loop."""
@@ -743,8 +1046,65 @@ class MegatronGenerationMixin:
             result = self.inference_client.start()
             if result is not None:
                 await result
+            if self._own_client_loop_wanted():
+                await self._move_client_to_own_loop()
 
         self._inference_engine_asleep = False
+
+    def _own_client_loop_wanted(self) -> bool:
+        """Run rank 0's inference client on its own event-loop thread (subclasses opt in; default: no)."""
+        return False
+
+    def _client_loop(self):
+        """The event loop that owns the inference client's socket (its own loop, else the engine loop)."""
+        return getattr(self, "_inference_client_loop", None) or self._inference_loop
+
+    async def _move_client_to_own_loop(self) -> None:
+        """Move the client's listener (and with it every client call) off the engine loop.
+
+        The engine loop then runs only the engine. The client keeps its socket and request-id counter (no new
+        connection), so requests and their ids are unchanged. ZMQ sockets are not thread safe: every send and the
+        listener run on the client loop (``_client_loop``; ``_client_send`` for the engine-control signals).
+        """
+        local_rank = int(os.environ["LOCAL_RANK"])
+        box: dict = {}
+
+        def run_loop():
+            torch.cuda.set_device(local_rank)
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            box["loop"] = loop
+            loop.run_forever()
+
+        self._inference_client_thread = threading.Thread(target=run_loop, name="inference-client", daemon=True)
+        self._inference_client_thread.start()
+        while "loop" not in box:
+            await asyncio.sleep(0.001)
+        client = self.inference_client
+        client.listener_task.cancel()
+        try:
+            await client.listener_task
+        except asyncio.CancelledError:
+            pass
+
+        async def listen():
+            client._loop = asyncio.get_running_loop()
+            client.listener_task = client._loop.create_task(client._recv_task())
+
+        await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(listen(), box["loop"]))
+        self._inference_client_loop = box["loop"]
+
+    async def _client_send(self, fn) -> None:
+        """Call ``fn()`` (a client send) on the client loop, from a coroutine on the engine loop."""
+        loop = self._client_loop()
+        if loop is self._inference_loop:
+            fn()
+            return
+
+        async def call():
+            fn()
+
+        await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(call(), loop))
 
     def _sleep(self) -> None:
         """Pause + suspend the engine. No-op if already asleep."""
@@ -754,23 +1114,25 @@ class MegatronGenerationMixin:
             self._sleep_engine(), self._inference_loop
         )
         future.result()
+        pause_engine_scratch()
         torch.distributed.barrier()
         self._inference_engine_asleep = True
         print(f"[Rank {self.rank}] paused inference engine")
 
     async def _sleep_engine(self):
         if torch.distributed.get_rank() == 0:
-            self.inference_client.pause_engines()
+            await self._client_send(self.inference_client.pause_engines)
         await self.dynamic_inference_engine.wait_until(EngineState.PAUSED)
 
         if torch.distributed.get_rank() == 0:
-            self.inference_client.suspend_engines()
+            await self._client_send(self.inference_client.suspend_engines)
         await self.dynamic_inference_engine.wait_until(EngineState.SUSPENDED)
 
     def _wake(self) -> None:
         """Resume + unpause the engine. No-op if already awake."""
         if not self._inference_engine_asleep:
             return
+        resume_engine_scratch()
         future = asyncio.run_coroutine_threadsafe(
             self._wake_engine(), self._inference_loop
         )
@@ -781,11 +1143,11 @@ class MegatronGenerationMixin:
 
     async def _wake_engine(self):
         if torch.distributed.get_rank() == 0:
-            self.inference_client.resume_engines()
+            await self._client_send(self.inference_client.resume_engines)
         await self.dynamic_inference_engine.wait_until(EngineState.RESUMED)
 
         if torch.distributed.get_rank() == 0:
-            self.inference_client.unpause_engines()
+            await self._client_send(self.inference_client.unpause_engines)
         await self.dynamic_inference_engine.wait_until(EngineState.RUNNING)
 
     def _start_inference_loop_thread(self):
@@ -1158,7 +1520,7 @@ class MegatronGenerationMixin:
         async def _send_epoch() -> None:
             self.inference_client.set_generation_epoch(version)
 
-        asyncio.run_coroutine_threadsafe(_send_epoch(), self._inference_loop).result()
+        asyncio.run_coroutine_threadsafe(_send_epoch(), self._client_loop()).result()
 
     def _build_sampling_params(
         self,
@@ -1204,7 +1566,8 @@ class MegatronGenerationMixin:
             for sample_ss in batch_stop_strings:
                 if sample_ss:
                     stop_set.update(sample_ss)
-        return list(stop_set) if stop_set else None
+        # Sorted: set order depends on PYTHONHASHSEED, so a plain list differs between processes.
+        return sorted(stop_set) if stop_set else None
 
     def _sample_vision_tensors(self, data, index: int):
         """Return one sample's vision tensors from RL PackedTensors."""
@@ -1373,11 +1736,43 @@ class MegatronGenerationMixin:
                 multi_modal_data_list,
                 sampling_params,
             ),
-            self._inference_loop,
+            self._client_loop(),
         )
-        result = future.result()
+        while True:
+            try:
+                result = future.result(timeout=_ENGINE_LIVENESS_POLL_S)
+            except concurrent.futures.TimeoutError:
+                self._raise_if_inference_engine_dead(future)
+            else:
+                break
 
         return self._parse_result_to_batched_data_dict(data, result)
+
+    def _raise_if_inference_engine_dead(self, future: concurrent.futures.Future) -> None:
+        """Fail a pending request instead of waiting forever on a dead engine loop.
+
+        The MCore engine loop logs a fatal step error (e.g. a CUDA fault during graph replay) and exits without
+        resolving in-flight request futures, so a caller blocked on them would hang. Checked: the engine loop thread,
+        rank 0's inference-client thread (when it has its own loop) and the engine's loop task.
+        """
+        reason = None
+        thread = getattr(self, "_inference_thread", None)
+        if thread is not None and not thread.is_alive():
+            reason = "the inference event-loop thread exited"
+        client_thread = getattr(self, "_inference_client_thread", None)
+        if reason is None and client_thread is not None and not client_thread.is_alive():
+            reason = "the inference-client event-loop thread exited"
+        engine_task = getattr(getattr(self, "dynamic_inference_engine", None), "engine_loop_task", None)
+        if reason is None and engine_task is not None and engine_task.done():
+            reason = "the Megatron inference engine loop exited"
+            if not engine_task.cancelled() and engine_task.exception() is not None:
+                reason += f" ({engine_task.exception()!r})"
+        if reason is not None:
+            future.cancel()
+            raise RuntimeError(
+                f"[Rank {getattr(self, 'rank', '?')}] generation request cannot complete: {reason}. "
+                "See the worker log for the engine traceback."
+            )
 
     async def generate_async(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
@@ -1409,9 +1804,22 @@ class MegatronGenerationMixin:
                     multi_modal_data_list,
                     sampling_params,
                 ),
-                self._inference_loop,
+                self._client_loop(),
             )
-            result = await asyncio.wrap_future(future)
+            wrapped = asyncio.wrap_future(future)
+            while True:
+                try:
+                    result = await asyncio.wait_for(
+                        asyncio.shield(wrapped), timeout=_ENGINE_LIVENESS_POLL_S
+                    )
+                except asyncio.TimeoutError:
+                    self._raise_if_inference_engine_dead(future)
+                except asyncio.CancelledError:
+                    # shield keeps the poll from cancelling the request; a cancelled caller still must.
+                    wrapped.cancel()
+                    raise
+                else:
+                    break
             output = self._parse_result_to_batched_data_dict(datum, result)
             return (index, output)
 
@@ -1515,6 +1923,70 @@ class MegatronGenerationRefitMixin:
         # Native MCore copy service, built by init_collective_mcore_generation.
         self.refit_copy_service = None
         self.refit_execution_batch_bytes: int | None = None
+        # Refit TCPStore server pre-bound by reserve_refit_store (rank 0 only):
+        # (port, store), consumed by the next init_collective_mcore_generation.
+        self._prebound_refit_store: tuple[int, Any] | None = None
+
+    def reserve_refit_store(
+        self,
+        world_size: int,
+        port_range_low: int,
+        port_range_high: int,
+        preferred_port: int | None = None,
+        max_attempts: int = 64,
+    ) -> tuple[str, int]:
+        """Bind the refit rendezvous TCPStore server here (global rank 0) and keep it.
+
+        Picking a port on the driver and binding it later on rank 0 is a
+        check-then-use race, and before this the bound port was not even the
+        probed one (``port + 1``): any listener already on ``port + 1`` (the
+        learner world's MASTER_PORT, another engine lane's store) made rank 0
+        die with EADDRINUSE. Here the server is bound first, in the master
+        port band, retrying on a bound port; the caller broadcasts the
+        returned (ip, port) to every other rank. Cost: one listening socket on
+        one rank, O(attempts) binds once per communicator, independent of
+        world size.
+
+        Returns:
+            (node ip of this rank, bound port).
+        """
+        from nemo_rl.distributed.virtual_cluster import (
+            _get_node_ip_local,
+            refit_store_port_candidates,
+        )
+
+        if torch.distributed.get_rank() != 0:
+            raise RuntimeError(
+                "reserve_refit_store must run on the store master (global rank 0)"
+            )
+        candidates = refit_store_port_candidates(
+            port_range_low, port_range_high, preferred_port, max_attempts
+        )
+        errors = []
+        for port in candidates:
+            try:
+                store = torch.distributed.TCPStore(
+                    host_name="0.0.0.0",
+                    port=port,
+                    world_size=world_size,
+                    is_master=True,
+                    wait_for_workers=False,
+                )
+            except (torch.distributed.DistNetworkError, RuntimeError) as e:
+                errors.append(f"{port}: {type(e).__name__}")
+                continue
+            self._prebound_refit_store = (port, store)
+            ip = _get_node_ip_local()
+            print(
+                f"  refit: native store bound on rank 0 at {ip}:{port} "
+                f"(attempt {len(errors) + 1})",
+                flush=True,
+            )
+            return ip, port
+        raise RuntimeError(
+            f"Could not bind the refit TCPStore in [{port_range_low}, "
+            f"{port_range_high}) after {len(candidates)} attempts: {errors[-8:]}"
+        )
 
     def init_collective_mcore_generation(
         self,
@@ -1551,13 +2023,21 @@ class MegatronGenerationRefitMixin:
         local_rank = torch.distributed.get_rank()
         global_rank = local_rank + rank_offset
 
-        # port+1 to avoid collision with the caller's rendezvous on `port`.
-        store = torch.distributed.TCPStore(
-            host_name=ip,
-            port=port + 1,
-            world_size=world_size,
-            is_master=(global_rank == 0),
-        )
+        # Bind/connect exactly `port`: the port the caller probed (or that
+        # reserve_refit_store already bound here). Nothing else in this path
+        # binds `port`; the old `port + 1` was neither probed nor reserved and
+        # collided with other listeners (EADDRINUSE, cohort lanes).
+        prebound = getattr(self, "_prebound_refit_store", None)
+        self._prebound_refit_store = None
+        if global_rank == 0 and prebound is not None and prebound[0] == port:
+            store = prebound[1]
+        else:
+            store = torch.distributed.TCPStore(
+                host_name=ip,
+                port=port,
+                world_size=world_size,
+                is_master=(global_rank == 0),
+            )
 
         group_name = "refit"
         pg_prefix_store = PrefixStore(f"{group_name}/", store)
@@ -1675,15 +2155,33 @@ class MegatronGenerationRefitMixin:
         if self.refit_execution_batch_bytes is None:
             raise RuntimeError("Native MCore refit was not initialized.")
 
-        swap_model_weights(
-            src_model,
-            dst_model,
-            refit_method=self.refit_copy_service,
-            group=self.refit_pg,
-            src_rank_offset=0,
-            dst_rank_offset=self.refit_dst_rank_offset,
-            execution_batch_bytes=self.refit_execution_batch_bytes,
-        )
+        transform = None
+        if not is_source:
+            from nemo_rl.models.megatron import fp16_gemm
+
+            if fp16_gemm.enabled():
+                # The engine holds dense GEMM weights (hold_fp16_weights) and its
+                # expert weights (fp16_moe) in fp16 while the plan's wire dtype is
+                # the learner's bf16; see Fp16HeldWeightReceive.
+                transform = getattr(self, "_fp16_refit_receive", None)
+                if transform is None:
+                    transform = self._fp16_refit_receive = Fp16HeldWeightReceive(
+                        _refit_core(self.model)
+                    )
+        # Destination: engine tensors allocated lazily during generation (the fp16
+        # expert buffers) are inference tensors, which in-place writes may only
+        # touch under inference mode (as in _reshard_into_inference_model).
+        with torch.inference_mode() if dst_model is not None else nullcontext():
+            swap_model_weights(
+                src_model,
+                dst_model,
+                refit_method=self.refit_copy_service,
+                group=self.refit_pg,
+                src_rank_offset=0,
+                dst_rank_offset=self.refit_dst_rank_offset,
+                transform=transform,
+                execution_batch_bytes=self.refit_execution_batch_bytes,
+            )
 
         return True
 
@@ -2295,7 +2793,8 @@ class MegatronGenerationRefitMixin:
         """Restore the colocated inference weights to GPU before resharding / generation."""
         if not self._inference_model_offloaded:
             return
-        resume_inference_weights()
+        resume_inference_weights(getattr(self, "_inference_model_kept", ()))
+        self._inference_model_kept = []
         self._inference_model_offloaded = False
 
     def _offload_inference_model(self) -> None:
@@ -2306,7 +2805,9 @@ class MegatronGenerationRefitMixin:
             or not HAVE_TORCH_MEMORY_SAVER
         ):
             return
-        pause_inference_weights()
+        self._inference_model_kept = pause_inference_weights(
+            getattr(self.inference_model, "_nrl_offload_keep", ())
+        )
         self._inference_model_offloaded = True
 
     def _reshard_into_inference_model(self) -> None:
@@ -2351,17 +2852,60 @@ class MegatronGenerationRefitMixin:
             )
             self._swap_weights_plan_prepared = True
 
-        swap_model_weights(
-            self.model,
-            inference_model,
-            refit_method=self.cfg["generation"]["mcore_generation_config"][
-                "refit_backend"
-            ],
-            group=None,
-            src_rank_offset=0,
-            dst_rank_offset=0,
-            execution_batch_bytes=execution_batch_bytes,
-        )
+        # Dense GEMM weights the engine holds in fp16 (_prepare_engine_numerics, from the second wake on) are
+        # sent as the bf16 training slice and written with copy_ (Fp16HeldLocalReshard); a dtype-strict receive
+        # would reinterpret the bf16 bits. Tensors that are not fp16-held keep the direct same-rank copy.
+        from nemo_rl.models.megatron import fp16_gemm
+
+        transform = None
+        if fp16_gemm.enabled():
+            transform = getattr(self, "_fp16_colocated_reshard", None)
+            if transform is None:
+                transform = self._fp16_colocated_reshard = Fp16HeldLocalReshard(
+                    _refit_core(inference_model)
+                )
+        n_wakes = getattr(self, "_colocated_reshards", 0)
+        self._colocated_reshards = n_wakes + 1
+        if n_wakes >= 1 and os.environ.get("NEMO_RL_DEBUG_COLOC_SKIP_RESHARD") == "1":
+            # Negative control (ThunderSync colo X1 gate, refused without CHECKS by the colo validator): the engine
+            # keeps its first weights, so the train-lp sentinel and the law check must fail from step 1 on.
+            print(f"[colocated-reshard] DEBUG skip reshard (wake {n_wakes})", flush=True)
+        else:
+            # The inference model only runs under inference mode, where tensors it
+            # allocates lazily (e.g. the fp16 GEMM weight caches of the zero-mismatch
+            # recipe) become inference tensors; outside inference mode MCore's in-place
+            # copy into them raises. Write the new weights under inference mode too.
+            torch.cuda.synchronize()
+            t_swap = time.perf_counter()
+            with torch.inference_mode():
+                swap_model_weights(
+                    self.model,
+                    inference_model,
+                    refit_method=self.cfg["generation"]["mcore_generation_config"][
+                        "refit_backend"
+                    ],
+                    group=None,
+                    src_rank_offset=0,
+                    dst_rank_offset=0,
+                    transform=transform,
+                    execution_batch_bytes=execution_batch_bytes,
+                )
+            torch.cuda.synchronize()
+            if self.rank == 0:
+                st = WEIGHT_OFFLOAD_STATS
+                print(
+                    f"[colo weights] wake {n_wakes}: reshard {time.perf_counter() - t_swap:.3f}s"
+                    + (
+                        f" | wait {st.get('resume_wait_s', 0):.3f}s resume {st.get('resume_s', 0):.3f}s"
+                        f" keep restore {st.get('keep_restore_s', 0):.3f}s"
+                        f" | last pause: sync {st.get('pause_sync_s', 0):.3f}s keep copy {st.get('keep_copy_s', 0):.3f}s"
+                        f" pause {st.get('pause_s', 0):.3f}s keep {st.get('keep_n', 0)} buffers"
+                        f" {st.get('keep_bytes', 0) / 2**20:.1f} MiB"
+                        if st
+                        else ""
+                    ),
+                    flush=True,
+                )
         # Offload training model.
         self.model = self.move_model(
             self.model, "cpu", move_params=True, move_grads=False

@@ -27,6 +27,7 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
 )
+from nemo_rl.models.megatron import learner_graphs
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     PipelineOffloadManager,
@@ -84,6 +85,15 @@ PostProcessingFunction = Union[
     "TopkLogitsPostProcessor",
 ]
 
+
+
+def _cp_group_or_none():
+    """The context-parallel group when CP > 1, else None (a CP-1 gather is the identity; unit tests and
+    single-rank callers run without initialized model-parallel groups)."""
+    try:
+        return get_context_parallel_group() if get_context_parallel_world_size() > 1 else None
+    except (AssertionError, RuntimeError):
+        return None
 
 def _prepare_padding_mask_for_model(
     model: GPTModel,
@@ -257,13 +267,24 @@ def model_forward(
         additional_kwargs["return_logprobs_for_linear_ce_fusion"] = True
 
     with straggler_timer() if straggler_timer is not None else nullcontext():
-        output_tensor = model(
-            input_ids=input_ids_cp_sharded,
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-            **additional_kwargs,
-            **multimodal_data,
-        )
+        if learner_graphs.active() and not multimodal_data:
+            # Opt-in CUDA-graph replay of the whole forward (eager when ineligible),
+            # and the MoE device dispatch's capacity guard.
+            output_tensor = learner_graphs.call(
+                model,
+                input_ids_cp_sharded,
+                position_ids,
+                attention_mask,
+                **additional_kwargs,
+            )
+        else:
+            output_tensor = model(
+                input_ids=input_ids_cp_sharded,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                **additional_kwargs,
+                **multimodal_data,
+            )
 
     # A model that slices context parallelism itself returns (output,
     # sliced_loss_mask) when it was handed a full-sequence loss_mask, so the
@@ -500,6 +521,23 @@ def forward_with_post_processing_fn(
         raise TypeError(
             f"Unknown post-processing function type: {type(post_processing_fn)}"
         )
+
+    # Sticky nucleus (exact top-p, ThunderSync): this micro-batch's drafter
+    # nucleus anchors define the policy whose log-probs the post-processing
+    # computes (exact_nucleus.mask_chunk reads them).
+    from nemo_rl.models.megatron import exact_nucleus
+
+    nucleus_anchors = (
+        data_dict.get("nucleus_anchors")
+        if exact_nucleus.sticky() and hasattr(data_dict, "get")
+        else None
+    )
+    if nucleus_anchors is not None:
+        inner_fn = post_processing_fn_wrapped
+
+        def post_processing_fn_wrapped(*args, **kwargs):  # noqa: F811
+            with exact_nucleus.anchors_context(nucleus_anchors):
+                return inner_fn(*args, **kwargs)
 
     return output_tensor, post_processing_fn_wrapped
 
@@ -874,16 +912,31 @@ def strip_context_parallel_local_loss_metric(
     return metrics
 
 
+def _law_dp_rank() -> int:
+    """Data-parallel rank (without CP) of this learner rank: the replica term of the law test's
+    PIT seed (thundersync_rl.law_check.pit_seed); 0 without torch.distributed (CPU tests)."""
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return 0
+    from megatron.core import parallel_state
+
+    return int(parallel_state.get_data_parallel_rank())
+
+
 class LogprobsPostProcessor:
     def __init__(
         self,
         cfg: PolicyConfig,
         sampling_params: Optional[TrainingSamplingParams] = None,
         use_fused_linear_logprobs: bool = False,
+        law: Optional[dict] = None,
     ):
         self.cfg = cfg
         self.sampling_params = sampling_params
         self.use_fused_linear_logprobs = use_fused_linear_logprobs
+        # ThunderSync law test (thundersync_rl/law_check.py): {"seed": int, "acc": None}; the
+        # randomized PIT stats of every masked target token are summed into law["acc"]
+        # (float64 [N_STATS], this rank's tokens; the caller reduces over CP).
+        self.law = law
 
     def __call__(
         self,
@@ -944,10 +997,17 @@ class LogprobsPostProcessor:
                     vocab_start_index=tp_rank * output_tensor.shape[-1],
                     vocab_end_index=(tp_rank + 1) * output_tensor.shape[-1],
                     tp_group=tp_grp,
+                    # Unpacked rows under BI context parallelism (bi_context_parallel): the model returned
+                    # this rank's zigzag chunk; the CP gather restores every position (as the loss path does).
+                    # (None at CP 1 / without initialized model parallel groups: same values, no gather).
+                    cp_group=_cp_group_or_none(),
                     inference_only=True,
                     chunk_size=logprob_chunk_size,
                     sampling_params=self.sampling_params,
                 )
+
+            if self.law is not None:
+                self._law_stats(output_tensor, data_dict, unpacked_input_ids)
 
             # Prepend 0 logprob for first token to maintain same sequence length as input
             token_logprobs = torch.cat(
@@ -968,6 +1028,100 @@ class LogprobsPostProcessor:
             return torch.tensor(0.0, device=token_logprobs.device), result_dict
 
         return processor_fn_inner
+
+    @torch.no_grad()
+    def _law_stats(self, output_tensor, data_dict, input_ids) -> None:
+        """Randomized-PIT law stats of this micro-batch's trained tokens (``law``)."""
+        from thundersync_rl import law_check
+        from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
+
+        if self.use_fused_linear_logprobs or self.cfg["sequence_packing"]["enabled"]:
+            raise NotImplementedError("law check: needs materialized logits, no packing")
+        if need_top_k_or_top_p_filtering(self.sampling_params):
+            raise NotImplementedError("law check: top-k / top-p filtered policies")
+        from nemo_rl.models.megatron import exact_nucleus
+        # output_tensor is already temperature-scaled (apply_temperature_scaling above).
+        cp_group = get_context_parallel_group()
+        cp_size = torch.distributed.get_world_size(cp_group) if cp_group is not None else 1
+        cp_rank = torch.distributed.get_rank(cp_group) if cp_size > 1 else 0
+        if not isinstance(output_tensor, torch.Tensor):
+            raise NotImplementedError("law check: needs a logits tensor")
+        logits = output_tensor  # [B, S_local, V / TP]
+        b, s_loc, vl = logits.shape
+        tgt = input_ids.roll(shifts=-1, dims=-1)
+        mask = (data_dict["token_mask"] * data_dict["sample_mask"].unsqueeze(-1)).roll(
+            shifts=-1, dims=-1
+        )
+        mask[:, -1] = 0  # the roll wrapped token 0 (never predicted)
+        pad = s_loc * cp_size - tgt.shape[1]
+        if pad > 0:
+            tgt = torch.nn.functional.pad(tgt, (0, pad), value=0)
+            mask = torch.nn.functional.pad(mask, (0, pad), value=0)
+        elif pad < 0:
+            tgt, mask = tgt[:, : s_loc * cp_size], mask[:, : s_loc * cp_size]
+        call = int(self.law.setdefault("calls", 0))
+        self.law["calls"] += 1
+        # PIT uniforms: independent across data-parallel replicas (law_check.pit_seed; ts-lawfix).
+        # The seed of (seed, call) alone gave call c the same grid on every replica -> overdispersed
+        # bins at DP > 1 (full-Nano -chk-v11q / -prod-v11q law "FAIL"s).
+        gen = torch.Generator(device=logits.device).manual_seed(
+            law_check.pit_seed(int(self.law["seed"]), _law_dp_rank(), call)
+        )
+        U = torch.rand(tgt.shape, generator=gen, dtype=torch.float64, device=logits.device)
+        U_legacy = None
+        if self.law.get("legacy"):
+            # THUNDERSYNC_LAW_LEGACY_SHADOW=1: the pre-fix grid (same on every replica) on the same
+            # tokens, accumulated apart (law_legacy/*, diagnostic only).
+            gen_l = torch.Generator(device=logits.device).manual_seed(int(self.law["seed"]) * 1_000_003 + call)
+            U_legacy = torch.rand(tgt.shape, generator=gen_l, dtype=torch.float64, device=logits.device)
+            U_legacy = _get_tokens_on_this_cp_rank(U_legacy, cp_rank, cp_size, seq_dim=1)
+        tgt = _get_tokens_on_this_cp_rank(tgt.to(logits.device), cp_rank, cp_size, seq_dim=1)
+        mask = _get_tokens_on_this_cp_rank(mask.to(logits.device), cp_rank, cp_size, seq_dim=1)
+        U = _get_tokens_on_this_cp_rank(U, cp_rank, cp_size, seq_dim=1)
+        sel = mask.reshape(-1).bool()
+        idx = sel.nonzero().flatten()  # rows gathered per chunk inside pit_rows (no [n, V] copy)
+        tp_rank = get_tensor_model_parallel_rank()
+        row_fn = None
+        if exact_nucleus.active():
+            # Exact top-p (ThunderSync, ts-nano-scale fix): the PIT under the TRUNCATED policy the
+            # engine samples and the learner trains (canonical nucleus; sticky: this
+            # micro-batch's drafter anchors, absolute positions, as mask_chunk). Before this the
+            # PIT used the untruncated softmax and failed every exact top-p run (ns-topp).
+            if torch.distributed.get_world_size(get_tensor_model_parallel_group()) > 1:
+                raise NotImplementedError("law check with exact top-p: TP > 1 (sharded nucleus) not built")
+            anchors = exact_nucleus.current_anchors()
+            a_flat = None
+            if anchors is not None:
+                if cp_size > 1:
+                    raise NotImplementedError("law check with a sticky nucleus: CP > 1 not built")
+                anchors = anchors[:, :s_loc].to(logits.device)
+                if anchors.shape[1] < s_loc:  # sequence padding past the anchored rows: self
+                    anchors = torch.cat(
+                        [anchors, anchors.new_full((b, s_loc - anchors.shape[1], anchors.shape[2]), -1)], 1
+                    )
+                a_flat = anchors.reshape(b * s_loc, -1)
+
+            def row_fn(z, rows):
+                keep = exact_nucleus.nucleus_mask(z, None, None if a_flat is None else a_flat[rows])
+                return z.masked_fill(~keep, float("-inf"))
+
+        res = law_check.pit_rows(
+            logits.reshape(-1, vl),
+            tgt.reshape(-1)[sel],
+            U.reshape(-1)[sel],
+            row_index=idx,
+            vocab_start=tp_rank * vl,
+            tp_group=get_tensor_model_parallel_group(),
+            moments=True,
+            row_fn=row_fn,
+            shadow_uniforms=None if U_legacy is None else U_legacy.reshape(-1)[sel],
+        )
+        u, t, mom = res[:3]
+        st = law_check.accumulate(u, t, mom)
+        self.law["acc"] = st if self.law.get("acc") is None else self.law["acc"] + st
+        if U_legacy is not None:
+            st_l = law_check.accumulate(res[3], res[4], mom)
+            self.law["acc_legacy"] = st_l if self.law.get("acc_legacy") is None else self.law["acc_legacy"] + st_l
 
 
 class TeacherFullPayloadPostProcessor:

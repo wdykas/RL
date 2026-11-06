@@ -21,6 +21,7 @@ pushed through the same gates the workers run at startup.
 """
 
 import copy
+import os
 import sys
 import types
 from dataclasses import make_dataclass
@@ -204,11 +205,131 @@ def test_batch_invariant_off_reports_nothing():
     assert zgm.validate_batch_invariant_mode(config).violations == []
 
 
-def test_batch_invariant_rejects_tensor_parallel():
+def _tp_config(tp_size: int = 2) -> dict[str, Any]:
     config = _policy_config()
-    config["megatron_cfg"]["tensor_model_parallel_size"] = 2
+    config["megatron_cfg"]["tensor_model_parallel_size"] = tp_size
+    # A multiple of every TP's lcm(token multiple, 32 * TP) (1056 at TP=3).
+    config["make_sequence_length_divisible_by"] = 1056 * 256
+    return config
+
+
+@pytest.mark.parametrize("tp_size", [2, 3, 4, 8])
+def test_batch_invariant_accepts_any_tp_with_the_same_generation_layout(tp_size):
+    config = _tp_config(tp_size)
+    config["generation"]["mcore_generation_config"]["tensor_model_parallel_size"] = (
+        tp_size
+    )
     result = zgm.validate_batch_invariant_mode(config)
-    assert any("tensor_model_parallel_size=1" in v for v in result.violations)
+    assert result.violations == []
+    # Generation TP inherited from training is the same TP.
+    assert zgm.validate_batch_invariant_mode(_tp_config(tp_size)).violations == []
+
+
+@pytest.mark.parametrize(
+    ("mutate", "expected"),
+    [
+        (
+            lambda c: c["megatron_cfg"].update(sequence_parallel=False),
+            "policy.megatron_cfg.sequence_parallel=true",
+        ),
+        (
+            lambda c: c["generation"]["mcore_generation_config"].update(
+                sequence_parallel=False
+            ),
+            "mcore_generation_config.sequence_parallel=true",
+        ),
+        (
+            lambda c: c["megatron_cfg"].update(expert_tensor_parallel_size=2),
+            "expert_tensor_parallel_size",
+        ),
+        (
+            lambda c: c["megatron_cfg"].update(expert_tensor_parallel_size=None),
+            "expert_tensor_parallel_size",
+        ),
+        (
+            lambda c: c["megatron_cfg"].update(inference_fuse_tp_communication=True),
+            "policy.megatron_cfg.inference_fuse_tp_communication=false",
+        ),
+        (
+            lambda c: c["generation"]["mcore_generation_config"].update(
+                inference_fuse_tp_communication=True
+            ),
+            "mcore_generation_config.inference_fuse_tp_communication=false",
+        ),
+        (
+            lambda c: c["megatron_cfg"].update(tp_comm_overlap=True),
+            "tp_comm_overlap=false",
+        ),
+        (
+            lambda c: c["generation"]["mcore_generation_config"].update(
+                tensor_model_parallel_size=1
+            ),
+            "tensor_model_parallel_size",
+        ),
+        (
+            lambda c: c["generation"]["mcore_generation_config"].update(
+                expert_model_parallel_size=2
+            ),
+            "expert_model_parallel_size",
+        ),
+        (
+            lambda c: c.update(make_sequence_length_divisible_by=32),
+            "multiple of 64",
+        ),
+    ],
+    ids=[
+        "train-sp",
+        "gen-sp",
+        "etp",
+        "etp-unset",
+        "fuse-train",
+        "fuse-gen",
+        "tp-comm-overlap",
+        "gen-tp",
+        "gen-ep",
+        "token-multiple",
+    ],
+)
+def test_batch_invariant_tensor_parallel_requirements(mutate, expected):
+    config = _tp_config(2)
+    mutate(config)
+    result = zgm.validate_batch_invariant_mode(config)
+    assert any(expected in v for v in result.violations), result.violations
+    if expected.endswith("_parallel_size"):  # layout fields: train == generation
+        assert any(
+            "same Megatron settings" in v and expected in v for v in result.violations
+        ), result.violations
+
+
+def test_batch_invariant_tp1_rules():
+    config = _policy_config()
+    # Sequence parallelism is inert at TP=1; an unset expert TP resolves to 1.
+    config["megatron_cfg"]["sequence_parallel"] = False
+    config["megatron_cfg"]["expert_tensor_parallel_size"] = None
+    assert zgm.validate_batch_invariant_mode(config).violations == []
+    # Fused TP communication is rejected at every TP.
+    config["generation"]["mcore_generation_config"][
+        "inference_fuse_tp_communication"
+    ] = True
+    result = zgm.validate_batch_invariant_mode(config)
+    assert any("inference_fuse_tp_communication=false" in v for v in result.violations)
+
+
+@pytest.mark.parametrize(
+    ("tp_size", "expected"), [(1, 64), (2, 64), (4, 128), (8, 256)]
+)
+def test_batch_invariant_tp_token_multiple_keeps_sp_norm_rows_aligned(
+    tp_size, expected
+):
+    # Each SP rank's norm sees tokens/TP rows; they must stay a multiple of 32:
+    # make_sequence_length_divisible_by must be a multiple of lcm(64, 32*TP).
+    config = _tp_config(tp_size)
+    config["make_sequence_length_divisible_by"] = expected
+    assert zgm.validate_batch_invariant_mode(config).violations == []
+    if tp_size > 1:
+        config["make_sequence_length_divisible_by"] = expected // 2
+        result = zgm.validate_batch_invariant_mode(config)
+        assert any(f"multiple of {expected}" in v for v in result.violations)
 
 
 def test_batch_invariant_reports_a_train_generation_tp_mismatch():
@@ -298,11 +419,13 @@ def test_validate_rejects_a_non_megatron_generation_backend():
     assert any("generation.backend must be 'megatron'" in v for v in result.violations)
 
 
-def test_validate_rejects_colocated_generation():
+def test_validate_colocated_generation_requires_mcore_reshard():
     config = _policy_config()
     config["generation"]["colocated"] = {"enabled": True}
     result = _validate(config)
-    assert any("does not support colocated generation" in v for v in result.violations)
+    assert any("refit_transport='mcore'" in v for v in result.violations)
+    config["generation"]["refit_transport"] = "mcore"
+    assert not any("colocated" in v for v in _validate(config).violations)
 
 
 def test_validate_rejects_missing_generation_block():
@@ -336,7 +459,6 @@ def test_validate_requires_flash_attention_4(version):
     ("key", "value"),
     [
         ("multi_latent_attention", True),
-        ("hybrid_layer_pattern", "M*L"),
         ("experimental_attention_variant", "some_variant"),
     ],
 )
@@ -346,6 +468,12 @@ def test_validate_provider_rejects_unsupported_architecture(key, value):
 
     with pytest.raises(ValueError, match=key):
         zgm.validate_zero_train_gen_model_provider(config, model_cfg)
+
+
+def test_validate_provider_accepts_hybrid_mamba_patterns():
+    # MCore's batch-invariant Mamba decode makes hybrid models exact.
+    model_cfg = types.SimpleNamespace(hybrid_layer_pattern="M*L")
+    zgm.validate_zero_train_gen_model_provider(_policy_config(), model_cfg)
 
 
 def test_validate_provider_is_noop_when_the_preset_is_off():
@@ -584,18 +712,54 @@ def test_enable_batch_invariant_kernels_passes_the_recipe_settings(monkeypatch):
     monkeypatch.setattr(
         zgm, "allow_installed_flash_attn_4", lambda: opened.append(True)
     )
+    monkeypatch.setattr(zgm, "_use_inference_log_softmax", lambda: shimmed.append(True))
+    mamba: list[tuple[bool, bool]] = []
     monkeypatch.setattr(
-        zgm, "_use_fused_log_softmax_at_tp1", lambda: shimmed.append(True)
+        zgm.mamba_ssd_parity,
+        "install",
+        lambda deterministic=False, recompute=False: mamba.append((deterministic, recompute)),
+    )
+    moe: list[bool] = []
+    monkeypatch.setattr(zgm.moe_deterministic, "install", lambda: moe.append(True))
+    monkeypatch.setattr(
+        zgm.bi_mean, "install", lambda: calls.append(("bi_mean", (), {}))
     )
 
     zgm.enable_batch_invariant_kernels(_policy_config())
 
     assert opened == [True]
     assert shimmed == [True]
+    # Batch invariance only by default: no deterministic-training fixes, no Mamba recompute.
+    assert mamba == [(False, False)]
+    assert moe == []
+    # The full-reduction mean fix is patched in before MCore registers aten::mean.dim.
     assert calls == [
         ("assert_te", (), {}),
+        ("bi_mean", (), {}),
         ("enable", (), {"backend": "te_native", "collective": "ordered"}),
     ]
+
+
+def test_enable_batch_invariant_kernels_deterministic_training_opt_in(monkeypatch):
+    _fake_batch_invariant_kernels(monkeypatch)
+    monkeypatch.setattr(zgm, "allow_installed_flash_attn_4", lambda: None)
+    monkeypatch.setattr(zgm, "_use_inference_log_softmax", lambda: None)
+    monkeypatch.setattr(zgm.bi_mean, "install", lambda: None)
+    mamba: list[tuple[bool, bool]] = []
+    moe: list[bool] = []
+    monkeypatch.setattr(
+        zgm.mamba_ssd_parity,
+        "install",
+        lambda deterministic=False, recompute=False: mamba.append((deterministic, recompute)),
+    )
+    monkeypatch.setattr(zgm.moe_deterministic, "install", lambda: moe.append(True))
+    monkeypatch.delenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", raising=False)
+    config = _policy_config()
+    config["megatron_cfg"]["deterministic_training"] = True
+    config["megatron_cfg"]["mamba_recompute"] = True
+    zgm.enable_batch_invariant_kernels(config)
+    assert mamba == [(True, True)] and moe == [True]
+    assert os.environ["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] == "0"
 
 
 def test_validate_kl_is_a_noop_when_everything_is_off():
@@ -651,6 +815,7 @@ def test_validate_kl_raises_on_an_invalid_preset():
 def test_validate_kl_raises_when_batch_invariant_checks_fail():
     config = _policy_config()
     config["megatron_cfg"]["tensor_model_parallel_size"] = 2
+    config["generation"]["mcore_generation_config"]["tensor_model_parallel_size"] = 1
     with pytest.raises(ValueError, match="batch_invariant_mode=True failed"):
         zgm.validate_zero_train_gen_kl(config, check_environment=False)
 
@@ -817,34 +982,342 @@ def test_token_rounder_matches_megatron_core():
     assert MCORE_TOKEN_ROUNDER == batch_dimensions_utils.TOKEN_ROUNDER
 
 
-def test_tp1_logprob_shim_only_replaces_size_one_groups(monkeypatch):
+# --------------------------------------------------------------------------- #
+# Log-prob shim: inference's full-vocabulary log-softmax at every TP size
+# (TP ranks are threads exchanging shards through a fake all_gather)
+# --------------------------------------------------------------------------- #
+
+
+def _full_logprobs(logits, target):
+    """TP=1 full-row log-probs under the active definition: log_softmax, or under
+    NEMO_RL_VOCAB_LSE=canonical_block fp32(z) - canonical-block LSE (vocab_lse.logprob_rows)."""
+    import torch
+
+    from nemo_rl.models.megatron import vocab_lse
+
+    rows = vocab_lse.logprob_rows(logits.detach()) if vocab_lse.enabled() else torch.log_softmax(logits.float(), dim=-1)
+    return rows.gather(-1, target.unsqueeze(-1)).squeeze(-1)
+
+
+def _full_grad_on_shard(logits, target, grad_out, start, end):
+    """Autograd of the TP=1 path (full log_softmax + gather), sliced to a shard (compared with a tolerance:
+    the canonical-block LSE differs from log_softmax's only in the last bits)."""
+    import torch
+
+    leaf = logits.detach().clone().requires_grad_(True)
+    lp = torch.log_softmax(leaf.float(), dim=-1).gather(-1, target.unsqueeze(-1)).squeeze(-1)
+    (lp * grad_out).sum().backward()
+    return leaf.grad[..., start:end]
+
+
+class _ThreadGroup:
+    """Fake process group: TP ranks are threads; all_gather is a barrier exchange."""
+
+    def __init__(self, shared, rank):
+        self.shared = shared
+        self.rank = rank
+        self.size = shared["size"]
+
+    def all_gather(self, parts, tensor):
+        shared = self.shared
+        shared["slots"][self.rank] = tensor.clone()
+        shared["barrier"].wait()
+        for i, slot in enumerate(shared["slots"]):
+            parts[i].copy_(slot)
+        shared["barrier"].wait()
+
+
+def _install_thread_group_dist(monkeypatch):
+    import torch
+
+    monkeypatch.setattr(
+        torch.distributed, "get_world_size", lambda group=None: group.size
+    )
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: group.rank)
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather",
+        lambda parts, tensor, group=None: group.all_gather(parts, tensor),
+    )
+
+
+def _run_tp_ranks(tp, fn):
+    """Run ``fn(group, rank)`` on ``tp`` thread "ranks"; return their results."""
+    import threading
+
+    shared = {
+        "size": tp,
+        "slots": [None] * tp,
+        "barrier": threading.Barrier(tp),
+    }
+    results: list[Any] = [None] * tp
+    errors: list[BaseException] = []
+
+    def body(rank):
+        try:
+            results[rank] = fn(_ThreadGroup(shared, rank), rank)
+        except BaseException as exc:  # noqa: BLE001 - re-raised below
+            errors.append(exc)
+            shared["barrier"].abort()
+
+    threads = [threading.Thread(target=body, args=(r,)) for r in range(tp)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    if errors:
+        raise errors[0]
+    return results
+
+
+@pytest.mark.parametrize("dtype_name", ["bfloat16", "float32"])
+@pytest.mark.parametrize("chunk_size", [None, 1, 3, 64])
+def test_gathered_logprobs_equal_full_log_softmax_bitwise(dtype_name, chunk_size):
+    import torch
+
+    torch.manual_seed(0)
+    dtype = getattr(torch, dtype_name)
+    logits = (4 * torch.randn(3, 7, 32)).to(dtype)
+    target = torch.randint(0, 32, (3, 7))
+    expected = _full_logprobs(logits, target)
+    # Fake 2-shard vocab split: the gather concatenates the shards in rank order.
+    shards = logits.chunk(2, dim=-1)
+
+    def gather_chunk(start, end):
+        return torch.cat([s[:, start:end] for s in shards], dim=-1)
+
+    chunk = zgm._gathered_chunk_size(logits, chunk_size)
+    got = zgm._gathered_target_logprobs(gather_chunk, target, chunk)
+    assert got.dtype == torch.float32
+    assert torch.equal(got, expected)
+
+
+@pytest.mark.parametrize("dtype_name", ["bfloat16", "float32"])
+def test_gathered_logprob_grad_is_the_full_vocab_grad_on_the_shard(dtype_name):
+    import torch
+
+    torch.manual_seed(1)
+    dtype = getattr(torch, dtype_name)
+    vocab, local = 32, 16
+    logits = (4 * torch.randn(2, 5, vocab)).to(dtype)
+    # Targets on both shards, including each shard's first and last column.
+    target = torch.tensor([[0, 15, 16, 31, 7], [20, 3, 16, 15, 30]])
+    grad_out = torch.randn(2, 5)
+
+    def gather_chunk(start, end):
+        return logits[:, start:end]
+
+    for rank in range(2):
+        start, end = rank * local, (rank + 1) * local
+        got = zgm._gathered_logprob_grad(
+            gather_chunk,
+            target,
+            grad_out,
+            vocab_start_index=start,
+            vocab_end_index=end,
+            chunk_size=2,
+            grad_input=torch.zeros(2, 5, local, dtype=dtype),
+        )
+        expected = _full_grad_on_shard(logits, target, grad_out, start, end)
+        assert got.dtype == expected.dtype == dtype
+        torch.testing.assert_close(got, expected, rtol=1e-6, atol=1e-7)
+
+
+@pytest.mark.parametrize("tp", [2, 3, 4])
+@pytest.mark.parametrize("chunked", [False, True])
+def test_shim_at_tp_matches_tp1_forward_bitwise_and_backward(monkeypatch, chunked, tp):
     import torch
 
     from nemo_rl.distributed import model_utils
 
     for name in ("DistributedLogprob", "ChunkedDistributedLogprob"):
         monkeypatch.setattr(model_utils, name, getattr(model_utils, name))
-    zgm._use_fused_log_softmax_at_tp1()
-    zgm._use_fused_log_softmax_at_tp1()  # idempotent: must not wrap twice
-
-    sizes = {"tp1": 1, "tp2": 2}
-    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: sizes[group])
-    logits = torch.randn(2, 5, 16, dtype=torch.bfloat16)
-    target = torch.randint(0, 16, (2, 5))
-    expected = (
-        torch.log_softmax(logits.float(), dim=-1)
-        .gather(-1, target.unsqueeze(-1))
-        .squeeze(-1)
+    zgm._use_inference_log_softmax()
+    _install_thread_group_dist(monkeypatch)
+    shim = (
+        model_utils.ChunkedDistributedLogprob
+        if chunked
+        else model_utils.DistributedLogprob
     )
 
+    torch.manual_seed(2)
+    vocab = 48
+    local = vocab // tp
+    logits = (4 * torch.randn(2, 6, vocab)).to(torch.bfloat16)
+    target = torch.randint(0, vocab, (2, 6))
+    grad_out = torch.randn(2, 6)
+    expected = _full_logprobs(logits, target)
+
+    def rank_fn(group, rank):
+        start, end = rank * local, (rank + 1) * local
+        shard = logits[..., start:end].clone().requires_grad_(True)
+        extra = (4,) if chunked else ()
+        args = (shard, target, start, end, *extra, group, False)
+        out = shim.apply(*args)
+        (out * grad_out).sum().backward()
+        return out.detach(), shard.grad
+
+    results = _run_tp_ranks(tp, rank_fn)
+    for rank, (out, grad) in enumerate(results):
+        assert torch.equal(out, expected)  # bitwise == TP=1 == inference
+        start, end = rank * local, (rank + 1) * local
+        torch.testing.assert_close(
+            grad, _full_grad_on_shard(logits, target, grad_out, start, end)
+        )
+
+
+def test_shim_at_tp_inference_only_saves_nothing(monkeypatch):
+    import torch
+
+    _install_thread_group_dist(monkeypatch)
+    torch.manual_seed(3)
+    logits = torch.randn(1, 4, 8)
+    target = torch.randint(0, 8, (1, 4))
+
+    def rank_fn(group, rank):
+        shard = logits[..., rank * 4 : (rank + 1) * 4]
+        return zgm._GatheredVocabLogprob.apply(
+            shard, target, rank * 4, (rank + 1) * 4, None, group, True
+        )
+
+    for out in _run_tp_ranks(2, rank_fn):
+        assert torch.equal(out, _full_logprobs(logits, target))
+        assert out.grad_fn is None
+
+
+def test_shim_rejects_an_uneven_or_reordered_vocab_split(monkeypatch):
+    import torch
+
+    _install_thread_group_dist(monkeypatch)
+    logits = torch.randn(1, 2, 8)
+    target = torch.zeros(1, 2, dtype=torch.long)
+
+    def rank_fn(group, rank):
+        # Rank r claims the other rank's vocabulary range.
+        start = (1 - rank) * 4
+        with pytest.raises(ValueError, match="even vocab split in rank"):
+            zgm._GatheredVocabLogprob.apply(
+                logits[..., :4], target, start, start + 4, None, group, True
+            )
+
+    _run_tp_ranks(2, rank_fn)
+
+
+def test_logprob_shim_is_idempotent_and_keeps_tp1_local(monkeypatch):
+    import torch
+
+    from nemo_rl.distributed import model_utils
+
+    for name in ("DistributedLogprob", "ChunkedDistributedLogprob"):
+        monkeypatch.setattr(model_utils, name, getattr(model_utils, name))
+    zgm._use_inference_log_softmax()
+    zgm._use_inference_log_softmax()  # idempotent: must not wrap twice
+
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 1)
+    logits = torch.randn(2, 5, 16, dtype=torch.bfloat16)
+    target = torch.randint(0, 16, (2, 5))
+    expected = _full_logprobs(logits, target)
+
     shim = model_utils.DistributedLogprob
-    assert isinstance(shim, zgm._Tp1LocalLogprob)
-    assert not isinstance(shim._original, zgm._Tp1LocalLogprob)
+    assert isinstance(shim, zgm._BatchInvariantLogprob)
+    assert not isinstance(shim._original, zgm._BatchInvariantLogprob)
     assert torch.equal(shim.apply(logits, target, 0, 16, "tp1", True), expected)
+    assert torch.equal(shim.apply(logits, target, 0, 16, None, True), expected)
 
     chunked = model_utils.ChunkedDistributedLogprob
     assert torch.equal(chunked.apply(logits, target, 0, 16, 2, "tp1", True), expected)
 
-    original = types.SimpleNamespace(apply=lambda *a: "orig")
-    monkeypatch.setattr(shim, "_original", original)
-    assert shim.apply(logits, target, 0, 16, "tp2", True) == "orig"
+
+def test_batch_invariant_allows_different_pipeline_parallelism():
+    """PP only moves activations point to point: train PP may differ from inference PP."""
+    config = _tp_config(2)
+    config["generation"]["mcore_generation_config"].update(
+        pipeline_model_parallel_size=1
+    )
+    config["megatron_cfg"]["pipeline_model_parallel_size"] = 2
+    result = zgm.validate_batch_invariant_mode(config)
+    assert not any("pipeline_model_parallel_size" in v for v in result.violations), (
+        result.violations
+    )
+
+
+def test_local_vocab_logprob_matches_autograd_and_saves_only_the_logits(monkeypatch):
+    """TP=1 BI log-probs: forward bitwise the plain path, gradient equal to autograd's."""
+    import torch
+
+    from nemo_rl.distributed import model_utils
+    from nemo_rl.models.megatron import zero_train_gen_mismatch as ztgm
+
+    monkeypatch.setattr(ztgm, "_GATHERED_LOGPROB_CHUNK_TOKENS", 5)
+    torch.manual_seed(0)
+    logits = (torch.randn(2, 7, 33) * 3).requires_grad_()
+    target = torch.randint(0, 33, (2, 7))
+    g = torch.randn(2, 7)
+
+    ref = model_utils._tp_target_logprobs(
+        logits, target, vocab_start_index=0, vocab_end_index=33, tp_group=None
+    )
+    (ref_grad,) = torch.autograd.grad(ref, logits, g)
+
+    saved = []
+    with torch.autograd.graph.saved_tensors_hooks(
+        lambda t: saved.append(t.shape) or t, lambda t: t
+    ):
+        out = ztgm._BatchInvariantLogprob(None, chunked=False).apply(
+            logits, target, 0, 33, None, False
+        )
+    (grad,) = torch.autograd.grad(out, logits, g)
+    from nemo_rl.models.megatron import vocab_lse
+
+    # flag off: bitwise the plain path; canonical_block: bitwise the canonical definition
+    assert torch.equal(out, _full_logprobs(logits, target) if vocab_lse.enabled() else ref)
+    torch.testing.assert_close(grad, ref_grad, rtol=1e-6, atol=1e-6)
+    assert saved == [logits.shape, target.shape]
+
+
+def test_ep_may_differ_with_ep_invariant_combine():
+    """moe_ep_invariant_combine lifts the EP equality (runs_1node/epinv-lanes-ep)."""
+    config = _tp_config(2)
+    config["megatron_cfg"]["moe_ep_invariant_combine"] = True
+    config["generation"]["mcore_generation_config"].update(
+        expert_model_parallel_size=2, moe_ep_invariant_combine=True
+    )
+    result = zgm.validate_batch_invariant_mode(config)
+    assert not any("expert_model_parallel_size" in v for v in result.violations), result.violations
+    # The combine itself must match on both sides.
+    config["generation"]["mcore_generation_config"]["moe_ep_invariant_combine"] = False
+    result = zgm.validate_batch_invariant_mode(config)
+    assert any("moe_ep_invariant_combine" in v for v in result.violations), result.violations
+
+
+def test_exact_top_p_lifts_the_top_p_refusal_only_when_opted_in():
+    """policy.megatron_cfg.exact_top_p (ThunderSync's exact nucleus policy,
+    exact_nucleus.py) accepts generation.top_p == exact_top_p; nothing else."""
+    config = _policy_config()
+    config["generation"]["top_p"] = 0.95
+    assert any("top_p=1.0" in v for v in zgm.validate_batch_invariant_mode(config).violations)
+    config["megatron_cfg"]["exact_top_p"] = 0.95
+    assert not any("top_p" in v for v in zgm.validate_batch_invariant_mode(config).violations)
+    zgm.validate_zero_train_gen_kl(config, check_environment=False)
+    config["megatron_cfg"]["exact_top_p"] = 0.9
+    assert any("exact_top_p" in v for v in zgm.validate_batch_invariant_mode(config).violations)
+    config["megatron_cfg"]["exact_top_p"] = 0.95
+    config["generation"]["top_k"] = 50
+    assert any("exact_top_p" in v for v in zgm.validate_batch_invariant_mode(config).violations)
+
+
+def test_device_dispatch_budget_must_cover_a_learner_micro_batch():
+    """Regression (Nano 16k MBS 2): a training micro-batch of MBS x max_total_sequence_length tokens above
+    NEMO_RL_MOE_DEVICE_DISPATCH_TOKENS raised at run time; the preflight now refuses it."""
+    config = _policy_config()
+    config["megatron_cfg"]["env_vars"]["NEMO_RL_MOE_DEVICE_DISPATCH"] = "1"
+    config["megatron_cfg"]["env_vars"]["NEMO_RL_MOE_DEVICE_DISPATCH_TOKENS"] = "20480"
+    config["max_total_sequence_length"] = 18432
+    config["train_micro_batch_size"] = 1
+    config["logprob_batch_size"] = 1
+    assert zgm.validate_batch_invariant_mode(config).violations == []
+    config["train_micro_batch_size"] = 2
+    v = zgm.validate_batch_invariant_mode(config).violations
+    assert any("train_micro_batch_size" in x and "36864" in x for x in v), v
+    config["megatron_cfg"]["env_vars"]["NEMO_RL_MOE_DEVICE_DISPATCH_TOKENS"] = "36864"
+    assert zgm.validate_batch_invariant_mode(config).violations == []

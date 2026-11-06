@@ -1,0 +1,18 @@
+# ThunderSync colocated exact partial rollout, VERIFY AT THE WAKE (docs/colo/THEORY.md v2 §13):
+# colo_xprs.yaml (⊥-BV pool at one constant envelope M, prompt drop, spare prompts) with thundersync.wake_verify.
+#   Phase k (engine on theta_k): batch k's continuations (rejected rows from tau, unfinished accepted rows from their
+#   end) decode beside the drafting of batch k+1; the phase ends when batch k is complete. At the stand-down the
+#   drafts of batch k+1 still decoding are cut where they stand (unfinished), so batch k+1 is complete there; after
+#   training, the stage verifies it against theta_{k+1} at the start of phase k+1. One wake per step for the
+#   continuations, no separate continuation phase (SPR's paused rows resume at the next wake the same way).
+#   Fixed-G rule (TAIL_FLOOR.md §4 (11-05)): M 1.35, N = 14 drafts per prompt (k_drafts 1.75 at G 8), 8 spare prompts
+#   (72 admitted for 64 trained at Super-L22); tail_mtd 4 (dead suffix + siblings).
+defaults:
+  - colo_xprs.yaml
+
+thundersync:
+  wake_verify: true
+  null_bv_fixed_m: 1.35
+  k_drafts: 1.75
+  spare_prompts: 8
+  tail_mtd: 4

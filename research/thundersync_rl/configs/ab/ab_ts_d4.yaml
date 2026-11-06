@@ -1,0 +1,8 @@
+# Arm "ts_d4": ThunderSync at depth 4 (lanes-k; la2.py): 4 cohort lanes, the cohort lane of step s drafts cohort
+# s + 4 from theta_s once its own cohort is final (drafts age 4; the k - 1 cohorts after step 0 / a boundary fall
+# back to lookahead 1). Everything else is arm ts_scale (run_ab_arm.sh LANES=4).
+defaults: ab_ts_scale.yaml
+
+thundersync:
+  cohort_lanes: 4
+  cohort_lane_lookahead: 4

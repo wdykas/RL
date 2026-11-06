@@ -1,0 +1,33 @@
+# Paper configuration, async-k on k engine lanes (lanes-k; k = 2 here; k = 4: ++thundersync.rollout_lag=4 ++thundersync.cohort_lanes=4).
+# Same learner / engine settings as ts.yaml where they are not ThunderSync-specific: keyed wide sampler, BI forwards,
+# vocab-parallel canonical log-probs (CONFERENCE_PLAN §6 item 3: on in every async arm), device-dispatch MoE, engine /
+# learner timing, NCCL_BUFFSIZE 1 MiB. No in-loop exactness checks (the arm is off-policy by design). Layout stays with
+# the launcher. Token cap 2 x (2048 + 8192) = 20480 as in ts.yaml.
+defaults: ../ab/ab_async2.yaml
+thundersync:
+  short_fillers: true
+  plain_engine_sampler: wide
+  driver_env:
+    NEMO_RL_VOCAB_LSE: canonical_block
+    THUNDERSYNC_ENGINE_PROF: "1"
+    NEMO_RL_MOE_DEVICE_DISPATCH: "1"
+    NEMO_RL_MOE_DEVICE_DISPATCH_TOKENS: "20480"
+    NEMO_RL_MOE_DEVICE_DISPATCH_CAPACITY: "2.0"
+    NEMO_RL_LEARNER_GRAPHS_SHARED_POOL: "0"
+policy:
+  megatron_cfg:
+    env_vars:
+      THUNDERSYNC_LEARNER_PROF: "1"
+      THUNDERSYNC_ENGINE_PROF: "1"
+      NEMO_RL_MOE_DEVICE_DISPATCH: "1"
+      NEMO_RL_MOE_DEVICE_DISPATCH_TOKENS: "20480"
+      NEMO_RL_MOE_DEVICE_DISPATCH_CAPACITY: "2.0"
+      NEMO_RL_LEARNER_DEFER_METRICS: "1"
+      NEMO_RL_LEARNER_GRAPHS_SHARED_POOL: "0"
+      NEMO_RL_VOCAB_LSE: canonical_block
+      NCCL_BUFFSIZE: "1048576"
+  generation:
+    mcore_generation_config:
+      cuda_graph_all_prefills: true
+      max_requests: 256
+      cuda_graph_max_tokens: 512

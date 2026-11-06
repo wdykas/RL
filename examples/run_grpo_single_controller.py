@@ -104,6 +104,16 @@ def main() -> None:
 
     config = OmegaConf.to_container(config, resolve=True)
     check_outdated_config(config)
+    if (config.get("thundersync") or {}).get("mode") == "nolanes":
+        # ThunderSync nolanes mode: validate, ThunderSync worker class, cross-fade routing on every worker.
+        from thundersync_rl.nolanes import configure_driver
+
+        configure_driver(config)
+    elif (config.get("thundersync") or {}).get("mode") == "colo":
+        # ThunderSync colocated mode (research/colo/MODEL.md): validate, ThunderSync worker class.
+        from thundersync_rl.colo import configure_driver as configure_colo_driver
+
+        configure_colo_driver(config)
     config = MasterConfig(**config)
     print("Applied CLI overrides")
 

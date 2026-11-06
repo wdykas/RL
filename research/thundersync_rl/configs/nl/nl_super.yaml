@@ -1,0 +1,63 @@
+# nolanes per-model config (super).
+# Routing: uniform cross-fade m .01, candidate cap 8 (research/routing_crux/DESIGN.md §10).
+# Learner / optimizer: EXACTLY the learner-tuned stock arm nrlli2 (research/baselines_nrl/README.md §2: ts optimizer
+# schedule, MBS 2, no precision-aware optimizer, force_on_policy_ratio, no seq log-prob filter, no packing), plus the
+# exact learner speed settings (host-sync-free MoE device dispatch, deferred loss metrics).
+defaults:
+  - nl_base.yaml
+
+grpo:
+  seq_logprob_error_threshold: null
+
+loss_fn:
+  force_on_policy_ratio: true
+
+policy:
+  train_micro_batch_size: 2
+  megatron_cfg:
+    recompute_granularity: selective
+    recompute_modules: [moe]
+    empty_unused_memory_level: 0
+    moe_per_layer_logging: false
+    track_moe_metrics: false
+    optimizer:
+      lr: 1.0e-06
+      min_lr: 1.0e-06
+      weight_decay: 0.01
+      clip_grad: 1.0
+      use_precision_aware_optimizer: false
+    scheduler:
+      start_weight_decay: 0.01
+      end_weight_decay: 0.01
+      weight_decay_incr_style: constant
+      lr_decay_style: constant
+      lr_warmup_iters: 13
+      lr_warmup_init: 5.0e-07
+    distributed_data_parallel_config:
+      overlap_param_gather: false
+      grad_reduce_in_fp32: true
+    env_vars:
+      NEMO_RL_MOE_DEVICE_DISPATCH: "1"
+      NEMO_RL_MOE_DEVICE_DISPATCH_TOKENS: "20480"
+      NEMO_RL_MOE_DEVICE_DISPATCH_CAPACITY: "2.0"
+      NEMO_RL_LEARNER_DEFER_METRICS: "1"
+
+thundersync:
+  crossfade_routing_m: 0.01
+  crossfade_routing_m_profile: null
+  crossfade_routing_extra: 8
+  # Learner expert GEMMs skip zero-weight cross-fade slots (device dispatch; same bits).
+  crossfade_routing_sparse: true
+  # Streaming continuation start: 4 verify calls, each run's rows decode while the next verifies.
+  verify_stream_chunks: 4
+  # R31 Option A (exact variant): groups train in arrival order as their tails finish, into the learner's
+  # order-invariant int64-limb gradient accumulator; one optimizer step per batch.
+  train_overlap: true
+  # EDV, η-deferred verification (DESIGN §22.4-22.12; thundersync_rl/edv.py). ⊥-BV accepts a draft whole iff its
+  # final coin η_g (row seed, known before any forward) <= b_g. Measured at Super-L22 (§22.10, 3816 rows): no b_g below
+  # 0.48, homogeneous rows (sd of S_g = the sd implied by the mean v), expected 0.003 surprises/step at e = 0.5.
+  # Finished drafts with η_g <= 0.5 are not forwarded before training; their group's training forward decides them
+  # (the verifier's b_g, bitwise) and a surprise drops that group's capture, verifies the row and retrains the group.
+  # Paired A/B 74.8 -> 71.1 s/step (§22.12). null = off (A/B arms). Needs train_overlap, force_on_policy_ratio,
+  # row_seeds, no packing (validator).
+  edv_threshold: 0.5    # fixed: knee of the empirical b_g law between 0.5 and 0.6; surprises are free with risk-first (§22.15)

@@ -15,6 +15,7 @@ import copy
 import datetime
 import gc
 import inspect
+import itertools
 import logging
 import os
 import re
@@ -23,7 +24,7 @@ import warnings
 from collections import OrderedDict, defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, replace
-from typing import Any, Iterable, Iterator, Optional, TypeVar, cast
+from typing import Any, Hashable, Iterable, Iterator, Optional, TypeVar, cast
 
 log = logging.getLogger(__name__)
 
@@ -54,12 +55,21 @@ from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import (
 )
 from transformers import PreTrainedTokenizerBase
 
-from nemo_rl.algorithms.logits_sampling_utils import (
-    TrainingSamplingParams,
+from nemo_rl.algorithms.grad_streaming import (
+    GradStreamingSpec,
+    StreamBucket,
+    StreamingGroupAccumulator,
+    grad_stream_memory,
 )
+from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossFunction
-from nemo_rl.algorithms.loss.loss_functions import ClippedPGLossFn
+from nemo_rl.algorithms.loss.loss_functions import (
+    ClippedPGLossFn,
+    deferred_metric_scalars,
+    resolve_metric_scalars,
+)
 from nemo_rl.algorithms.loss.utils import rescale_loss_metrics
+from nemo_rl.algorithms.loss.wrapper import empty_mb_metrics
 from nemo_rl.algorithms.metric_utils import LEARNING_RATE_KEY
 from nemo_rl.data.multimodal_utils import (
     attach_media_token_validity_mask,
@@ -103,6 +113,7 @@ from nemo_rl.models.megatron.pipeline_parallel import (
     broadcast_obj_from_pp_rank,
     broadcast_tensors_from_last_stage,
 )
+from nemo_rl.models.megatron import sticky_routing
 from nemo_rl.models.megatron.router_replay import (
     router_replay_dimensions,
     router_replay_enabled,
@@ -178,6 +189,28 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
 )
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
+
+
+def _defer_metrics_ctx():
+    """Learner loss metrics as device scalars inside a forward/backward call (opt-in,
+    ``NEMO_RL_LEARNER_DEFER_METRICS=1``: no ``.item()`` between a micro-batch's forward
+    and backward; resolved once per call, same values)."""
+    return deferred_metric_scalars() if _defer_metrics_on() else nullcontext()
+
+
+def _defer_metrics_on() -> bool:
+    return os.environ.get("NEMO_RL_LEARNER_DEFER_METRICS", "0") == "1"
+
+
+@dataclass
+class _TrainPiece:
+    """One DP slice prepared for a pipeline call (see ``train_microbatches``)."""
+
+    data_iterator: Iterator[Any]
+    num_microbatches: int
+    micro_batch_size: int
+    padded_seq_length: int
+    use_router_replay: bool
 
 
 def _should_use_router_replay(
@@ -845,6 +878,68 @@ class MegatronPolicyWorkerImpl(
         os.environ["LOCAL_RANK"] = str(local_rank)
         # Batch-invariant / zero-KL kernels must be enabled before CUDA init.
         enable_batch_invariant_mode(config)
+        if config["megatron_cfg"].get("moe_ep_invariant_combine", False):
+            # MoE combine through exact fixed-point limbs: the same bits at every
+            # EP size, learner (AlltoAll unpermute) and engine (limb reduce-scatter).
+            from nemo_rl.models.megatron import ep_invariant_combine
+
+            ep_invariant_combine.set_enabled(True)
+            ep_invariant_combine.install_engine_buffers()
+        if config["megatron_cfg"].get("batch_invariant_mode") and (
+            config["megatron_cfg"].get("fused_bi_unpermute", True)
+            or config["megatron_cfg"].get("moe_ep_invariant_combine", False)
+        ):
+            # One Triton kernel for the AlltoAll batch-invariant unpermute, bitwise
+            # Megatron's EP x top-k eager loop (fused_bi_unpermute=false keeps the loop).
+            from nemo_rl.models.megatron import bi_unpermute
+
+            bi_unpermute.install()
+        from nemo_rl.models.megatron import device_dispatch, moe_dispatcher_refs
+
+        # MoE dispatchers drop their routing-probs reference after the combine, so the
+        # MoE recompute's graph (norm output + its grad per MoE layer) is not kept
+        # alive after a training call (moe_dispatcher_refs.py).
+        moe_dispatcher_refs.install()
+        if device_dispatch.enabled():
+            # Opt-in (NEMO_RL_MOE_DEVICE_DISPATCH=1): MoE token dispatch without host
+            # syncs (device counts; EP > 1 symmetric-memory exchange), bitwise Megatron's.
+            device_dispatch.install()
+        if (config["megatron_cfg"].get("bi_split_kv") or {}).get("enabled", False):
+            # Anchored, batch-invariant split-KV FA4 attention for learner and engine.
+            from nemo_rl.models.megatron import bi_split_kv
+
+            gen = (config.get("generation") or {}).get("mcore_generation_config") or {}
+            bi_split_kv.install(
+                config["megatron_cfg"],
+                max_seq_len=max(
+                    int(config.get("max_total_sequence_length") or 0),
+                    int(gen.get("max_model_len") or 0),
+                ),
+            )
+        if config["megatron_cfg"].get("fp32_residual_connection"):
+            from nemo_rl.models.megatron import fp32_residual
+
+            fp32_residual.install()
+        if config["megatron_cfg"].get("forward_gemm_precision") is not None:
+            from nemo_rl.models.megatron import fp16_gemm
+
+            fp16_gemm.install(
+                config["megatron_cfg"].get("lm_head_precision"),
+                config["megatron_cfg"].get("down_proj_prescale_log2") or 0,
+                bool(config["megatron_cfg"].get("mamba_fp32_prenorm_input", True)),
+            )
+            if config["megatron_cfg"].get("moe_latent_tp_shard"):
+                # TP-sharded latent MoE projections (pre-wrap hook shards the models).
+                from nemo_rl.models.megatron import latent_tp_shard
+
+                latent_tp_shard.install(True)
+            if config["megatron_cfg"].get("precision_raise"):
+                # Targeted precision raises (opt-in acceptance levers; same on both sides).
+                from nemo_rl.models.megatron import precision_raise
+
+                precision_raise.install(
+                    config["megatron_cfg"]["precision_raise"], config["megatron_cfg"]
+                )
         torch.cuda.set_device(local_rank)
 
         # Apply patch from https://github.com/NVIDIA/TransformerEngine/pull/2286/files
@@ -863,7 +958,11 @@ class MegatronPolicyWorkerImpl(
         init_telemetry_worker()
 
         self.cfg = config
-        self._router_replay_enabled = router_replay_enabled(config)
+        # Sticky MoE routing (ThunderSync speculation) replays per-token anchors
+        # through the same RouterReplay plumbing as R3 router replay.
+        self._router_replay_enabled = router_replay_enabled(
+            config
+        ) or sticky_routing.configure(config) is not None
         # HF param names to MXFP8-quantize on the trainer during refit; set via
         # enable_refit_prequantize() when vllm_cfg.refit_prequantize is on.
         self._refit_prequant_names: set[str] = set()
@@ -994,7 +1093,38 @@ class MegatronPolicyWorkerImpl(
 
         self.mcore_state = model_and_optimizer_state.state
         self.model = model_and_optimizer_state.model
+        if (
+            self.cfg["megatron_cfg"].get("batch_invariant_mode")
+            and (self.cfg["megatron_cfg"].get("context_parallel_size") or 1) > 1
+        ):
+            # BI context parallelism: head-parallel attention / Mamba on Megatron's CP group.
+            from nemo_rl.models.megatron import bi_context_parallel
+
+            n = bi_context_parallel.install_megatron_cp(self.model)
+            print(f"[bi_context_parallel] CP {bi_context_parallel.size()} installed: {n}", flush=True)
         self.optimizer = model_and_optimizer_state.optimizer
+        if (
+            self.optimizer is not None
+            and config["megatron_cfg"].get("forward_gemm_precision") is not None
+        ):
+            # fp16 routed expert parameters: fail on a non-finite fp16 weight after every optimizer step.
+            from nemo_rl.models.megatron import fp16_moe
+
+            fp16_params = fp16_moe.fp16_expert_params(self.model)
+            if fp16_params:
+                fp16_moe.guard_after_optimizer_step(self.optimizer, fp16_params)
+                # Startup evidence: fp16 expert range at load, router frozen (weights and bias).
+                routers = [
+                    p for n, p in self.model.named_parameters() if ".router." in n
+                ]
+                print(
+                    f"[fp16_moe] rank {torch.distributed.get_rank()}: {len(fp16_params)} fp16 expert "
+                    f"params, max |w| {fp16_moe.check_fp16_expert_params(fp16_params):.6g} at load; "
+                    f"router params trainable {sum(p.requires_grad for p in routers)}/{len(routers)}, "
+                    f"moe_router_bias_update_rate "
+                    f"{config['megatron_cfg'].get('moe_router_bias_update_rate')}",
+                    flush=True,
+                )
         self.scheduler = model_and_optimizer_state.scheduler
         self.checkpointing_context = model_and_optimizer_state.checkpointing_context
         param_sync_func = model_and_optimizer_state.param_sync_func
@@ -1146,6 +1276,14 @@ class MegatronPolicyWorkerImpl(
 
         log_gpu_memory_diagnostics(
             label="init_complete", worker_type="MegatronPolicyWorker"
+        )
+        # Every learner / engine process: one source tree per package (megatron.core, megatron.bridge,
+        # transformer_engine, nemo_rl), printed and enforced (nemo_rl/utils/module_provenance.py).
+        from nemo_rl.utils.module_provenance import check_module_provenance
+
+        check_module_provenance(
+            f"worker {type(self).__name__} rank="
+            f"{torch.distributed.get_rank() if torch.distributed.is_initialized() else '?'}"
         )
 
     def enable_forward_pre_hook(self):
@@ -1487,7 +1625,7 @@ class MegatronPolicyWorkerImpl(
                         stage="train",
                         require=True,
                     )
-                    with maybe_r3_trace_stage("train", enabled=use_router_replay):
+                    with maybe_r3_trace_stage("train", enabled=use_router_replay), _defer_metrics_ctx():
                         losses_reduced = megatron_forward_backward(
                             model=self.model,
                             data_iterator=data_iterator,
@@ -1510,6 +1648,9 @@ class MegatronPolicyWorkerImpl(
                             use_router_replay=use_router_replay,
                             router_replay_train=not eval_mode,
                         )
+
+                if _defer_metrics_on() and parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+                    resolve_metric_scalars(losses_reduced)
 
                 # Clear mtp_grad_scale_func after the forward-backward pass so
                 # it doesn't get serialized in the run_config.yaml when saving
@@ -1666,6 +1807,7 @@ class MegatronPolicyWorkerImpl(
         )
 
         metrics = {
+            **({"exact_grad_accum": exact_accum_report} if exact_accum_report is not None else {}),
             "global_loss": global_loss.cpu(),
             "rank": torch.distributed.get_rank(),
             "gpu_name": torch.cuda.get_device_name(),
@@ -1843,16 +1985,57 @@ class MegatronPolicyWorkerImpl(
                 f"mtp_loss_scaling_factor={mtp_loss_scaling_factor}."
             )
 
+        skip_zero_advantage_rows = (
+            isinstance(loss_fn, ClippedPGLossFn) and loss_fn.skip_zero_advantage_rows
+        )
+        if skip_zero_advantage_rows:
+            self._require_advantage_weighted_gradients(
+                "loss_fn.skip_zero_advantage_rows"
+            )
+            # Packed / dynamic microbatches are laid out by the driver for the
+            # full row set; dropping rows on the worker would invalidate them.
+            if (
+                self.cfg["sequence_packing"]["enabled"]
+                or self.cfg["dynamic_batching"]["enabled"]
+            ):
+                raise ValueError(
+                    "loss_fn.skip_zero_advantage_rows requires fixed-size "
+                    "microbatches (sequence_packing and dynamic_batching disabled)"
+                )
+            # Skipping drops a data-dependent number of rows (or whole calls)
+            # on each DP rank, so ranks would run different numbers of
+            # forward/backward passes; the expert-parallel all-to-all spans DP
+            # ranks and would hang. Train every row instead: zero-advantage
+            # rows add exactly zero gradient, so only the speedup is lost.
+            if self.cfg["megatron_cfg"]["expert_model_parallel_size"] > 1:
+                # Subclasses whose own planner skips zero-advantage rows with equal
+                # forwards per rank (ThunderSync count-only chunks) set
+                # _planner_skips_zero_advantage: the warning is false there and,
+                # firing every run, trained readers to ignore warnings.
+                if not getattr(self, "_planner_skips_zero_advantage", False):
+                    # warnings.warn reports once per call site, not once per step.
+                    warnings.warn(
+                        "loss_fn.skip_zero_advantage_rows is ignored with "
+                        "expert_model_parallel_size > 1: every data-parallel rank "
+                        "must run the same number of forward passes"
+                    )
+                skip_zero_advantage_rows = False
+
         return {
             "loss_fn": loss_fn,
             "loss_type": loss_type,
             "metric_normalizations": metric_normalizations,
+            "skip_zero_advantage_rows": skip_zero_advantage_rows,
             "mtp_enabled": mtp_enabled,
             "mtp_detach_heads": mtp_detach_heads,
             "gbs": gbs or self.cfg["train_global_batch_size"],
             "mbs": mbs or self.cfg["train_micro_batch_size"],
             "local_valid_seqs": torch.zeros((), dtype=torch.float64, device="cuda"),
             "local_valid_toks": torch.zeros((), dtype=torch.float64, device="cuda"),
+            # Counts of the rows actually trained (differs from the above only
+            # when zero-advantage rows are skipped); denominators for metrics.
+            "trained_valid_seqs": torch.zeros((), dtype=torch.float64, device="cuda"),
+            "trained_valid_toks": torch.zeros((), dtype=torch.float64, device="cuda"),
             "all_mb_metrics": [],
             "mb_losses": [],
             "total_num_microbatches": 0,
@@ -1863,7 +2046,18 @@ class MegatronPolicyWorkerImpl(
             # Policy parameters/optimizer may be offloaded between PPO chunks;
             # accumulated gradients remain resident until the step closes.
             "offloaded": False,
+            # ``forward_backward_func`` invocations this step. Equals
+            # num_chunks unless train_microbatches runs several slices per
+            # call (pipeline-parallel streaming); each call pays one pipeline
+            # fill/drain bubble.
+            "num_pipeline_calls": 0,
             "draft_step_state": DraftStepState(),
+            # Trajectory-level gradient streaming (see grad_streaming.py);
+            # None unless begin_train_step was given a GradStreamingSpec.
+            "grad_stream": None,
+            # group -> (local_valid_seqs, local_valid_toks) contributed by its
+            # bucketed chunks, so a discarded group can be un-counted.
+            "grad_stream_group_counts": {},
             # Saved across the step so we can restore at finish/abort.
             "saved_grad_sync_func": None,
             "saved_no_sync_func": None,
@@ -1937,6 +2131,7 @@ class MegatronPolicyWorkerImpl(
         loss_fn: LossFunction,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
+        grad_streaming: Optional[GradStreamingSpec] = None,
     ) -> None:
         existing = getattr(self, "_train_step_state", None)
         if existing is not None:
@@ -2010,12 +2205,17 @@ class MegatronPolicyWorkerImpl(
             state["saved_no_sync_func"] = None
             state["saved_finalize_model_grads_func"] = None
 
+        if grad_streaming is not None:
+            state["grad_stream"] = self._make_grad_stream_accumulator(grad_streaming)
+        state["exact_accum"] = self._exact_grad_accum_for_step(grad_streaming)
+
         self._train_step_state = state
 
     @wrap_with_nvtx_name("megatron_policy_worker/train_microbatch")
     def train_microbatch(
         self,
         data: BatchedDataDict[Any],
+        stream_bucket: Optional[StreamBucket] = None,
     ) -> None:
         """One DP slice of data → one ``forward_backward_func`` invocation.
 
@@ -2026,14 +2226,131 @@ class MegatronPolicyWorkerImpl(
         land in ``param.main_grad`` and per-microbatch metrics accumulate
         in the open-step state until ``finish_train_step`` surfaces them.
 
+        With gradient streaming enabled for the step, the chunk's gradient
+        is moved out of the grad buffers right after backward: into the
+        ``stream_bucket`` accumulator when given (chunk trained with
+        advantage 1, group still open), else straight into the batch
+        accumulator (chunk trained with final advantages). A step opened with
+        ``max_open_groups=0`` has no buckets, and final chunks simply
+        accumulate in the grad buffers as in a non-streamed step.
+
         Multimodal validity-mask and model-owned packing/CP behavior match the
         regular ``train`` path.
+        """
+        self.train_microbatches([data], stream_bucket=stream_bucket)
+
+    @wrap_with_nvtx_name("megatron_policy_worker/train_microbatches")
+    def train_microbatches(
+        self,
+        datas: list[BatchedDataDict[Any]],
+        stream_bucket: Optional[StreamBucket] = None,
+        micro_batch_sizes: Optional[list[int]] = None,
+    ) -> None:
+        """Several DP slices → ONE ``forward_backward_func`` invocation.
+
+        Equivalent to ``train_microbatch`` on each slice in order (same
+        micro-batches, same normalization counts, same zero-advantage
+        skipping per slice), except that all their micro-batches run in a
+        single pipeline schedule call. Under pipeline parallelism every call
+        pays a fill/drain bubble of ``P - 1`` micro-batch slots, so k calls of
+        m micro-batches each idle for ``k (P - 1)`` slots and one call of
+        ``k m`` micro-batches for ``P - 1``. The gradient differs from k
+        separate calls only in fp32 rounding (Megatron scales each
+        micro-batch's loss by ``M / M`` with M the call's micro-batch count).
+
+        All slices share one gradient destination: ``stream_bucket`` (one
+        open-group bucket) or the batch gradient (final advantages). The
+        gradient is captured once, after the call.
+
+        Micro-batches of different shapes (row count, padded sequence length)
+        share a call only under ``config.variable_seq_lengths``, which this
+        method switches on for the call when PP > 1 and the shapes differ
+        (each pipeline send then exchanges its shape first).
+
+        Args:
+            datas: DP slices, each as ``train_microbatch`` takes it.
+            stream_bucket: see ``train_microbatch``.
+            micro_batch_sizes: micro-batch size per slice (default: the
+                step's ``mbs`` for every slice).
         """
         state = self._assert_step_open()
         if state.get("offloaded", False):
             raise RuntimeError("prepare_for_training must restore the offloaded step")
+        grad_stream: Optional[StreamingGroupAccumulator] = state["grad_stream"]
+        if stream_bucket is not None and grad_stream is None:
+            raise ValueError(
+                "train_microbatch got a stream_bucket but the step was opened "
+                "without grad_streaming"
+            )
+        if micro_batch_sizes is not None and len(micro_batch_sizes) != len(datas):
+            raise ValueError(
+                f"{len(micro_batch_sizes)} micro_batch_sizes for {len(datas)} slices"
+            )
+        if grad_stream is not None:
+            # Reject before backward: in the in-place mode (max_open_groups=0)
+            # a bucket chunk's gradient would land in the batch gradient.
+            grad_stream.check_capture(
+                None if stream_bucket is None else stream_bucket.group
+            )
+        replay_snapshot = self._snapshot_step_counters(state) if state.get("exact_replay") else None
+        # A capture the backend may refuse after the call (``_pre_capture_discard``): the step counters to restore.
+        discard_snapshot = (
+            self._snapshot_step_counters(state)
+            if state.get("exact_accum") is not None and self._capture_may_discard()
+            else None
+        )
+        if state.get("exact_accum") is not None:
+            # R33 hardening: each group's backward starts on an idle device (nothing from the previous group, the
+            # data-plane fetch or the moment park still in flight), so arrival timing cannot shift what overlaps it.
+            torch.cuda.synchronize()
         try:
-            self._train_microbatch_body(state, data)
+            if stream_bucket is not None:
+                seqs_before = state["local_valid_seqs"].clone()
+                toks_before = state["local_valid_toks"].clone()
+            # With zero-advantage skipping, an all-zero slice is dropped
+            # without a forward when another slice of the call runs (the call
+            # reports this step's metrics); see _drop_zero_advantage_rows.
+            call_has_live = state["skip_zero_advantage_rows"] and any(
+                bool(self._live_rows(d).any()) for d in datas
+            )
+            pieces = [
+                self._prepare_train_piece(
+                    state,
+                    data,
+                    state["mbs"] if micro_batch_sizes is None else micro_batch_sizes[i],
+                    call_has_live=call_has_live,
+                )
+                for i, data in enumerate(datas)
+            ]
+            pieces = [p for p in pieces if p is not None]
+            for call, variable_shapes in (
+                self._pipeline_call_groups(pieces) if pieces else []
+            ):
+                self._run_train_pieces(state, call, variable_shapes)
+            if state.get("exact_accum") is not None:
+                if state.get("exact_replay"):
+                    state["exact_accum"].replay_compare()
+                    self._restore_step_counters(state, replay_snapshot)
+                    state["exact_replay"] = False
+                elif discard_snapshot is not None and self._pre_capture_discard(state):
+                    # The call's gradient is dropped, not added, and the step's counters are those before the call.
+                    state["exact_accum"].discard()
+                    self._restore_step_counters(state, discard_snapshot)
+                else:
+                    # One call = one prompt group (nolanes train overlap): fold its gradient out of the buffers.
+                    state["exact_accum"].capture()
+            if stream_bucket is not None:
+                counts = state["grad_stream_group_counts"]
+                prev_seqs, prev_toks = counts.get(stream_bucket.group, (0.0, 0.0))
+                counts[stream_bucket.group] = (
+                    prev_seqs + (state["local_valid_seqs"] - seqs_before),
+                    prev_toks + (state["local_valid_toks"] - toks_before),
+                )
+            if grad_stream is not None:
+                if stream_bucket is None:
+                    grad_stream.capture(None, None)
+                else:
+                    grad_stream.capture(stream_bucket.group, stream_bucket.reward)
         except Exception:
             # The body left all three mcore hooks nulled when begin_train_step
             # opened the step. If we propagate without restoring, future steps
@@ -2055,11 +2372,137 @@ class MegatronPolicyWorkerImpl(
                 )
             raise
 
+    def _capture_may_discard(self) -> bool:
+        """Whether ``_pre_capture_discard`` can refuse a call's capture (a subclass hook; never in stock)."""
+        return False
+
+    def _pre_capture_discard(self, state: dict[str, Any]) -> bool:
+        """Called on every rank after a call's backward, before its exact-accumulator capture: True drops the call's
+        gradient (every rank must return the same value). Stock: never."""
+        return False
+
+    @staticmethod
+    def _snapshot_step_counters(state: dict[str, Any]) -> dict[str, Any]:
+        """Scalars (tensors, numbers) and list lengths of the open step, to undo a CHECKS replay call."""
+        snap: dict[str, Any] = {}
+        for k, v in state.items():
+            if torch.is_tensor(v) and v.numel() <= 1:
+                snap[k] = v.clone()
+            elif isinstance(v, (int, float)) and not isinstance(v, bool):
+                snap[k] = v
+            elif isinstance(v, list):
+                snap[k] = ("__len__", len(v))
+        return snap
+
+    @staticmethod
+    def _restore_step_counters(state: dict[str, Any], snap: dict[str, Any]) -> None:
+        for k, v in snap.items():
+            if isinstance(v, tuple) and v and v[0] == "__len__":
+                del state[k][v[1] :]
+            elif torch.is_tensor(v):
+                state[k].copy_(v)
+            else:
+                state[k] = v
+
+    @staticmethod
+    def _live_rows(data: BatchedDataDict[Any]) -> torch.Tensor:
+        """Rows with a nonzero advantage on some valid token (bool per row)."""
+        sample_mask = data["sample_mask"]
+        token_mask = data["token_mask"][:, 1:] * sample_mask.unsqueeze(-1)
+        return (data["advantages"][:, 1:] * token_mask).ne(0).any(dim=-1)
+
+    def _drop_zero_advantage_rows(
+        self,
+        data: BatchedDataDict[Any],
+        mbs: Optional[int] = None,
+        call_has_live: bool = False,
+    ) -> tuple[Optional[BatchedDataDict[Any]], torch.Tensor, torch.Tensor]:
+        """Keep only rows with a nonzero advantage on some valid token.
+
+        Returns the kept rows (``None`` if there are none) and their valid
+        sequence/token counts. The kept set is topped up with dropped rows to
+        a multiple of the microbatch size (``mbs``, default the step's): fixed-
+        size microbatching would otherwise discard the remainder, and a
+        zero-advantage row adds exactly zero gradient.
+
+        ``call_has_live``: another slice of the same pipeline call has live
+        rows, so the call reports metrics and an all-zero slice is dropped
+        outright.
+
+        Only reached with expert parallelism off (``skip_zero_advantage_rows``
+        is forced off under EP), so ranks may run different forward counts.
+        """
+        sample_mask = data["sample_mask"]
+        token_mask = data["token_mask"][:, 1:] * sample_mask.unsqueeze(-1)
+        live = self._live_rows(data)
+        keep = torch.nonzero(live).flatten().tolist()
+        state = self._train_step_state
+        if not keep and call_has_live:
+            zero = torch.zeros((), dtype=torch.float64, device="cuda")
+            return None, zero, zero
+        if not keep:
+            # Every rank reports at least one per-microbatch metric entry per
+            # step, so the step's metric schema does not depend on how chunks
+            # were scheduled. Once a microbatch has run on this worker the
+            # schema is known and that entry is synthesized as an all-masked
+            # microbatch would report it; only the very first chunk on a
+            # worker still runs a forward/backward (gradient exactly zero).
+            filler = self._empty_mb_metrics(state["loss_fn"])
+            if state["all_mb_metrics"] or filler is not None:
+                if not state["all_mb_metrics"]:
+                    state["all_mb_metrics"].append(filler)
+                zero = torch.zeros((), dtype=torch.float64, device="cuda")
+                return None, zero, zero
+        mbs = state["mbs"] if mbs is None else mbs
+        pad = -len(keep) % mbs if keep else min(mbs, data.size)
+        if pad:
+            dropped = torch.nonzero(~live).flatten().tolist()
+            keep = sorted(keep + dropped[:pad])
+        kept_seqs = torch.sum(sample_mask[keep]).to(torch.float64)
+        kept_toks = torch.sum(token_mask[keep]).to(torch.float64)
+        if len(keep) < data.size:
+            data = data.select_indices(keep)
+        return data, kept_seqs, kept_toks
+
+    def _empty_mb_metrics(self, loss_fn: LossFunction) -> Optional[dict[str, Any]]:
+        """Metrics of a microbatch with no valid token, without running it.
+
+        Uses the metric keys this loss reported on an earlier microbatch of
+        this worker (``None`` if there was none yet). Values are what the loss
+        reports for an all-masked microbatch: zero sums (and zero loss),
+        ``+inf`` minima and ``-inf`` maxima, which every metric reducer skips.
+        """
+        keys = getattr(self, "_mb_metric_keys", {}).get(type(loss_fn))
+        if keys is None:
+            return None
+        return empty_mb_metrics(keys)
+
     def _train_microbatch_body(
         self,
         state: dict[str, Any],
         data: BatchedDataDict[Any],
     ) -> None:
+        """One slice, one ``forward_backward_func`` call (no capture)."""
+        if should_reduce_loss_across_context_parallel(data):
+            raise NotImplementedError(
+                "Direct packed SFT rows are not supported by the split training API"
+            )
+        piece = self._prepare_train_piece(state, data, state["mbs"])
+        if piece is not None:
+            self._run_train_pieces(state, [piece])
+
+    def _prepare_train_piece(
+        self,
+        state: dict[str, Any],
+        data: BatchedDataDict[Any],
+        mbs: int,
+        call_has_live: bool = False,
+    ) -> Optional["_TrainPiece"]:
+        """Count one slice for normalization and build its micro-batch iterator.
+
+        Returns ``None`` when zero-advantage skipping drops the whole slice
+        (its tokens are still counted).
+        """
         if should_reduce_loss_across_context_parallel(data):
             raise NotImplementedError(
                 "Direct packed SFT rows are not supported by the split training API"
@@ -2067,7 +2510,6 @@ class MegatronPolicyWorkerImpl(
 
         state["num_chunks"] += 1
         self._log_gpu_mem("chunk_enter")
-        loss_fn = state["loss_fn"]
 
         # Accumulate local mask sums for the finish-time all_reduce.
         # Inlined from process_global_batch (data.py:319-332) — we can't
@@ -2086,6 +2528,18 @@ class MegatronPolicyWorkerImpl(
 
         state["local_valid_seqs"] = state["local_valid_seqs"] + call_local_seqs
         state["local_valid_toks"] = state["local_valid_toks"] + call_local_toks
+
+        # Rows whose advantages are all zero contribute exactly zero gradient
+        # (the loss validated that every term is advantage-weighted) but keep
+        # their tokens in the normalization counted above.
+        if state["skip_zero_advantage_rows"]:
+            data, call_local_seqs, call_local_toks = self._drop_zero_advantage_rows(
+                data, mbs, call_has_live
+            )
+            if data is None:
+                return None
+        state["trained_valid_seqs"] = state["trained_valid_seqs"] + call_local_seqs
+        state["trained_valid_toks"] = state["trained_valid_toks"] + call_local_toks
 
         # Match the synchronous Megatron path: derive the mask on the worker
         # immediately before microbatch processing so sequence packing applies
@@ -2117,20 +2571,19 @@ class MegatronPolicyWorkerImpl(
                 state["local_valid_toks"].item(),
             )
 
-        # Build the per-call iterator. Each ``train_microbatches_from_meta``
-        # call carries one DP slice; the iterator subdivides into pipeline
-        # microbatches.
+        # Build the per-slice iterator. Each slice is subdivided into pipeline
+        # microbatches; ``_run_train_pieces`` chains the slices of one call.
         attach_media_token_validity_mask(data, self.media_placeholder_token_id)
         (
             data_iterator,
             num_microbatches,
             micro_batch_size,
-            seq_length,
+            _seq_length,
             padded_seq_length,
         ) = get_microbatch_iterator(
             data,
             self.cfg,
-            state["mbs"],
+            mbs,
             straggler_timer=self.mcore_state.straggler_timer,
             delegate_pack_to_model=self.delegate_pack_to_model,
             delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
@@ -2139,7 +2592,102 @@ class MegatronPolicyWorkerImpl(
             create_router_padding_mask=self.create_router_padding_mask,
             allow_unmasked_chunkwise_cp=self.allow_unmasked_chunkwise_cp,
         )
-        state["total_num_microbatches"] += int(num_microbatches)
+        use_router_replay = _should_use_router_replay(
+            enabled=self._router_replay_enabled,
+            data=data,
+            stage="train",
+            require=True,
+        )
+        return _TrainPiece(
+            data_iterator=data_iterator,
+            num_microbatches=int(num_microbatches),
+            micro_batch_size=int(micro_batch_size),
+            padded_seq_length=int(padded_seq_length),
+            use_router_replay=bool(use_router_replay),
+        )
+
+    def _pipeline_call_groups(
+        self, pieces: list["_TrainPiece"]
+    ) -> list[tuple[list["_TrainPiece"], bool]]:
+        """Split ``pieces`` into pipeline calls: ``[(pieces, variable_shapes)]``.
+
+        Pipeline stages receive activations into buffers of the call's fixed
+        shape ``(seq_length, micro_batch_size, hidden)`` unless
+        ``config.variable_seq_lengths`` is set, in which case every send first
+        exchanges its shape. Pieces of one shape (or any pieces at PP = 1,
+        which sends nothing) form one call. Pieces of different shapes under
+        PP > 1 form one call with ``variable_seq_lengths`` switched on for it,
+        except with the ``allgather`` MoE token dispatcher, which Megatron's
+        TransformerConfig rejects together with ``variable_seq_lengths``: those
+        fall back to one call per piece (the previous behavior).
+        """
+        shapes = {(p.micro_batch_size, p.padded_seq_length) for p in pieces}
+        pp = self.cfg["megatron_cfg"].get("pipeline_model_parallel_size", 1) or 1
+        model_config = getattr(self.model, "config", None)
+        if len(shapes) == 1 or pp == 1:
+            return [(pieces, False)]
+        if model_config is not None and getattr(
+            model_config, "variable_seq_lengths", False
+        ):
+            return [(pieces, False)]  # already exchanging shapes
+        if (
+            model_config is None
+            or getattr(model_config, "moe_token_dispatcher_type", None) == "allgather"
+        ):
+            if not getattr(self, "_warned_split_shapes", False):
+                self._warned_split_shapes = True
+                warnings.warn(
+                    "train_microbatches: micro-batches of different shapes run as "
+                    "separate pipeline calls (variable_seq_lengths is not "
+                    "available with this model config); each call pays a "
+                    "pipeline bubble"
+                )
+            return [([p], False) for p in pieces]
+        if not getattr(self, "_warned_variable_shapes", False):
+            self._warned_variable_shapes = True
+            warnings.warn(
+                "train_microbatches: micro-batches of different shapes share one "
+                "pipeline call via config.variable_seq_lengths; untested end to "
+                "end on GPU (see research/thundersync_rl/tests/functional/"
+                "check_equivalence.py at PP=2)"
+            )
+        return [(pieces, True)]
+
+    @contextmanager
+    def _variable_seq_lengths(self, enabled: bool) -> Iterator[None]:
+        """Set ``config.variable_seq_lengths`` for one pipeline call."""
+        model_config = getattr(self.model, "config", None)
+        if not enabled or model_config is None:
+            yield
+            return
+        model_config.variable_seq_lengths = True
+        try:
+            yield
+        finally:
+            model_config.variable_seq_lengths = False
+
+    def _run_train_pieces(
+        self,
+        state: dict[str, Any],
+        pieces: list["_TrainPiece"],
+        variable_shapes: bool = False,
+    ) -> None:
+        """Run every micro-batch of ``pieces`` in one ``forward_backward_func`` call."""
+        loss_fn = state["loss_fn"]
+        num_microbatches = sum(p.num_microbatches for p in pieces)
+        state["total_num_microbatches"] += num_microbatches
+        state["num_pipeline_calls"] += 1
+        use_router_replay = pieces[0].use_router_replay
+        if any(p.use_router_replay != use_router_replay for p in pieces):
+            raise ValueError(
+                "slices of one train_microbatches call disagree on router replay"
+            )
+        if len(pieces) == 1:
+            data_iterator = pieces[0].data_iterator
+        else:
+            data_iterator = itertools.chain.from_iterable(
+                p.data_iterator for p in pieces
+            )
 
         loss_post_processor = LossPostProcessor(
             loss_fn=loss_fn,
@@ -2157,18 +2705,14 @@ class MegatronPolicyWorkerImpl(
         placeholder_n = torch.tensor(1.0, device="cuda")
 
         draft_enabled = "draft" in self.cfg and self.cfg["draft"].enabled
-        use_router_replay = _should_use_router_replay(
-            enabled=self._router_replay_enabled,
-            data=data,
-            stage="train",
-            require=True,
-        )
 
         # The critical wrap: hooks fire (accumulate main_grad) but the
         # per-call reduce dispatch is gated off.
         with (
             maybe_r3_trace_stage("train", enabled=use_router_replay),
             self.model.no_sync(),
+            self._variable_seq_lengths(variable_shapes),
+            _defer_metrics_ctx(),
         ):
             rerun_state_machine = get_rerun_state_machine()
             while rerun_state_machine.should_run_forward_backward(data_iterator):
@@ -2176,8 +2720,8 @@ class MegatronPolicyWorkerImpl(
                     model=self.model,
                     data_iterator=data_iterator,
                     num_microbatches=num_microbatches,
-                    seq_length=padded_seq_length,
-                    mbs=micro_batch_size,
+                    seq_length=max(p.padded_seq_length for p in pieces),
+                    mbs=max(p.micro_batch_size for p in pieces),
                     post_processing_fn=loss_post_processor,
                     forward_only=False,
                     defer_fp32_logits=self.defer_fp32_logits,
@@ -2207,12 +2751,22 @@ class MegatronPolicyWorkerImpl(
             mb_metrics_collected = []
             for x in losses_reduced:
                 mb_metrics_collected.append(dict(x))
+            if _defer_metrics_on():
+                # Deferred loss metrics (device scalars): one copy for the whole call.
+                resolve_metric_scalars(mb_metrics_collected)
         else:
             mb_metrics_collected = None
 
         mb_metrics_collected = broadcast_loss_metrics_from_last_stage(
             mb_metrics_collected
         )
+        if state["skip_zero_advantage_rows"] and mb_metrics_collected:
+            # Metric schema for _empty_mb_metrics (later all-zero chunks).
+            if not hasattr(self, "_mb_metric_keys"):
+                self._mb_metric_keys = {}
+            self._mb_metric_keys[type(loss_fn)] = tuple(
+                k for k in mb_metrics_collected[0] if k != DRAFT_STEP_PAYLOAD_KEY
+            )
 
         for m in mb_metrics_collected:
             draft_payload = m.get(DRAFT_STEP_PAYLOAD_KEY)
@@ -2259,6 +2813,25 @@ class MegatronPolicyWorkerImpl(
     def _finish_train_step_body(self, state: dict[str, Any]) -> dict[str, Any]:
         from nemo_rl.algorithms.loss.interfaces import LossType
 
+        # Gradient streaming: fold the batch accumulator back into the grad
+        # buffers so normalization, DP reduction, clipping and the optimizer
+        # step below run exactly as for a non-streamed step.
+        if state["grad_stream"] is not None:
+            state["grad_stream"].finalize()
+            state["grad_stream"] = None
+        exact_accum_report = None
+        if state.get("exact_accum") is not None:
+            # Order-invariant sum of the step's group gradients back into the buffers (before 1/N, DP reduce, clip).
+            ea = state["exact_accum"]
+            ea.finalize()
+            exact_accum_report = {
+                "captures": float(ea.captures), "bytes": float(ea.nbytes), "capture_s": float(ea.capture_s),
+                "park_s": float(getattr(self, "_park_s", 0.0)),
+                **ea.order_check, **ea.replay,
+            }
+            state["exact_accum"] = None
+            state["exact_accum_done"] = ea  # released (and the moments unparked) right before the optimizer step
+
         # Recover policy and draft counts with one existing DP collective.
         # The draft slice is length-1 while the step is active and empty
         # otherwise, so every rank in the DP group has to agree on
@@ -2270,9 +2843,19 @@ class MegatronPolicyWorkerImpl(
         policy_counts = torch.stack(
             [state["local_valid_seqs"], state["local_valid_toks"]]
         ).to(torch.float64)
+        # Trained-row counts (metric denominators) differ from the policy
+        # counts only when zero-advantage rows are skipped; reduce them in the
+        # same collective then.
+        skip_zero_adv = state["skip_zero_advantage_rows"]
+        trained_counts = (
+            torch.stack([state["trained_valid_seqs"], state["trained_valid_toks"]])
+            if skip_zero_adv
+            else policy_counts[:0]
+        ).to(torch.float64)
         to_reduce = torch.cat(
             [
                 policy_counts,
+                trained_counts,
                 draft_step_state.counts_for_reduction(policy_counts),
             ]
         )
@@ -2281,7 +2864,12 @@ class MegatronPolicyWorkerImpl(
         )
         global_valid_seqs = to_reduce[0]
         global_valid_toks = to_reduce[1]
-        draft_step_state.set_global_counts(to_reduce[2:])
+        trained_valid_seqs, trained_valid_toks = (
+            (to_reduce[2], to_reduce[3])
+            if skip_zero_adv
+            else (global_valid_seqs, global_valid_toks)
+        )
+        draft_step_state.set_global_counts(to_reduce[2 + trained_counts.numel() :])
 
         if state["loss_type"] == LossType.TOKEN_LEVEL:
             n_true = global_valid_toks
@@ -2362,9 +2950,35 @@ class MegatronPolicyWorkerImpl(
         # reads main_grad. Without this, grad_norm collapses to ~1/2.
         torch.cuda.synchronize()
 
+        ea_done = state.pop("exact_accum_done", None)
+        if ea_done is not None:
+            if ea_done.acc_slices is not None:
+                ocfg = self.cfg["megatron_cfg"].get("optimizer", {}) or {}
+                exact_accum_report.update(
+                    ea_done.adam_sim(
+                        inv_n, self.__dict__.setdefault("_exact_adam_sim", {}),
+                        float(ocfg.get("adam_beta1", 0.9)), float(ocfg.get("adam_beta2", 0.999)),
+                        float(ocfg.get("adam_eps", 1e-8)),
+                    )
+                )
+            ea_done.release()
+            del ea_done
+            t0 = time.perf_counter()
+            self._unpark_optimizer_moments()
+            torch.cuda.current_stream().synchronize()
+            exact_accum_report["unpark_s"] = time.perf_counter() - t0
+            if int(os.environ.get("NEMO_RL_EXACT_GRAD_ACCUM_CHECK", "0") or 0) > 0:
+                exact_accum_report["moments_roundtrip_exact"] = float(self._moments_match_host())
+            exact_accum_report["reserved_gib"] = torch.cuda.memory_reserved() / 2**30
+            exact_accum_report["peak_gib"] = torch.cuda.max_memory_allocated() / 2**30
+
         # opt.step clips internally (clip_grad config); operates on the
         # already-rescaled grad. Returns (success, grad_norm, num_zeros).
         update_successful, grad_norm, num_zeros_in_grad = self.optimizer.step()
+        if exact_accum_report is not None:
+            # The first optimizer step creates the Adam moments in fresh allocations; move them into the persistent
+            # overlap buffer once, so the buffer + moments never coexist across the next verify (X1).
+            self._adopt_moments_into_overlap_buffer()
         mtp_grad_norm = (
             self.optimizer.grad_norms_by_group.get("mtp")
             if state["mtp_enabled"]
@@ -2446,14 +3060,18 @@ class MegatronPolicyWorkerImpl(
         # (see MetricNormalizer in the loss interfaces). masked_mean is
         # linear in 1/N so per-metric scalar multiplies recover the right
         # normalized values.
+        # Diagnostics are sums over the rows that ran forward, so they are
+        # averaged over those rows; this equals the full batch unless
+        # zero-advantage rows were skipped. The loss keeps the full-batch
+        # (gradient) normalization: skipped rows contribute zero loss.
         n_toks_safe = (
-            global_valid_toks
-            if global_valid_toks.item() > 0
+            trained_valid_toks
+            if trained_valid_toks.item() > 0
             else torch.tensor(1.0, device="cuda")
         )
         n_seqs_safe = (
-            global_valid_seqs
-            if global_valid_seqs.item() > 0
+            trained_valid_seqs
+            if trained_valid_seqs.item() > 0
             else torch.tensor(1.0, device="cuda")
         )
         inv_toks = float((1.0 / n_toks_safe).item())
@@ -2472,7 +3090,9 @@ class MegatronPolicyWorkerImpl(
             kind = metric_normalizations.get(name)
             if kind is MetricNormalizer.NONE:
                 return value
-            if kind is MetricNormalizer.TOKENS:
+            if name == "loss":
+                scale = inv_n
+            elif kind is MetricNormalizer.TOKENS:
                 scale = inv_toks
             elif kind is MetricNormalizer.SEQUENCES:
                 scale = inv_seqs
@@ -2488,6 +3108,7 @@ class MegatronPolicyWorkerImpl(
         # curr_lr/curr_wd captured pre-scheduler.step above.
         global_valid_seqs_f = float(global_valid_seqs.item())
         global_valid_toks_f = float(global_valid_toks.item())
+        trained_valid_toks_f = float(trained_valid_toks.item())
 
         for m in state["all_mb_metrics"]:
             out: dict[str, Any] = {}
@@ -2511,6 +3132,8 @@ class MegatronPolicyWorkerImpl(
             out["wd"] = curr_wd
             out["global_valid_seqs"] = global_valid_seqs_f
             out["global_valid_toks"] = global_valid_toks_f
+            if state["skip_zero_advantage_rows"]:
+                out["trained_valid_toks"] = trained_valid_toks_f
             rescaled_metrics.append(out)
 
         # Scale per-mb losses by 1/N and reduce per-call sums.
@@ -2524,12 +3147,21 @@ class MegatronPolicyWorkerImpl(
         )
 
         metrics = {
+            **({"exact_grad_accum": exact_accum_report} if exact_accum_report is not None else {}),
             "global_loss": global_loss.cpu(),
             "rank": torch.distributed.get_rank(),
             "gpu_name": torch.cuda.get_device_name(),
             "model_dtype": self.dtype,
             "all_mb_metrics": mb_metrics,
             "grad_norm": torch.tensor([grad_norm]),
+            # This rank's loss denominators (DP-reduced) and micro-batch count, for
+            # conservation checks (every rank reports, also with zero micro-batches).
+            "step_counts": {
+                "global_valid_seqs": global_valid_seqs_f,
+                "global_valid_toks": global_valid_toks_f,
+                "trained_valid_toks": trained_valid_toks_f,
+                "num_microbatches": int(state["total_num_microbatches"]),
+            },
         }
         if draft_grad_norm is not None:
             metrics["draft_grad_norm"] = torch.tensor([draft_grad_norm])
@@ -2564,6 +3196,308 @@ class MegatronPolicyWorkerImpl(
         self._train_step_state = None
         return metrics
 
+    def _require_advantage_weighted_gradients(self, feature: str) -> None:
+        """Reject model-side loss terms that are not advantage-weighted.
+
+        Gradient streaming rescales a chunk's gradient by its advantage and
+        zero-advantage skipping drops rows whose advantage is zero; both are
+        exact only if every gradient term is proportional to the advantage.
+        """
+        if self.mtp_enabled:
+            raise ValueError(f"{feature} does not support MTP losses")
+        if "draft" in self.cfg and self.cfg["draft"].enabled:
+            raise ValueError(f"{feature} does not support draft-model training")
+        if self.cfg["megatron_cfg"]["moe_router_load_balancing_type"] != "none":
+            raise ValueError(
+                f"{feature} requires moe_router_load_balancing_type='none': "
+                "MoE auxiliary losses are not advantage-weighted"
+            )
+        # Settings that come from the model provider rather than the config:
+        # the router z-loss is not advantage-weighted, and expert-bias updates
+        # and capacity-based token dropping depend on which rows share a batch.
+        model_cfg = getattr(self.model, "config", None)
+        if getattr(model_cfg, "num_moe_experts", None):
+            if getattr(model_cfg, "moe_z_loss_coeff", None):
+                raise ValueError(f"{feature} requires moe_z_loss_coeff=0")
+            if getattr(model_cfg, "moe_router_enable_expert_bias", False) and getattr(
+                model_cfg, "moe_router_bias_update_rate", 0.0
+            ):
+                raise ValueError(f"{feature} requires moe_router_bias_update_rate=0")
+            if getattr(model_cfg, "moe_expert_capacity_factor", None) is not None:
+                raise ValueError(
+                    f"{feature} requires dropless MoE (moe_expert_capacity_factor=None)"
+                )
+
+    def _optimizer_state_dicts(self) -> list[dict]:
+        if self.optimizer is None:
+            return []
+        st = self.optimizer.state if isinstance(self.optimizer, ChainedOptimizer) else self.optimizer._get_state()
+        return [v for _, v in st.items()]  # ChainedOptimizer.state is a ProxyDict (items() only), as move_optimizer
+
+    @torch.no_grad()
+    def _park_optimizer_moments(self) -> None:
+        """Optimizer state tensors -> persistent pinned host buffers (one copy each way per step; no-op before the
+        first optimizer step creates them)."""
+        if self.optimizer_cpu_offload:
+            return
+        cache = self.__dict__.setdefault("_parked_host", {})
+        moved = 0
+        for st in self._optimizer_state_dicts():
+            for k, v in list(st.items()):
+                if torch.is_tensor(v) and v.is_cuda and v.numel() > 1:
+                    key = (id(st), k)
+                    h = cache.get(key)
+                    if h is None or h.shape != v.shape or h.dtype != v.dtype:
+                        h = cache[key] = torch.empty(v.shape, dtype=v.dtype, device="cpu", pin_memory=True)
+                    h.copy_(v, non_blocking=True)
+                    st[k] = h
+                    moved += v.numel() * v.element_size()
+        if moved:
+            torch.cuda.current_stream().synchronize()
+        self._parked_bytes = moved
+
+    @torch.no_grad()
+    def _moments_match_host(self) -> bool:
+        """CHECKS: every unparked moment equals its pinned host copy bitwise (the copy-back landed before use)."""
+        cache = getattr(self, "_parked_host", {})
+        ok = True
+        for st in self._optimizer_state_dicts():
+            for k, v in st.items():
+                h = cache.get((id(st), k))
+                if h is not None and torch.is_tensor(v) and v.is_cuda and v.shape == h.shape:
+                    ok &= bool(torch.equal(v.cpu(), h))
+        return ok
+
+    def exact_accum_arm_replay(self) -> None:
+        """CHECKS (R32 item 1): the next train call re-runs an earlier group; its gradient is compared with that
+        group's first contribution and dropped (no add, no counts, no metrics)."""
+        state = self._assert_step_open()
+        if state.get("exact_accum") is None:
+            raise RuntimeError("exact_accum_arm_replay without NEMO_RL_EXACT_GRAD_ACCUM")
+        state["exact_replay"] = True
+
+    @torch.no_grad()
+    def _adopt_moments_into_overlap_buffer(self) -> None:
+        buf = getattr(self, "_overlap_buf", None)
+        if buf is None or self.optimizer_cpu_offload:
+            return
+        base = buf.untyped_storage().data_ptr()
+        outside = any(
+            torch.is_tensor(v) and v.is_cuda and v.numel() > 1 and v.untyped_storage().data_ptr() != base
+            for st in self._optimizer_state_dicts() for v in st.values()
+        )
+        if outside:
+            self._park_optimizer_moments()
+            self._unpark_optimizer_moments()
+            torch.cuda.current_stream().synchronize()
+
+    def _overlap_buffer_views(self, grads: list) -> list:
+        """int64 views (one per grad buffer) of the persistent overlap buffer, allocated on first use."""
+        need = sum(g.numel() for g in grads) * 8
+        buf = getattr(self, "_overlap_buf", None)
+        if buf is None or buf.numel() < need:
+            if buf is not None:
+                raise RuntimeError(f"[exact_grad_accum] grad buffers grew ({buf.numel()} -> {need} bytes)")
+            # Slack for the moments' 256-B alignment and distributed-optimizer shard padding (they must all fit).
+            self._overlap_buf = buf = torch.empty(need + need // 100 + (64 << 20), dtype=torch.uint8, device="cuda")
+        views, off = [], 0
+        for g in grads:
+            n = g.numel() * 8
+            views.append(buf[off : off + n].view(torch.int64))
+            off += n
+        return views
+
+    @torch.no_grad()
+    def _unpark_optimizer_moments(self) -> None:
+        """Pinned host moments -> device. With the persistent overlap buffer they become views of it (same bytes
+        every step: no allocation); the copies are issued on the current stream, the stream the optimizer step runs
+        on next (Megatron's optimizer launches on the current stream), so they are ordered before its reads; an
+        event recorded after the copies is waited on explicitly as well (R32 item 4)."""
+        if self.optimizer_cpu_offload or not getattr(self, "_parked_bytes", 0):
+            return
+        buf = getattr(self, "_overlap_buf", None)
+        off = 0
+        stream = torch.cuda.current_stream()
+        for st in self._optimizer_state_dicts():
+            for k, v in list(st.items()):
+                if torch.is_tensor(v) and not v.is_cuda and v.is_pinned():
+                    n = v.numel() * v.element_size()
+                    a = (off + 255) // 256 * 256
+                    if buf is not None and a + n <= buf.numel():
+                        g = buf[a : a + n].view(v.dtype).view(v.shape)
+                        off = a + n
+                    else:
+                        g = torch.empty(v.shape, dtype=v.dtype, device="cuda")
+                    g.copy_(v, non_blocking=True)
+                    st[k] = g
+        ev = torch.cuda.Event()
+        ev.record(stream)
+        stream.wait_event(ev)
+        self._unpark_event = ev
+        self._parked_bytes = 0
+
+    def _exact_grad_accum_for_step(self, grad_streaming: Optional[GradStreamingSpec]) -> Any:
+        """``NEMO_RL_EXACT_GRAD_ACCUM`` (nolanes train overlap, R31): ``1`` folds every ``train_microbatches`` call's
+        gradient into the order-invariant int64-limb accumulator (exact_grad_accum.py), ``naive`` is the negative
+        control (plain fp32 sum in call order). ``NEMO_RL_EXACT_GRAD_ACCUM_CHECK=<n>`` keeps n elements per buffer per
+        call and re-sums them in other orders at finish (CHECKS runs). Allocated at begin, dropped at finalize."""
+        mode = os.environ.get("NEMO_RL_EXACT_GRAD_ACCUM", "").strip()
+        if mode in ("", "0"):
+            return None
+        if mode not in ("1", "naive"):
+            raise ValueError(f"NEMO_RL_EXACT_GRAD_ACCUM={mode!r}: expected 1 or naive")
+        if grad_streaming is not None:
+            raise ValueError("NEMO_RL_EXACT_GRAD_ACCUM and gradient streaming both own the grad buffers")
+        if not self.cfg["megatron_cfg"]["distributed_data_parallel_config"]["grad_reduce_in_fp32"]:
+            raise ValueError("NEMO_RL_EXACT_GRAD_ACCUM needs grad_reduce_in_fp32 (fp32 grad buffers)")
+        from nemo_rl.algorithms.exact_grad_accum import (
+            NaiveArrivalOrderAccumulator,
+            OrderInvariantGradAccumulator,
+        )
+
+        grads = [buf.grad_data for buf in self.model.buffers + self.model.expert_parallel_buffers]
+        cls = NaiveArrivalOrderAccumulator if mode == "naive" else OrderInvariantGradAccumulator
+        check = int(os.environ.get("NEMO_RL_EXACT_GRAD_ACCUM_CHECK", "0") or 0)
+        # Lives only for the step's training phase (begin -> finalize): the verify forwards before it and the
+        # optimizer step after it reuse the same memory (X1: a resident accumulator OOMed the next verify).
+        # The Adam moments (8 B per optimizer element) are not read until the optimizer step, so they wait in pinned
+        # host memory during the training phase (X1: accumulator + resident moments OOMed step 1's
+        # training): training-phase device memory stays at the stock 18 B per element.
+        torch.cuda.reset_peak_memory_stats()
+        t0 = time.perf_counter()
+        self._park_optimizer_moments()
+        self._park_s = time.perf_counter() - t0
+        acc_views = None
+        if cls is OrderInvariantGradAccumulator:
+            # One persistent device buffer alternates roles (R32 item 3): the int64 sums during the training phase,
+            # the Adam moments (as views) outside it. Allocated once, never freed.
+            acc_views = self._overlap_buffer_views(grads)
+        acc = cls(grads, check_elems=check, acc_views=acc_views)
+        acc.reset()
+        if self.rank == 0 and not getattr(self, "_exact_accum_logged", False):
+            self._exact_accum_logged = True
+            print(
+                f"[exact_grad_accum] mode={mode} buffers={len(grads)} elements={sum(g.numel() for g in grads)} "
+                f"accumulator {acc.nbytes / 2**30:.2f} GiB/rank (training phase only) check_elems={check}",
+                flush=True,
+            )
+        return acc
+
+    def _make_grad_stream_accumulator(
+        self, spec: GradStreamingSpec
+    ) -> StreamingGroupAccumulator:
+        # Buckets are later scaled by the group's advantage.
+        self._require_advantage_weighted_gradients("gradient streaming")
+        ddp_cfg = self.cfg["megatron_cfg"]["distributed_data_parallel_config"]
+        if not ddp_cfg["grad_reduce_in_fp32"]:
+            raise ValueError(
+                "gradient streaming moves per-chunk gradients out of the grad "
+                "buffers; set distributed_data_parallel_config.grad_reduce_in_fp32"
+                "=true so they are fp32"
+            )
+        buffers = self.model.buffers + self.model.expert_parallel_buffers
+        if any(
+            getattr(buf.ddp_config, "reuse_grad_buf_for_mxfp8_param_ag", False)
+            for buf in buffers
+        ):
+            raise ValueError(
+                "gradient streaming uses the grad buffers as scratch space, which "
+                "is incompatible with reusing them for MXFP8 param all-gather"
+            )
+        grads = [buf.grad_data for buf in buffers]
+        # max_open_groups=0 (group granularity): every chunk carries final
+        # advantages, so gradients accumulate in place in the grad buffers and
+        # the accumulator allocates nothing (0 bytes on device and host).
+        # Otherwise: one fp32 copy of this rank's gradients for the batch
+        # accumulator (always on device) plus up to max_buckets_per_group
+        # copies per streaming group (on storage_device).
+        mem = grad_stream_memory(spec, sum(g.numel() for g in grads))
+        copies = (
+            f"{mem.copy_bytes / 2**30:.1f} GiB per gradient copy, "
+            f"{spec.max_buckets_per_group} x {spec.max_open_groups} bucket copies"
+        )
+        if mem.device_bytes > 0:
+            free, _ = torch.cuda.mem_get_info()
+            free += torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+            # The batch accumulator is always on device; it must fit outright.
+            # The streamed chunks' activations and logits need the rest, so
+            # warn when the copies take more than half of what is free (fits
+            # with activation checkpointing or small micro-batches, may OOM
+            # otherwise).
+            if mem.device_bytes > free:
+                raise ValueError(
+                    f"gradient streaming needs {mem.device_bytes / 2**30:.1f} GiB "
+                    f"of GPU memory ({copies}) but only {free / 2**30:.1f} GiB is "
+                    "free; lower max_open_groups (0 needs no extra memory), use "
+                    "storage_device=cpu, or add training GPUs"
+                )
+            if mem.device_bytes > 0.5 * free:
+                warnings.warn(
+                    f"gradient streaming takes {mem.device_bytes / 2**30:.1f} of "
+                    f"{free / 2**30:.1f} GiB free GPU memory ({copies}); the "
+                    "streamed chunks' activations must fit in the rest"
+                )
+        if mem.host_bytes > 0:
+            with open("/proc/meminfo") as f:
+                meminfo = dict(line.split(":", 1) for line in f)
+            available = int(meminfo["MemAvailable"].split()[0]) * 1024
+            # This rank's share; exact on one node, conservative across nodes.
+            ranks = (
+                torch.distributed.get_world_size()
+                if torch.distributed.is_initialized()
+                else 1
+            )
+            if mem.host_bytes > 0.8 * available / ranks:
+                raise ValueError(
+                    f"gradient streaming needs {mem.host_bytes / 2**30:.1f} GiB of "
+                    f"pinned host memory ({copies}) but its budget is "
+                    f"{0.8 * available / ranks / 2**30:.1f} GiB; lower max_open_groups"
+                )
+        return StreamingGroupAccumulator(
+            grads,
+            storage_device=spec.storage_device,
+            max_buckets_per_group=spec.max_buckets_per_group,
+            buckets=mem.buckets,
+        )
+
+    def close_stream_groups(
+        self, closes: list[tuple[Hashable, dict[float, float]]]
+    ) -> None:
+        """Fold closed groups' streamed gradients into the batch accumulator.
+
+        Args:
+            closes: ``(group, {reward: advantage})`` for each group whose last
+                streamed chunk has already been passed to ``train_microbatch``.
+                Groups with no streamed chunk on this rank are ignored.
+        """
+        state = self._assert_step_open()
+        grad_stream: Optional[StreamingGroupAccumulator] = state["grad_stream"]
+        if grad_stream is None:
+            raise ValueError(
+                "close_stream_groups needs a step opened with grad_streaming"
+            )
+        for group, advantage_by_reward in closes:
+            grad_stream.close_group(group, advantage_by_reward)
+            state["grad_stream_group_counts"].pop(group, None)
+
+    def discard_stream_groups(self, groups: list[Hashable]) -> None:
+        """Drop open groups' streamed gradients and their normalization counts.
+
+        Used when a group's rollout is retried after some of its trajectories
+        were already backpropagated; the retry streams fresh trajectories.
+        """
+        state = self._assert_step_open()
+        grad_stream: Optional[StreamingGroupAccumulator] = state["grad_stream"]
+        if grad_stream is None:
+            raise ValueError(
+                "discard_stream_groups needs a step opened with grad_streaming"
+            )
+        for group in groups:
+            grad_stream.discard_group(group)
+            seqs, toks = state["grad_stream_group_counts"].pop(group, (0.0, 0.0))
+            state["local_valid_seqs"] = state["local_valid_seqs"] - seqs
+            state["local_valid_toks"] = state["local_valid_toks"] - toks
+
     @wrap_with_nvtx_name("megatron_policy_worker/abort_train_step")
     def abort_train_step(self) -> None:
         state = getattr(self, "_train_step_state", None)
@@ -2577,6 +3511,9 @@ class MegatronPolicyWorkerImpl(
             self._restore_saved_mcore_hooks(state)
             self.model.zero_grad_buffer()
             self.optimizer.zero_grad()
+            if state.get("exact_accum") is not None:
+                state["exact_accum"].release()
+                self._unpark_optimizer_moments()
             self._train_step_state = None
 
     @wrap_with_nvtx_name("megatron_policy_worker/get_logprobs")
@@ -2586,8 +3523,14 @@ class MegatronPolicyWorkerImpl(
         data: BatchedDataDict[Any],
         micro_batch_size: Optional[int] = None,
         require_router_replay: bool = True,
+        law_check: Optional[dict] = None,
     ) -> BatchedDataDict[LogprobOutputSpec]:
         """Get the logprobs of the model for a batch of data.
+
+        ``law_check`` ({"seed": int}, ThunderSync exactness check): also return
+        "law_stats" [rows, 2 x N_STATS] float64 (row 0 = this data-parallel replica's
+        randomized-PIT stats of the masked target tokens, then the legacy-grid shadow stats of
+        THUNDERSYNC_LAW_LEGACY_SHADOW=1 (zeros when off); other rows 0; the caller sums).
 
         Uses the configured logprob_batch_size to do microbatching.
         Input data is assumed to be right-padded. The method internally converts to
@@ -2636,10 +3579,17 @@ class MegatronPolicyWorkerImpl(
         use_fused_linear_logprobs = self.cfg["megatron_cfg"].get(
             "use_fused_linear_logprobs", False
         )
+        law = None if law_check is None else {
+            "seed": int(law_check.get("seed", 0)),
+            "acc": None,
+            # ts-lawfix diagnostic: also the pre-fix PIT grid (same on every DP replica), columns N_STATS: of law_stats.
+            "legacy": os.environ.get("THUNDERSYNC_LAW_LEGACY_SHADOW") == "1",
+        }
         logprobs_post_processor = LogprobsPostProcessor(
             cfg=self.cfg,
             sampling_params=self.sampling_params,
             use_fused_linear_logprobs=use_fused_linear_logprobs,
+            law=law,
         )
         use_router_replay = _should_use_router_replay(
             enabled=self._router_replay_enabled,
@@ -2674,8 +3624,29 @@ class MegatronPolicyWorkerImpl(
             }
         else:
             tensors = {"logprobs": None}
-        broadcasted = broadcast_tensors_from_last_stage(tensors)
-        logprobs = broadcasted["logprobs"]
+        logprobs = broadcast_tensors_from_last_stage(tensors)["logprobs"]
+        law_rows = None
+        if law is not None:
+            from thundersync_rl import law_check as _lc
+
+            if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+                zero = lambda: torch.zeros(_lc.N_STATS, dtype=torch.float64, device="cuda")  # noqa: E731
+                acc = law["acc"] if law["acc"] is not None else zero()
+                acc_l = law.get("acc_legacy")
+                acc_l = acc_l if acc_l is not None else zero()
+                # [2 x N_STATS]: the law test's stats, then the legacy-grid shadow (zeros when off).
+                acc = torch.cat([acc.view(-1), acc_l.view(-1)])
+                if parallel_state.get_context_parallel_world_size() > 1:
+                    torch.distributed.all_reduce(
+                        acc, group=parallel_state.get_context_parallel_group()
+                    )
+                law_t = {"law": acc.view(1, -1)}
+            else:
+                law_t = {"law": None}
+            acc = broadcast_tensors_from_last_stage(law_t)["law"].view(-1)
+            law_rows = torch.zeros((logprobs.shape[0], 2 * _lc.N_STATS), dtype=torch.float64)
+            if law_rows.shape[0]:
+                law_rows[0] = acc.double().cpu()
 
         no_grad.__exit__(None, None, None)
         self.timer.stop("get_logprobs")
@@ -2687,8 +3658,9 @@ class MegatronPolicyWorkerImpl(
             pin_memory=True,
         )
         cpu_logprobs.copy_(logprobs, non_blocking=False)
-        result = BatchedDataDict[LogprobOutputSpec](logprobs=cpu_logprobs)
-        return result
+        if law_rows is not None:
+            return BatchedDataDict[LogprobOutputSpec](logprobs=cpu_logprobs, law_stats=law_rows)
+        return BatchedDataDict[LogprobOutputSpec](logprobs=cpu_logprobs)
 
     def _resolve_output_layer_owner(self) -> Optional[Any]:
         """Return the unwrapped module owning ``output_layer``, or None off the last PP stage.
@@ -3064,11 +4036,26 @@ class MegatronPolicyWorkerImpl(
             self.disable_forward_pre_hook()
 
         with torch.no_grad():
-            # Save original references
+            # Save original references. Keep the copy on the GPU when there is
+            # room for it (with headroom for the logprob pass): a device-side
+            # clone avoids a full GPU->CPU->GPU round trip on every call, which
+            # is paid once per chunk when the controller streams chunks.
+            policy_state = self.model.state_dict()
+            state_bytes = sum(
+                t.numel() * t.element_size()
+                for t in policy_state.values()
+                if isinstance(t, torch.Tensor)
+            )
+            free_bytes = (
+                torch.cuda.mem_get_info()[0] if torch.cuda.is_available() else 0
+            )
+            save_device = "cuda" if state_bytes < 0.25 * free_bytes else "cpu"
             model_state_dict = {}
-            for name, item in self.model.state_dict().items():
+            for name, item in policy_state.items():
                 if isinstance(item, torch.Tensor):
-                    item = item.detach().to(device="cpu", non_blocking=True, copy=True)
+                    item = item.detach().to(
+                        device=save_device, non_blocking=True, copy=True
+                    )
                 model_state_dict[name] = item
 
             # Swap reference state into self.model. Use _apply_state_dict_to_model
@@ -4601,8 +5588,11 @@ class MegatronPolicyWorkerImpl(
         # follow the configured offload policy here too.
         self._release_opd_full_teacher_lm_head()
 
-        gc.collect()
-        torch.cuda.empty_cache()
+        # Mid-step (streaming chunks) nothing was offloaded above, so a full
+        # gc.collect() + empty_cache() per chunk only costs time.
+        if not keep_train_buffers:
+            gc.collect()
+            torch.cuda.empty_cache()
         self._log_gpu_mem("lp_prep_exit")
 
     def _build_colocated_inference_model(self, config: PolicyConfig) -> None:

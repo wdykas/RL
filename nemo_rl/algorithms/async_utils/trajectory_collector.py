@@ -978,6 +978,16 @@ class AsyncTrajectoryCollector:
             )
             try:
                 with self._threads_lock:
+                    # Atomic with prepare_for_refit's pause (taken under this lock): a refit
+                    # that began or finished since the pause check above would otherwise
+                    # see no in-flight worker to wait for, and these rollouts would carry
+                    # a stale generation_weight_version.
+                    if (
+                        not self._refit_pause_cleared.is_set()
+                        or self.current_weight_version != generation_weight_version
+                    ):
+                        self._release_target(reserved_target)
+                        return batch
                     self._inflight_threads.add(worker)
                     self._live_threads.add(worker)
                 if dispatched_task_indices:
@@ -1058,8 +1068,9 @@ class AsyncTrajectoryCollector:
         start_time = time.time()
         print("🔄 Preparing for refit: pausing new generations...")
 
-        # Pause new generation starts
-        self._refit_pause_cleared.clear()
+        # Pause new generation starts (under the lock that registers new workers)
+        with self._threads_lock:
+            self._refit_pause_cleared.clear()
         self._generation_pause_requested_for_refit = False
         self._generation_paused_for_refit = False
         print("⏸️ New generation starts paused")

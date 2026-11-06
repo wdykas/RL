@@ -212,6 +212,10 @@ class AdvantageRequest:
     # names its file after it and the pool has no view of the controller's
     # counter. Unset when the dump is off, which is the default.
     train_step: Optional[int] = None
+    # Trajectory streaming (async_rl.trajectory_streaming): per-row advantages
+    # decided by the controller (one float per row: metadata-sized), so the
+    # estimator and clipping are skipped.
+    row_advantages: Optional[tuple[float, ...]] = None
 
 
 def split_meta_by_prompt_group(
@@ -439,7 +443,22 @@ class AdvantageComputer:
         # Value-model estimators (GAE) hand back the regression target alongside
         # the advantages; the group-relative ones return a bare tensor.
         returns: Optional[torch.Tensor] = None
-        if has_valid_training_tokens:
+        row_advantages = request.row_advantages
+        if row_advantages is not None:
+            if cfg.message_level_advantage_penalties_enabled:
+                raise NotImplementedError(
+                    "async_rl.trajectory_streaming does not support message-level "
+                    "advantage penalties"
+                )
+            # Rows of open groups carry a placeholder 1; final rows carry the
+            # group's already-clipped advantage.
+            advantages = (
+                torch.tensor(row_advantages, dtype=mask.dtype)
+                .unsqueeze(-1)
+                .expand_as(mask)
+                .clone()
+            )
+        elif has_valid_training_tokens:
             result = self._advantage_estimator.compute_advantage(
                 prompt_ids=prompt_ids,
                 rewards=rewards,
@@ -460,7 +479,7 @@ class AdvantageComputer:
             if cfg.is_ppo:
                 returns = torch.zeros_like(mask)
 
-        if cfg.message_level_advantage_penalties_enabled:
+        if cfg.message_level_advantage_penalties_enabled and row_advantages is None:
             # Sequence-error filtering and the pre-existing sample mask remain
             # authoritative: a message penalty must not make a filtered token
             # trainable again.
@@ -500,11 +519,17 @@ class AdvantageComputer:
         # OPD accumulates its statistics from the estimator output above. The
         # ordinary advantage metrics and policy training use the clipped values,
         # matching the legacy paths.
-        if not cfg.is_ppo:
+        if not cfg.is_ppo and row_advantages is None:
             assert isinstance(cfg.algo, GRPOConfig)
             advantages = _clip_grpo_advantages(advantages, cfg.algo)
             response_advantages = torch.masked_select(advantages, mask.bool())
-        advantage_partial = AdvantagePartial.from_values(response_advantages)
+        # Trajectory streaming logs each group's final advantages once, when it
+        # seals (the controller); rows here may carry placeholders.
+        advantage_partial = AdvantagePartial.from_values(
+            response_advantages
+            if row_advantages is None
+            else response_advantages.new_empty(0)
+        )
 
         train_data_dump_s = 0.0
         train_data_dump_rows = 0

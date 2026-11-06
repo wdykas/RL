@@ -124,7 +124,28 @@ def _unwrap_model_config(model: Any) -> Optional[Any]:
     return None
 
 
+def _hybrid_main_pattern(model_config: Any) -> Optional[str]:
+    """Main-decoder layer pattern of a hybrid (Mamba/attention/MoE) model, else None.
+
+    Hybrid models (MCore ``HybridModel``, e.g. Nemotron-H) declare their layers
+    with a pattern string ('M' Mamba, '*' attention, 'E' MoE, '-' MLP, ...),
+    optionally with '|' pipeline-stage separators and '/'-separated MTP
+    patterns; ``moe_layer_freq`` does not apply to them.
+    """
+    pattern = getattr(model_config, "hybrid_layer_pattern", None) or getattr(
+        model_config, "hybrid_override_pattern", None
+    )
+    if not isinstance(pattern, str) or not pattern:
+        return None
+    return pattern.split("/")[0].replace("|", "")
+
+
 def _global_moe_layer_numbers(model_config: Any) -> list[int]:
+    hybrid = _hybrid_main_pattern(model_config)
+    if hybrid is not None:
+        # Global 1-based layer numbers of the 'E' (MoE) layers: HybridStack numbers
+        # its layers by position in the main pattern (layer_number = i + 1 + offset).
+        return [i + 1 for i, symbol in enumerate(hybrid) if symbol == "E"]
     num_layers = int(getattr(model_config, "num_layers"))
     moe_layer_freq = getattr(model_config, "moe_layer_freq", 1)
 
@@ -209,6 +230,7 @@ def _payload_indices_for_moe_layers(
     global_moe_layers: list[int],
     num_payload_layers: int,
     total_num_layers: int,
+    local_moe_layers: Optional[list[int]] = None,
 ) -> dict[int, int]:
     if num_payload_layers == len(global_moe_layers):
         return {
@@ -219,12 +241,21 @@ def _payload_indices_for_moe_layers(
     if num_payload_layers == total_num_layers:
         return {layer_number: layer_number - 1 for layer_number in global_moe_layers}
 
+    # Stage-local layout (pipeline parallelism): one column per MoE layer of
+    # this stage, in ascending layer order.
+    if local_moe_layers and num_payload_layers == len(local_moe_layers):
+        return {
+            layer_number: payload_idx
+            for payload_idx, layer_number in enumerate(sorted(local_moe_layers))
+        }
+
     raise ValueError(
         "routed_experts layer axis does not match a supported payload layout: "
         f"payload={num_payload_layers}, moe_layers={len(global_moe_layers)}, "
         f"total_layers={total_num_layers}. Expected exactly "
-        f"{len(global_moe_layers)} layers for compressed MoE-layer layout or "
-        f"{total_num_layers} layers for vLLM full-transformer-layer layout."
+        f"{len(global_moe_layers)} layers for compressed MoE-layer layout, "
+        f"{total_num_layers} layers for vLLM full-transformer-layer layout or "
+        f"{len(local_moe_layers or [])} layers for the stage-local MoE-layer layout."
     )
 
 
@@ -468,11 +499,6 @@ def build_router_replay_assignments(
     global_moe_layers = _global_moe_layer_numbers(model_config)
     total_num_layers = int(getattr(model_config, "num_layers"))
     num_payload_layers = local_routed_experts.shape[1]
-    moe_layer_to_payload_idx = _payload_indices_for_moe_layers(
-        global_moe_layers=global_moe_layers,
-        num_payload_layers=num_payload_layers,
-        total_num_layers=total_num_layers,
-    )
     model_instances = _router_replay_instances_for_model(model)
     if len(model_instances) == 0:
         local_moe_layers = _local_layer_numbers_for_model(model).intersection(
@@ -485,6 +511,13 @@ def build_router_replay_assignments(
             f"layers {sorted(local_moe_layers)}. Ensure Megatron was initialized "
             "with moe_enable_routing_replay=True."
         )
+
+    moe_layer_to_payload_idx = _payload_indices_for_moe_layers(
+        global_moe_layers=global_moe_layers,
+        num_payload_layers=num_payload_layers,
+        total_num_layers=total_num_layers,
+        local_moe_layers=[layer_number for _, layer_number in model_instances],
+    )
 
     replay_assignments = []
     for replay_instance, layer_number in model_instances:
