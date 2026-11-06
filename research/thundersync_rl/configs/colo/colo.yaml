@@ -11,7 +11,10 @@
 #   async_rl.sampler.max_lookahead_versions 0           sync: batch k admitted after the wake that installs theta_k
 #   async_rl.max_buffered_rollouts / max_inflight P     one batch in flight (lag 0)
 #   thundersync: {mode: colo}                           replaces the nolanes block: nothing is verified at lag 0
-#                                                       (plain top-k routing, no cross-fade, no EDV / MTD / drafts)
+#                                                       (no EDV / MTD / drafts)
+#   thundersync.crossfade_routing_*                     the cross-fade band of every colo arm (F3, 11-06: part of the
+#                                                       policy definition, the same in XS, SPR-BI and every ThunderSync
+#                                                       arm; levers_audit.py checks the pair carries equal bands)
 defaults:
   - ../nl/nl_super.yaml
 
@@ -38,3 +41,9 @@ async_rl:
 thundersync:
   _override_: true
   mode: colo
+  crossfade_routing_m: 0.01
+  crossfade_routing_m_profile: null
+  crossfade_routing_extra: 8
+  crossfade_routing_ramp_stopgrad: true
+  crossfade_routing_sparse: true
+  crossfade_routing_sparse_engine: true

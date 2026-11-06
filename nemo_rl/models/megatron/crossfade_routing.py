@@ -320,6 +320,13 @@ def configure(config: Any, model_cfg: Any) -> Optional[float]:
         return None
     if m <= 0:
         raise ValueError(f"crossfade_routing_m must be > 0 (got {m})")
+    if os.environ.get("THUNDERSYNC_DEBUG_CF_ENGINE_M_SCALE", "") not in ("", "0") and not (
+        os.environ.get("THUNDERSYNC_NL_CHECKS") == "1" or os.environ.get("THUNDERSYNC_NL_NEG") == "cf_engine_m"
+    ):
+        # Negative control only (engine band != learner band): refused outside CHECKS / the cf_engine_m negative, on
+        # every path including the stock loop (no ThunderSync validator there).
+        raise ValueError("THUNDERSYNC_DEBUG_CF_ENGINE_M_SCALE is a negative control: set THUNDERSYNC_NL_CHECKS=1 or "
+                         "THUNDERSYNC_NL_NEG=cf_engine_m")
     extra = crossfade_extra(config)
     if extra < 0 or (extra == 0 and not os.environ.get("THUNDERSYNC_DEBUG_CF_ALLOW_EXTRA0")):
         raise ValueError(f"crossfade_routing_extra must be >= 1 (got {extra}; 0 only as a debug plumbing check)")
@@ -358,6 +365,11 @@ def configure(config: Any, model_cfg: Any) -> Optional[float]:
         )
     _STATE.update(m=m, k=k, extra=extra, sparse=crossfade_sparse(config), ramp_stopgrad=crossfade_ramp_stopgrad(config),
                   layer_m=layer_m, sparse_engine=crossfade_sparse_engine(config))
+    # One line per model built (the learner's and, colocated, the engine's provider): the band that process routes with.
+    bands = None if layer_m is None else [round(layer_m[ln], 6) for ln in sorted(layer_m)]
+    print(f"[crossfade] configure provider={type(model_cfg).__name__} pid={os.getpid()} k={k} extra={extra} m={m} "
+          f"layer_m={bands} sparse={_STATE['sparse']} sparse_engine={_STATE['sparse_engine']} "
+          f"ramp_stopgrad={_STATE['ramp_stopgrad']}", flush=True)
     install()
     return m
 

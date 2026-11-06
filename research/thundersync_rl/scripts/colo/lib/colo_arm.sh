@@ -117,6 +117,20 @@ PAR+=(policy.generation.mcore_generation_config.buffer_size_gb=$ENGINE_BUF)
 PAR+=(policy.generation.mcore_generation_config.kv_cache_management_mode=$COLO_KV)   # offload with torch_memory_saver (COLO_TMS)
 [ -n "${MBS:-}" ] && PAR+=(policy.train_micro_batch_size=$MBS)
 [ -n "${SEED:-}" ] && PAR+=(grpo.seed=$SEED)
+# Cross-fade band (F3): part of the policy definition, a per-model constant, the same in EVERY arm (XS, SPR-BI, every
+# ThunderSync arm). Rule: the band with the lowest measured per-token TV between consecutive policies at no step-time
+# cost. Nano (23 MoE layers, k 6, E 128): cfS30, m .03 x [.3, 1, .5] over the MoE-depth thirds [0, 6/23) / [6/23, 18/23)
+# / [18/23, 1], extra 4. Measured on Nano 8k: TV x0.89-0.95 vs m .01 at K 1 / 2, step time and memory no worse. Other
+# models keep the configs' band (m .01, extra 8: the measured Pareto point at Super-L22 / Ultra-L27) until measured the
+# same way. Written where the arm reads it: the thundersync block for ThunderSync modes (apply_crossfade copies it to
+# policy.megatron_cfg), policy.megatron_cfg for the stock-loop SPR-BI arm (colo_sprbi.yaml). XA still overrides.
+CF_BAND=()
+case "$(basename "$MODEL")" in
+  *[Nn]ano*) CF_BAND=(crossfade_routing_m=0.03 "crossfade_routing_m_profile=[[0.0,0.2608,0.3],[0.2608,0.7826,1.0],[0.7826,1.0,0.5]]"
+                      crossfade_routing_extra=4) ;;
+esac
+CF_PFX=thundersync; [[ $CFG_REL == *colo_sprbi.yaml ]] && CF_PFX=policy.megatron_cfg
+for kv in "${CF_BAND[@]}"; do PAR+=("++$CF_PFX.$kv"); done
 if [ "$PARITY" = 1 ]; then export NL_PARITY_REWARD=1; PAR+=(data.default.env_name=math_parity); fi
 unset THUNDERSYNC_MISMATCH_CHECK THUNDERSYNC_ENGINE_Q_CHECK THUNDERSYNC_LAW_CHECK THUNDERSYNC_NL_CHECKS THUNDERSYNC_NL_NEG \
   NEMO_RL_DEBUG_COLOC_SKIP_RESHARD

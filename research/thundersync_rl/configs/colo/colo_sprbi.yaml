@@ -8,9 +8,21 @@
 #   async_rl.max_buffered_rollouts / max_inflight  (K + 1) P groups buffered and 2 P prompts in flight, as stock SPR
 #   thundersync: {} (no mode)                      no ThunderSync stage: no keyed sampler, train-lp sentinel or
 #                                                  router fingerprints; the BI validators still run
-# Launcher (scripts/colo/lib/colo_arm.sh) sets max_requests / buffer / layout identically for both arms.
+#   policy.megatron_cfg.crossfade_routing_*        the colo arms' cross-fade band (colo.yaml thundersync block), set
+#                                                  directly where the stock path reads it: one policy definition for
+#                                                  every arm (F3, 11-06; levers_audit.py checks the pair is equal)
+# Launcher (scripts/colo/run_colo_arm.sh) sets max_requests / buffer / layout identically for both arms.
 defaults:
   - colo.yaml
+
+policy:
+  megatron_cfg:
+    crossfade_routing_m: 0.01
+    crossfade_routing_m_profile: null
+    crossfade_routing_extra: 8
+    crossfade_routing_ramp_stopgrad: true
+    crossfade_routing_sparse: true
+    crossfade_routing_sparse_engine: true
 
 async_rl:
   sampler:
