@@ -704,7 +704,7 @@ def test_check_cache_rule_on_mcore_requests():
 
 
 def test_check_cache_rule_multi_block_prompts():
-    # Regression (isP : IndexError in MCore's _register_range): prompts of several KV blocks, two check
+    # Regression (IndexError in MCore's _register_range): prompts of several KV blocks, two check
     # requests on one prompt (siblings) share its leading blocks -- a cache hit on a partial prefix -- and every
     # request carries one hash per complete block, the index contract MCore's registration chain relies on.
     from megatron.core.inference.engines import dynamic_engine as de
