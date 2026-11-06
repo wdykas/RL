@@ -1,0 +1,40 @@
+# ThunderSync colocated mode (thundersync.mode=colo; docs/colo/THEORY.md), arm XS: exact colocated
+# synchronous GRPO on the batch-invariant fp16 engine. One GPU fleet generates and trains (NeMo-RL's SingleController
+# loop, colocated Megatron generation = a dedicated inference model resharded from the learner at every wake), lag 0.
+#
+# Composition (later wins): nl_super.yaml (the stock recipe + V8b BI numerics + the learner-tuned stock learner settings
+# the nl arms and the stock baselines share), then this file, then the CLI of scripts/colo/lib/colo_arm.sh (model,
+# shape, layout, engine capacity, env_name).
+#
+# Differences to nl_super.yaml, and why:
+#   policy.generation.colocated.enabled true            colocated: the engine runs inside the policy workers
+#   async_rl.sampler.max_lookahead_versions 0           sync: batch k admitted after the wake that installs theta_k
+#   async_rl.max_buffered_rollouts / max_inflight P     one batch in flight (lag 0)
+#   thundersync: {mode: colo}                           replaces the nolanes block: nothing is verified at lag 0
+#                                                       (plain top-k routing, no cross-fade, no EDV / MTD / drafts)
+defaults:
+  - ../nl/nl_super.yaml
+
+policy:
+  megatron_cfg:
+    # Batch-invariant Mamba mixer under activation recompute (mamba_ssd_parity.py): a Mamba layer keeps only its input
+    # for the backward instead of ~80 KiB / token of fp32 conv / x / z / B / C / dt / scan copies; forward values
+    # unchanged. Full-Nano XS at stock's micro-batch 2 OOMed on ~40 GiB of these (snapshot research/colo/mem/
+    # nano-xs-m2-2d2c1a0b: _ssm_training 12.1, _scan_and_gate 28 GiB); stock's fused Mamba kernels keep none.
+    mamba_recompute: true
+  # Resident colocated learner (MODEL.md v2 §11): no per-step optimizer / grad offload around the engine phase.
+  offload_optimizer_for_refit: false
+  generation:
+    colocated:
+      enabled: true
+
+async_rl:
+  sampler:
+    name: in_order
+    max_lookahead_versions: 0
+  max_buffered_rollouts: ${grpo.num_prompts_per_step}
+  max_inflight_prompts: ${grpo.num_prompts_per_step}
+
+thundersync:
+  _override_: true
+  mode: colo

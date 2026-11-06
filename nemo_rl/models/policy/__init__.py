@@ -601,6 +601,37 @@ class MegatronConfig(TypedDict):
     freeze_config: NotRequired[dict[str, Any]]
     # Megatron-Core batch-invariant kernels (bitwise train/generation parity).
     batch_invariant_mode: NotRequired[bool]
+    # Opt-in bitwise-reproducible training on top of batch invariance (default false):
+    # fixed-order MoE token-gather backward, TE deterministic attention backward
+    # (NVTE_ALLOW_NONDETERMINISTIC_ALGO=0), causal_conv1d weight/bias grads per row in
+    # row order, mamba_ssm deterministic chunk-scan backward. Batch invariance (0
+    # train/generation logprob difference) does not need it.
+    deterministic_training: NotRequired[bool]
+    # Batch-invariant fp16-GEMM recipe, TP=1 (default true): the training LM head's
+    # logits are formed chunk by chunk inside the log-prob op (never for a whole
+    # micro-batch; nemo_rl/models/megatron/deferred_head.py). Bitwise the same
+    # forward log-probs.
+    deferred_lm_head: NotRequired[bool]
+    # Cross-fade MoE routing band width m in selection-score units (None/absent: off), and the number of
+    # candidates beyond the stock top-k (default 4). Set by ThunderSync from thundersync.crossfade_routing_m /
+    # crossfade_routing_extra (nemo_rl/models/megatron/crossfade_routing.py).
+    crossfade_routing_m: NotRequired[float | None]
+    crossfade_routing_extra: NotRequired[int | None]
+    crossfade_routing_sparse: NotRequired[bool]
+    crossfade_routing_ramp_stopgrad: NotRequired[bool]
+    # Per-layer cross-fade band: [[start, end, scale], ...] over the MoE layers' relative depth (m x scale per layer).
+    crossfade_routing_m_profile: NotRequired[list[list[float]] | None]
+    # Exact integer law (absent/False: off). Set by ThunderSync from
+    # thundersync.engine_sampler == "exact_int" (nemo_rl/models/megatron/exact_int.py):
+    # learner log-probs are log(w_x) - log(W), w = floor(exp(fp32 log_softmax) 2^52).
+    exact_int_law: NotRequired[bool]
+    # Exact top-p policy (absent/None: off). Set by ThunderSync from
+    # thundersync.exact_top_p = policy.generation.top_p
+    # (nemo_rl/models/megatron/exact_nucleus.py); sticky-nucleus threshold in
+    # probability-mass units and anchor cap (token ids per position).
+    exact_top_p: NotRequired[float | None]
+    sticky_nucleus_delta: NotRequired[float | None]
+    sticky_nucleus_cap: NotRequired[int]
     batch_invariant_backend: NotRequired[Literal["deepgemm", "te_native", "triton"]]
     # Cross-rank EP combine: "ordered" is portable, "multimem" uses NVLS.
     batch_invariant_collective: NotRequired[Literal["multimem", "ordered"]]
@@ -610,6 +641,58 @@ class MegatronConfig(TypedDict):
     flash_attention_version: NotRequired[Literal[2, 3, 4] | None]
     # flag to enable zero train/gen KL with generation.backend='megatron'.
     zero_train_gen_mismatch: NotRequired[bool]
+    # Megatron fp32 residual stream (TransformerConfig.fp32_residual_connection).
+    fp32_residual_connection: NotRequired[bool]
+    # Forward GEMM numerics (nemo_rl/models/megatron/fp16_gemm.py). Unset: the
+    # default bf16 forward. "fp16": every linear layer (and the LM head) casts its
+    # input and bf16 weight to fp16 and emits fp32 (fp32 accumulation); norms run in
+    # fp32; q/k/v, attention and the generation KV cache are fp16; logits fp32.
+    # Weights, checkpoints and the optimizer are unchanged. Requires
+    # fp32_residual_connection=true; must match between training and generation.
+    # Dense (non-MoE) models only.
+    forward_gemm_precision: NotRequired[str | None]
+    # LM-head GEMM under forward_gemm_precision="fp16": "fp32" (default when
+    # unset) multiplies the fp32 final-norm output (not rounded to fp16) by the
+    # head weight, all products exact (fp16_gemm.fp32_gemm: two fp16 GEMMs on a
+    # hi/lo split of the input); "fp16" uses the fp16 GEMM. Must match
+    # between training and generation.
+    lm_head_precision: NotRequired[str | None]
+    # forward_gemm_precision="fp16": power-of-two prescale s of the MLP / expert
+    # down-projection input (x * 2^-s cast to fp16, output * 2^s), widening fp16's
+    # range there 2^s-fold for models whose SwiGLU outputs approach 65504. 0 = off.
+    # Must match between training and generation.
+    down_proj_prescale_log2: NotRequired[int | None]
+    # forward_gemm_precision="fp16" on hybrid (Mamba) models: True (default when
+    # unset) feeds the fp32 residual to the Mamba layers' fused pre-norm; False
+    # keeps stock MCore's cast of the layer input to params_dtype (bf16 noise
+    # floor in draft acceptance; control arms only). Must match between training
+    # and generation.
+    mamba_fp32_prenorm_input: NotRequired[bool]
+    # batch_invariant_mode on hybrid (Mamba) models, learner memory: recompute each
+    # Mamba mixer's in-projection + conv + SSD scan + gated norm in the backward
+    # (activation checkpoint of MambaMixer._mamba_chunk) instead of saving its fp32
+    # activations (~80 KiB per token per Mamba layer at Nano). Forward values are
+    # unchanged; the backward runs that part of the forward once more. Training only
+    # (need not match generation). Unset: off.
+    mamba_recompute: NotRequired[bool]
+    # MoE under forward_gemm_precision="fp16": sum each token's expert rows through
+    # exact fixed-point limbs (nemo_rl/models/megatron/ep_invariant_combine.py), so
+    # the MoE output has the same bits at every expert-parallel size (training and
+    # generation may then use different EP). Engine combine bytes and RSV memory
+    # 4x (fp64 hi/lo limbs instead of fp32 rows). Must match between training and
+    # generation.
+    moe_ep_invariant_combine: NotRequired[bool]
+    # Targeted precision raises of the fp16 GEMM forward (opt-in acceptance levers,
+    # nemo_rl/models/megatron/precision_raise.py): {preset: none,
+    # raise_sites: [attn_qkv_hilo, mamba_inout_hilo, shared_expert_hilo,
+    # routed_fc2_hilo], combine_payload_fp16: bool}. Unset: none.
+    # Requires forward_gemm_precision="fp16"; must match between training and generation.
+    precision_raise: NotRequired[dict[str, Any] | None]
+    # Latent MoE (Nemotron Super / Ultra): keep 1/TP of fc1_latent_proj / fc2_latent_proj
+    # per TP rank instead of the duplicated weight (nemo_rl/models/megatron/latent_tp_shard.py;
+    # requires forward_gemm_precision="fp16"). Same output bits as the duplicated layer, so the
+    # two sides may differ. Default False.
+    moe_latent_tp_shard: NotRequired[bool]
 
 
 # Block drafters propose a whole anchored block per step and exist only on

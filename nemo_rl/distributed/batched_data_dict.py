@@ -1134,13 +1134,18 @@ class BatchedDataDict(UserDict, Generic[DictT]):
     def make_microbatch_iterator(
         self, microbatch_size: int
     ) -> Iterator["SlicedDataDict"]:
-        """Make an iterator over the batch that yields microbatches of size microbatch_size."""
+        """Make an iterator over the batch that yields microbatches of size microbatch_size.
+
+        Raises ``ValueError`` here (not on first use, and also under ``python -O``) if
+        the batch is not a whole number of micro-batches: the remainder rows would be
+        silently left out of the iteration.
+        """
         bsize = self.size
-        assert bsize % microbatch_size == 0, (
-            f"Data dict size ({bsize}) is not a multiple of the provided microbatch size ({microbatch_size})"
-        )
-        for i in range(0, bsize, microbatch_size):
-            yield self.slice(i, i + microbatch_size)
+        if microbatch_size <= 0 or bsize % microbatch_size != 0:
+            raise ValueError(
+                f"Data dict size ({bsize}) is not a multiple of the provided microbatch size ({microbatch_size})"
+            )
+        return (self.slice(i, i + microbatch_size) for i in range(0, bsize, microbatch_size))
 
     @property
     def size(self) -> int:

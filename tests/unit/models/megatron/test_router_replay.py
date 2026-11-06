@@ -472,7 +472,7 @@ def test_build_router_replay_tensors_rejects_partial_padded_layer_payload():
         with pytest.raises(
             ValueError,
             match=(
-                "Expected exactly 3 layers for compressed MoE-layer layout or "
+                "Expected exactly 3 layers for compressed MoE-layer layout, "
                 "8 layers for vLLM full-transformer-layer layout"
             ),
         ):

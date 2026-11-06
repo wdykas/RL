@@ -1,0 +1,30 @@
+# IS-SPR (docs/colo/THEORY.md, "IS-SPR" and section 6; thundersync_rl/isspr.py): stock
+# colocated partial rollout exactly as SPR-BI (colo_sprbi.yaml: SingleController loop, in_order sampler at lag K, rows
+# paused in the engine at the stand-down), with every row's state and log-probs recomputed under the new weights at
+# each wake and each GRPO group weighted by W_g = min(C, exp(s_g)) against the weights it trains at.
+#
+# Differences to colo_sprbi.yaml (all method):
+#   thundersync: {mode: isspr}      the ThunderSync worker (keyed sampler, exact SPR's engine rescore and wake cut),
+#                                   the row loop, the weight, the always-on train-lp sentinel and router check
+#   thundersync.weight group        the group product (approved); "row" = RIS, opt-in (isspr.py docstring)
+#   thundersync.clip_c 5            C of the weight (TAIL_FLOOR §5.5)
+#   thundersync.crossfade_routing_* cross-fade routing as every speculative colo arm (LEVERS.md; wvs0's values)
+#   loss_fn.token_level_loss false  constant normalizer: per-row token mean, then the mean over the batch's rows (the
+#                                   batch loss is a sum of row terms, so the weight keeps it unbiased)
+defaults:
+  - colo_sprbi.yaml
+
+loss_fn:
+  token_level_loss: false
+
+thundersync:
+  _override_: true
+  mode: isspr
+  weight: group
+  clip_c: 5.0
+  crossfade_routing_m: 0.01
+  crossfade_routing_m_profile: null
+  crossfade_routing_extra: 8
+  crossfade_routing_ramp_stopgrad: true
+  crossfade_routing_sparse: true
+  crossfade_routing_sparse_engine: true

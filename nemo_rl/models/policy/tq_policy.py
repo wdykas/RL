@@ -40,6 +40,7 @@ from typing import Any, Optional
 
 import ray
 
+from nemo_rl.algorithms.grad_streaming import GradStreamingSpec
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.data_plane import (
     KVBatchMeta,
@@ -632,8 +633,17 @@ class TQPolicy(TQDriverMixin, Policy):
         loss_fn: LossFunction,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
+        grad_streaming: Optional[GradStreamingSpec] = None,
     ) -> None:
-        """Open a logical train step on every worker."""
+        """Open a logical train step on every worker.
+
+        Args:
+            loss_fn: Loss for every chunk of the step.
+            gbs: Logical global batch size.
+            mbs: Micro-batch size.
+            grad_streaming: Enables trajectory-level gradient streaming for
+                the step (see ``nemo_rl.algorithms.grad_streaming``).
+        """
         batch_size = gbs or self.cfg["train_global_batch_size"]
         micro_batch_size = mbs or self.cfg["train_micro_batch_size"]
         if self.flops_tracker is not None:
@@ -646,6 +656,7 @@ class TQPolicy(TQDriverMixin, Policy):
             loss_fn=loss_fn,
             gbs=batch_size,
             mbs=micro_batch_size,
+            grad_streaming=grad_streaming,
             **trace_context_kwargs(),
         )
         ray.get(futures)
@@ -686,6 +697,59 @@ class TQPolicy(TQDriverMixin, Policy):
             timer: Optional timer for nested policy-training measurements.
             train_fields: Columns produced for this step and fetched by workers.
         """
+        dp_metas = self._shard_train_meta(meta, timer, train_fields)
+        self._dispatch_train_microbatches(dp_metas, timer=timer)
+
+    def train_groups_from_metas(
+        self,
+        metas: list[KVBatchMeta],
+        timer: Optional[Timer] = None,
+        train_fields: tuple[str, ...] = DP_TRAIN_FIELDS,
+    ) -> None:
+        """Train several groups in ONE worker call, each exactly as :meth:`train_microbatches_from_meta` trains it.
+
+        Each group is DP-sharded on its own; every rank receives its slice of every group and trains them one after
+        the other (``train_groups_presharded``), so per-group semantics (micro-batches, normalization counts, the
+        exact accumulator's one capture per group) are unchanged. Only the driver round trip (shard, submit, wait) is
+        paid once per call instead of once per group.
+        """
+        per_group = [self._shard_train_meta(m, timer, train_fields) for m in metas]
+        dp = len(per_group[0])
+        by_rank = [[g[r] for g in per_group] for r in range(dp)]
+        if self.flops_tracker is not None:
+            for g in per_group:
+                for m in g:
+                    self.flops_tracker.track_batch(list(m.sequence_lengths or []))
+        with (
+            timer.time("policy_training/submit_microbatch_futures")
+            if timer
+            else nullcontext()
+        ):
+            futures = self.worker_group.run_all_workers_sharded_data(
+                "train_groups_presharded",
+                metas=by_rank,
+                in_sharded_axes=["data_parallel"],
+                replicate_on_axes=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+                output_is_replicated=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+                common_kwargs=trace_context_kwargs(),
+            )
+        self.worker_group.get_all_worker_results(futures)
+
+    def _shard_train_meta(
+        self,
+        meta: KVBatchMeta,
+        timer: Optional[Timer],
+        train_fields: tuple[str, ...],
+    ) -> list[KVBatchMeta]:
+        """Route fields + DP sharding of one train slice (one meta per DP rank)."""
         spa, dba = self._packing_args("train_mb_tokens")
         train_meta = self._with_route_fields(
             meta,
@@ -711,8 +775,27 @@ class TQPolicy(TQDriverMixin, Policy):
                 sequence_packing_args=spa,
                 dynamic_batching_args=dba,
             )
+        return dp_metas
 
-        self._dispatch_train_microbatches(dp_metas, timer=timer)
+    def close_stream_groups(self, closes: list[tuple[Any, dict[float, float]]]) -> None:
+        """Apply closed groups' advantages to their streamed gradients on every worker."""
+        ray.get(
+            self.worker_group.run_all_workers_single_data(
+                "close_stream_groups_presharded",
+                closes=closes,
+                **trace_context_kwargs(),
+            )
+        )
+
+    def discard_stream_groups(self, groups: list[Any]) -> None:
+        """Drop retried groups' streamed gradients on every worker."""
+        ray.get(
+            self.worker_group.run_all_workers_single_data(
+                "discard_stream_groups_presharded",
+                groups=groups,
+                **trace_context_kwargs(),
+            )
+        )
 
     def train_placed_microbatches(
         self,
@@ -838,6 +921,14 @@ class TQPolicy(TQDriverMixin, Policy):
         # dispatch; finish has no data to shard, so we dedupe here.
         leader_results = [r for r in results if r.get("is_replica_leader", True)]
         aggregated_results = _aggregate_train_results(leader_results)
+        # Order-invariant gradient accumulator reports (nolanes train overlap): every rank's own grad shard.
+        exact_reports = [r["exact_grad_accum"] for r in results if r.get("exact_grad_accum") is not None]
+        if exact_reports:
+            aggregated_results["exact_grad_accum"] = exact_reports
+        # Router-freeze fingerprints (nolanes; every rank's own routers after the optimizer step).
+        router_reports = [r["nl_router_fp"] for r in results if r.get("nl_router_fp") is not None]
+        if router_reports:
+            aggregated_results["nl_router_fp"] = router_reports
 
         if self.flops_tracker is not None:
             aggregated_results["total_flops"] = self.flops_tracker.total_flops

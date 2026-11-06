@@ -114,9 +114,19 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
             self._transport.init_communicator()
             return
         ip, port = self._train_cluster.get_master_address_and_port()
-        print(f"Using ip: {ip}, port: {port} for collective communication", flush=True)
         train_world_size = self._train_cluster.world_size()
         world_size = train_world_size + self._inference_cluster.world_size()
+        # Learner rank 0 binds the store before any rank is told the port (no
+        # probe-then-bind race; retries in the master band if `port` was taken
+        # meanwhile, e.g. by another engine lane's store); then every rank gets
+        # the bound (ip, port).
+        ip, port = self._policy.reserve_refit_store(
+            world_size,
+            port_range_low=self._train_cluster.port_range_low,
+            port_range_high=self._train_cluster.port_range_high,
+            preferred_port=port,
+        )
+        print(f"Using ip: {ip}, port: {port} for collective communication", flush=True)
         self._refit_backend = self._generation.cfg["mcore_generation_config"][
             "refit_backend"
         ]

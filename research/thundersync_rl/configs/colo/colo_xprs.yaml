@@ -1,0 +1,18 @@
+# ThunderSync colocated EXACT PARTIAL ROLLOUT with SPARE DRAFTS, XPR-S (docs/colo/THEORY.md
+# Theorem S, §3-§3b): colo_xpr.yaml plus a ⊥-BV pool at one constant envelope M with prompt drop, N = k_drafts x G drafts
+# per prompt, and S spare prompts per step: the step admits P + S prompt groups (launcher SPARE=S: num_prompts_per_step
+# = PROMPTS + S, train_global_batch_size = PROMPTS x G) and trains the first P whose pools fill their G slots (⊥ counts
+# and the fixed order only: an independent thinning, exact). A larger M turns early-tau continuations (the full-length
+# tails of Theorem T) into ⊥ outcomes that the spare drafts absorb.
+#   M 1.5 and N 16 / prompt with S 8 of 72 are the model's choice at Super-L22 v1 (TAIL_FLOOR §3: P(continued) ~ 0,
+#   ⊥ ~ 1/3; P(pool short) small at 16 drafts); one fixed rule, no adaptation.
+defaults:
+  - colo_xpr.yaml
+
+# Spares by rule: N = ceil(G M + 1.5 sqrt(G M (M - 1))) drafts per prompt (P(⊥) = 1 - 1/M per draft; 1.5 sd margin),
+# M 1.25 -> N 13 (bv_len at Super-L22 lag-1 v: continued 1.4 %, ⊥ 18 %). M 1.5 (N 16) did not fit beside the BI
+# learner at Super-L22 on 16 GPUs (288 requests / rank).
+thundersync:
+  null_bv_fixed_m: 1.25
+  k_drafts: 1.625
+  spare_prompts: 8

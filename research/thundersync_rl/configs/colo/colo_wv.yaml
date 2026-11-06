@@ -1,0 +1,22 @@
+# ThunderSync colocated exact partial rollout, VERIFY AT THE WAKE (docs/colo/THEORY.md, "Wake verify"):
+# colo_xprs.yaml (⊥-BV pool at one constant envelope M, prompt drop, spare prompts) with thundersync.wake_verify.
+#   Phase k (engine on theta_k): batch k's continuations (rejected rows from tau, unfinished accepted rows from their
+#   end) decode beside the drafting of batch k+1; the phase ends when batch k is complete. At the stand-down the
+#   drafts of batch k+1 still decoding are cut where they stand (unfinished), so batch k+1 is complete there; after
+#   training, the stage verifies it against theta_{k+1} at the start of phase k+1. One wake per step for the
+#   continuations, no separate continuation phase (SPR's paused rows resume at the next wake the same way).
+#   Fixed-G rule (TAIL_FLOOR.md §4 (11-05)): M 1.35, N = 14 drafts per prompt (k_drafts 1.75 at G 8), 8 spare prompts
+#   (72 admitted for 64 trained at Super-L22).
+# The research measurements (ts-colo) had MTD 4 on; colo-slim has no MTD.
+# Engine row slots (engine_slots.py) are on for every colocated stage; the Super-L22 4-node reference arm
+# (colo-wvs1-sl22n4-sched1) launches lib/colo_arm.sh with TP=2 EP=8 GPUS=16 PROMPTS=64 G=8 SPARE=8 MAX_REQ=128
+# ENGINE_BUF=9 MBS=2 and XA='async_rl.sampler.max_lookahead_versions=1
+# policy.generation.mcore_generation_config.num_cuda_graphs=-1' (the launcher sets these keys, overriding the yaml).
+defaults:
+  - colo_xprs.yaml
+
+thundersync:
+  wake_verify: true
+  null_bv_fixed_m: 1.35
+  k_drafts: 1.75
+  spare_prompts: 8

@@ -170,6 +170,9 @@ def test_mcore_nccl_m2n_builds_hybrid_group_and_copy_service(
     assert process_group_type.call_args.args[1:] == (2, 4)
     assert nccl_backend_type.call_args.args[1:3] == (2, 4)
     assert tcp_store_type.call_args.kwargs["is_master"] is False
+    # The probed/reserved port itself, never an unprobed neighbour (port + 1
+    # collided with other listeners: EADDRINUSE with cohort lanes).
+    assert tcp_store_type.call_args.kwargs["port"] == 1234
     nccl_backend_type.assert_called_once()
     m2n_service_type.assert_called_once_with(group=process_group)
     assert worker.refit_copy_service is m2n_service
@@ -181,6 +184,83 @@ def test_mcore_nccl_m2n_builds_hybrid_group_and_copy_service(
         dst_rank_offset=2,
         execution_batch_bytes=123,
     )
+
+
+def test_reserve_refit_store_retries_bound_port_and_init_reuses_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rank 0 binds the refit store up front, skipping ports already in use,
+    and init_collective_mcore_generation adopts that server instead of binding
+    again (what crashed i4-all: a second lane's store on a taken port)."""
+    import socket
+
+    from nemo_rl.models.generation.megatron import megatron_worker as worker_module
+
+    worker = object.__new__(worker_module.MegatronGenerationRefitMixin)
+    monkeypatch.setattr(
+        worker_module.torch.distributed, "get_rank", MagicMock(return_value=0)
+    )
+    # A real listener on the preferred port, like the learner's MASTER_PORT store.
+    blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    blocker.bind(("", 0))
+    blocker.listen(1)
+    taken = blocker.getsockname()[1]
+    try:
+        ip, port = worker.reserve_refit_store(
+            world_size=2,
+            port_range_low=max(1024, taken - 40),
+            port_range_high=taken + 40,
+            preferred_port=taken,
+        )
+        assert port != taken
+        assert isinstance(ip, str) and ip
+        prebound_port, prebound_store = worker._prebound_refit_store
+        assert prebound_port == port
+        # A client can reach the pre-bound server (it is really listening).
+        client = torch.distributed.TCPStore(
+            "127.0.0.1", port, world_size=2, is_master=False,
+            timeout=__import__("datetime").timedelta(seconds=10),
+        )
+        client.set("k", "v")
+        assert prebound_store.get("k") == b"v"
+
+        # init on rank 0 must reuse the pre-bound store, not construct a new one.
+        tcp_store_type = MagicMock(side_effect=AssertionError("rebound the store"))
+        monkeypatch.setattr(worker_module.torch.distributed, "TCPStore", tcp_store_type)
+        seen = {}
+
+        class _Stop(Exception):
+            pass
+
+        def _prefix_store(prefix, store):
+            seen["store"] = store
+            raise _Stop()
+
+        monkeypatch.setattr(worker_module, "PrefixStore", _prefix_store)
+        with pytest.raises(_Stop):
+            worker.init_collective_mcore_generation(
+                ip, port, 2, rank_offset=0,
+                refit_execution_batch_bytes=None, refit_backend="gloo",
+            )
+        assert seen["store"] is prebound_store
+        assert worker._prebound_refit_store is None
+    finally:
+        blocker.close()
+
+
+def test_reserve_refit_store_refuses_non_master_rank(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nemo_rl.models.generation.megatron import megatron_worker as worker_module
+
+    worker = object.__new__(worker_module.MegatronGenerationRefitMixin)
+    monkeypatch.setattr(
+        worker_module.torch.distributed, "get_rank", MagicMock(return_value=3)
+    )
+    with pytest.raises(RuntimeError, match="global rank 0"):
+        worker.reserve_refit_store(
+            world_size=2, port_range_low=1400, port_range_high=1999
+        )
 
 
 @pytest.mark.parametrize(

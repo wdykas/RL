@@ -137,8 +137,12 @@ def test_stream_cleanup_cancels_siblings(failure):
             finally:
                 finished.set()
 
+        loop = asyncio.get_running_loop()
         worker = SimpleNamespace(
-            _inference_loop=asyncio.get_running_loop(),
+            _inference_loop=loop,
+            # generate_async submits to the client loop (lanehost P1b) and polls engine liveness (RD3)
+            _client_loop=lambda: loop,
+            _raise_if_inference_engine_dead=lambda future: None,
             _prepare_data_for_generation=lambda datum, greedy: (
                 datum["input_ids"].tolist(),
                 [None],

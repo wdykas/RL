@@ -1,0 +1,18 @@
+# ThunderSync colocated EXACT PARTIAL ROLLOUT with VARIABLE GROUP SIZE, VG-1.4 (the research notes, summarized in docs/colo/
+# TAIL_FLOOR.md §4.5): colo_xpr.yaml plus a ⊥-BV walk of EVERY draft at one constant envelope M (walk_all: no M = 1
+# fallback, no stopping rule, slots = N). A prompt's group is all its non-⊥ outputs (size Bin(N, 1/M), mean N / M) and
+# a group with fewer than 2 outputs is dropped; both are functions of the ⊥ pattern alone, so the trained rows are iid
+# theta_k. GRPO's baseline is per group (group-id keyed leave-one-out) over the group's own size.
+#   M 1.4, N = G = 8 drafts per prompt; the launcher admits PROMPTS prompts and the step trains ~PROMPTS x 8 / 1.4 rows
+#   (Super-L22: PROMPTS 90 -> ~514 rows, SPR trains 512). One fixed rule, no controller.
+# wake_verify (MODEL.md v2 §13): the lookahead drafts are cut at the stand-down and verified at the start of the next
+#   phase; kept rows continue inside that phase beside the next batch's drafting (no separate continuation phase).
+defaults:
+  - colo_xpr.yaml
+
+# The research measurements (ts-colo) had MTD 4 on; colo-slim has no MTD.
+thundersync:
+  null_bv_fixed_m: 1.4
+  k_drafts: 1.0
+  variable_group: true
+  wake_verify: true

@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import hashlib
 import io
 import json
@@ -56,7 +57,7 @@ import uuid
 import warnings
 from collections import deque
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 from typing import (
@@ -93,6 +94,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     TransactionalAdmissionSampler,
     create_sampler,
 )
+from nemo_rl.algorithms.grad_streaming import GradStreamingSpec, pick_final_first
 from nemo_rl.algorithms.grpo import (
     GRPOSaveState,
     _write_latest_checkpoint_status,
@@ -160,6 +162,8 @@ from nemo_rl.data_plane.schema import (
     DP_TRAIN_FIELDS,
     ROLLOUT_METRICS,
     ROUTE_PLAN_TAG,
+    STREAM_BUCKET_TAG,
+    STREAM_REWARD_TAG,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_context_lost
@@ -324,6 +328,24 @@ def _train_fields_for_step(
     )
 
 
+@dataclass
+class _TrajectoryStepState:
+    """Per-step bookkeeping for trajectory-level gradient streaming."""
+
+    # Sealed groups: {reward: final advantage} (trajectories with equal rewards
+    # in a group share an advantage).
+    group_advantages: dict[str, dict[float, float]] = field(default_factory=dict)
+    bucketed: set[str] = field(default_factory=set)  # groups with streamed buckets
+    closed: set[str] = field(default_factory=set)  # groups folded into the batch
+    counted: set[str] = field(default_factory=set)  # sealed + fully claimed
+    claimed: set[str] = field(default_factory=set)  # groups with any claimed row
+    # Groups removed for a retry after some rows were claimed. Their claimed
+    # rows stay in the data plane until the step's cleanup clears them.
+    vanished: set[str] = field(default_factory=set)
+    # Rollout metrics of groups completed since the last drain.
+    rollout_metrics: list[dict[str, Any]] = field(default_factory=list)
+
+
 @ray.remote(num_cpus=1, num_gpus=0)  # pragma: no cover
 class SingleControllerActor:
     """CPU-only Ray actor that orchestrates the RL training loop.
@@ -351,6 +373,10 @@ class SingleControllerActor:
     # AbstractPolicyWorker.model_update_group is: the stall watchdog reads it on every
     # tick, and it must exist on any instance the watchdog can reach.
     _recovering_from_refit: bool = False
+
+    # The ThunderSync stage (thundersync.mode nolanes / colo; ``_init_nolanes``), None in stock runs. Declared on the
+    # class for the same reason: every pump checks it, including on instances built without running __init__.
+    _nl: Any = None
 
     # Declared on the class for the same reason, and because every pump reaches
     # for it: ``None`` makes ``managed_span`` fall back to the process-global
@@ -512,6 +538,11 @@ class SingleControllerActor:
         # when Ray deserializes rollout_manager and tq_buffer separately.
         self._rollout_manager._tq_buffer = self._buffer
         self._rollout_recovery_ledger = self._rollout_manager.recovery_ledger
+        # ThunderSync nolanes mode (thundersync.mode=nolanes; research/thundersync_rl/thundersync_rl/nolanes.py):
+        # verify stage before training, drafts per prompt N >= G. None: stock.
+        self._nl = self._init_nolanes(master_config)
+        if self._nl is not None:
+            self._train_fields += self._nl.extra_train_fields
         self._restored_replay_groups_to_regenerate: list[TQReplayGroupMetadata] = []
 
         # Direct access, deliberately. A getattr default here reads as defensive but
@@ -683,6 +714,9 @@ class SingleControllerActor:
         # accumulation remains snapshot-safe because selected rows stay owned by
         # the replay buffer and are re-indexed in periodic snapshots.
         self._optimizer_commit_in_progress = False
+        # Trajectory-streaming steps own per-row claims that rollout snapshots
+        # do not record, so snapshots are deferred until such a step closes.
+        self._trajectory_step_open = False
 
         # Gate: cleared during _sync_weights, set when generation may proceed
         self._rollout_permitted: asyncio.Event = asyncio.Event()
@@ -801,12 +835,86 @@ class SingleControllerActor:
         # try/finally as a path that can fall off the end of the function.
         return result
 
+    def _admission_version(self) -> int:
+        """The version the sampler's admission gate compares against.
+
+        Stock: the trainer version, bumped at the optimizer step before the refit,
+        so prompts admitted in that gap prefill on the previous weights. nolanes:
+        the stage decides (the engine's installed version; VerifyStage.
+        admission_version). Either is a function of the past (exact, DESIGN §1).
+        """
+        if self._nl is not None:
+            return self._nl.admission_version(
+                self._rollout_manager.weight_version(), self._trainer_version
+            )
+        return self._trainer_version
+
+    def _init_nolanes(self, master_config: MasterConfig) -> Any:
+        """The nolanes verify stage (ThunderSync), or None when thundersync.mode is not nolanes."""
+        ts = getattr(master_config, "thundersync", None)
+        if not isinstance(ts, dict) or ts.get("mode") not in ("nolanes", "colo", "xspr", "isspr"):
+            return None
+        if ts.get("mode") == "isspr":
+            # IS-SPR (research/colo/TAIL_FLOOR.md §5.5): exact SPR's recompute at every wake, a weight per group.
+            from thundersync_rl.isspr import IsSprConfig
+            from thundersync_rl.isspr_stage import IsSprStage
+
+            return IsSprStage(self, master_config, IsSprConfig.from_config({"thundersync": ts}))
+        if ts.get("mode") == "xspr":
+            # Exact SPR (research/colo/SIMPLE_EXACT_SPR.md): the stock loop; rows are checked in the rollout path.
+            from thundersync_rl.xspr import XsprConfig
+            from thundersync_rl.xspr_stage import XsprStage
+
+            return XsprStage(self, master_config, XsprConfig.from_config({"thundersync": ts}))
+        if ts.get("mode") == "colo":
+            # Colocated mode (research/colo/MODEL.md): same hooks, no verification at lag 0.
+            from thundersync_rl.colo import ColoConfig
+            from thundersync_rl.colo_stage import ColoStage
+
+            stage = ColoStage(
+                self,
+                {"grpo": {"num_generations_per_prompt": int(self._algo_cfg.num_generations_per_prompt),
+                          "seed": int(getattr(self._algo_cfg, "seed", 0) or 0)}},
+                ColoConfig.from_config({"thundersync": ts}),
+            )
+            self._rollout_manager.nl_record_sink = stage.record_sink
+            return stage
+        from thundersync_rl import nolanes
+        from thundersync_rl.nolanes_stage import VerifyStage
+
+        cfg = nolanes.NolanesConfig.from_config({"thundersync": ts})
+        mc = {
+            "grpo": {
+                "num_generations_per_prompt": int(self._algo_cfg.num_generations_per_prompt),
+                "seed": int(getattr(self._algo_cfg, "seed", 0) or 0),
+            },
+            "policy": {
+                "generation": {"max_new_tokens": int(master_config.policy["generation"]["max_new_tokens"])},
+                "max_total_sequence_length": master_config.policy.get("max_total_sequence_length"),
+                # VG (variable group size): the stage rounds its random row count to the learner's DP x micro-batch.
+                "train_micro_batch_size": int(master_config.policy.get("train_micro_batch_size") or 1),
+                "logprob_batch_size": int(master_config.policy.get("logprob_batch_size")
+                                          or master_config.policy.get("train_micro_batch_size") or 1),
+            },
+            "async_rl": {"sampler": {"max_lookahead_versions": int(
+                getattr(self._async_cfg.sampler, "max_lookahead_versions", 1) or 1)}},
+        }
+        stage = VerifyStage(self, mc, cfg)
+        # N = max(G, round(K G)) drafts per prompt; the verify stage keeps G output rows.
+        impl = self._rollout_manager._impl
+        impl._num_generations_per_prompt = stage.n
+        self._rollout_manager._num_generations_per_prompt = stage.n
+        self._rollout_manager.nl_record_sink = stage.record_sink
+        return stage
+
     async def _run_pumps(self) -> dict[str, Any]:
         """Start the rollout / train / watchdog pumps and run until one finishes."""
         # Synchronize weights before starting the pumps, unless setup already delivered them.
         if self._weight_synchronizer.is_stale:
             await self._sync_weights()
         self._rollout_manager.set_weight_version(self._trainer_version)
+        if self._nl is not None:
+            await asyncio.to_thread(self._nl.setup, self._trainer_version)
 
         replay_restore_started = time.monotonic()
         restored_replay_groups = await self._maybe_restore_replay_buffer()
@@ -1467,7 +1575,7 @@ class SingleControllerActor:
 
         if isinstance(self._sampler, TransactionalAdmissionSampler):
             await self._sampler.wait_until_admissible(
-                trainer_version_fn=lambda: self._trainer_version
+                trainer_version_fn=self._admission_version
             )
             async with self._data_plane_checkpoint_barrier.mutation(
                 "prompt_reservations"
@@ -1485,7 +1593,7 @@ class SingleControllerActor:
             "prompt_reservations"
         ) as cut:
             target_step = await self._sampler.admit(
-                trainer_version_fn=lambda: self._trainer_version
+                trainer_version_fn=self._admission_version
             )
             return _commit(cut, target_step)
 
@@ -2507,7 +2615,7 @@ class SingleControllerActor:
                         if self._divert_batch_to_reserve(prompt_batch):
                             continue
                         target_step = await self._sampler.admit(
-                            trainer_version_fn=lambda: self._trainer_version
+                            trainer_version_fn=self._admission_version
                         )
                         if target_step is not None:
                             self._sampler_stamps_target_steps = True
@@ -2676,7 +2784,7 @@ class SingleControllerActor:
                 self._replacement_reserve.popleft() for _ in range(num_prompts_per_step)
             ]
             target_step = await self._sampler.admit(
-                trainer_version_fn=lambda: self._trainer_version
+                trainer_version_fn=self._admission_version
             )
             self._require_unoccupied_target_step(target_step)
             print(
@@ -2956,6 +3064,12 @@ class SingleControllerActor:
             step_finalizer_metrics: dict[str, list[float]] = {}
             step_finalizer_rewards: list[FinalizedReward] = []
             step_finalizer_group_ids: set[str] = set()
+            # Trajectory-level gradient streaming state (async_rl.trajectory_streaming).
+            traj_cfg = self._async_cfg.trajectory_streaming
+            traj = _TrajectoryStepState()
+            self._trajectory_step_open = traj_cfg is not None
+            traj_row_advantages: Optional[torch.Tensor] = None
+            traj_row_buckets: list[Optional[tuple[str, float]]] = []
 
             with (
                 # Pinned here rather than read per span: _train_steps is
@@ -2995,6 +3109,11 @@ class SingleControllerActor:
                             current_train_weight=self._trainer_version,
                         )
                         evicted_stale_prompt_groups += evicted
+                        if evicted and self._nl is not None:
+                            raise RuntimeError(
+                                f"nolanes: {evicted} stale prompt group(s) evicted (MEDIUM-4: every dispatched "
+                                "group must be trained at its target step)"
+                            )
                         if evicted:
                             print(
                                 f"  evicted {evicted} stale prompt group(s)",
@@ -3024,47 +3143,63 @@ class SingleControllerActor:
                         )
                         selected_group_ids: list[str] = []
                         selected_training_claim_ids: list[str] = []
-                        training_claim_ids_before = (
-                            self._buffer.training_owned_group_ids()
-                        )
-                        train_meta, num_groups = await self._sampler.select(
-                            current_train_weight=self._trainer_version,
-                            min_prompt_groups=min_prompt_groups,
-                            max_prompt_groups=max_prompt_groups,
-                            **selection_kwargs,
-                        )
-                        training_claim_ids_after = (
-                            self._buffer.training_owned_group_ids()
-                        )
-                        removed_training_claim_ids = (
-                            training_claim_ids_before - training_claim_ids_after
-                        )
-                        if removed_training_claim_ids:
-                            raise RuntimeError(
-                                "sampler selection removed existing training claims: "
-                                f"{sorted(removed_training_claim_ids)!r}"
+                        if traj_cfg is not None:
+                            (
+                                train_meta,
+                                num_groups,
+                                traj_row_advantages,
+                                traj_row_buckets,
+                            ) = await self._select_trajectory_chunk(traj)
+                            selected_rollout_metrics.extend(traj.rollout_metrics)
+                            traj.rollout_metrics = []
+                            if train_meta is None and num_groups:
+                                # Groups completed with no new rows: fold them in.
+                                await self._close_trajectory_groups(traj)
+                                groups_dispatched += num_groups
+                                consumed_group_count += num_groups
+                                continue
+                        else:
+                            training_claim_ids_before = (
+                                self._buffer.training_owned_group_ids()
                             )
-                        new_training_claim_ids = (
-                            training_claim_ids_after - training_claim_ids_before
-                        )
-                        if train_meta is not None:
-                            selected_group_ids = self._group_ids_from_meta(train_meta)
-                            if new_training_claim_ids:
-                                if set(selected_group_ids) != new_training_claim_ids:
-                                    raise RuntimeError(
-                                        "sampler selection does not match its new "
-                                        "training claims: "
-                                        f"selected={selected_group_ids!r}, "
-                                        "claimed="
-                                        f"{sorted(new_training_claim_ids)!r}"
-                                    )
-                                selected_training_claim_ids = selected_group_ids
-                        elif new_training_claim_ids:
-                            raise RuntimeError(
-                                "sampler selection created training claims without "
-                                "returning batch metadata: "
-                                f"{sorted(new_training_claim_ids)!r}"
+                            train_meta, num_groups = await self._sampler.select(
+                                current_train_weight=self._trainer_version,
+                                min_prompt_groups=min_prompt_groups,
+                                max_prompt_groups=max_prompt_groups,
+                                **selection_kwargs,
                             )
+                            training_claim_ids_after = (
+                                self._buffer.training_owned_group_ids()
+                            )
+                            removed_training_claim_ids = (
+                                training_claim_ids_before - training_claim_ids_after
+                            )
+                            if removed_training_claim_ids:
+                                raise RuntimeError(
+                                    "sampler selection removed existing training claims: "
+                                    f"{sorted(removed_training_claim_ids)!r}"
+                                )
+                            new_training_claim_ids = (
+                                training_claim_ids_after - training_claim_ids_before
+                            )
+                            if train_meta is not None:
+                                selected_group_ids = self._group_ids_from_meta(train_meta)
+                                if new_training_claim_ids:
+                                    if set(selected_group_ids) != new_training_claim_ids:
+                                        raise RuntimeError(
+                                            "sampler selection does not match its new "
+                                            "training claims: "
+                                            f"selected={selected_group_ids!r}, "
+                                            "claimed="
+                                            f"{sorted(new_training_claim_ids)!r}"
+                                        )
+                                    selected_training_claim_ids = selected_group_ids
+                            elif new_training_claim_ids:
+                                raise RuntimeError(
+                                    "sampler selection created training claims without "
+                                    "returning batch metadata: "
+                                    f"{sorted(new_training_claim_ids)!r}"
+                                )
 
                         # If no batch is selectable, sleep and retry
                         if train_meta is None:
@@ -3132,6 +3267,11 @@ class SingleControllerActor:
                         selected_rollout_metrics.extend(
                             train_meta.extra_info.pop(ROLLOUT_METRICS, [])
                         )
+                        if self._nl is not None:
+                            # nolanes: verify batch k against theta_k, finish rejected rows at theta_k.
+                            with self._timer.time("nl_verify_stage"):
+                                train_meta = await self._nl.run(train_meta, version_during_step)
+                            consumed_metas[-1] = train_meta
 
                     if groups_dispatched == 0:
                         try:
@@ -3227,7 +3367,9 @@ class SingleControllerActor:
                                 tracer=self._tracer,
                             ),
                         ):
-                            if self._policy_logprobs_required:
+                            if self._policy_logprobs_required and not (
+                                self._nl is not None and self._nl.prev_from_verify
+                            ):
                                 await asyncio.to_thread(
                                     self._trainer.get_logprobs_from_meta, train_meta
                                 )
@@ -3249,7 +3391,14 @@ class SingleControllerActor:
                         (
                             train_meta,
                             has_valid_training_tokens,
-                        ) = await self._advantage_stage(train_meta)
+                        ) = await self._advantage_stage(
+                            train_meta,
+                            **(
+                                {}
+                                if traj_row_advantages is None
+                                else {"row_advantages": traj_row_advantages}
+                            ),
+                        )
 
                     step_has_valid_training_tokens |= has_valid_training_tokens
                     if self._is_ppo:
@@ -3319,13 +3468,19 @@ class SingleControllerActor:
                                         await asyncio.to_thread(
                                             self._trainer.begin_train_step,
                                             self._loss_fn,
+                                            **self._begin_train_step_kwargs(),
                                         )
                                         step_open = True
-                                    await asyncio.to_thread(
-                                        self._trainer.train_microbatches_from_meta,
-                                        train_meta,
-                                        train_fields=self._train_fields,
-                                    )
+                                    if traj_cfg is None:
+                                        await asyncio.to_thread(
+                                            self._trainer.train_microbatches_from_meta,
+                                            train_meta,
+                                            train_fields=self._train_fields,
+                                        )
+                                    else:
+                                        await self._train_trajectory_chunk(
+                                            traj, train_meta, traj_row_buckets
+                                        )
                                     # Full-batch PPO closes each policy epoch;
                                     # streaming keeps accumulating across chunks.
                                     if self._is_ppo and not self._streaming_ppo:
@@ -3339,6 +3494,10 @@ class SingleControllerActor:
                                         )
                                         step_open = False
 
+                    if traj_cfg is not None:
+                        # Independent of whether this chunk trained (an
+                        # all-masked chunk skips training but groups may seal).
+                        await self._close_trajectory_groups(traj)
                     if train_meta.sequence_lengths:
                         self._step_log_dict["sequence_lengths"].extend(
                             int(s) for s in train_meta.sequence_lengths
@@ -3554,6 +3713,8 @@ class SingleControllerActor:
                             "to avoid an optimizer step with an empty batch."
                         )
 
+                    if traj_cfg is not None:
+                        await self._finish_trajectory_step(traj)
                     with (
                         self._timer.time("policy_training"),
                         managed_span(
@@ -3571,6 +3732,9 @@ class SingleControllerActor:
                 step_metrics = {}
                 if policy_result is not None:
                     step_metrics.update(aggregate_step_metrics(policy_result))
+                    if self._nl is not None:
+                        self._nl.check_train_lp(step_metrics, version_during_step)
+                        self._nl.check_router_frozen(policy_result, version_during_step)
                 if value_result is not None:
                     step_metrics.update(_compute_critic_metrics(value_result))
                 async with self._data_plane_checkpoint_barrier.mutation(
@@ -3581,6 +3745,14 @@ class SingleControllerActor:
                     for group_id in step_finalizer_group_ids:
                         self._finalizer_metrics_by_group.pop(group_id, None)
                         self._finalizer_rewards_by_group.pop(group_id, None)
+                if traj_cfg is not None:
+                    # Every claimed row, including those of groups removed for a
+                    # retry mid-step, was just cleared with the consumed metas.
+                    self._buffer.release_trajectory_claims(
+                        sorted(traj.counted | traj.vanished)
+                    )
+                    for group_id in traj.counted:
+                        await self._buffer.remove_group(group_id)
                 for _ in range(consumed_group_count):
                     self._buffer_capacity.release()
                 step_metrics.update(
@@ -3648,8 +3820,14 @@ class SingleControllerActor:
 
                 if not early_refit_done:
                     self._trainer_version += 1
+                    if self._nl is not None:
+                        # The learner holds theta_{k+1}: stash its LM head before anything else moves it; the
+                        # engines record the version their next refit installs.
+                        await asyncio.to_thread(self._nl.stash_head, self._trainer_version)
+                        await asyncio.to_thread(self._nl.announce_version, self._trainer_version)
                 self._train_steps += 1
                 self._optimizer_commit_in_progress = False
+                self._trajectory_step_open = False
                 dropped_prompt_groups = self._batch_shortfall.get(
                     version_during_step, 0
                 )
@@ -3718,10 +3896,16 @@ class SingleControllerActor:
                 # ---- 6. Refit the model ----
                 # Critic warmup doesn't need a refit and the version still advances.
                 # But a colocated engine that was stood down still needs to be woken up via reshard.
+                # ThunderSync nolanes wake_verify (colocated): the next step's verify stage runs with the engine
+                # stood down and its wake carries theta_{k+1}; waking here would only be undone by that stage.
+                nl_defer_wake = self._nl is not None and self._nl.defers_post_step_wake()
                 if not early_refit_done and (
                     is_policy_training_step or self._gen.blocks_training()
                 ):
-                    if defer_refit_for_save:
+                    if nl_defer_wake and not defer_refit_for_save:
+                        with self._timer.time("weight_sync"):
+                            pass
+                    elif defer_refit_for_save:
                         # Refit-deferral (colocated): the engine is about to be saved; let it sleep.
                         # Record `weight_sync` for consistency in reports.
                         # No refit_bubble: this branch syncs nothing.
@@ -3747,7 +3931,10 @@ class SingleControllerActor:
                             )
                 if not early_refit_done:
                     self._retune_lookahead_versions()
-                    self._rollout_manager.set_weight_version(self._trainer_version)
+                    if not nl_defer_wake:
+                        self._rollout_manager.set_weight_version(self._trainer_version)
+                        if self._nl is not None:
+                            await asyncio.to_thread(self._nl.check_engine_version, self._trainer_version)
                 step_metrics.update(
                     {
                         "evicted_stale_prompt_groups": evicted_stale_prompt_groups,
@@ -3793,14 +3980,25 @@ class SingleControllerActor:
                         if not loop_will_exit:
                             with self._timer.time("weight_sync"):
                                 # The save onloaded model+optimizer; generation needs offload.
-                                await asyncio.to_thread(
-                                    self._trainer.offload_after_refit
-                                )
-                                await asyncio.to_thread(
-                                    self._gen.prepare_for_generation
-                                )
-                                self._rollout_permitted.set()
-                                self._rollout_manager.resume_request_deadlines()
+                                # wake_verify (nl_defer_wake): the next step's verify stage wakes the engine with
+                                # theta_{k+1} installed, the rollout weight version stamped and checked before the
+                                # dispatch gate opens; a bare wake here would admit rollouts stamped with version k.
+                                # The resident learner (offload_optimizer_for_refit false) keeps its parameters and
+                                # grad buffers on the device: only the async save is finalized (offloading here would
+                                # free the grad buffers and re-grow them at the next training step).
+                                if nl_defer_wake:
+                                    await asyncio.to_thread(
+                                        self._trainer.finalize_async_save
+                                    )
+                                else:
+                                    await asyncio.to_thread(
+                                        self._trainer.offload_after_refit
+                                    )
+                                    await asyncio.to_thread(
+                                        self._gen.prepare_for_generation
+                                    )
+                                    self._rollout_permitted.set()
+                                    self._rollout_manager.resume_request_deadlines()
 
             timing_metrics: dict[str, float] = self._timer.get_timing_metrics(
                 reduction_op="sum"
@@ -4672,6 +4870,11 @@ class SingleControllerActor:
                     saved=False,
                     reason="optimizer_commit_in_progress",
                 )
+            if self._trajectory_step_open:
+                return _RolloutCheckpointSaveResult(
+                    saved=False,
+                    reason="trajectory_step_open",
+                )
             if (
                 not force
                 and self._last_rollout_snapshot_mutation_version
@@ -4745,6 +4948,7 @@ class SingleControllerActor:
                     barrier_acquired = time.monotonic()
                     if (
                         self._optimizer_commit_in_progress
+                        or self._trajectory_step_open
                         or self._train_steps != expected_train_step
                         or self._trainer_version != expected_trainer_version
                     ):
@@ -5464,6 +5668,11 @@ class SingleControllerActor:
             if should_use_nemo_gym(self._master_config)
             else await self._abort_stale_inflight()
         )
+        if aborted_stale_inflight_groups and self._nl is not None:
+            raise RuntimeError(
+                f"nolanes: {aborted_stale_inflight_groups} in-flight group(s) aborted as stale (every dispatched "
+                "group must be trained at its target step)"
+            )
 
         # TODO(#2625): Add drain-gate support during refit.
 
@@ -5659,7 +5868,11 @@ class SingleControllerActor:
         assert result is not None
         return result
 
-    async def _advantage_stage(self, meta: KVBatchMeta) -> tuple[KVBatchMeta, bool]:
+    async def _advantage_stage(
+        self,
+        meta: KVBatchMeta,
+        row_advantages: Optional[torch.Tensor] = None,
+    ) -> tuple[KVBatchMeta, bool]:
         """Fetch advantage inputs, compute advantages, and write them back.
 
         SC owns the prompt-group-scoped advantage stage because the selected
@@ -5685,7 +5898,7 @@ class SingleControllerActor:
         num_actors = len(self._advantage_actors)
         shards = (
             split_meta_by_prompt_group(meta, num_actors)
-            if stage_cfg.shardable
+            if stage_cfg.shardable and row_advantages is None
             else None
         )
         # Every decline is silent by construction, so an unlogged one is
@@ -5694,6 +5907,10 @@ class SingleControllerActor:
         # default pool of 0 would otherwise report a layout it never examined.
         if shards is not None:
             decline = ""
+        elif row_advantages is not None:
+            # Trajectory streaming: the caller decided every row's advantage
+            # (rows of open groups carry a placeholder), so nothing to shard.
+            decline = " (trajectory-streaming chunk)"
         elif not stage_cfg.shardable:
             decline = (
                 f" (estimator {stage_cfg.algo.adv_estimator.name!r} is not "
@@ -5719,6 +5936,13 @@ class SingleControllerActor:
                 # writes the dump and needs the step to name the file by.
                 train_step=(
                     self._train_steps if self._train_data_dump is not None else None
+                ),
+                # Plain floats, one per row: the request crosses the pool's
+                # metadata-only RPC boundary (no tensors).
+                row_advantages=(
+                    None
+                    if row_advantages is None
+                    else tuple(float(x) for x in row_advantages.tolist())
                 ),
             )
             for shard in (shards if shards is not None else [meta])
@@ -5785,6 +6009,283 @@ class SingleControllerActor:
                 "train_data_dump", outcome.train_data_dump_s, should_log=False
             )
         self._train_data_dump_rows += outcome.train_data_dump_rows
+
+    def _begin_train_step_kwargs(self) -> dict[str, Any]:
+        """Extra ``begin_train_step`` kwargs: the streaming spec, if enabled."""
+        ts_cfg = self._async_cfg.trajectory_streaming
+        if ts_cfg is None:
+            return {}
+        return {
+            "grad_streaming": GradStreamingSpec(
+                storage_device=ts_cfg.storage_device,
+                max_buckets_per_group=ts_cfg.max_buckets_per_group,
+                max_open_groups=ts_cfg.max_open_groups,
+            )
+        }
+
+    def _advantage_base_inputs(
+        self, data: Any
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Advantage inputs shared by the chunk and the sealed-group paths.
+
+        Returns prompt ids, rewards, token mask, sample mask, the env
+        mask-sample flags and the final sample mask (sample mask minus
+        env-flagged and, with overlong filtering, truncated samples).
+        """
+        from nemo_rl.algorithms.single_controller_utils.utils import (
+            squeeze_trailing_unit_dim,
+            tensor_field,
+        )
+
+        adv_cfg = self._advantage_cfg
+        rewards = squeeze_trailing_unit_dim(
+            tensor_field(data, adv_cfg.reward_field)
+        ).float()
+        token_mask = tensor_field(data, adv_cfg.token_mask_field).float()
+        sample_mask = squeeze_trailing_unit_dim(
+            tensor_field(data, adv_cfg.sample_mask_field)
+        ).float()
+        mask_sample = squeeze_trailing_unit_dim(
+            tensor_field(data, adv_cfg.mask_sample_field)
+        ).bool()
+        final_sample_mask = sample_mask * (~mask_sample).to(sample_mask.dtype)
+        if self._algo_cfg.overlong_filtering:
+            truncated = squeeze_trailing_unit_dim(
+                tensor_field(data, adv_cfg.truncated_field)
+            ).bool()
+            final_sample_mask = final_sample_mask * (~truncated).to(sample_mask.dtype)
+        prompt_ids = tensor_field(data, adv_cfg.prompt_ids_field)
+        return (
+            prompt_ids,
+            rewards,
+            token_mask,
+            sample_mask,
+            mask_sample,
+            final_sample_mask,
+        )
+
+    def _repeated_batch(
+        self, data: Any, rewards: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        from nemo_rl.algorithms.single_controller_utils.utils import (
+            squeeze_trailing_unit_dim,
+            tensor_field,
+        )
+
+        repeated_batch: dict[str, torch.Tensor] = {"total_reward": rewards}
+        for field_name in self._advantage_cfg.repeated_batch_fields:
+            repeated_batch[field_name] = squeeze_trailing_unit_dim(
+                tensor_field(data, field_name)
+            )
+        return repeated_batch
+
+    async def _group_advantage_by_reward(self, meta: KVBatchMeta) -> dict[float, float]:
+        """Final advantage per reward value of a sealed group.
+
+        Exactly what :meth:`_advantage_stage` computes for the complete group
+        (same masks, estimator and clipping); trajectories with equal rewards
+        in a group share one advantage, which is what the gradient buckets need.
+        """
+        adv_cfg = self._advantage_cfg
+        data = await call_data_plane(
+            self._dp_client,
+            "get_samples",
+            sample_ids=meta.sample_ids,
+            partition_id=meta.partition_id,
+            select_fields=list(
+                dict.fromkeys(
+                    [
+                        adv_cfg.prompt_ids_field,
+                        adv_cfg.reward_field,
+                        adv_cfg.token_mask_field,
+                        adv_cfg.sample_mask_field,
+                        adv_cfg.mask_sample_field,
+                        adv_cfg.truncated_field,
+                        *adv_cfg.repeated_batch_fields,
+                    ]
+                )
+            ),
+        )
+        from nemo_rl.algorithms.grpo import GRPOConfig, _clip_grpo_advantages
+        from nemo_rl.algorithms.single_controller_utils.utils import AdvantagePartial
+
+        # One sealed group: a single baseline group whatever the key.
+        prompt_ids, rewards, token_mask, _, _, final_sample_mask = (
+            self._advantage_base_inputs(data)
+        )
+        mask = token_mask * final_sample_mask.unsqueeze(-1)
+        advantages = self._advantage_estimator.compute_advantage(
+            prompt_ids=prompt_ids,
+            rewards=rewards,
+            mask=mask,
+            repeated_batch=self._repeated_batch(data, rewards),
+            valid_mask=final_sample_mask,
+        )
+        assert isinstance(self._algo_cfg, GRPOConfig)
+        advantages = _clip_grpo_advantages(advantages, self._algo_cfg)
+        # Same metric the batch path logs, once per group (chunks skip it).
+        self._step_log_dict["advantage_partials"].append(
+            AdvantagePartial.from_values(torch.masked_select(advantages, mask.bool()))
+        )
+        # Masked rows (overlong, env-flagged) are left out of the baseline, so
+        # their advantage differs from valid rows with the same reward; it is
+        # never trained on (zero sample mask), so valid rows take precedence.
+        by_reward: dict[float, float] = {}
+        valid_rows = final_sample_mask.bool().tolist()
+        for valid_pass in (True, False):
+            for reward, advantage, valid in zip(
+                rewards.tolist(), advantages[:, 0].tolist(), valid_rows
+            ):
+                if valid is valid_pass:
+                    by_reward.setdefault(reward, advantage)
+        return by_reward
+
+    async def _drop_vanished_groups(
+        self, traj: "_TrajectoryStepState", live: set[str]
+    ) -> None:
+        """Forget groups removed from the buffer for a retry mid-step.
+
+        Their streamed buckets are discarded on the workers (with their
+        normalization counts). The buffer keeps their claimed rows (and their
+        claims) until step cleanup clears them.
+        """
+        vanished = (traj.claimed | traj.bucketed) - live - traj.counted
+        if not vanished:
+            return
+        retried = sorted((vanished & traj.bucketed) - traj.closed)
+        if retried:
+            await asyncio.to_thread(self._trainer.discard_stream_groups, retried)
+        traj.bucketed -= vanished
+        traj.claimed -= vanished
+        traj.vanished |= vanished
+
+    async def _select_trajectory_chunk(
+        self, traj: "_TrajectoryStepState"
+    ) -> tuple[
+        Optional[KVBatchMeta],
+        int,
+        Optional[torch.Tensor],
+        list[Optional[tuple[str, float]]],
+    ]:
+        """Claim the next chunk of published, untrained rows of this step.
+
+        Returns the chunk metadata (None when nothing is ready), the number of
+        groups that became sealed and fully claimed, per-row advantages (1 for
+        rows of open groups, final otherwise) and per-row buckets
+        (``(group_id, reward)`` for open groups, None for final rows).
+        """
+        version = self._trainer_version
+        step_groups = self._buffer.trajectory_step_groups(version)
+        await self._drop_vanished_groups(traj, {g for g, _, _ in step_groups})
+        for group_id, sealed, meta in step_groups:
+            if sealed and group_id not in traj.group_advantages:
+                assert meta is not None
+                traj.group_advantages[group_id] = await self._group_advantage_by_reward(
+                    meta
+                )
+
+        dp_size = self._trainer.sharding_annotations.get_axis_size("data_parallel")
+        # Chunks are trimmed to a multiple of the DP size, so a step can only
+        # drain completely if every group's row count is one too (a dropped
+        # prompt or an odd group size would leave rows that are never claimed).
+        if self._algo_cfg.num_generations_per_prompt % dp_size:
+            raise ValueError(
+                "async_rl.trajectory_streaming requires num_generations_per_prompt "
+                f"({self._algo_cfg.num_generations_per_prompt}) to be a multiple "
+                f"of the training data-parallel size ({dp_size})"
+            )
+        peeked = self._buffer.peek_trajectory_rows(target_step=version)
+        rows = pick_final_first(
+            [(g, m.tags[0][STREAM_REWARD_TAG], (g, m)) for g, m in peeked],
+            closed=traj.group_advantages.keys(),
+            streaming=traj.bucketed - traj.closed,
+            max_open_groups=self._async_cfg.trajectory_streaming.max_open_groups,
+            multiple_of=dp_size,
+        )
+        for group_id, row_meta in rows:
+            self._buffer.claim_trajectory_sample_ids(
+                group_id, list(row_meta.sample_ids)
+            )
+            traj.claimed.add(group_id)
+
+        newly_complete = 0
+        for group_id, _, meta in self._buffer.trajectory_step_groups(version):
+            if (
+                group_id in traj.group_advantages
+                and group_id not in traj.counted
+                and self._buffer.trajectory_group_fully_claimed(group_id)
+            ):
+                newly_complete += 1
+                traj.counted.add(group_id)
+                assert meta is not None
+                traj.rollout_metrics.extend(meta.extra_info.get(ROLLOUT_METRICS, []))
+        if not rows:
+            return None, newly_complete, None, []
+
+        buckets: list[Optional[tuple[str, float]]] = []
+        row_advantages: list[float] = []
+        for group_id, row_meta in rows:
+            reward = row_meta.tags[0][STREAM_REWARD_TAG]
+            if group_id in traj.group_advantages:
+                buckets.append(None)
+                row_advantages.append(traj.group_advantages[group_id][reward])
+            else:
+                buckets.append((group_id, reward))
+                row_advantages.append(1.0)
+        metas = [m for _, m in rows]
+        meta = metas[0].concat(*metas[1:])
+        return meta, newly_complete, torch.tensor(row_advantages), buckets
+
+    async def _train_trajectory_chunk(
+        self,
+        traj: "_TrajectoryStepState",
+        meta: KVBatchMeta,
+        buckets: list[Optional[tuple[str, float]]],
+    ) -> None:
+        """Backprop a chunk in one RPC; workers split rows by their bucket tag."""
+        traj.bucketed.update(b[0] for b in buckets if b is not None)
+        tags = [
+            {**tag, STREAM_BUCKET_TAG: None if b is None else [b[0], b[1]]}
+            for tag, b in zip(meta.tags or [{} for _ in buckets], buckets)
+        ]
+        await asyncio.to_thread(
+            self._trainer.train_microbatches_from_meta,
+            dataclasses.replace(meta, tags=tags),
+            train_fields=self._train_fields,
+        )
+
+    async def _finish_trajectory_step(self, traj: "_TrajectoryStepState") -> None:
+        """Last sweep before the optimizer step: no streamed bucket may stay open."""
+        live = {
+            g for g, _, _ in self._buffer.trajectory_step_groups(self._trainer_version)
+        }
+        await self._drop_vanished_groups(traj, live)
+        await self._close_trajectory_groups(traj)
+        still_open = sorted(traj.bucketed - traj.closed)
+        if still_open:
+            raise RuntimeError(
+                "trajectory streaming: groups with streamed gradients are neither "
+                f"sealed nor retried at the optimizer step: {still_open}"
+            )
+
+    async def _close_trajectory_groups(self, traj: "_TrajectoryStepState") -> None:
+        """Apply sealed groups' advantages to their streamed gradient buckets."""
+        newly_sealed = sorted(set(traj.group_advantages) - traj.closed)
+        traj.closed.update(newly_sealed)
+        closes = [
+            (group_id, traj.group_advantages[group_id])
+            for group_id in newly_sealed
+            if group_id in traj.bucketed
+        ]
+        if closes:
+            await asyncio.to_thread(self._trainer.close_stream_groups, closes)
 
     # ── utility helpers ────────────────────────────────────────────────────
 

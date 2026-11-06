@@ -1,0 +1,81 @@
+# nrl_k: stock NeMo-RL async GRPO (SingleController loop, in_order staleness sampler, lag k), user decision 10-30.
+#
+# Base = the in-tree NeMo-RL recipe
+#   examples/configs/recipes/llm/grpo-nanov3-30BA3B-2n8g-megatron_generation-noncolocated-async-gym-single-controller-token_capture.yaml
+# (the launcher composes  defaults: [<RL_ROOT>/<recipe>, this file]  and adds model / shape / layout on the CLI).
+# This file holds ONLY what has to differ from the recipe to run our task: data + reward (DAPO-Math-17k instead of
+# NeMo-Gym), and run bookkeeping (no validation, no checkpoints, no wandb). The async algorithm (in_order sampler,
+# its buffers, refit, KV recompute), the loss (IS correction, PPO clips, on-policy KL approximation), the optimizer,
+# numerics (bf16, no batch invariance, stock attention / MoE kernels), sequence packing and the engine knobs are the
+# recipe's. The lag k (async_rl.sampler.max_lookahead_versions) and the layout come from run_nrl_arm.sh.
+
+grpo:
+  max_num_steps: 16
+  seed: 42
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+
+policy:
+  tokenizer:
+    name: ${policy.model_name}
+    # Same chat template call as every ts run (ab_base): thinking on; single-turn, so history truncation is moot.
+    chat_template_kwargs:
+      enable_thinking: true
+      truncate_history_thinking: false
+  generation:
+    mcore_generation_config:
+      kv_cache_management_mode: persist  # image constraint, see the note above checkpointing
+
+# Data: our task (ab_base.yaml's data block). The recipe's data block is NeMo-Gym's (NemoGymDataset).
+data:
+  _override_: true
+  max_input_seq_length: 2048
+  shuffle: true
+  num_workers: 1
+  use_multiple_dataloader: false
+  train:
+    dataset_name: DAPOMath17K
+  validation: null
+  default:
+    prompt_file: null
+    system_prompt_file: null
+    processor: math_hf_data_processor
+    env_name: math
+
+# Reward: NeMo-RL's math environment with the DAPO verifier (as ab_base). The recipe's env block is NeMo-Gym's.
+# run_nrl_arm.sh PARITY=1 switches data.default.env_name to math_parity (truncated models; nrl_parity_env.py).
+env:
+  _override_: true
+  should_use_nemo_gym: false
+  math:
+    num_workers: 16
+    math_verify_impl: dapo_math_verify
+  math_parity:
+    num_workers: 16
+    math_verify_impl: dapo_math_verify
+
+# Token capture is the recipe's NeMo-Gym capture path (Gym receipts -> finalizer); with the math environment there
+# are no receipts to capture, and rollouts are produced by the SC rollout pump directly.
+token_capture:
+  enabled: false
+
+# Image constraint (not a choice): the recipe's parent sets kv_cache_management_mode: recompute, which MCore refuses
+# without UVM or torch_memory_saver ("Static KV memory pointers require UVM or torch_memory_saver when not persisted");
+# the container image we used has neither. persist is the base grpo_nanov3.yaml value, the
+# value every ts run uses, and the one MCore's message names. Non-colocated engines are never suspended for training,
+# so the mode only decides whether KV pointers stay static across refits.
+# persist requires the SC loop's KV recompute switch off (megatron_generation.py: the two must agree).
+async_rl:
+  recompute_kv_cache_after_weight_updates: false
+
+checkpointing:
+  enabled: false
+
+logger:
+  log_dir: logs/nrl
+  wandb_enabled: false
+  tensorboard_enabled: false
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: false

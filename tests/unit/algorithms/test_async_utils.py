@@ -2996,6 +2996,64 @@ class TestAsyncTrajectoryCollector:
 
         assert target_weight not in collector._generating_targets
 
+    @pytest.mark.parametrize("refit_finished", [False, True])
+    def test_refit_between_pause_check_and_registration_starts_no_stale_worker(
+        self, monkeypatch, refit_finished
+    ):
+        """A refit that begins (or completes) after the pause check but before the worker is
+        registered must not let a rollout start with the old generation_weight_version
+        (source: rl-determinism 7eaf6ee4, collector hunk)."""
+
+        class RemoteMethod:
+            def remote(self, *args, **kwargs):
+                return 2
+
+        class FakeReplayBuffer:
+            get_trajectories_needed = RemoteMethod()
+
+        started = []
+
+        class RecordingThread:
+            def __init__(self, *, target, daemon, name):
+                self.target = target
+                self.name = name
+
+            def start(self):
+                started.append(self)
+
+            def is_alive(self):
+                return False
+
+        target_weight = 3
+        collector = self.create_local_collector(replay_buffer=FakeReplayBuffer())
+        collector.running = True
+
+        def reserve_target(generation_weight_version):
+            collector._generating_targets.add(target_weight)
+            return target_weight
+
+        stamped = trajectory_collector_mod._stamped_task_indices
+
+        def stamp_then_refit(batch):
+            # Runs between the pause check and the worker registration.
+            collector._refit_pause_cleared.clear()
+            collector.current_weight_version += 1
+            if refit_finished:
+                collector._refit_pause_cleared.set()
+            return stamped(batch)
+
+        collector._get_next_target_for_generation = reserve_target
+        monkeypatch.setattr(trajectory_collector_mod, "_stamped_task_indices", stamp_then_refit)
+        monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda value: value)
+        monkeypatch.setattr(trajectory_collector_mod._threading, "Thread", RecordingThread)
+
+        batch = self.create_mock_batch(size=2)
+        out = collector._process_batch(batch)
+
+        assert started == []  # no rollout with the pre-refit version label
+        assert out is batch  # handed back whole for the next pass
+        assert target_weight not in collector._generating_targets
+
     def test_process_batch_gap_fill_spawns_only_needed(self, monkeypatch):
         """Gap-fill sends only the needed prompt groups to one batch worker."""
 

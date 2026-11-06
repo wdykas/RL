@@ -1,0 +1,540 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Mamba-2 training forward on the Megatron engine's SSD kernels (batch-invariant mode).
+
+The learner's Mamba mixer trains through mamba_ssm's fused split-conv1d-scan, while the
+Megatron dynamic engine prefills and decodes with Megatron's own copy of the SSD kernels
+(``megatron.core.ssm.ops.mamba2``). The two copies select their Triton tile configs
+independently, and the dA cumsum head tiling and (for fp32 inputs) the chunk-scan warp
+count change the bits, so train == engine held only when the two happened to agree.
+
+``install`` makes batch-invariant training run the engine's kernels:
+
+- ``MambaMixer._ssm_training`` is replaced, in batch-invariant mode only, by the conv
+  followed by ``mamba_chunk_scan_combined_train``: Megatron's varlen SSD forward with the
+  gate inside the scan (as prefill and the buffered decode replay apply it), FP32 chunk
+  states (as the engine keeps them), and mamba_ssm's backward.
+- the engine's SSD forward kernels and varlen conv are pinned to constant configs built
+  from a table, whatever candidate list each autotuner kept at import, so the training
+  and the rollout processes launch the same tiles.
+
+This is the Megatron-LM change ``fix/mamba-ssd-train-inference-parity`` (draft PR), applied to the Megatron-Core this repo pins. The one
+difference: that Megatron-Core's chunk-scan kernel cannot store the pre-gate output, so
+the backward recomputes it with one extra SSD forward.
+
+Activation recompute (``install(recompute=True)``, ``policy.megatron_cfg.mamba_recompute``):
+in batch-invariant training, ``MambaMixer._mamba_chunk`` (in-projection, conv, SSD scan,
+gated RMSNorm) runs under a non-reentrant activation checkpoint, so a Mamba layer keeps
+only its input for the backward instead of the conv input, x / z / B / C / dt copies and
+the scan output (all fp32 under the fp16-GEMM recipe: ~80 KiB per token per layer at
+Nano). The forward runs the same code with autograd on, so its values are unchanged;
+the backward re-runs that forward once (deterministic kernels: the same saved values).
+"""
+
+
+from __future__ import annotations
+
+import contextlib
+import functools
+from typing import Iterator, Optional
+
+import torch
+
+_INSTALLED: list[bool] = []
+_ORIGINAL_SSM_TRAINING: list = []
+_ORIGINAL_MAMBA_CHUNK: list = []
+# Opt-in activation recompute of the training mixer (``install(recompute=True)``).
+_RECOMPUTE = [False]
+
+# Tile kwargs and launch options per kernel, as in the upstream change: the minimax choice
+# of a per-kernel sweep over Nano / Super / Ultra-scale per-rank shapes, bf16 and fp32,
+# 16k and 64k tokens (GB200).
+PINNED_CONFIGS = {
+    "_bmm_chunk_fwd_kernel": (
+        {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 32},
+        {"num_warps": 4, "num_stages": 4},
+    ),
+    "_chunk_scan_fwd_kernel": (
+        {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32},
+        {"num_warps": 2, "num_stages": 5},
+    ),
+    "_chunk_state_fwd_kernel": (
+        {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32},
+        {"num_warps": 2, "num_stages": 4},
+    ),
+    "_chunk_cumsum_fwd_kernel": (
+        {"BLOCK_SIZE_H": 16},
+        {"num_warps": 4, "num_stages": 3},
+    ),
+    "_state_passing_fwd_kernel": (
+        {"BLOCK_SIZE": 1024},
+        {"num_warps": 4, "num_stages": 3},
+    ),
+    "_causal_conv1d_varlen_kernel": (
+        {"BLOCK_T": 8, "BLOCK_C": 256},
+        {"num_warps": 4, "num_stages": 2},
+    ),
+}
+
+
+def _pinned_autotuners():
+    from megatron.core.ssm.ops.common import causal_conv1d_varlen
+    from megatron.core.ssm.ops.mamba2 import (
+        ssd_bmm,
+        ssd_chunk_scan,
+        ssd_chunk_state,
+        ssd_state_passing,
+    )
+
+    return (
+        ssd_bmm._bmm_chunk_fwd_kernel,
+        ssd_chunk_scan._chunk_scan_fwd_kernel,
+        ssd_chunk_state._chunk_cumsum_fwd_kernel,
+        ssd_chunk_state._chunk_state_fwd_kernel,
+        ssd_state_passing._state_passing_fwd_kernel,
+        causal_conv1d_varlen._causal_conv1d_varlen_kernel,
+    )
+
+
+def pin_engine_kernels() -> None:
+    """Give each engine SSD forward kernel and the varlen conv one constant config."""
+    import triton
+
+    for kernel in _pinned_autotuners():
+        kwargs, launch = PINNED_CONFIGS[kernel.fn.__name__]
+        kernel.configs = [triton.Config(kwargs, **launch)]
+        kernel.cache.clear()
+
+
+def _varlen_layout(batch: int, seqlen: int, chunk_size: int, device: torch.device):
+    """Chunk metadata for ``batch`` rows of ``seqlen`` tokens, each chunked from its start."""
+    chunks_per_seq = -(-seqlen // chunk_size)
+    chunk_starts = torch.arange(0, seqlen, chunk_size, dtype=torch.int32, device=device)
+    seq_starts = torch.arange(
+        0, batch * seqlen, seqlen, dtype=torch.int32, device=device
+    )
+    cu_chunk_seqlens = torch.cat(
+        [
+            (seq_starts[:, None] + chunk_starts[None, :]).flatten(),
+            torch.full((1,), batch * seqlen, dtype=torch.int32, device=device),
+        ]
+    )
+    seq_idx = torch.arange(batch, dtype=torch.int32, device=device).repeat_interleave(
+        chunks_per_seq
+    )
+    last_chunk_indices = (
+        torch.arange(1, batch + 1, dtype=torch.int32, device=device) * chunks_per_seq
+        - 1
+    )
+    return cu_chunk_seqlens, seq_idx, last_chunk_indices
+
+
+def _engine_scan(
+    x,
+    dt,
+    A,
+    B,
+    C,
+    chunk_size,
+    D,
+    z,
+    dt_bias,
+    dt_softplus,
+    dt_limit,
+    initial_states=None,
+    return_chunk_states=False,
+):
+    """Megatron's varlen SSD forward over (batch, seqlen, ...) rows, FP32 chunk states.
+
+    ``initial_states`` [batch, nheads, headdim, dstate] (fp32): each row's SSM
+    state before its first token (the state at a chunk boundary of a longer
+    row: the scan then continues that row exactly, ``prefix_state_cache``).
+    ``return_chunk_states``: also return the fp32 state at the end of every
+    chunk, [batch, chunks per row, nheads, headdim, dstate].
+    """
+    from megatron.core.ssm.ops.mamba2.ssd_combined import (
+        mamba_chunk_scan_combined_varlen,
+    )
+
+    batch, seqlen = x.shape[:2]
+    cu_chunk_seqlens, seq_idx, last_chunk_indices = _varlen_layout(
+        batch, seqlen, chunk_size, x.device
+    )
+
+    def flat(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        return None if t is None else t.reshape(batch * seqlen, *t.shape[2:])
+
+    out = torch.empty_like(flat(x))
+    states = mamba_chunk_scan_combined_varlen(
+        x=flat(x),
+        dt=flat(dt),
+        A=A,
+        B=flat(B),
+        C=flat(C),
+        chunk_size=chunk_size,
+        cu_chunk_seqlens=cu_chunk_seqlens,
+        last_chunk_indices=last_chunk_indices,
+        seq_idx=seq_idx,
+        out=out,
+        D=D,
+        z=flat(z),
+        dt_bias=dt_bias,
+        dt_softplus=dt_softplus,
+        dt_limit=dt_limit,
+        initial_states=initial_states,
+        return_raw_states=return_chunk_states,
+        state_dtype=torch.float32,
+    )
+    if not return_chunk_states:
+        return out.view_as(x)
+    return out.view_as(x), states[1].view(batch, -1, *states[1].shape[1:])
+
+
+class _EngineChunkScanFn(torch.autograd.Function):
+    """Engine SSD forward with mamba_ssm's chunk-scan backward."""
+
+    @staticmethod
+    def forward(ctx, x, dt, A, B, C, chunk_size, D, z, dt_bias, dt_softplus, dt_limit):
+        """Gated output of the engine's kernels; saves the inputs for the backward."""
+        ctx.save_for_backward(x, dt, A, B, C, D, z, dt_bias)
+        ctx.chunk_size = chunk_size
+        ctx.dt_softplus = dt_softplus
+        ctx.dt_limit = dt_limit
+        return _engine_scan(
+            x, dt, A, B, C, chunk_size, D, z, dt_bias, dt_softplus, dt_limit
+        )
+
+    @staticmethod
+    def backward(ctx, dout):
+        """mamba_ssm's backward on the pre-gate output, recomputed with the engine kernels."""
+        from mamba_ssm.ops.triton.ssd_combined import _mamba_chunk_scan_combined_bwd
+
+        x, dt, A, B, C, D, z, dt_bias = ctx.saved_tensors
+        args = (x, dt, A, B, C, ctx.chunk_size, D)
+        out_x = _engine_scan(*args, None, dt_bias, ctx.dt_softplus, ctx.dt_limit)
+        dx, ddt, dA, dB, dC, dD, dz, ddt_bias, _ = _mamba_chunk_scan_combined_bwd(
+            dout,
+            x,
+            dt,
+            A,
+            B,
+            C,
+            out_x,
+            ctx.chunk_size,
+            D=D,
+            z=z,
+            dt_bias=dt_bias,
+            dt_softplus=ctx.dt_softplus,
+            dt_limit=ctx.dt_limit,
+        )
+        return dx, ddt, dA, dB, dC, None, dD, dz, ddt_bias, None, None
+
+
+def mamba_chunk_scan_combined_train(
+    x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, dt_softplus=False
+):
+    """Differentiable chunk scan, bitwise equal to the engine's prefill of each row."""
+    return _EngineChunkScanFn.apply(
+        x, dt, A, B, C, chunk_size, D, z, dt_bias, dt_softplus, (0.0, float("inf"))
+    )
+
+
+class _ConvFixedOrderGradFn(torch.autograd.Function):
+    """``causal_conv1d_fn`` whose weight and bias gradients are summed over rows in a fixed order.
+
+    causal_conv1d's backward adds each batch row's weight / bias gradient into
+    the result with atomics, so with more than one row per micro-batch those
+    two gradients differ bit for bit between identical steps (the input
+    gradient does not; one row is reproducible). The forward and every row's
+    gradients are the kernel's; the backward runs the kernel once per row and
+    sums the rows' weight / bias gradients in row order in fp32. Per rank: the
+    same kernel work in ``rows`` launches per Mamba layer, plus fp32 copies of
+    the [channels, width] weight and its partial sums.
+    """
+
+    @staticmethod
+    def forward(ctx, x, weight, bias, activation):  # noqa: D102
+        from causal_conv1d import causal_conv1d_fn
+
+        ctx.save_for_backward(x, weight, bias)
+        ctx.activation = activation
+        return causal_conv1d_fn(x=x, weight=weight, bias=bias, activation=activation)
+
+    @staticmethod
+    def backward(ctx, dout):  # noqa: D102
+        from causal_conv1d.causal_conv1d_interface import causal_conv1d_bwd_function
+
+        x, weight, bias = ctx.saved_tensors
+        dout = dout.contiguous()
+        silu = ctx.activation in ("silu", "swish")
+        # fp32 weight / bias (exact upcasts; the kernel computes in fp32 either
+        # way) make the kernel return fp32 row partials.
+        w32 = weight.float()
+        b32 = None if bias is None else bias.float()
+        dx = torch.empty_like(x)
+        dweight = torch.zeros_like(w32)
+        dbias = None if bias is None else torch.zeros_like(b32)
+        for r in range(x.shape[0]):
+            _, dw, db, _ = causal_conv1d_bwd_function(
+                x[r : r + 1], w32, b32, dout[r : r + 1], None, None, None, dx[r : r + 1], False, silu
+            )
+            dweight += dw
+            if dbias is not None:
+                dbias += db
+        return dx, dweight.to(weight.dtype), None if dbias is None else dbias.to(bias.dtype), None
+
+
+# Opt-in reproducible gradients (``install(deterministic=True)``).
+_DETERMINISTIC = [False]
+
+
+def _split_proj(self, zxBCdt):
+    """(z, xBC, dt) of the in-projection output, (l, b, d) -> (b, l, d) each."""
+    from einops import rearrange
+
+    zxBCdt = rearrange(zxBCdt, "l b d -> b l d").contiguous()
+    d_inner = self.cp.d_inner_local_tpcp
+    groups_state = self.cp.ngroups_local_tpcp * self.d_state
+    return torch.split(
+        zxBCdt, [d_inner, d_inner + 2 * groups_state, self.cp.nheads_local_tpcp], dim=-1
+    )
+
+
+def _conv(self, xBC_bdl):
+    """The non-fused training conv (``MambaMixer._static_prefill``) over (b, d, l) inputs.
+
+    Bitwise equal to the engine's varlen prefill conv and its decode update.
+    Returns (b, l, d).
+    """
+    from einops import rearrange
+
+    from causal_conv1d import causal_conv1d_fn
+
+    weight = rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w")
+    bias = self.cp.get_conv1d_bias()
+    if _DETERMINISTIC[0]:
+        # Weight / bias gradients reduced in a fixed row order (same forward).
+        out = _ConvFixedOrderGradFn.apply(xBC_bdl, weight, bias, self.activation)
+    else:
+        out = causal_conv1d_fn(x=xBC_bdl, weight=weight, bias=bias, activation=self.activation)
+    return rearrange(out, "b d l -> b l d").contiguous()
+
+
+def _scan_and_gate(self, xBC, z, dt, scan):
+    """SSD scan of the conv output, gate inside the scan, gated RMSNorm: (l, b, d).
+
+    ``scan(*args)``: ``mamba_chunk_scan_combined_train`` (training) or an
+    ``_engine_scan`` closure (prefix-state forwards); returns (y, extra).
+    """
+    from einops import rearrange
+
+    d_inner = self.cp.d_inner_local_tpcp
+    groups_state = self.cp.ngroups_local_tpcp * self.d_state
+    x, B, C = torch.split(xBC, [d_inner, groups_state, groups_state], dim=-1)
+    D = self.cp.get_D()
+    if self.D_has_hdim:
+        D = rearrange(D.float(), "(h p) -> h p", p=self.headdim)
+    y, extra = scan(
+        rearrange(x, "b l (h p) -> b l h p", p=self.headdim).contiguous(),
+        dt.contiguous(),
+        -torch.exp(self.cp.get_A_log().float()),
+        rearrange(B, "b l (g n) -> b l g n", n=self.d_state).contiguous(),
+        rearrange(C, "b l (g n) -> b l g n", n=self.d_state).contiguous(),
+        self.chunk_size,
+        D,
+        rearrange(z, "b l (h p) -> b l h p", p=self.headdim).contiguous(),
+        self.cp.get_dt_bias().float(),
+    )
+    y = rearrange(y, "b l h p -> l b (h p)").contiguous()
+    y = self.cp.post_conv_ssm(y)
+    # The gate went through the scan, as the engine's prefill and decode apply it.
+    return self.norm(y), extra
+
+
+def _check_bi_mixer(self, packed_seq_params) -> None:
+    assert packed_seq_params is None, (
+        "batch-invariant Mamba training does not pack sequences"
+    )
+    assert self.rmsnorm, "batch-invariant Mamba requires the gated RMSNorm"
+
+
+def _ssm_training(self, zxBCdt, packed_seq_params=None, **kwargs):
+    """``MambaMixer._ssm_training`` on the engine's kernels in batch-invariant mode.
+
+    ``kwargs``: Megatron-LM main passes ``runtime_cp`` (the call's context-parallel view of the mixer). Batch-invariant
+    mode requires context_parallel_size 1 (TransformerConfig), where it is the mixer's own ``self.cp``.
+    """
+    from einops import rearrange
+
+    if not self.config.batch_invariant_mode:
+        return _ORIGINAL_SSM_TRAINING[0](self, zxBCdt, packed_seq_params, **kwargs)
+    _check_bi_mixer(self, packed_seq_params)
+    z, xBC, dt = _split_proj(self, zxBCdt)
+    xBC = _conv(self, rearrange(xBC, "b l d -> b d l").contiguous())
+
+    def scan(x, dt, A, B, C, chunk_size, D, z, dt_bias):
+        y = mamba_chunk_scan_combined_train(
+            x, dt, A, B, C, chunk_size, D=D, z=z, dt_bias=dt_bias, dt_softplus=True
+        )
+        return y, None
+
+    return _scan_and_gate(self, xBC, z, dt, scan)[0]
+
+
+
+
+@contextlib.contextmanager
+def _recompute_side_effects_off() -> Iterator[None]:
+    """The backward's re-run of a checkpointed mixer forward adds no fp16 range counts.
+
+    The fp16 range monitor (fp16_gemm) counts the in-projection input at its fp16 cast;
+    the forward already counted it, so the recompute must not count it again (counts
+    and ``act_checked`` stay those of one forward). The cast's bits do not depend on
+    the monitor.
+    """
+    from nemo_rl.models.megatron import fp16_gemm
+
+    on = fp16_gemm._RANGE["on"]
+    fp16_gemm._RANGE["on"] = False
+    try:
+        yield
+    finally:
+        fp16_gemm._RANGE["on"] = on
+
+
+def _checkpoint_contexts():
+    return contextlib.nullcontext(), _recompute_side_effects_off()
+
+
+def _mamba_chunk(
+    self,
+    hidden_states,
+    conv_state=None,
+    ssm_state=None,
+    packed_seq_params=None,
+    inference_mode=False,
+):
+    """``MambaMixer._mamba_chunk``; with recompute on, a batch-invariant training call is checkpointed.
+
+    Checkpointed: in-projection -> context-parallel pre-processing -> ``_ssm_training``
+    (conv, SSD scan, gated RMSNorm). Saved for the backward: the input ``hidden_states``
+    (the layer's pre-norm input, which the fused in-projection norm saved anyway).
+    Non-reentrant: the forward runs exactly as without recompute (autograd on, same
+    kernels), and the backward re-runs it once to rebuild the dropped tensors. No RNG
+    in the mixer, so its state is not stashed. Inference, no-grad forwards (verification,
+    log-probs, prefix-state forwards) and non-batch-invariant models are unchanged.
+    """
+    orig = _ORIGINAL_MAMBA_CHUNK[0]
+    if not (
+        _RECOMPUTE[0]
+        and self.config.batch_invariant_mode
+        and not inference_mode
+        and conv_state is None
+        and ssm_state is None
+        and torch.is_grad_enabled()
+    ):
+        return orig(
+            self,
+            hidden_states,
+            conv_state=conv_state,
+            ssm_state=ssm_state,
+            packed_seq_params=packed_seq_params,
+            inference_mode=inference_mode,
+        )
+    from torch.utils.checkpoint import checkpoint
+
+    return checkpoint(
+        functools.partial(orig, self, packed_seq_params=packed_seq_params),
+        hidden_states,
+        use_reentrant=False,
+        preserve_rng_state=False,
+        context_fn=_checkpoint_contexts,
+    )
+
+
+
+
+def install(deterministic: bool = False, recompute: bool = False) -> None:
+    """Train batch-invariant Mamba on the engine's pinned SSD kernels (idempotent).
+
+    ``deterministic`` (policy.megatron_cfg.deterministic_training, opt-in):
+    bitwise-reproducible gradients. The conv weight / bias gradients are summed
+    per row in row order (``_ConvFixedOrderGradFn``, ~+0.9 ms per Mamba layer
+    per micro-batch on Nano L8) and mamba_ssm's chunk-scan backward reduces the
+    A_log / dt_bias partials in a fixed order instead of with atomics (cost at
+    noise on Nano-L8 shapes). Neither changes forward values.
+
+    ``recompute`` (policy.megatron_cfg.mamba_recompute; learner memory): checkpoint the
+    training mixer (``_mamba_chunk``); forward values unchanged, the backward re-runs
+    the in-projection + conv + scan + norm of each Mamba layer once.
+    """
+    pin_engine_kernels()
+    _RECOMPUTE[0] = bool(recompute)
+    if deterministic:
+        import os
+
+        from mamba_ssm.utils.determinism import set_deterministic_mode
+
+        set_deterministic_mode(True)
+        # Modules imported from now on filter their autotune candidates at import.
+        os.environ["MAMBA_DETERMINISTIC"] = "1"
+        _DETERMINISTIC[0] = True
+    if not _INSTALLED:
+        from megatron.core.ssm.mamba_mixer import MambaMixer
+
+        _ORIGINAL_SSM_TRAINING.append(MambaMixer._ssm_training)
+        MambaMixer._ssm_training = _ssm_training
+        _ORIGINAL_MAMBA_CHUNK.append(MambaMixer._mamba_chunk)
+        MambaMixer._mamba_chunk = _mamba_chunk
+        _INSTALLED.append(True)
+    if recompute:
+        print("[mamba_ssd_parity] training mixer recompute on", flush=True)
+    if deterministic:
+        n = pin_mamba_ssm_autotuners()
+        print(
+            f"[mamba_ssd_parity] deterministic: {n} autotuned mamba_ssm kernels pinned to one config",
+            flush=True,
+        )
+
+
+def pin_mamba_ssm_autotuners() -> int:
+    """Give every already-imported multi-config mamba_ssm Triton autotuner one config.
+
+    mamba_ssm applies its deterministic config choice (``autotune_configs``: the
+    TRITON_AUTOTUNE_BLOCK_SIZE_* filter, else the cheapest block size x stages)
+    when a kernel module is *imported* in deterministic mode. The training
+    backward kernels (chunk scan / state / state passing / bmm backward) are
+    imported before ``set_deterministic_mode`` runs here, so they kept every
+    candidate and autotuned by timing in each process: within one process the
+    choice is cached (in-process replays agree), but two processes can pick
+    different tiles, hence different reduction orders and gradient bits
+    (rr-resume-nano @cf3bc405: same rollouts, different gradients at step 0).
+    The same rule is applied now, process-independently. Forward kernels of the
+    engine path are pinned separately (``pin_engine_kernels``). Returns the count.
+    """
+    import sys
+
+    from mamba_ssm.utils.determinism import autotune_configs
+    from triton.runtime.autotuner import Autotuner
+
+    n = 0
+    for name, mod in list(sys.modules.items()):
+        if mod is None or not name.startswith("mamba_ssm.ops"):
+            continue
+        for attr in list(vars(mod).values()):
+            if isinstance(attr, Autotuner) and len(attr.configs) > 1:
+                attr.configs = list(autotune_configs(attr.configs))
+                attr.cache.clear()
+                n += 1
+    return n

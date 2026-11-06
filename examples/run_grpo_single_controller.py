@@ -104,6 +104,26 @@ def main() -> None:
 
     config = OmegaConf.to_container(config, resolve=True)
     check_outdated_config(config)
+    if (config.get("thundersync") or {}).get("mode") == "nolanes":
+        # ThunderSync nolanes mode: validate, ThunderSync worker class, cross-fade routing on every worker.
+        from thundersync_rl.nolanes import configure_driver
+
+        configure_driver(config)
+    elif (config.get("thundersync") or {}).get("mode") == "colo":
+        # ThunderSync colocated mode (research/colo/MODEL.md): validate, ThunderSync worker class.
+        from thundersync_rl.colo import configure_driver as configure_colo_driver
+
+        configure_colo_driver(config)
+    elif (config.get("thundersync") or {}).get("mode") == "xspr":
+        # ThunderSync exact SPR (research/colo/SIMPLE_EXACT_SPR.md): validate, ThunderSync worker class, engine check.
+        from thundersync_rl.xspr import configure_driver as configure_xspr_driver
+
+        configure_xspr_driver(config)
+    elif (config.get("thundersync") or {}).get("mode") == "isspr":
+        # ThunderSync IS-SPR (research/colo/TAIL_FLOOR.md §5.5): validate, exact SPR's worker setup.
+        from thundersync_rl.isspr import configure_driver as configure_isspr_driver
+
+        configure_isspr_driver(config)
     config = MasterConfig(**config)
     print("Applied CLI overrides")
 

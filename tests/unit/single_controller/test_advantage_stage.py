@@ -463,6 +463,9 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         # A bare step number, not a payload: the stage writes the training
         # dump and has no other way to learn which step it is writing.
         "train_step",
+        # Trajectory streaming: one float per row of the chunk (metadata-sized),
+        # decided by the controller; None otherwise.
+        "row_advantages",
     }
     assert {f.name for f in fields(AdvantageOutcome)} == {
         "meta",

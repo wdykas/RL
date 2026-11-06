@@ -1,0 +1,23 @@
+# Baseline arm SPR-BI (method-overhead baseline): stock colocated partial rollout --
+# NeMo-RL's SingleController loop as is (no ThunderSync stage, stock worker and sampler), in_order sampler at lag 1,
+# persist KV -- on exactly the engine and batch-invariant numerics of arm XS (colo.yaml). With XS it isolates the
+# method: XS / SPR-BI = method overhead, SPR-BI / SPR = the cost of batch-invariant numerics.
+#
+# Differences to colo.yaml (all method):
+#   async_rl.sampler.max_lookahead_versions 1      partial rollout at lag 1, as stock SPR
+#   async_rl.max_buffered_rollouts / max_inflight  (K + 1) P groups buffered and 2 P prompts in flight, as stock SPR
+#   thundersync: {} (no mode)                      no ThunderSync stage: no keyed sampler, train-lp sentinel or
+#                                                  router fingerprints; the BI validators still run
+# Launcher (scripts/colo/lib/colo_arm.sh) sets max_requests / buffer / layout identically for both arms.
+defaults:
+  - colo.yaml
+
+async_rl:
+  sampler:
+    name: in_order
+    max_lookahead_versions: 1
+  max_buffered_rollouts: ${mul:2,${grpo.num_prompts_per_step}}
+  max_inflight_prompts: ${mul:2,${grpo.num_prompts_per_step}}
+
+thundersync:
+  _override_: true

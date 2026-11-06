@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import copy
 import enum
 import json
@@ -491,12 +492,23 @@ class _Deadline:
         self._remaining = None
 
 
+# The training step the running rollout targets (in_order sampler stamp), set by generate_and_push around the
+# rollout; ThunderSync exact SPR keys and certifies each row by it.
+ROLLOUT_TARGET_STEP: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar(
+    "rollout_target_step", default=None
+)
+
+
 class AsyncRolloutImpl:
     """Manages per-prompt multi-turn rollouts, producing a PromptGroupRecord per call.
 
     Each run_rollout takes one prompt and returns num_generations_per_prompt completions
     generated concurrently via asyncio.gather.
     """
+
+    # ThunderSync exact SPR (research/thundersync_rl/thundersync_rl/xspr.py): when set, each row's response is
+    # produced by ``xspr.respond`` (keyed decode, checked under the weights it trains at) instead of one request.
+    xspr: Optional[Any] = None
 
     def __init__(
         self,
@@ -533,6 +545,9 @@ class AsyncRolloutImpl:
         Args:
             input_sample: A single prompt (one DatumSpec entry).
             rollout_ids: Unsupported here — token capture is NeMo-Gym only.
+            on_completion: Awaited with ``(generation_index, completion)`` as
+                each sibling finishes, before the group completes (used by
+                trajectory-level gradient streaming).
 
         Returns:
             PromptGroupRecord with num_generations_per_prompt completions.
@@ -543,9 +558,6 @@ class AsyncRolloutImpl:
         assert generation_indices is None, (
             "partial sibling dispatch is only supported on the NeMo-Gym path"
         )
-        assert on_completion is None, (
-            "streamed completion callbacks are only supported on the NeMo-Gym path"
-        )
         assert recovery_granularity is RecoveryGranularity.SIBLING, (
             "recovery granularity is only supported on the NeMo-Gym path"
         )
@@ -554,11 +566,15 @@ class AsyncRolloutImpl:
         timer.start(f"{timer_prefix}/total")
 
         with timer.time(f"{timer_prefix}/run_rollouts"):
+
+            async def run_one(traj_idx: int):
+                result = await self._run_single_rollout(input_sample, traj_idx)
+                if on_completion is not None:
+                    await on_completion(traj_idx, result[0])
+                return result
+
             results = await _gather_cancelling_siblings(
-                [
-                    self._run_single_rollout(input_sample, traj_idx)
-                    for traj_idx in range(self._num_generations_per_prompt)
-                ]
+                [run_one(i) for i in range(self._num_generations_per_prompt)]
             )
             completions = [c for c, _ in results]
             all_sample_metrics = [m for _, m in results]
@@ -581,8 +597,27 @@ class AsyncRolloutImpl:
             loss_multiplier=float(input_sample.get("loss_multiplier", 1.0)),
         )
 
+    async def run_rows(
+        self, input_sample: DatumSpec, specs: list[dict[str, Any]]
+    ) -> list[tuple[Completion, dict]]:
+        """Rollouts of one prompt whose first assistant turn may start from a fixed prefix.
+
+        ThunderSync nolanes mode (research/thundersync_rl/thundersync_rl/nolanes.py): each spec is
+        ``{"prefix": token ids, "prefix_logprobs": log-probs, "generation_data": extra per-request fields}``; the
+        engine continues the prefix as a NEW request (the prompt and prefix are prefilled at the current weights)
+        and the assistant message holds prefix + continuation. An empty prefix is an ordinary rollout.
+        """
+        return list(
+            await _gather_cancelling_siblings(
+                [self._run_single_rollout(input_sample, i, forced=spec) for i, spec in enumerate(specs)]
+            )
+        )
+
     async def _run_single_rollout(
-        self, input_sample: DatumSpec, traj_idx: int
+        self,
+        input_sample: DatumSpec,
+        traj_idx: int,
+        forced: Optional[dict[str, Any]] = None,
     ) -> tuple[Completion, dict]:
         """Run one multi-turn rollout for a single generation index."""
         current_message_log = copy.deepcopy(input_sample["message_log"])
@@ -630,15 +665,23 @@ class AsyncRolloutImpl:
             # would commit a zero-reward row that still counts toward this prompt
             # group's GRPO baseline, silently biasing every sibling's advantage.
             try:
-                (
-                    assistant_message,
-                    input_lengths,
-                    gen_metrics,
-                ) = await self._generate_response(
-                    current_message_log,
-                    current_stop_strings,
-                    native_generation_data=turn_native_generation_data,
-                )
+                if self.xspr is not None:
+                    response = self.xspr.respond(
+                        self,
+                        current_message_log,
+                        current_stop_strings,
+                        turn_native_generation_data,
+                        input_sample,
+                        traj_idx,
+                    )
+                else:
+                    response = self._generate_response(
+                        current_message_log,
+                        current_stop_strings,
+                        native_generation_data=turn_native_generation_data,
+                        forced=forced if turn_count == 1 else None,
+                    )
+                assistant_message, input_lengths, gen_metrics = await response
             except Exception as e:
                 raise _classify_generation_failure(
                     e, prompt_idx=input_sample["idx"], traj_idx=traj_idx
@@ -766,8 +809,13 @@ class AsyncRolloutImpl:
         stop_strings: list[str] | None,
         *,
         native_generation_data: dict[str, Any] | None = None,
+        forced: dict[str, Any] | None = None,
     ) -> tuple[dict, torch.Tensor, dict[str, Any]]:
         """Generate a single-turn response for one sample.
+
+        ``forced`` (ThunderSync nolanes, ``run_rows``): the response starts with ``forced["prefix"]`` (log-probs
+        ``forced["prefix_logprobs"]``); the engine generates the rest from prompt + prefix, with the extra
+        per-request fields ``forced["generation_data"]``.
 
         Returns:
             Tuple of (assistant_message, input_lengths, gen_metrics)
@@ -780,6 +828,14 @@ class AsyncRolloutImpl:
             pad_value_dict={"token_ids": self._tokenizer.pad_token_id},
         )
         input_ids = flat_messages["token_ids"]
+        prefix = list((forced or {}).get("prefix") or [])
+        if prefix:
+            if input_ids.shape[0] != 1 or int(input_lengths[0]) != input_ids.shape[1]:
+                input_ids = input_ids[:, : int(input_lengths[0])]
+            input_ids = torch.cat(
+                [input_ids, torch.tensor([prefix], dtype=input_ids.dtype)], dim=1
+            )
+            input_lengths = input_lengths + len(prefix)
         generation_input_data = BatchedDataDict[GenerationDatumSpec](
             {
                 "input_ids": input_ids,
@@ -796,6 +852,25 @@ class AsyncRolloutImpl:
             generation_input_data.update(
                 {key: [value] for key, value in native_generation_data.items()}
             )
+        if forced and forced.get("generation_data"):
+            generation_input_data.update(
+                {key: [value] for key, value in forced["generation_data"].items()}
+            )
+
+        if forced and forced.get("complete"):
+            # ThunderSync nolanes: the verified prefix is the whole response (it ended at EOS or the length cap):
+            # nothing to generate; the environment still scores it below.
+            gen_ids = torch.tensor(prefix, dtype=input_ids.dtype)
+            assistant_message = {
+                "role": "assistant",
+                "content": self._tokenizer.decode(gen_ids, skip_special_tokens=True),
+                "token_ids": gen_ids,
+                "generation_logprobs": torch.tensor(
+                    list(forced["prefix_logprobs"]), dtype=torch.float32
+                ),
+            }
+            gen_metrics = {"_response_truncated": [bool(forced.get("truncated", False))]}
+            return assistant_message, input_lengths - len(prefix), gen_metrics
 
         # Generate response
         # TODO: update generate_async to return a single item directly
@@ -815,6 +890,13 @@ class AsyncRolloutImpl:
         total_len = int(output["unpadded_sequence_lengths"][0].item())
         output_ids = output["output_ids"]
         generated_ids = output_ids[0, input_len:total_len]
+        if prefix:
+            # The fixed prefix is part of this turn's response (it was prefilled as input).
+            generated_ids = torch.cat(
+                [torch.tensor(prefix, dtype=generated_ids.dtype), generated_ids]
+            )
+            input_len -= len(prefix)
+            input_lengths = input_lengths - len(prefix)
 
         assistant_message: dict = {
             "role": "assistant",
@@ -823,8 +905,24 @@ class AsyncRolloutImpl:
         }
         if "logprobs" in output:
             assistant_message["generation_logprobs"] = output["logprobs"][
-                0, input_len:total_len
+                0, input_len + len(prefix) : total_len
             ]
+            if prefix:
+                assistant_message["generation_logprobs"] = torch.cat(
+                    [
+                        torch.tensor(
+                            list(forced["prefix_logprobs"]),
+                            dtype=assistant_message["generation_logprobs"].dtype,
+                        ),
+                        assistant_message["generation_logprobs"],
+                    ]
+                )
+        if "ts_draft" in output:
+            # ThunderSync nolanes: the engine's draft reference (hidden-log key, request id).
+            assistant_message["ts_draft"] = output["ts_draft"][0]
+        if "xspr" in output:
+            # ThunderSync exact SPR: the request's cut flag / check result (xspr.ExactRows pops it).
+            assistant_message["xspr"] = output["xspr"][0]
         if "routed_experts" in output:
             routed_experts = output["routed_experts"][0]
             prefix_length = _attach_routed_experts_to_message_log_prefix(
@@ -1652,8 +1750,95 @@ class AsyncNemoGymRolloutImpl:
         return rollout_metrics
 
 
+class _TrajectoryPublisher:
+    """Publishes a group's finished trajectories in coalesced batches.
+
+    Each ``add`` queues one completion; the first queued completion starts a
+    timer and everything queued when it fires is written with one
+    ``TQReplayBuffer.commit_trajectories`` call. ``drain`` flushes the rest
+    and surfaces any write error before the group is sealed.
+    """
+
+    def __init__(
+        self,
+        *,
+        tq_buffer: TQReplayBuffer,
+        group_id: str,
+        input_sample: DatumSpec,
+        start_weight_version: int,
+        coalesce_s: float,
+    ) -> None:
+        self._tq_buffer = tq_buffer
+        self._group_id = group_id
+        self._input_sample = input_sample
+        self._start_weight_version = start_weight_version
+        self._coalesce_s = coalesce_s
+        self._pending: list[tuple[int, Completion]] = []
+        self._flushes: list[asyncio.Task[None]] = []
+        self._timer: Optional[asyncio.Task[None]] = None
+
+    async def add(self, generation_index: int, completion: Completion) -> None:
+        self._pending.append((generation_index, completion))
+        if self._timer is None:
+            self._timer = asyncio.create_task(self._flush_after_delay())
+            self._flushes.append(self._timer)
+
+    async def _flush_after_delay(self) -> None:
+        await asyncio.sleep(self._coalesce_s)
+        self._timer = None
+        await self._flush()
+
+    async def _flush(self) -> None:
+        batch, self._pending = self._pending, []
+        if not batch:
+            return
+        sample = self._input_sample
+        record = PromptGroupRecord(
+            prompt_idx=sample["idx"],
+            prompt=sample["message_log"],
+            extra_env_info=sample["extra_env_info"],
+            metadata={"task_name": sample["task_name"]},
+            completions=[completion for _, completion in batch],
+            rollout_metrics={},
+            loss_multiplier=float(sample.get("loss_multiplier", 1.0)),
+        )
+        await self._tq_buffer.commit_trajectories(
+            self._group_id,
+            [index for index, _ in batch],
+            record,
+            start_weight_version=self._start_weight_version,
+        )
+
+    async def drain(self) -> None:
+        """Write everything still queued; raise if any earlier write failed."""
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+        await self._flush()
+        results = await asyncio.gather(*self._flushes, return_exceptions=True)
+        self._flushes = []
+        for result in results:
+            if isinstance(result, BaseException) and not isinstance(
+                result, asyncio.CancelledError
+            ):
+                raise result
+
+    def cancel(self) -> None:
+        """Drop queued rows and stop pending writes (the group is being removed)."""
+        self._pending = []
+        for task in self._flushes:
+            task.cancel()
+
+
 class RolloutManager:
     """Routes to AsyncRolloutImpl (native async) or AsyncNemoGymRolloutImpl (NeMo-Gym), and pushes results to a TQReplayBuffer."""
+
+    # Class-level default so subclasses/test doubles that skip __init__ keep
+    # whole-group publishing.
+    _trajectory_publish_coalesce_s: Optional[float] = None
+    # ThunderSync nolanes mode: called with (group id, input sample, record) before each commit, so the
+    # verify stage can rebuild the group's rows from its drafts (research/thundersync_rl/thundersync_rl/nolanes.py).
+    nl_record_sink: Optional[Callable[[str, Any, Any], None]] = None
 
     def __init__(
         self,
@@ -1673,7 +1858,16 @@ class RolloutManager:
         retry_policy: Optional[RolloutRetryPolicy] = None,
         effort_config: Optional[EffortLevelsConfig] = None,
         log_full_result_tables: bool = False,
+        trajectory_publish_coalesce_s: Optional[float] = None,
     ) -> None:
+        """See class docstring.
+
+        ``trajectory_publish_coalesce_s`` enables per-trajectory publishing for
+        trajectory-level gradient streaming (``async_rl.trajectory_streaming``):
+        finished trajectories of a group are written to the replay buffer in
+        batches coalesced over this many seconds, and the group is sealed at
+        the end. None publishes whole groups.
+        """
         assert num_generations_per_prompt >= 1, (
             "num_generations_per_prompt must be >= 1"
         )
@@ -1726,6 +1920,7 @@ class RolloutManager:
         self._num_generations_per_prompt = num_generations_per_prompt
         self._rollout_recovery_config = rollout_recovery_config
         self._tq_buffer = tq_buffer
+        self._trajectory_publish_coalesce_s = trajectory_publish_coalesce_s
         self._recovery_ledger = RolloutRecoveryLedger()
         self._data_plane_checkpoint_barrier: Optional[DataPlaneCheckpointBarrier] = None
         self._env_handles = task_to_env
@@ -1881,6 +2076,10 @@ class RolloutManager:
         """
         self._weight_version = int(version)
 
+    def weight_version(self) -> int:
+        """The weight version stamped on rollouts launched now (the version the engine has installed)."""
+        return self._weight_version
+
     async def run_rollout(
         self,
         input_sample: DatumSpec,
@@ -1892,8 +2091,12 @@ class RolloutManager:
     ) -> PromptGroupRecord:
         if rollout_ids is None:
             assert generation_indices is None
-            assert on_completion is None
             assert recovery_granularity is RecoveryGranularity.SIBLING
+            if on_completion is not None:
+                # Trajectory publishing (no token capture): per-sibling callback.
+                return await self._impl.run_rollout(
+                    input_sample, on_completion=on_completion
+                )
             # Legacy path: keep the impl call signature byte-identical.
             return await self._impl.run_rollout(input_sample)
         return await self._impl.run_rollout(
@@ -1996,6 +2199,7 @@ class RolloutManager:
         # separately and terminates from within, since exhausting it is a statement
         # about the prompt rather than about the fleet.
         while infra_attempts < policy.max_infra_attempts:
+            publisher: Optional[_TrajectoryPublisher] = None
             start_version = self._weight_version
             # A lineage-tracked prompt reuses its durable logical ID only after the
             # prior attempt's buffer slot was removed successfully. Ordinary callers
@@ -2023,30 +2227,62 @@ class RolloutManager:
                         attempt_extra_env_info[NEMO_GYM_GROUP_ATTEMPT_KEY] = (
                             group_attempt
                         )
-                    record = await self.run_rollout(attempt_input_sample)
+                    if self._trajectory_publish_coalesce_s is not None:
+                        publisher = _TrajectoryPublisher(
+                            tq_buffer=self._tq_buffer,
+                            group_id=tq_group_id,
+                            input_sample=attempt_input_sample,
+                            start_weight_version=start_version,
+                            coalesce_s=self._trajectory_publish_coalesce_s,
+                        )
+                    target_token = ROLLOUT_TARGET_STEP.set(target_step)
+                    try:
+                        record = await self.run_rollout(
+                            attempt_input_sample,
+                            on_completion=None if publisher is None else publisher.add,
+                        )
+                    finally:
+                        ROLLOUT_TARGET_STEP.reset(target_token)
                 finally:
                     if inflight_registry is not None:
                         inflight_registry.pop(tq_group_id, None)
                 end_version = self._weight_version
-                await self._tq_buffer.commit(
-                    tq_group_id,
-                    record,
-                    start_weight_version=start_version,
-                    end_weight_version=end_version,
-                )
+                if publisher is not None:
+                    await publisher.drain()
+                    await self._tq_buffer.seal_group(
+                        tq_group_id, record, end_weight_version=end_version
+                    )
+                else:
+                    if self.nl_record_sink is not None:
+                        self.nl_record_sink(tq_group_id, attempt_input_sample, record)
+                    await self._tq_buffer.commit(
+                        tq_group_id,
+                        record,
+                        start_weight_version=start_version,
+                        end_weight_version=end_version,
+                    )
             except Exception as error:
                 # A failed rollout must not leave an unready slot that can block an
                 # in-order sampler. commit() rolls back any DataPlane rows it wrote.
                 # Cleanup failure must not mask the error that caused it.
                 cleanup_failed = False
+                if publisher is not None:
+                    publisher.cancel()
                 try:
-                    await self._tq_buffer.remove_group(tq_group_id)
+                    # Trajectory publishing may already have written rows.
+                    await self._tq_buffer.remove_group(
+                        tq_group_id, remove_in_dp=publisher is not None
+                    )
                 except Exception as cleanup_exc:
                     cleanup_failed = True
                     print(
                         f"  warn: remove_group({tq_group_id}) cleanup failed: {cleanup_exc!r}",
                         flush=True,
                     )
+                if getattr(self._impl, "xspr", None) is not None:
+                    # ThunderSync exact SPR: no retry or skip; a redrawn or dropped row would make the batch depend
+                    # on its content (D5), so the failure ends the run.
+                    raise
                 if cleanup_failed:
                     # Fail fast for every caller, not only lineage-tracked ones:
                     # the failed remove leaves an unready slot the retry cannot
@@ -2109,8 +2345,13 @@ class RolloutManager:
                 continue
             except BaseException:
                 # Cancellation and other non-Exception exits: clean up, never retry.
+                if publisher is not None:
+                    publisher.cancel()
                 try:
-                    await self._tq_buffer.remove_group(tq_group_id)
+                    # Trajectory publishing may already have written rows.
+                    await self._tq_buffer.remove_group(
+                        tq_group_id, remove_in_dp=publisher is not None
+                    )
                 except Exception as cleanup_exc:
                     print(
                         f"  warn: remove_group({tq_group_id}) cleanup failed: {cleanup_exc!r}",

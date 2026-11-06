@@ -268,8 +268,9 @@ def make_processed_microbatch_iterator(
                 context_parallel_size=get_context_parallel_world_size(),
             )
 
-        # Move to GPU
-        data_dict = data_dict.to("cuda")
+        # Move to GPU: pinned, asynchronous copies (a pageable host-to-device copy waits for the
+        # stream, i.e. for every kernel queued before it; same values).
+        data_dict = to_cuda_async(data_dict)
 
         # Process the microbatch
         processed_inputs = process_microbatch(
@@ -351,6 +352,24 @@ def _pad_sequence_aligned_tensors(
         data_dict[key] = torch.cat(
             (value, value.new_zeros(pad_shape)), dim=1
         ).contiguous()
+
+
+def to_cuda_async(data_dict: BatchedDataDict) -> BatchedDataDict:
+    """``data_dict.to("cuda")`` without host stalls: host tensors are staged in pinned memory and copied
+    with ``non_blocking=True``. A pageable copy is synchronous with respect to the stream (it waits for
+    every kernel queued before it), which re-serializes the host with the GPU when a forward is already
+    queued (pipelined verification). The caching host allocator keeps each pinned block until its copy
+    has run. Values are unchanged; other entries (``PackedTensor``, non-tensors) move as before.
+    """
+    if not torch.cuda.is_available():
+        return data_dict.to("cuda")
+    for k, v in list(data_dict.items()):
+        if torch.is_tensor(v):
+            if not v.is_cuda:
+                data_dict[k] = v.pin_memory().to("cuda", non_blocking=True)
+        elif isinstance(v, PackedTensor):
+            data_dict[k] = v.to("cuda")
+    return data_dict
 
 
 def get_microbatch_iterator(
@@ -472,6 +491,7 @@ def get_microbatch_iterator(
         )
         micro_batch_size = 1
     else:
+        # Raises ValueError unless num_microbatches * mbs == data.size.
         raw_iterator = data.make_microbatch_iterator(mbs)
         data_iterator_len = data.size // mbs
 
@@ -1469,18 +1489,14 @@ def _fill_routed_experts_padding(
         device=routed_experts.device,
     ).unsqueeze(0)
     padding_mask = seq_positions >= seq_lengths.unsqueeze(1)
-    if not bool(padding_mask.any().item()):
-        return routed_experts
-
-    repaired = routed_experts.clone()
     default_route = torch.arange(
         routed_experts.shape[-1],
         dtype=routed_experts.dtype,
         device=routed_experts.device,
     ).view(1, 1, 1, routed_experts.shape[-1])
-    default_routes = default_route.expand_as(repaired)
-    repaired[padding_mask] = default_routes[padding_mask]
-    return repaired
+    # Device-side select, no host sync: an `if padding_mask.any().item()` early exit
+    # stalled the learner's launch queue once per micro-batch. Same values either way.
+    return torch.where(padding_mask[:, :, None, None], default_route, routed_experts)
 
 
 def process_global_batch(

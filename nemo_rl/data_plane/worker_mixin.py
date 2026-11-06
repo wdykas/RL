@@ -28,6 +28,7 @@ TP=CP=PP=1) and inherit ``train`` / ``get_logprobs`` /
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
 import time
@@ -54,6 +55,7 @@ from nemo_rl.data_plane.schema import (
     ROUTED_EXPERTS_ENCODING_FIELD,
     ROUTED_EXPERTS_FIELD,
     ROUTED_EXTRAS_METADATA_FIELD,
+    STREAM_BUCKET_TAG,
     Layout,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict, SequencePackingArgs
@@ -63,6 +65,7 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.r3_trace import trace_tq_fetch_payload
 
 if TYPE_CHECKING:
+    from nemo_rl.algorithms.grad_streaming import GradStreamingSpec
     from nemo_rl.data_plane import KVBatchMeta
     from nemo_rl.data_plane.interfaces import (
         DataPlaneClient,
@@ -1256,6 +1259,7 @@ class TQWorkerMixin:
         loss_fn: Any,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
+        grad_streaming: Optional["GradStreamingSpec"] = None,
     ) -> None:
         """Open a logical train step. No fetch — pure lifecycle.
 
@@ -1266,10 +1270,12 @@ class TQWorkerMixin:
         ``begin`` — so no step identifier is needed. Optimizer state is
         untouched here.
         """
+        kwargs = {} if grad_streaming is None else {"grad_streaming": grad_streaming}
         self.begin_train_step(  # type: ignore[attr-defined]
             loss_fn=loss_fn,
             gbs=gbs,
             mbs=mbs,
+            **kwargs,
         )
 
     @accepts_trace_context
@@ -1285,11 +1291,83 @@ class TQWorkerMixin:
         accumulate in the backend's open-step state and surface once via
         ``finish_train_step_presharded``.
         """
+        if any(STREAM_BUCKET_TAG in t for t in meta.tags or []):
+            self._train_tagged_stream_buckets(meta)
+            return
         data = self._fetch(meta)
         data = self._attach_or_repack_pack_metadata(data, meta)
         self.train_microbatch(  # type: ignore[attr-defined]
             data=data,
         )
+
+    @accepts_trace_context
+    @wrap_with_nvtx_name("policy_worker/train_groups_presharded")
+    def train_groups_presharded(self, metas: list["KVBatchMeta"]) -> None:
+        """Several groups in one RPC, trained one after the other.
+
+        Each group runs exactly as its own ``train_microbatch_presharded``
+        call would (its own fetch, micro-batches and, under the exact
+        accumulator, its own capture), so the gradient is the one of the
+        per-group calls. Fetching group i+1 overlaps the tail of group i's
+        kernels instead of waiting for a driver round trip.
+        """
+        for meta in metas:
+            if any(STREAM_BUCKET_TAG in t for t in meta.tags or []):
+                raise ValueError("train_groups_presharded: stream-bucket chunks train via train_microbatch_presharded")
+            data = self._fetch(meta)
+            data = self._attach_or_repack_pack_metadata(data, meta)
+            self.train_microbatch(data=data)  # type: ignore[attr-defined]
+
+    def _train_tagged_stream_buckets(self, meta: "KVBatchMeta") -> None:
+        """Train a trajectory-streaming chunk whose rows carry bucket tags.
+
+        One driver RPC per chunk: rows are split here by their
+        ``STREAM_BUCKET_TAG`` (``[group_id, reward]`` or None for rows with
+        final advantages) and each bucket is backpropagated separately.
+        Driver packing metadata describes the whole chunk, so it is dropped
+        and re-derived per subset.
+        """
+        from nemo_rl.algorithms.grad_streaming import StreamBucket
+
+        by_bucket: dict[Optional[tuple[Any, float]], list[int]] = {}
+        for i, tag in enumerate(meta.tags or []):
+            key = tag.get(STREAM_BUCKET_TAG)
+            by_bucket.setdefault(
+                None if key is None else (key[0], float(key[1])), []
+            ).append(i)
+        dropped = {MICRO_BATCH_INDICES, MICRO_BATCH_LENGTHS, ELEM_COUNTS_PER_GB}
+        # One data-plane fetch per chunk; buckets are sliced locally.
+        data_all = self._fetch(meta)
+        for key, idxs in by_bucket.items():
+            sub = meta.subset(idxs)
+            sub = dataclasses.replace(
+                sub,
+                extra_info={
+                    k: v for k, v in (sub.extra_info or {}).items() if k not in dropped
+                },
+            )
+            data = data_all.select_indices(idxs)
+            data = self._attach_or_repack_pack_metadata(data, sub)
+            self.train_microbatch(  # type: ignore[attr-defined]
+                data=data,
+                stream_bucket=(
+                    None if key is None else StreamBucket(group=key[0], reward=key[1])
+                ),
+            )
+
+    @accepts_trace_context
+    @wrap_with_nvtx_name("policy_worker/close_stream_groups_presharded")
+    def close_stream_groups_presharded(
+        self, closes: list[tuple[Any, dict[float, float]]]
+    ) -> None:
+        """Apply closed groups' advantages to their streamed gradients."""
+        self.close_stream_groups(closes)  # type: ignore[attr-defined]
+
+    @accepts_trace_context
+    @wrap_with_nvtx_name("policy_worker/discard_stream_groups_presharded")
+    def discard_stream_groups_presharded(self, groups: list[Any]) -> None:
+        """Drop retried groups' streamed gradients and normalization counts."""
+        self.discard_stream_groups(groups)  # type: ignore[attr-defined]
 
     @accepts_trace_context
     @wrap_with_nvtx_name("policy_worker/finish_train_step_presharded")

@@ -1,0 +1,238 @@
+# ThunderSync "nolanes" (NL2): NeMo-RL's stock SingleController async GRPO loop (in_order sampler, lag k, one
+# non-colocated generation fleet refitted in persist mode) + thundersync.mode=nolanes (verify stage, cross-fade
+# routing, engine version tags; thundersync_rl/nolanes.py, docs/colo/THEORY.md).
+#
+# Composition (later wins):
+#   1. the stock recipe the nrl_k baseline uses (research/baselines_nrl/README.md):
+#        examples/configs/recipes/llm/grpo-nanov3-30BA3B-2n8g-megatron_generation-noncolocated-async-gym-single-controller-token_capture.yaml
+#   2. this file: (a) the nrl_k task overrides (copy of the research notes, summarized in docs/colo/:
+#      DAPO data + math env, token capture off, no val / ckpt / wandb, persist KV), (b) the ts arms' V8b batch-invariant
+#      numerics + engine knobs (ab_base.yaml / ab_ts_scale.yaml) so that engine == learner bitwise, (c) the nolanes
+#      sampler / buffer shape, (d) the thundersync block.
+#   3. the CLI of scripts/nl/run_nl_arm.sh: model, shape (prompts, G, lengths), layout (cluster, TP / EP / SP / CP,
+#      engine resources), lag (async_rl.sampler.max_lookahead_versions), engine capacity (max_requests), env_name.
+#
+# Every leaf below that differs from the stock recipe, and why (S = stock recipe value):
+# -- task (identical to the nrl_k arm) --
+#   grpo.max_num_steps / val_* (S 1e6 / val_period 0)    bookkeeping: short runs, no validation (SC has none)
+#   policy.tokenizer.chat_template_kwargs (S absent)     thinking on, as every ts / nrl run
+#   data.* / env.* (S NeMo-Gym blocks)                   DAPO-Math-17k + math env (math_parity for truncated models)
+#   token_capture.enabled (S true)                       Gym-only capture path; no receipts with the math env
+#   checkpointing.enabled, logger.* (S on / wandb)       bookkeeping
+#   kv_cache_management_mode persist (S recompute)       image constraint (no UVM / torch_memory_saver; nrl README), and
+#   async_rl.recompute_kv_cache_after_weight_updates     nolanes needs persist: requests stay in flight across the refit
+#     false (S true; the schema default)                 with static KV pointers (CUDA graphs); the two must agree
+# -- V8b exact-numerics recipe, learner AND engine (the engine Policy is built from the same policy.megatron_cfg) --
+#   policy.megatron_cfg.forward_gemm_precision fp16 (S absent = bf16 GEMMs)  fp16 GEMM operands, fp32 GEMM outputs
+#   policy.megatron_cfg.distributed_data_parallel_config.grad_reduce_in_fp32 true (S false)  fp32 main_grad for the fp16 expert params
+#   policy.megatron_cfg.fp32_residual_connection true (S absent/false)      fp32 residual stream (required by fp16)
+#   policy.megatron_cfg.defer_fp32_logits true (S true; restated)           fp32 logits
+#   policy.megatron_cfg.moe_router_dtype fp32 (S fp32; restated)            fp32 router
+#   policy.megatron_cfg.batch_invariant_mode true (S absent)                BI kernels: training fwd == engine fwd bitwise
+#   policy.megatron_cfg.batch_invariant_backend te_native (S absent)        as ab_base
+#   policy.megatron_cfg.batch_invariant_collective ordered (S absent)       as ab_base (ordered TP / EP reductions)
+#   policy.megatron_cfg.zero_train_gen_mismatch true (S absent)             runs the BI / zero-KL config validators
+#   policy.megatron_cfg.attention_backend flash (S absent = Megatron auto)  BI attention path (validator: required)
+#   policy.megatron_cfg.flash_attention_version 4 (S absent)                BI FA4 (validator: required 4)
+#   policy.megatron_cfg.moe_permute_fusion false (S true)                   validator: required false under BI
+#   policy.megatron_cfg.bias_activation_fusion false (S false; restated)
+#   policy.megatron_cfg.use_fused_linear_logprobs false (S absent)          BI + fp16 validators refuse the fused head
+#   policy.megatron_cfg.env_vars CUBLASLT_WORKSPACE_SIZE=0,                 te_native: workspace-free cuBLAS (fixed
+#     CUBLAS_WORKSPACE_CONFIG=:0:0 (S null)                                  reduction order); validator: required
+#   policy.megatron_cfg.context_parallel_size 1 (S 2)                       as ts (generation never runs CP); also CLI
+#   policy.make_sequence_length_divisible_by 128 (S 8)                      BI validator: multiple of lcm(64, 32 TP)
+#                                                                            (launcher sets lcm(that, 128) per TP)
+#   policy.sequence_packing.enabled false (S true)                          BI validator; the law check needs
+#                                                                            materialized per-row logits
+#   policy.generation.mcore_generation_config.logprobs_mode raw_logprobs    BI validator: raw logprobs
+#     (S processed_logprobs)
+#   policy.generation.mcore_generation_config.enable_chunked_prefill false  zero-KL validator: required false
+#     (S true)
+#   policy.generation.mcore_generation_config.enable_prefix_caching false   E8: continuations re-prefill at theta_k;
+#     (S true)                                                               the prefix cache is not version-keyed
+#   (Mamba SSM state: S mamba_inference_ssm_states_dtype float32 kept; MCore forces fp32 under BI anyway. Conv state:
+#    fp32 under forward_gemm_precision fp16, utils.resolve_mamba_conv_states_dtype.)
+# -- engine knobs as the ts_scale arm (not numerics; batch invariance makes them bit-neutral) --
+#   mcore_generation_config.num_cuda_graphs 16 (S -1)                       ts decode-graph ladder
+#   mcore_generation_config.cuda_graph_all_prefills true (S absent)         graphed prefills (ts_scale)
+#   mcore_generation_config.max_tokens = max_total_sequence_length (S the same; was 16384 from ab_base); with chunked prefill off a
+#                                                                            continuation's re-prefill (prompt + kept
+#                                                                            prefix) must fit one engine step
+#   mcore_generation_config.buffer_size_gb 48 (S 20)                        ab_base; launcher ENGINE_BUF overrides
+#   mcore_generation_config.progress_log_interval_s 60, stall_timeout_s 600 (S absent)  ab_base progress / stall dump
+#   (max_requests: set by the launcher from P x G x (lag + 1) x drafts / engine DP; S absent.)
+# -- nolanes shape --
+#   async_rl.sampler.max_lookahead_versions 1 (S 1; restated)               lag 1 by measurement (DESIGN §16: Super-L22
+#                                                                            32 steps 91.2 vs 101.5 s/step at lag 2, no
+#                                                                            drift; Ultra-L27 drafting not exposed at
+#                                                                            lag 1); launcher LAG overrides
+#   async_rl.max_buffered_rollouts P x (lag + 1) (S 2 P)                    in_order required_buffer_capacity
+#   async_rl.max_inflight_prompts P x (lag + 1) (S P)                       keep lag + 1 batches generating
+#   async_rl.min_groups_for_streaming_train P (S P; restated)               R2: one chunk per step
+#   async_rl.rollout_failure.max_skipped_prompts / max_consecutive_dropped_prompts 0 (schema default; restated, MEDIUM-4)
+#   thundersync.* (S absent)                                                the nolanes block (validator: nolanes.py)
+#
+# Deliberately NOT changed (stock recipe kept): the loss (IS correction, PPO clips 0.2 / 0.28, on-policy KL approx,
+# token-level loss, leave-one-out baseline, grpo.seq_logprob_error_threshold 2), the optimizer (Adam 3e-6, warmup 10,
+# precision-aware distributed optimizer), refit (mcore over NCCL, requests in flight), activation
+# checkpointing, empty_unused_memory_level, MoE router bias / freeze, apply_rope_fusion, micro-batch sizes. None of them
+# enters the forward bits that E5 needs; thundersync_rl.nolanes.configure_driver owns any loss / worker-class change.
+defaults:
+  - ../../../../examples/configs/recipes/llm/grpo-nanov3-30BA3B-2n8g-megatron_generation-noncolocated-async-gym-single-controller-token_capture.yaml
+
+grpo:
+  max_num_steps: 5
+  seed: 42
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+
+policy:
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template_kwargs:
+      enable_thinking: true
+      truncate_history_thinking: false
+  make_sequence_length_divisible_by: 128
+  sequence_packing:
+    enabled: false
+  megatron_cfg:
+    context_parallel_size: 1
+    # User rule 11-02: the MoE router gate weights and the expert bias are ALWAYS frozen, in nolanes and in the stock
+    # baselines (research/baselines_nrl/README.md). The validator refuses anything else, and the learner's router bits
+    # are checked against the first step after every optimizer step (router_freeze.py).
+    moe_router_bias_update_rate: 0.0
+    freeze_moe_router: true
+    optimizer:
+      use_precision_aware_optimizer: false  # as nrlli2 (and the ts runs)
+    # V8b exact-numerics recipe (ab_base.yaml), learner and engine.
+    forward_gemm_precision: fp16
+    # The fp16 recipe stores the routed experts as fp16 parameters (fp16_moe.store_routed_experts_fp16): fp32
+    # grad buffers are required (an fp16 main_grad would underflow small gradients; setup refuses it).
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: true
+    fp32_residual_connection: true
+    defer_fp32_logits: true
+    moe_router_dtype: fp32
+    moe_permute_fusion: false
+    bias_activation_fusion: false
+    use_fused_linear_logprobs: false
+    # Batch invariance (NeMo-RL PR 3208): training forward == engine forward bitwise.
+    zero_train_gen_mismatch: true
+    batch_invariant_mode: true
+    batch_invariant_backend: te_native
+    batch_invariant_collective: ordered
+    attention_backend: flash
+    flash_attention_version: 4
+    env_vars:
+      CUBLASLT_WORKSPACE_SIZE: "0"
+      CUBLAS_WORKSPACE_CONFIG: ":0:0"
+      # Learner verify path (INC5 carry + R24): DS2 sharded residual scans, grouped verify forwards with hidden
+      # prefetch, device hidden gather, canonical-block vocab LSE (the uf/r2 gate settings, EXACT there).
+      THUNDERSYNC_DS2: "1"
+      THUNDERSYNC_VERIFY_FWD_GROUP: "4"
+      THUNDERSYNC_HIDDEN_PREFETCH_GB: "16"
+      THUNDERSYNC_HIDDEN_DEVICE_GATHER: "1"
+      NEMO_RL_VOCAB_LSE: canonical_block
+  generation:
+    mcore_generation_config:
+      kv_cache_management_mode: persist
+      logprobs_mode: raw_logprobs
+      enable_chunked_prefill: false
+      enable_prefix_caching: false
+      materialize_only_last_token_logits: true
+      num_cuda_graphs: 16
+      cuda_graph_all_prefills: true
+      async_sched_mode: async  # MCore's default (stock); explicit so both arms match
+      # Engine token budget = the longest sequence: the floor without chunked prefill (a continuation re-prefills
+      # in one engine step; the validator refuses less), and not more, since the engine's AllGather-V MoE dispatcher
+      # sizes its buffers and CUDA-graph pools by max_tokens x EP / TP (16384 OOMs at engine EP 8, DESIGN §18.3).
+      max_tokens: ${policy.max_total_sequence_length}
+      buffer_size_gb: 48
+      progress_log_interval_s: 60
+      stall_timeout_s: 600
+      # No OpenAI HTTP front-end: nolanes generates through the Ray generation actors (math env, no Gym). Starting it
+      # (8 server replicas + health wait) cost ~80 s of the initial weight sync with every GPU idle (X1: 125.6 -> 42.2 s,
+      # ; DESIGN §16.9). Startup only; no effect on any step.
+      expose_http_server: false
+
+# Data: our task (ab_base.yaml's data block; nrl_overrides.yaml). The recipe's data block is NeMo-Gym's.
+data:
+  _override_: true
+  max_input_seq_length: 2048
+  shuffle: true
+  num_workers: 1
+  use_multiple_dataloader: false
+  train:
+    dataset_name: DAPOMath17K
+  validation: null
+  default:
+    prompt_file: null
+    system_prompt_file: null
+    processor: math_hf_data_processor
+    env_name: math
+
+# Reward: NeMo-RL's math environment with the DAPO verifier. run_nl_arm.sh PARITY=1 (default) switches
+# data.default.env_name to math_parity (truncated models; thundersync_rl/nl_parity_env.py, NL_PARITY_REWARD=1).
+env:
+  _override_: true
+  should_use_nemo_gym: false
+  math:
+    num_workers: 16
+    math_verify_impl: dapo_math_verify
+  math_parity:
+    num_workers: 16
+    math_verify_impl: dapo_math_verify
+
+token_capture:
+  enabled: false
+
+async_rl:
+  recompute_kv_cache_after_weight_updates: false
+  sampler:
+    name: in_order
+    max_lookahead_versions: 1
+  min_groups_for_streaming_train: ${grpo.num_prompts_per_step}
+  max_buffered_rollouts: ${mul:${grpo.num_prompts_per_step}, ${add:${async_rl.sampler.max_lookahead_versions}, 1}}
+  max_inflight_prompts: ${mul:${grpo.num_prompts_per_step}, ${add:${async_rl.sampler.max_lookahead_versions}, 1}}
+  rollout_failure:
+    max_skipped_prompts: 0
+    max_consecutive_dropped_prompts: 0
+    # R29: no data retry after environment scoring (a retried group is chosen by its rewards) and no deadlines
+    # (a timed-out group is chosen by its length).
+    max_data_attempts_per_prompt: 1
+    max_infra_attempts_per_prompt: 1
+    native:
+      generation_timeout_s: null
+      env_timeout_s: null
+
+thundersync:
+  mode: nolanes
+  # Drafts per output, N = max(G, round(K G)). Rule: the smallest K whose spare drafts cover the expected ⊥ rows
+  # (spares = K - 1 of the slots >= the measured ⊥-row fraction, logged as spec/null_* in [nolanes verify]). Super-L22:
+  # ⊥ 6.4% at K 1.125, so 1.125 holds (K 1.0 doubled the continuations, 88-100 s/step; 1.25 drafted 11% more for
+  # nothing: §18.1, §18.3). One value for every scale until a scale's ⊥ fraction says otherwise.
+  k_drafts: 1.125
+  crossfade_routing_m: 0.03       # base band s; per-layer m = s x scale (routing_crux 10-30, full-depth Nano)
+  crossfade_routing_m_profile: [[0.0, 0.2608, 0.3], [0.2608, 0.7826, 1.0], [0.7826, 1.0, 0.5]]
+  crossfade_routing_extra: 4
+  crossfade_routing_ramp_stopgrad: true
+  crossfade_routing_sparse_engine: true  # engine expert GEMMs skip zero-weight cf slots (R28, same bits); learner fixed-width
+  verify_split_x: 1.0
+  tail_priority: true
+  null_bv_logratio_var: 8.0e-7
+  null_bv_fixed_m: null
+  engine_sampler: wide
+  row_seeds: true        # F3 per-row verification seeds
+  prev_logprobs_from_verify: true  # the verify pass is the prev-logprob pass (gen log-probs are theta_k's own)
+
+checkpointing:
+  enabled: false
+
+logger:
+  log_dir: logs/nl
+  wandb_enabled: false
+  tensorboard_enabled: false
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: false
