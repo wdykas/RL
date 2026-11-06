@@ -15,6 +15,8 @@ Two code lineages exist:
   (= `6a3660905` + NVIDIA/Megatron-LM#8385 cherry-pick + its tests) and Megatron-Bridge `1f8873bb`. Point the kit at
   it with `COLO_RL=<old-pin checkout> COLO_MLM=<Megatron-LM handoff/oldpin-pin> COLO_MBRIDGE_TREE=<Bridge @ 1f8873bb>`
   (untested with this kit; the streams were run with equivalent launchers).
+  The old-pin line's own launchers (`research/thundersync_rl/scripts/{ab,nl,colo}/`) expect a research workspace
+  (`TS_WORK`: models, overlays, an environment script, run dirs) that is not published; prefer the colo kit.
 
 | branch (RL fork) | on top of | stream |
 |---|---|---|
@@ -27,9 +29,9 @@ Two code lineages exist:
 | `handoff/f3-band` | `colo-handoff` | H. wider cross-fade band |
 | `handoff/xssd-slim2` | `colo-handoff` | D. XS-SD on the slim line |
 | `handoff/tree-prod-slim` | `colo-handoff` | C. tree speculation, slim gate integration |
-| `handoff/draft-head` | `colo-handoff` | F. MTP draft head code |
 | `handoff/oldpin-base` | upstream main `ce0cb739` | common base of the old-pin line |
-| `handoff/ext-tree` | `handoff/oldpin-base` | C. shared tree-speculation module |
+| `handoff/tree-spec` | `handoff/oldpin-base` | C. shared tree-speculation module, MTP head input contract v2 |
+| `handoff/draft-head` | `handoff/tree-spec` | F. MTP draft head training / export / evaluation code |
 | `handoff/tree-prod` | `handoff/oldpin-base` | C. tree speculation, production-ready (old pin) |
 | `handoff/xssd-mainpin` | `handoff/oldpin-base` | D. XS-SD on Megatron-LM main |
 | `handoff/ext-tree-xssd` | `handoff/oldpin-base` | D. XS-SD, old pin |
@@ -79,7 +81,7 @@ before measuring.
   a non-finite s.
 - **Open:** a non-finite log-prob seen once at step 6 of one run; root cause unknown. Reproduce with the dump on.
 
-### C. Tree speculation (`handoff/ext-tree`, `handoff/tree-prod`, `handoff/tree-prod-slim`)
+### C. Tree speculation (`handoff/tree-spec`, `handoff/tree-prod`, `handoff/tree-prod-slim`)
 - **What:** a shared tree-speculation module: graphed tree stage, MTP draft source, prefix caching / chunked prefill
   through a version-keyed cache.
 - **State:** `handoff/tree-prod` is MTD-free, on Megatron-LM main, exact in the harness for lag K ≤ 4, and passed
@@ -94,7 +96,7 @@ before measuring.
 - **Running:** fair 4-arm SPR / SPR-BI / SPR-SD / XS-SD with the c3 draft head on the slim line.
 - **Prediction:** 1.17-1.38× SPR-BI. `handoff/ext-tree-xssd` is the old-pin line.
 
-### E. EX-T and BX-SD fork lane (`handoff/bxsd2`; EX-T lives in `handoff/ext-tree`)
+### E. EX-T and BX-SD fork lane (`handoff/bxsd2`; EX-T lives in `handoff/tree-spec`)
 - **EX-T + MTP:** 1.37× SPR-BI with draft head r1_e3, 1.28× with c3 (control arm); c3 pairs queued.
 - **BX-SD:** v1 / v2 missed (97.5 s/step) because of two bugs, both fixed; at Nano 4 nodes the capacity model caps
   the gain at ~3.5 s/step; a third iteration is queued.
@@ -106,7 +108,8 @@ before measuring.
 - **Acceptance audit:** no bug; c3 sits at 97% of the 1 − TV ceiling.
 - **Round 2:** wide MLP, entropy-weighted loss, multi-layer features, many more prompts. Target: slowest row ≥ 2.2.
 - **Checkpoint:** not in git (~96 MB); to be published as a release asset or HF model repo. Retrain with the code in
-  `research/thundersync_rl/draft_head/`.
+  `research/thundersync_rl/draft_head/` on `handoff/draft-head` (it needs the head input contract v2 of
+  `handoff/tree-spec`).
 
 ### G. DX, exact in the non-colocated async setting (`handoff/dx`)
 - **Built:** GRPO-Z (sibling-draft leave-one-out baseline, train on arrival; unbiased) and engine-side block
