@@ -948,6 +948,23 @@ class MegatronGenerationMixin:
             from nemo_rl.models.megatron import mamba_bi_decode
 
             mamba_bi_decode.install()
+            # Tree speculation (thundersync.tail_tree, tree_spec): the node-row state (tree_kv: scratch conv and
+            # replay rows in the Mamba layers, the private-block KV gather), before the context is sized and the
+            # graphs captured.
+            tree = os.environ.get("THUNDERSYNC_TAIL_TREE", "").strip()
+            if tree:
+                from nemo_rl.models.generation.megatron import tree_kv
+
+                tree_kv.install(int(tree.split(":")[2]))
+                # MTP draft source (thundersync.tail_tree_mtp): the decoder output of every engine forward, captured
+                # into a fixed buffer by a hook on the final norm (inside the graphs once they are captured).
+                if os.environ.get("THUNDERSYNC_TAIL_TREE_MTP", "").strip():
+                    from nemo_rl.models.generation.megatron import tree_mtp
+
+                    gcfg = self.cfg["generation"]["mcore_generation_config"]
+                    tree_mtp.install_hidden_capture(
+                        engine_model, int(gcfg["max_tokens"]), int(engine_model.config.hidden_size)
+                    )
 
     def _start_generation_progress_monitor(self, mcore_generation_config: dict) -> None:
         """Progress log + stall watchdog over this rank's engine counters (progress.py)."""
