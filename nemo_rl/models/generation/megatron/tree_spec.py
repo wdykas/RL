@@ -11,8 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Exact tree speculation on opted-in engine requests (shared engine module; interface:
-the research notes, summarized in docs/colo/). A single proposal chain is its 1-branch case. Self-contained:
+"""Exact tree speculation on opted-in engine requests (shared engine module; interface
+notes summarized in docs/colo/THEORY.md). A single proposal chain is its 1-branch case. Self-contained:
 the node-row state (KV and Mamba) is tree_kv's; no other speculation module is needed.
 
 Per engine iteration an opted-in request ("tail") gets up to W extra decode rows, one per tree node. The nodes are
@@ -83,7 +83,7 @@ LOOK_MAX = 8  # = mamba_bi_fused_decode.LOOK_MAX = tree_kv.LOOK_MAX: depth <= 7
 BLOCK = 1024  # reference positions per candidate program
 KMTP = 4  # MTP draft depth (candidate 0 of the trie)
 # Cost of one decode row relative to an iteration: Nano TP1 EP8 BI engine 0.03-0.045 ms per row at 26-78 rows/rank
-# (bi_curve : 6.16 / 6.85 / 7.34 / 8.40 / 9.02 ms at 8 / 32 / 52 / 64 / 78 rows) against the in-loop ~10 ms
+# (bi_curve: 6.16 / 6.85 / 7.34 / 8.40 / 9.02 ms at 8 / 32 / 52 / 64 / 78 rows) against the in-loop ~10 ms
 # iteration; FP_B M2: 0.6-0.9 ms per extra token at 26 rows/rank (0.03 ms / row).
 BETA = 0.004
 PRIOR0, FORGET = 0.5, 0.9995  # first node's prior acceptance; pooled counts forgotten over ~2000 tail iterations
@@ -800,7 +800,7 @@ class TreeSpec:
         A resident request's tail state is version-free: H / P are its committed tokens and positions, the node rows of
         each forward are drawn and accepted under that forward's own weights. It is kept (no detach / re-attach: on the
         first step after a resume MCore runs no overlap, so the record already holds the in-flight token and a host
-        re-sync would be one position ahead; measured a measured run l3: persist K = 1 / 2 / 4 inexact with the re-sync, exact
+        re-sync would be one position ahead; measured (l3): persist K = 1 / 2 / 4 inexact with the re-sync, exact
         without). Only what was built from the old weights is dropped: the MTP slot (its K / V are the old weights'
         hidden states) and the key id is resolved again. A request MCore rebuilt is released: re-added for a prefill
         (a RECOMPUTE resume: prompt + generated as its prompt, fresh MCore state) or not resident (waiting to be

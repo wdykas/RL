@@ -214,7 +214,7 @@ class _OldEngine:
 
 @pytest.mark.parametrize("main", [True, False])
 def test_tails_tokens_reach_finished_and_surviving_rows(main):
-    """Regression (main-pin in-loop : a finished tail's log-probs outnumbered its tokens by a - 1): the tails'
+    """Regression (main-pin in-loop: a finished tail's log-probs outnumbered its tokens by a - 1): the tails'
     accepted tokens replace the sample wherever MCore applies it, the finalize path of finished rows included."""
     t = _spec()
     t.on_post_process = lambda fin, ev: None
