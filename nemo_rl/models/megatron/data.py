@@ -40,6 +40,7 @@ from nemo_rl.data_plane.codec import pad_field
 from nemo_rl.data_plane.schema import MICROBATCH_PADDED_FIELDS, OPD_FULL_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
+from nemo_rl.models.generation.interfaces import ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL
 from nemo_rl.models.megatron.alignment import get_fp8_token_alignment
 from nemo_rl.models.megatron.common import _round_up_to_multiple
 from nemo_rl.models.megatron.hybridep import (
@@ -268,8 +269,9 @@ def make_processed_microbatch_iterator(
                 context_parallel_size=get_context_parallel_world_size(),
             )
 
-        # Move to GPU
-        data_dict = data_dict.to("cuda")
+        # Move to GPU: pinned, asynchronous copies (a pageable host-to-device copy waits for the
+        # stream, i.e. for every kernel queued before it; same values).
+        data_dict = to_cuda_async(data_dict)
 
         # Process the microbatch
         processed_inputs = process_microbatch(
@@ -351,6 +353,24 @@ def _pad_sequence_aligned_tensors(
         data_dict[key] = torch.cat(
             (value, value.new_zeros(pad_shape)), dim=1
         ).contiguous()
+
+
+def to_cuda_async(data_dict: BatchedDataDict) -> BatchedDataDict:
+    """``data_dict.to("cuda")`` without host stalls: host tensors are staged in pinned memory and copied
+    with ``non_blocking=True``. A pageable copy is synchronous with respect to the stream (it waits for
+    every kernel queued before it), which re-serializes the host with the GPU when a forward is already
+    queued (pipelined verification). The caching host allocator keeps each pinned block until its copy
+    has run. Values are unchanged; other entries (``PackedTensor``, non-tensors) move as before.
+    """
+    if not torch.cuda.is_available():
+        return data_dict.to("cuda")
+    for k, v in list(data_dict.items()):
+        if torch.is_tensor(v):
+            if not v.is_cuda:
+                data_dict[k] = v.pin_memory().to("cuda", non_blocking=True)
+        elif isinstance(v, PackedTensor):
+            data_dict[k] = v.to("cuda")
+    return data_dict
 
 
 def get_microbatch_iterator(
@@ -472,6 +492,7 @@ def get_microbatch_iterator(
         )
         micro_batch_size = 1
     else:
+        # Raises ValueError unless num_microbatches * mbs == data.size.
         raw_iterator = data.make_microbatch_iterator(mbs)
         data_iterator_len = data.size // mbs
 
@@ -1272,9 +1293,14 @@ def process_microbatch(
                         "is disabled so padding rows can be repaired before router "
                         "replay."
                     )
+                from nemo_rl.models.megatron import sticky_routing
+
                 routed_experts = _fill_routed_experts_padding(
                     routed_experts,
                     data_dict["input_lengths"],
+                    # Sticky routing: padding is anchored to itself (plain
+                    # routing), as every position without a route anchor.
+                    keep_missing_routes=sticky_routing.get_delta() is not None,
                 )
                 routed_experts_cp_sharded = routed_experts
                 if r3_trace_verify_forward_enabled():
@@ -1450,8 +1476,16 @@ def _verify_r3_trace_cp_token_alignment(
 def _fill_routed_experts_padding(
     routed_experts: torch.Tensor,
     seq_lengths: torch.Tensor,
+    keep_missing_routes: bool = False,
 ) -> torch.Tensor:
-    """Replace materialized jagged padding with a valid dummy top-k route."""
+    """Replace materialized jagged padding with a valid dummy top-k route.
+
+    ``keep_missing_routes``: padding positions that already hold the missing-route
+    sentinel at every layer keep it, so the router routes them plainly (the
+    missing-route fallback). Sticky MoE routing relies on this: a sentinel
+    position is anchored to itself, and sticky rounding anchors exactly the
+    positions with valid route anchors, which must not include padding.
+    """
     if routed_experts.dim() != 4:
         raise ValueError(
             "routed_experts must have shape [batch, seq, num_moe_layers, topk]; "
@@ -1469,18 +1503,18 @@ def _fill_routed_experts_padding(
         device=routed_experts.device,
     ).unsqueeze(0)
     padding_mask = seq_positions >= seq_lengths.unsqueeze(1)
-    if not bool(padding_mask.any().item()):
-        return routed_experts
-
-    repaired = routed_experts.clone()
+    if keep_missing_routes:
+        missing = routed_experts.eq(ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL).flatten(2).all(-1)
+        padding_mask = padding_mask & ~missing
     default_route = torch.arange(
         routed_experts.shape[-1],
         dtype=routed_experts.dtype,
         device=routed_experts.device,
     ).view(1, 1, 1, routed_experts.shape[-1])
-    default_routes = default_route.expand_as(repaired)
-    repaired[padding_mask] = default_routes[padding_mask]
-    return repaired
+    # Device-side select, no host sync: an `if padding_mask.any().item()` early exit
+    # stalled the learner's launch queue once per micro-batch (sticky routing keeps
+    # padding as the sentinel, so the mask is usually empty). Same values either way.
+    return torch.where(padding_mask[:, :, None, None], default_route, routed_experts)
 
 
 def process_global_batch(

@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import copy
 import datetime
+import gc
 import hashlib
 import json
 import os
@@ -304,6 +306,7 @@ from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.generation.megatron.config import (
     dedicated_inference_megatron_cfg,
+    merged_inference_megatron_cfg,
 )
 from nemo_rl.models.megatron.community_import import (
     import_model_from_hf_name,
@@ -444,6 +447,41 @@ def enable_batch_invariant_mode(config: PolicyConfig) -> None:
     validate_zero_train_gen_kl(config, check_environment=True)
     if config["megatron_cfg"].get("batch_invariant_mode"):
         enable_batch_invariant_kernels(config)
+    # Exact integer law (ThunderSync engine_sampler=exact_int sets
+    # policy.megatron_cfg.exact_int_law): every learner log-prob is log(w_x) - log(W).
+    from nemo_rl.models.megatron import exact_int
+
+    exact_int.configure_from_policy(config)
+    # Exact top-p policy (ThunderSync sets policy.megatron_cfg.exact_top_p):
+    # engine sampler and learner log-probs mask the same canonical nucleus.
+    from nemo_rl.models.megatron import exact_nucleus
+
+    exact_nucleus.configure_from_policy(config)
+    _validate_forward_gemm_precision(config)
+
+
+def _validate_forward_gemm_precision(config: PolicyConfig) -> None:
+    """Raise on an invalid ``forward_gemm_precision`` setup (no-op when unset)."""
+    from nemo_rl.models.megatron import fp16_gemm
+
+    megatron_cfg = config["megatron_cfg"]
+    inference_cfg = None
+    generation = config.get("generation")
+    if generation is not None and generation.get("backend") == "megatron":
+        inference_cfg = merged_inference_megatron_cfg(config)
+    errors = fp16_gemm.validate_config(megatron_cfg, inference_cfg)
+    from nemo_rl.models.megatron import precision_raise
+
+    errors += precision_raise.validate_config(megatron_cfg, inference_cfg)
+    if megatron_cfg.get("forward_gemm_precision") is not None and (
+        generation is not None and generation.get("backend") != "megatron"
+    ):
+        errors.append(
+            "forward_gemm_precision requires policy.generation.backend='megatron' "
+            "(other engines do not run the fp16 GEMM forward)."
+        )
+    if errors:
+        raise ValueError("\n".join(errors))
 
 
 def destroy_parallel_state():
@@ -575,6 +613,13 @@ def validate_and_set_config(
             top_p=generation_cfg["top_p"],
             temperature=generation_cfg["temperature"],
         )
+        if config["megatron_cfg"].get("exact_top_p") is not None:
+            # The exact nucleus is applied inside the batch-invariant log-prob
+            # path (exact_nucleus.py); NeMo-RL's own sort/cumsum filter would
+            # truncate a second time with a different boundary rule.
+            sampling_params = TrainingSamplingParams(
+                top_k=None, top_p=1.0, temperature=generation_cfg["temperature"]
+            )
 
     # Setup data types
     dtype_map = {
@@ -1109,6 +1154,13 @@ def setup_model_config(
     if "layernorm_epsilon" in config["megatron_cfg"]:
         model_cfg.layernorm_epsilon = config["megatron_cfg"]["layernorm_epsilon"]
 
+    # Optional fp32 residual stream (training and, through the merged inference
+    # config, generation models).
+    if "fp32_residual_connection" in config["megatron_cfg"]:
+        model_cfg.fp32_residual_connection = config["megatron_cfg"][
+            "fp32_residual_connection"
+        ]
+
     # Provider objects loaded from checkpoint metadata otherwise retain the
     # serialized defaults. Apply explicit recipe controls before model
     # construction so RADIO positional encoding and frozen towers are stable
@@ -1165,6 +1217,18 @@ def setup_model_config(
     _validate_training_config(config, model_cfg)
 
     validate_zero_train_gen_model_provider(config, model_cfg)
+    if config["megatron_cfg"].get("forward_gemm_precision") is not None:
+        from nemo_rl.models.megatron import fp16_gemm
+
+        fp16_gemm.validate_model(
+            model_cfg,
+            bool(config["megatron_cfg"].get("moe_ep_invariant_combine", False)),
+        )
+    elif config["megatron_cfg"].get("moe_ep_invariant_combine", False):
+        raise ValueError(
+            "moe_ep_invariant_combine needs forward_gemm_precision='fp16' (the bf16 "
+            "batch-invariant MoE path is not built yet)."
+        )
 
     # Create final megatron config
     megatron_cfg = _create_megatron_config(
@@ -1300,9 +1364,11 @@ def _apply_parallelism_config(model_cfg: Any, config: PolicyConfig) -> None:
         # GPTModel path) OR the model does it internally (mbridge VLM wrappers
         # like Qwen3VL, auto-detected at model build). Both paths require
         # cu_seqlens to flow via PackedSeqParams, so sequence_packing must be on.
-        assert config["sequence_packing"]["enabled"], (
-            "Sequence Packing must be enabled to use Context Parallelism with MCore."
-        )
+        # Batch-invariant CP (bi_context_parallel.py) takes whole unpacked rows and keeps each rank's zigzag
+        # chunk inside the model forward (BI Mamba training does not pack).
+        assert config["sequence_packing"]["enabled"] or config["megatron_cfg"].get(
+            "batch_invariant_mode", False
+        ), "Sequence Packing must be enabled to use Context Parallelism with MCore."
         assert not config["megatron_cfg"].get("use_fused_linear_logprobs", False), (
             "Context Parallelism is not supported with linear CE fusion loss, please set use_fused_linear_logprobs to false"
         )
@@ -1470,7 +1536,17 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
 
     if "moe_grouped_gemm" in config["megatron_cfg"]:
         model_cfg.moe_grouped_gemm = config["megatron_cfg"]["moe_grouped_gemm"]
-    model_cfg.moe_enable_routing_replay = router_replay_enabled(config)
+    # Sticky MoE routing (sticky_routing.py) uses the RouterReplay instances too.
+    from nemo_rl.models.megatron.sticky_routing import sticky_routing_enabled
+
+    model_cfg.moe_enable_routing_replay = router_replay_enabled(
+        config
+    ) or sticky_routing_enabled(config)
+    if sticky_routing_enabled(config) and getattr(model_cfg, "moe_router_fusion", False):
+        raise ValueError(
+            "sticky routing requires moe_router_fusion=False: the fused TE top-k "
+            "bypasses MCore's RouterReplay, so the sticky rule would not run."
+        )
 
 
 def _apply_mtp_config(model_cfg: Any, config: PolicyConfig) -> None:
@@ -2028,6 +2104,87 @@ def _create_checkpoint_config(
     return CheckpointConfig(**kwargs)
 
 
+# NCCL timeout of every collective issued while the initial checkpoint loads.
+DEFAULT_CHECKPOINT_LOAD_TIMEOUT_MINUTES = 60
+
+
+@contextlib.contextmanager
+def _checkpoint_load_collective_timeout(minutes: Optional[float]):
+    """Give every collective issued during the checkpoint load ``minutes`` of NCCL timeout.
+
+    Megatron's fully-parallel load (fully_parallel.py) has each data-parallel rank
+    read its share of the checkpoint from storage with no collectives
+    (``no_dist=True``) and then enqueue the broadcast exchange
+    (exchange_loaded_tensors_broadcast). The NCCL watchdog therefore times the
+    fastest rank's broadcast from the moment it is enqueued until the slowest
+    rank in the group finishes reading, and later world collectives likewise wait
+    for the slowest data-parallel group. That gap is storage time, set by the
+    filesystem and the bytes per rank, not by the parallel layout's
+    ``distributed_timeout_minutes`` (10 min). On a shared parallel filesystem a rank of the
+    multi-node Qwen3-30B-A3B runs fell more than 10 min behind its peer
+    (NCCL watchdog on the first exchange broadcast; 2x per-rank read-time spread
+    measured even on an idle node).
+
+    Raises the timeout of this rank's NCCL/Gloo process groups for the load (the
+    process-group timeout applies to work created while it is set) and restores
+    each group's previous value afterwards. ``minutes`` None or <= 0 keeps the
+    groups' timeouts. Cost: one Python call per process group per rank.
+    """
+    if not minutes or minutes <= 0 or not torch.distributed.is_initialized():
+        yield
+        return
+    import datetime
+
+    from torch.distributed.distributed_c10d import _set_pg_timeout, _world
+
+    load_timeout = datetime.timedelta(minutes=float(minutes))
+    previous = []
+    for pg in list(_world.pg_map):
+        timeouts = [
+            pg._get_backend(device).options._timeout
+            for device in pg._device_types
+            if hasattr(pg._get_backend(device), "options")
+        ]
+        if not timeouts:
+            continue
+        previous.append((pg, timeouts[0]))
+        _set_pg_timeout(max(load_timeout, timeouts[0]), pg)
+    try:
+        yield
+    finally:
+        for pg, timeout in previous:
+            _set_pg_timeout(timeout, pg)
+
+
+@contextlib.contextmanager
+def _checkpoint_load_debug_logging():
+    """NRL_CKPT_LOAD_DEBUG=1: per-rank timestamped timings of every dist-checkpoint
+    load phase (Megatron's ``debug_time`` DEBUG lines: metadata exchange, this
+    rank's storage reads, the tensor/object exchange), to find a rank that stalls
+    the fully-parallel load. Off by default."""
+    if os.environ.get("NRL_CKPT_LOAD_DEBUG") != "1":
+        yield
+        return
+    import logging
+
+    log = logging.getLogger("megatron.core.dist_checkpointing")
+    handler = logging.StreamHandler()
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+    handler.setFormatter(
+        logging.Formatter(f"[ckpt load debug] %(asctime)s rank {rank} %(message)s")
+    )
+    old_level, old_propagate = log.level, log.propagate
+    log.addHandler(handler)
+    log.setLevel(logging.DEBUG)
+    log.propagate = False
+    try:
+        yield
+    finally:
+        log.removeHandler(handler)
+        log.setLevel(old_level)
+        log.propagate = old_propagate
+
+
 def _validate_training_config(config: PolicyConfig, model_cfg: Any) -> None:
     """Validate training configuration."""
     assert "train_iters" in config["megatron_cfg"], (
@@ -2268,6 +2425,70 @@ def _patch_bridge_signal_handler_for_worker_threads() -> None:
     _BRIDGE_SIGNAL_HANDLER_PATCHED = True
 
 
+_BRIDGE_SAVE_PLAN_GROUP_PATCHED = False
+_SAVE_PLAN_GLOO_GROUP = None
+
+
+def _save_plan_gloo_group():
+    """World-sized Gloo group for torch-dist checkpoint planning (created on first use by every rank)."""
+    global _SAVE_PLAN_GLOO_GROUP
+    if _SAVE_PLAN_GLOO_GROUP is None:
+        _SAVE_PLAN_GLOO_GROUP = torch.distributed.new_group(backend="gloo")
+    return _SAVE_PLAN_GLOO_GROUP
+
+
+def _patch_bridge_sync_save_plan_group() -> None:
+    """Run the synchronous torch-dist save's plan exchange on Gloo, not on the NCCL world group.
+
+    MCore's ``TorchDistSaveShardedStrategy.save`` calls ``torch.distributed.checkpoint.save``
+    without a process group, so DCP's coordinator exchange (``gather_object`` of every rank's
+    local plan, ``scatter_object_list`` of the global plan) runs on the default NCCL group.
+    NCCL implements gather / scatter with point-to-point sends, and the first ones set up
+    persistent P2P connections (per-channel buffers) between the coordinator and every peer.
+    They stay allocated for the communicator's lifetime and nothing else in training uses
+    them: about 0.375 GiB per peer on GB200 (NCCL 2.30), i.e. +0.375 GiB on every rank and
+    +0.375 x (world - 1) GiB on the coordinator (full Nano EP4, 8 learner ranks: +2.62 GiB of
+    non-PyTorch memory on rank 0 from the first save on; linear in the learner world size).
+    The plan exchange only moves pickled metadata, so it runs on a Gloo group here; the
+    shard data is written by each rank locally as before (same files, same bytes).
+    """
+    global _BRIDGE_SAVE_PLAN_GROUP_PATCHED
+    if _BRIDGE_SAVE_PLAN_GROUP_PATCHED:
+        return
+    from megatron.bridge.training import checkpointing as bridge_ckpt
+    from megatron.core.dist_checkpointing.strategies import torch as mcore_torch
+
+    base = bridge_ckpt.TorchDistSaveShardedStrategy
+
+    class GlooPlanTorchDistSaveShardedStrategy(base):
+        def save(self, sharded_state_dict, checkpoint_dir):
+            if self.separation_hint is not None or not torch.distributed.is_initialized():
+                return super().save(sharded_state_dict, checkpoint_dir)
+            # MCore's synchronous save, with DCP's process group set (mcore torch.py save()).
+            sharded_state_dict, _flat_mapping, _rename_mapping = (
+                mcore_torch._replace_state_dict_keys_with_sharded_keys(
+                    sharded_state_dict, self.keep_only_main_replica
+                )
+            )
+            pyt_state_dict = mcore_torch.mcore_to_pyt_state_dict(sharded_state_dict, False)
+            writer = mcore_torch._get_filesystem_writer(
+                checkpoint_dir, thread_count=self.thread_count
+            )
+            mcore_torch.checkpoint.save(
+                pyt_state_dict,
+                storage_writer=writer,
+                planner=mcore_torch.MCoreSavePlanner(
+                    dedup_replicated_tensors=not self.keep_only_main_replica,
+                    flatten_state_dict=False,
+                    flatten_sharded_tensors=False,
+                ),
+                process_group=_save_plan_gloo_group(),
+            )
+
+    bridge_ckpt.TorchDistSaveShardedStrategy = GlooPlanTorchDistSaveShardedStrategy
+    _BRIDGE_SAVE_PLAN_GROUP_PATCHED = True
+
+
 def build_inference_model(
     policy_cfg: PolicyConfig,
     megatron_cfg: ConfigContainer,
@@ -2362,6 +2583,10 @@ def build_inference_model(
             wrap_with_ddp=False,  # never trained: no DDP, no grad buffers, no optimizer
         )
     inference_model = inference_model[0]
+    from nemo_rl.models.megatron import latent_tp_shard
+
+    if latent_tp_shard.enabled():
+        latent_tp_shard.shard_model([inference_model])
     inference_model.eval()
     return inference_model
 
@@ -2378,6 +2603,7 @@ def setup_model_and_optimizer(
 ):
     state = GlobalState()
     _patch_bridge_signal_handler_for_worker_threads()
+    _patch_bridge_sync_save_plan_group()
     state.cfg = megatron_cfg
     # TODO: Freeze state.cfg
 
@@ -2623,6 +2849,11 @@ def setup_model_and_optimizer(
 
     if additional_pre_wrap_hooks:
         pre_wrap_hook.extend(additional_pre_wrap_hooks)
+    # TP-sharded latent MoE projections (opt-in; before DDP sizes its buffers).
+    from nemo_rl.models.megatron import latent_tp_shard
+
+    if latent_tp_shard.enabled():
+        pre_wrap_hook.append(latent_tp_shard.pre_wrap_hook)
 
     # Model, optimizer, and learning rate.
     pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -2678,7 +2909,17 @@ def setup_model_and_optimizer(
     if should_load_checkpoint:
         if pre_load_checkpoint_hook is not None:
             pre_load_checkpoint_hook(state, model)
-        with _sync_consumed_samples_on_scheduler_load(state, scheduler):
+        load_start = time.time()
+        with (
+            _sync_consumed_samples_on_scheduler_load(state, scheduler),
+            _checkpoint_load_debug_logging(),
+            _checkpoint_load_collective_timeout(
+                policy_cfg["megatron_cfg"].get(
+                    "checkpoint_load_timeout_minutes",
+                    DEFAULT_CHECKPOINT_LOAD_TIMEOUT_MINUTES,
+                )
+            ),
+        ):
             load_checkpoint(
                 state,
                 model,
@@ -2688,7 +2929,17 @@ def setup_model_and_optimizer(
                 skip_load_to_model_and_opt=HAVE_FSDP2
                 and megatron_cfg.dist.use_torch_fsdp2,
             )
-        print("Checkpoint loaded")
+            own_s = time.time() - load_start
+            # Every rank leaves the load window together (see
+            # _checkpoint_load_collective_timeout): ranks whose groups finished
+            # early must not enter a normal-timeout collective while another
+            # group is still reading.
+            torch.distributed.barrier()
+        print(
+            f"Checkpoint loaded (rank {torch.distributed.get_rank()}: "
+            f"{own_s:.1f} s own, {time.time() - load_start:.1f} s all ranks)",
+            flush=True,
+        )
 
         # See _force_sync_optimizer_fp32_from_model: required when
         # optimizer_cpu_offload=True so the first optimizer step does Adam on the
@@ -2913,6 +3164,7 @@ def setup_reference_model_state(
                 )
             )
 
+    reference_model = None
     try:
         reference_model = get_model(
             megatron_cfg.model,
@@ -2956,7 +3208,13 @@ def setup_reference_model_state(
             for name, item in reference_model.state_dict().items():
                 if isinstance(item, torch.Tensor):
                     cpu_item = item.detach().to(
-                        device="cpu", non_blocking=True, copy=True
+                        device="cpu",
+                        # Pinned (non_blocking) copies round up in the pinned host allocator;
+                        # with the optimizer state also in host RAM that inflates host memory.
+                        non_blocking=not config["megatron_cfg"]
+                        .get("optimizer", {})
+                        .get("optimizer_cpu_offload", False),
+                        copy=True,
                     )
                     del item
                 else:
@@ -2967,6 +3225,11 @@ def setup_reference_model_state(
             print("Reference model not loaded")
     finally:
         clear_global_router_replay_instances()
+        # DDP autograd hooks form reference cycles that keep the temporary reference model's
+        # parameters and gradient buffers alive on the GPU after its CPU snapshot is taken.
+        # Release them before the caller loads the policy (source: rl-determinism 69c3fd21).
+        reference_model = None
+        gc.collect()
 
     return reference_state_dict
 

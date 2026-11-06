@@ -1,0 +1,14 @@
+# Arm "sync_coloc": NeMo-RL's standard synchronous GRPO (nemo_rl.algorithms.grpo.grpo_train via
+# run_ab_baseline.py) with the learner and the Megatron engine COLOCATED on the same GPUs: every
+# rollout of step k is generated at theta_k, then the same GPUs train on the whole batch. Exact
+# on-policy; no GPU idles while the other phase runs. Same exact-numerics recipe, data, caps and G
+# as every other arm (ab_base.yaml); the job is sized to one side's layout (submit_ab.sh).
+defaults: ab_base.yaml
+
+policy:
+  generation:
+    colocated:
+      enabled: true
+    refit_transport: mcore  # colocated Megatron generation reshards in place into its inference model
+    mcore_generation_config:
+      refit_backend: nccl

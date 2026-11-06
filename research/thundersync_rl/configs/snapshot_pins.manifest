@@ -1,0 +1,13 @@
+# Pinned dependency trees of this branch line (s1): the frozen Megatron-LM / Megatron-Bridge worktrees and the TE
+# overlay that clean_branch/ladder/freeze.sh writes into a snapshot's .snapshot_pins (with absolute roots) and that
+# nemo_rl/utils/module_provenance.py enforces at startup. Commit = git HEAD of the pinned tree, hash = module_provenance.tree_hash
+# of the package files. *_DIR names the tree (Megatron: next to the RL checkout; TE: under thundersync_work).
+# Tested by research/thundersync_rl/tests/unit/test_snapshot_pins_manifest.py.
+MEGATRON_LM_DIR=Megatron-LM-pin-3ae0ddcd
+MEGATRON_LM_SHA=3ae0ddcdc0f6824379244f74da6a29f8c2ab7d5f
+MEGATRON_LM_HASH=0fdf16ca41d969cd2e2cfa21b6a5e19be7ddbabadc1d94d918f40dc12e210cfd
+MEGATRON_BRIDGE_DIR=Megatron-Bridge-pin-1f8873bb/src
+MEGATRON_BRIDGE_SHA=1f8873bb00a8ddf3af811649f0a7efdb2363570c
+MEGATRON_BRIDGE_HASH=c83b2634f199d737d529b9953fe69f31d74a6a2610305eae9a75939f3bca5f2d
+TE_DIR=overlay_bi
+TE_HASH=75b8fb3a2798badf82d7a202ee89508b6b2eb4ed0eb7d4aecb545e4ae3df603e

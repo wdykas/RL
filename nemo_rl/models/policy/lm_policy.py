@@ -616,6 +616,29 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # this function should co-work with vllm, so we should wait for all futures to complete outside
         return futures
 
+    def reserve_refit_store(
+        self,
+        world_size: int,
+        *,
+        port_range_low: int,
+        port_range_high: int,
+        preferred_port: int | None = None,
+    ) -> tuple[str, int]:
+        """Bind the native-refit TCPStore on learner rank 0; returns its (ip, port).
+
+        Pass the result to ``init_collective_mcore_generation`` on both sides.
+        """
+        return ray.get(
+            self.worker_group.run_single_worker_single_data(
+                "reserve_refit_store",
+                worker_idx=0,
+                world_size=world_size,
+                port_range_low=port_range_low,
+                port_range_high=port_range_high,
+                preferred_port=preferred_port,
+            )
+        )
+
     def init_collective_mcore_generation(
         self,
         ip: str,
@@ -797,8 +820,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         self,
         data: BatchedDataDict[GenerationDatumSpec],
         timer: Optional[Timer] = None,
+        law_check: Optional[dict] = None,
     ) -> BatchedDataDict[LogprobOutputSpec]:
         """Get the logprobs of the model for a data dict.
+
+        ``law_check``: forwarded to the workers (Megatron: ThunderSync law test stats).
 
         Returns:
           a BatchedDataDict with key "logprobs" and shape [batch_size, sequence_length].
@@ -828,6 +854,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     "tensor_parallel",
                     "pipeline_parallel",
                 ],
+                **({"common_kwargs": {"law_check": law_check}} if law_check is not None else {}),
             )
         logprobs: BatchedDataDict[LogprobOutputSpec] = BatchedDataDict.from_batches(
             self.worker_group.get_all_worker_results(futures)

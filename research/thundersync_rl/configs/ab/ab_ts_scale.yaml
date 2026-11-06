@@ -1,0 +1,41 @@
+# Arm "ts_scale": the production configuration.
+# ts_por (sticky routing + pooled ⊥-BV) with the best configuration measured or modeled on the integ6 / exact-harden
+# line as defaults. Everything else stays opt-in (exact_top_p, sticky_nucleus, engine_sampler=exact_int, anchor_epoch,
+# verify0_stream, verify_on=engine, banded IS, sticky rounding, momentum drafts).
+# Set by the launcher (run_ab_arm.sh, not here): LANES=2 (cohort lanes), LGRAPHS=1 (learner device dispatch + no-grad
+# graphs), V0B=tcap (verify0 budget = device-dispatch token cap), the layout (EP / GPUs), checks, checkpoints.
+defaults: ab_ts_por.yaml
+
+thundersync:
+  # Drafts from the live theta_k (lookahead-2 drafts start mid-step on theta_k; momentum drafts mid-step are not built).
+  draft_weights: current
+  draft_cut_slack_s: 0.5
+  # ⊥-BV drafts per output K = 2.0 (critic X4: late fails/step K 1.5 1.34 -> 1.75 0.30 -> 2.0 0.067 [D, count process
+  # calibrated in loop]). Fit: lane capacity = max_requests x engine DP = 256 x 4 = 1024 = 2.0 x 64 x 8 per EP4 lane at
+  # 4 nodes (weak scaling keeps the ratio: 8 / 16 nodes double / quadruple both). Engine memory is set by max_requests
+  # (Mamba state per slot + paged KV), so K 2.0 costs no engine memory over K 1.75 at max_requests 256; it costs decode
+  # rows: 256 instead of 224 per drafting-lane rank.
+  null_bv_drafts_per_output: 2.0
+  # Every submitted draft starts at the top of the window (also closes the queued-admission presence channel).
+  draft_admission: fit
+  # Two-period drafting on the cohort lanes.
+  cohort_lane_lookahead: 2
+  # One-shot verify0 packed per learner forward (budget from V0B=tcap).
+  verify0_stream: false
+  # Tails: piece verification yields into training, no chunk growth, canonical tail-group order by kept tokens.
+  verify_yield: true
+  sticky_continuation_chunk_growth: 0
+  tail_group_order: kept
+  # Filler micro-batches of empty rows.
+  short_fillers: true
+  # 53-bit keyed engine sampler (the code default, stated here).
+  engine_sampler: wide
+
+policy:
+  generation:
+    mcore_generation_config:
+      cuda_graph_all_prefills: true
+      # 256 slots per engine rank: K 2.0 x G 8 x prompts / engine DP per lane (see above). 48 GiB buffer at 8k:
+      # 256 x ~125 MB Mamba state + 256 full 10240-token rows of KV (6 KiB/token) fit. 32k needs ~96 GB
+      # (SCALE_RUNBOOK.md: the launcher sets it from MAXLEN).
+      max_requests: 256

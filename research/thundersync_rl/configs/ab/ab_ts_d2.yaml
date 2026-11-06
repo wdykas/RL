@@ -1,0 +1,9 @@
+# Arm "ts_d2": ThunderSync at depth 2 (lanes-k; la2.py): 2 cohort lanes, the cohort lane of step s drafts cohort
+# s + 2 from theta_s once its own cohort is final (drafts age 2; the k - 1 cohorts after step 0 / a boundary fall
+# back to lookahead 1). Everything else is arm ts_scale (run_ab_arm.sh LANES=2).
+# Depth 2 IS lookahead 2 (ts_scale, LANES=2): this arm is the same-tree LA2 control of the depth series.
+defaults: ab_ts_scale.yaml
+
+thundersync:
+  cohort_lanes: 2
+  cohort_lane_lookahead: 2

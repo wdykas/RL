@@ -1,0 +1,404 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Momentum-predicted draft weights (``thundersync.draft_weights: momentum``).
+
+The engine drafts the rollouts of step n+1 with
+
+    theta_hat_{n+1} = AdamW step from (theta_n, m_n, v_n) with gradient 0,
+
+rounded to the parameter storage dtype, instead of theta_n. It is a different
+proposal q only: q stays the law the engine actually sampled (engine-sourced
+q), so block verification against pi_{n+1} is unchanged.
+
+theta_hat is computed on the learner from the Megatron DistributedOptimizer
+state, on the rank that owns each main-parameter shard (no gather of master or
+moments), in chunks of ``CHUNK_ELEMS`` elements (bounded fp32 temporaries),
+written into the DDP parameter buffer in place of cast(master) and all-gathered
+exactly as after an optimizer step. The existing refit path then streams the
+buffer to the engine, and the training weights are restored bitwise by the
+optimizer's own main -> model copy + all-gather. No extra full copy of the
+model is materialized.
+
+Precision-aware optimizer (``use_precision_aware_optimizer``): the masters live
+in TE FusedAdam's state (fp32, fp16-scaled, or bf16 parameter + int16 remainder
+bits); they are read per chunk the same way, and since TE writes the parameter
+slice inside its step (no main -> model copy to redo), the owned slice is saved
+before the draft is written (2 bytes per owned element) and copied back.
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field
+from typing import Iterator
+
+import torch
+
+DRAFT_WEIGHTS = ("current", "momentum")
+
+
+def momentum_draft_master(
+    w: torch.Tensor,
+    exp_avg: torch.Tensor,
+    exp_avg_sq: torch.Tensor,
+    *,
+    lr: float,
+    beta1: float,
+    beta2: float,
+    eps: float,
+    weight_decay: float,
+    step: int,
+    steps: int = 1,
+) -> torch.Tensor:
+    """fp32 master after ``steps`` AdamW steps with gradient 0, the first at optimizer count ``step``.
+
+    ``steps`` = h > 1 (anchor epochs: Psi_h): counts step .. step + h - 1, fp32 throughout, one final
+    rounding by the caller -- verbatim the E2 harness's ``psi(n, st, L)`` (research/sticky_alt/adam_lag_alt.py).
+
+    The expression (and its operation order) is the research harness's
+    ``adam_new(n, None, t + 1)`` (``research/sticky/adam_draft_gpu.py``,
+    ``draft_master_fn("mom")``), so the draft is bitwise the one the offline
+    acceptance numbers were measured with. ``step`` is the count of the update
+    being predicted (optimizer steps taken so far + 1). Does not mutate.
+    """
+    if int(steps) == 1:
+        mm = beta1 * exp_avg
+        vv = beta2 * exp_avg_sq
+        upd = (mm / (1 - beta1**step)) / ((vv / (1 - beta2**step)).sqrt() + eps)
+        return w - lr * (upd + weight_decay * w)
+    if int(steps) < 1:
+        raise ValueError(f"momentum draft: steps must be >= 1 (got {steps})")
+    mm, vv = exp_avg, exp_avg_sq
+    for j in range(int(steps)):
+        t1 = step + j
+        mm = beta1 * mm
+        vv = beta2 * vv
+        w = w - lr * ((mm / (1 - beta1**t1)) / ((vv / (1 - beta2**t1)).sqrt() + eps) + weight_decay * w)
+    return w
+
+
+@dataclass
+class _Shard:
+    inner: torch.optim.Optimizer  # the Adam over main-parameter shards
+    group: dict
+    key: torch.Tensor  # the inner optimizer's parameter (its state key)
+    target: torch.Tensor  # this rank's slice of the DDP parameter buffer
+    # True when the buffer slice must be saved to be restored bitwise: an fp32
+    # model param (the main shard *is* the slice), or any param under the
+    # precision-aware optimizer (TE FusedAdam writes the slice in its step; there
+    # is no separate main -> model copy to redo).
+    aliased: bool
+    # fp32 main shard (default optimizer); None: masters inside TE FusedAdam.
+    main: torch.Tensor | None = None
+
+
+def master_from_remainders(param: torch.Tensor, remainder: torch.Tensor) -> torch.Tensor:
+    """fp32 master of TE FusedAdam ``store_param_remainders`` (bf16 param + int16 low bits).
+
+    TE keeps the high 16 bits in the bf16 parameter, rounded up when the low
+    16 bits (the int16 remainder) have their top bit set (negative as int16),
+    so the high half is ``param bits - (remainder < 0)``. Inverse of
+    ``multi_tensor_adam_param_remainder``'s split; elementwise.
+    """
+    if param.dtype != torch.bfloat16 or remainder.dtype != torch.int16:
+        raise TypeError(f"expected bf16 param + int16 remainder, got {param.dtype}, {remainder.dtype}")
+    hi = param.view(torch.int16).to(torch.int32) - (remainder < 0).to(torch.int32)
+    bits = (hi << 16) | (remainder.to(torch.int32) & 0xFFFF)
+    return bits.view(torch.float32)
+
+
+def _dist_optimizers(optimizer) -> list:
+    from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+
+    members = getattr(optimizer, "chained_optimizers", [optimizer])
+    for opt in members:
+        if not isinstance(opt, DistributedOptimizer):
+            raise NotImplementedError(
+                "draft_weights=momentum: built for Megatron's DistributedOptimizer "
+                f"(use_distributed_optimizer=true); got {type(opt).__name__}"
+            )
+        if opt.ddp_config.use_megatron_fsdp:
+            raise NotImplementedError("draft_weights=momentum: Megatron-FSDP not built yet")
+        if opt.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8 and not hasattr(
+            opt.optimizer, "get_unscaled_state"
+        ):
+            raise NotImplementedError(
+                "draft_weights=momentum: the precision-aware optimizer is built for "
+                f"TE FusedAdam (master weights in its state); got {type(opt.optimizer).__name__}"
+            )
+        if opt.ddp_config.fp8_param_gather or opt.ddp_config.fp4_param_gather:
+            raise NotImplementedError("draft_weights=momentum: fp8/fp4 params not built yet")
+        if not getattr(opt.optimizer, "adam_w_mode", True):
+            raise NotImplementedError(
+                "draft_weights=momentum: the draft is an AdamW (decoupled weight decay) step"
+            )
+    return [opt for opt in members if not opt.is_stub_optimizer]
+
+
+def _shards(optimizer) -> Iterator[_Shard]:
+    """Every main-parameter shard of this rank with its parameter-buffer slice."""
+    for opt in _dist_optimizers(optimizer):
+        group_of = {
+            id(p): g for g in opt.optimizer.param_groups for p in g["params"]
+        }
+        if opt.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+            # The inner optimizer's params are the model-param shards (views of
+            # the buffer); TE FusedAdam holds their masters.
+            pairs = (
+                (opt.shard_float16_groups, opt.model_float16_groups, True, False),
+                (opt.shard_fp32_groups, opt.model_fp32_groups, True, False),
+            )
+        else:
+            pairs = (
+                (opt.shard_fp32_from_float16_groups, opt.model_float16_groups, False, True),
+                (opt.shard_fp32_groups, opt.model_fp32_groups, True, True),
+            )
+        for keys, models, aliased, has_main in pairs:
+            for key_group, model_group in zip(keys, models):
+                for key, model_param in zip(key_group, model_group):
+                    world_range = opt._get_model_param_range_map(model_param)[
+                        "gbuf_world_in_bucket"
+                    ]
+                    gbuf_index, _, bucket_id = opt.model_param_gbuf_map[model_param]
+                    buf = opt.buffers[gbuf_index].buckets[bucket_id].param_data
+                    yield _Shard(
+                        inner=opt.optimizer,
+                        group=group_of[id(key)],
+                        key=key,
+                        target=buf.view(-1)[world_range.start : world_range.end],
+                        aliased=aliased,
+                        main=key if has_main else None,
+                    )
+
+
+def _adam_state(inner, main: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Flat (exp_avg, exp_avg_sq) of a main shard; zeros before the first step."""
+    if not inner.state.get(main):
+        z = main.new_zeros(()).expand(main.numel())  # flat zeros, no allocation
+        return z, z
+    get = getattr(inner, "get_unscaled_state", None)
+    if get is not None:  # TE FusedAdam (handles fp16/bf16/fp8-stored states)
+        m, v = get(main, "exp_avg"), get(main, "exp_avg_sq")
+    else:
+        m, v = inner.state[main]["exp_avg"], inner.state[main]["exp_avg_sq"]
+    return m.view(-1), v.view(-1)
+
+
+# Elements per draft computation: bounds the fp32 temporaries (about 5 x 4 B per
+# element) independently of the largest parameter shard. The formula is
+# elementwise, so chunking does not change a bit.
+CHUNK_ELEMS = 1 << 24
+
+
+def _master_chunks(shard: _Shard):
+    """Callable slice -> fp32 master values of the shard (no full fp32 copy if avoidable)."""
+    if shard.main is not None:
+        w = shard.main.view(-1)
+        return lambda sl: w[sl]
+    state = shard.inner.state.get(shard.key)
+    param = shard.key.view(-1)
+    if not state or "master_param" not in state:
+        # fp32 param (its own master), or before the first step: the master is
+        # the parameter itself.
+        return lambda sl: param[sl].float()
+    master = state["master_param"]
+    if master.dtype == torch.int16:  # store_param_remainders
+        rem = master.view(-1)
+        return lambda sl: master_from_remainders(param[sl], rem[sl])
+    full = shard.inner.get_unscaled_state(shard.key, "master_param").view(-1)
+    return lambda sl: full[sl].float()
+
+
+def _draft_chunks(shard: _Shard, chunk: int, steps: int = 1) -> Iterator[tuple[slice, torch.Tensor]]:
+    """(slice, rounded draft) of one main shard, ``chunk`` elements at a time."""
+    g = shard.group
+    beta1, beta2 = g["betas"]
+    m, v = _adam_state(shard.inner, shard.key)
+    master = _master_chunks(shard)
+    n = shard.target.numel()
+    for start in range(0, n, chunk):
+        sl = slice(start, min(start + chunk, n))
+        draft = momentum_draft_master(
+            master(sl),
+            m[sl].float(),  # no-op for fp32 states
+            v[sl].float(),
+            lr=g["lr"],
+            beta1=beta1,
+            beta2=beta2,
+            eps=g["eps"],
+            weight_decay=g["weight_decay"],
+            step=int(g.get("step", 0)) + 1,
+            steps=steps,
+        )
+        yield sl, draft.to(shard.target.dtype)
+
+
+def check_no_expert_bias_updates(model) -> None:
+    """Refuse momentum drafts when MoE expert-bias updates are enabled (not built yet).
+
+    ``load_draft`` writes theta_hat into the optimizer-owned parameters only;
+    ``expert_bias`` is a buffer updated in ``finalize_model_grads`` before the
+    optimizer step, so the staged drafting weights would carry the old bias
+    (not its predicted update) and ``EngineStage`` stages parameters only.
+    Staging the bias buffer is not built yet: the combination is an error.
+    """
+    chunks = model if isinstance(model, (list, tuple)) else [model]
+    for chunk in chunks:
+        for name, mod in chunk.named_modules():
+            cfg = getattr(mod, "config", None)
+            rate = getattr(cfg, "moe_router_bias_update_rate", 0.0) or 0.0
+            enabled = getattr(cfg, "moe_router_enable_expert_bias", False)
+            if getattr(mod, "expert_bias", None) is not None and enabled and rate:
+                raise NotImplementedError(
+                    f"draft_weights=momentum with expert-bias updates "
+                    f"(moe_router_bias_update_rate={rate}, {name}.expert_bias): the "
+                    "momentum stage does not stage the expert_bias buffer (not built yet)"
+                )
+
+
+@dataclass
+class DraftSwap:
+    """Training weights temporarily replaced by draft weights (see ``load_draft``)."""
+
+    optimizer: object
+    # fp32 model params whose main shard is the buffer itself: original values.
+    saved: list[tuple[torch.Tensor, torch.Tensor]] = field(default_factory=list)
+    stats: dict[str, float] = field(default_factory=dict)
+
+
+def _param_sync(optimizer) -> None:
+    for chunk in optimizer.model_chunks:
+        chunk.start_param_sync(force_sync=True)
+
+
+@torch.no_grad()
+def load_draft(optimizer, kind: str, chunk: int = CHUNK_ELEMS, steps: int = 1) -> DraftSwap:
+    """Write draft weights ``kind`` into the model parameters (all ranks, collective).
+
+    Per main shard: compute the fp32 draft, round it into the shard's slice of
+    the parameter buffer (as the optimizer's main -> model copy does), then
+    all-gather the buffers as after an optimizer step. Undo with
+    ``restore_training``. Frozen parameters (no main shard) keep theta_n,
+    which is their AdamW step too.
+    """
+    if kind != "momentum":
+        raise ValueError(f"unknown draft weights {kind!r} (expected one of {DRAFT_WEIGHTS})")
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    base = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    swap = DraftSwap(optimizer)
+    changed = total = 0
+    for shard in _shards(optimizer):
+        if shard.aliased:
+            swap.saved.append((shard.target, shard.target.clone()))
+        target = shard.target.view(-1)
+        for sl, new in _draft_chunks(shard, chunk, steps):
+            changed += (new != target[sl]).sum()  # on device: no sync per chunk
+            total += new.numel()
+            target[sl].copy_(new)
+    torch.cuda.synchronize()
+    t1 = time.perf_counter()
+    _param_sync(optimizer)
+    torch.cuda.synchronize()
+    swap.stats = {
+        "draft/compute_s": t1 - t0,
+        "draft/gather_s": time.perf_counter() - t1,
+        "draft/peak_extra_bytes": float(torch.cuda.max_memory_allocated() - base),
+        "draft/changed_elems": float(changed),  # one sync, after the gather
+        "draft/shard_elems": float(total),
+    }
+    return swap
+
+
+@torch.no_grad()
+def restore_training(swap: DraftSwap) -> dict[str, float]:
+    """Put theta_n back, bitwise: saved slices, the optimizer's main -> model copy, all-gather."""
+    t0 = time.perf_counter()
+    for target, orig in swap.saved:
+        target.copy_(orig)
+    swap.saved.clear()
+    swap.optimizer.quantize_and_sync_model_params_from_main_params()
+    torch.cuda.synchronize()
+    return {"draft/restore_s": time.perf_counter() - t0}
+
+
+class EngineStage:
+    """Host staging copy of an engine rank's weights (the next drafting weights).
+
+    The draft weights are refit into the engine at the top of a step, copied
+    here, and replaced by the step's rollout weights; once the rollouts are
+    done ``load`` copies them back into the same parameter storage (CUDA graphs
+    keep pointing at it). Local to the rank: no collective, no learner. Costs
+    one pinned host copy of the rank's parameters (allocated once) and one
+    device -> host and one host -> device copy of them per step.
+    """
+
+    def __init__(self) -> None:
+        self._host: list[torch.Tensor] = []
+
+    @staticmethod
+    def _params(model) -> list[torch.Tensor]:
+        chunks = model if isinstance(model, (list, tuple)) else [model]
+        seen, out = set(), []
+        for chunk in chunks:
+            for p in chunk.parameters():
+                key = (p.data_ptr(), p.numel(), p.dtype)
+                if key not in seen:
+                    seen.add(key)
+                    out.append(p.data)
+        return out
+
+    @staticmethod
+    def _checksum(tensors: list[torch.Tensor]) -> float:
+        return float(sum(t.double().sum() for t in tensors))
+
+    @torch.no_grad()
+    def stage(self, model, checksum: bool = False) -> dict[str, float]:
+        """Copy the live parameters of ``model`` into the host staging buffers."""
+        t0 = time.perf_counter()
+        params = self._params(model)
+        if [(h.shape, h.dtype) for h in self._host] != [(p.shape, p.dtype) for p in params]:
+            pin = torch.cuda.is_available()
+            self._host = [
+                torch.empty(p.shape, dtype=p.dtype, device="cpu", pin_memory=pin)
+                for p in params
+            ]
+        for h, p in zip(self._host, params):
+            h.copy_(p, non_blocking=True)
+        if torch.cuda.is_available():
+            torch.cuda.current_stream().synchronize()
+        out = {
+            "stage_s": time.perf_counter() - t0,
+            "stage_bytes": float(sum(h.numel() * h.element_size() for h in self._host)),
+        }
+        if checksum:
+            out["checksum"] = self._checksum(params)
+        return out
+
+    @torch.no_grad()
+    def load(self, model, checksum: bool = False) -> dict[str, float]:
+        """Copy the staged weights back into the parameters of ``model``, in place."""
+        params = self._params(model)
+        if [(h.shape, h.dtype) for h in self._host] != [(p.shape, p.dtype) for p in params]:
+            raise RuntimeError("engine weights were not staged for this model")
+        t0 = time.perf_counter()
+        for h, p in zip(self._host, params):
+            p.copy_(h, non_blocking=True)
+        if torch.cuda.is_available():
+            torch.cuda.current_stream().synchronize()
+        out = {"load_s": time.perf_counter() - t0}
+        if checksum:
+            out["checksum"] = self._checksum(params)
+        return out

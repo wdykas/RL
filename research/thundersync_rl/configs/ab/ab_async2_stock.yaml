@@ -1,0 +1,29 @@
+# Arm "async2_stock" (R-C7, user 10-28): lanes-k async2 (ab_async2.yaml) with the exact-numerics recipe and batch
+# invariance OFF, as ab_async1_stock.yaml on ts-baseline da11ad53 (red team 10-16 finding 3): bf16 GEMMs and residual,
+# MoE permute fusion, no zero-train-gen-mismatch. The best-configured non-BI async-2 on the same lanes,
+# learner loop, GPUs and prompts. Launch with EPINV=0 (no EP-invariant combine) and LGRAPHS=0 (device dispatch is
+# inactive with permute fusion). Differences to ab_async1_stock: run_ab_arm.sh on this line keeps the cuBLAS
+# workspace / TF32 pins (the da11ad53 launcher dropped them for *_stock arms); IS correction stays on (stale rollouts).
+defaults: ab_async2.yaml
+
+policy:
+  megatron_cfg:
+    batch_invariant_mode: false
+    zero_train_gen_mismatch: false
+    forward_gemm_precision: null
+    fp32_residual_connection: false
+    moe_permute_fusion: true
+    # The BI recipe pins FA4 (ab_base), but with batch invariance off attention takes Megatron's flash path, and
+    # FlashAttention-4 is not installed in the image ("flash_attention_version=4 requested but FlashAttention-4 is
+    # not installed"): auto (FA3 > FA2) as stock Megatron.
+    flash_attention_version: null
+  generation:
+    mcore_generation_config:
+      # Chunked prefill stays OFF, as on the BI async2 arm (ab_base): it is not a batch-invariance setting, so turning
+      # it on would be a second difference. (With it on, a Super-L22 run died at step 1: a partial
+      # prefill chunk is sampled and its draw discarded, and the always-on wide-sampler key check saw request r at
+      # position len(prompt) twice -> SamplerKeyError -> engine event loop exited. test_ab_async2_stock_config.py.)
+      enable_chunked_prefill: false
+      # BI forces fp32 Mamba SSM states (MCore InferenceConfig); with BI off the default would be the params dtype.
+      # Pinned to fp32 so the stock arm keeps the BI arm's state precision.
+      mamba_inference_ssm_states_dtype: float32

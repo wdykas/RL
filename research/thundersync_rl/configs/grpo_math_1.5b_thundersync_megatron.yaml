@@ -1,0 +1,127 @@
+# ThunderSyncRL: zero-staleness GRPO with gradient streaming.
+# Megatron training backend + non-colocated Megatron inference backend.
+defaults: "../../../examples/configs/grpo_math_1B_megatron.yaml"
+
+thundersync:
+  granularity: trajectory  # trajectory (ThunderSyncRL) | group | batch (sync baseline)
+  storage_device: cuda  # per-group accumulators: cuda | cpu (pinned host memory)
+  max_buckets_per_group: 2  # distinct rewards per open group before collapsing to (G1, G2)
+  max_open_groups: 4  # cap on groups holding gradient buckets (bounds accumulator memory)
+  max_chunk_trajectories: 8
+  # Deal each training dispatch's rows over every learner DP rank, one micro-batch per unit:
+  # no all-masked filler micro-batches under expert parallelism. false: whole max_chunk_trajectories chunks per rank.
+  deal_rows: true
+  # Sticky fp16 rounding toward a theta_{k-1} anchor forward (opt-in, needs sticky_routing).
+  sticky_rounding: false
+  # Pipeline parallelism: one pipeline call per dispatch and
+  # gradient destination; hold closed-group rows until this many micro-batches per
+  # learner rank are queued (null: 2 * PP when PP > 1, else 0), flushed at the end.
+  merge_pipeline_calls: true
+  min_pipeline_microbatches: null
+  # Cross-iteration speculative rollouts. Off by default; the values below
+  # are the defaults that apply when it is on (validated at 1.5B on 2+2 GPUs). Also set
+  # NVIDIA_TF32_OVERRIDE=1 for TF32 GEMMs in the fp32 verification scorer.
+  speculate: false
+  draft_budget: 4096  # max new tokens per draft
+  draft_start_frac: 0.0  # start drafting at this fraction of finished rollouts
+  draft_lookahead: 3  # iterations drafted concurrently; cut drafts resume next iteration
+  verify_mode: block  # block (max expected kept prefix) | keyed (shared-randomness; reproduces plain decoding). Both exact with verify_source=engine under batch invariance
+  verify_precision: fp32  # fp32 Megatron scorer copy | model (training dtypes, ~90% kept)
+  verify_lazy: false  # lazy, logit-free block verification (same decisions; A/B pending)
+  verify_on: both  # learner | inference | both: worker groups that verify
+  verify_chunks: 4  # verification chunks; plans publish as each finishes
+  verify_overlap: true  # verify concurrently with the rollouts
+  verify_longest_first: true  # longest drafts (likely stragglers) first
+  verify_batch_tokens: 16384  # tokens per scorer forward (bounds logits memory)
+  # Risk-first streaming verify0 (opt-in, sticky streaming over the tails): verify0 runs inside
+  # the step in calls of whole prompts, riskiest first (draft length x past steps' whole acceptance); each
+  # prompt's tails start at its decision and its ready groups train between the calls.
+  verify0_stream: false
+  verify0_stream_first_chunk_tokens: 262144  # forward tokens of the first call (the riskiest prompts)
+  verify0_stream_chunk_tokens: 524288  # forward tokens of each later call
+  verify0_stream_window: 2  # verification calls queued on the learner at once
+  verify0_stream_order: risk  # risk (past-only score, riskiest first) | drafting (control)
+  # EXPERIMENTAL (untested on GPU): fused verification + training under
+  # policy.megatron_cfg.batch_invariant_mode. Needs verify_on=learner and
+  # verify_precision=model; 
+  fused_verify_train: false
+  fused_max_retained_tokens: 16384  # retained verification graphs per learner rank
+
+grpo:
+  num_prompts_per_step: 16
+  num_generations_per_prompt: 8
+  max_num_steps: 20
+  val_period: -1
+  val_at_start: false
+  normalize_rewards: true
+  use_leave_one_out_baseline: true
+  async_grpo:
+    # Engine KV caches persist across refits (the default before upstream #3929 flipped it to recompute):
+    # ThunderSync verifies and continues drafts itself, and engine CUDA graphs need the static KV pointers.
+    recompute_kv_cache_after_weight_updates: false
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  force_on_policy_ratio: true
+  # Optional: correct the inference/training numerical mismatch (zero staleness removes
+  # policy lag, not kernel differences). Weights exp(log pi_train - log pi_infer) are
+  # detached per-token constants, so streaming stays exact.
+  use_importance_sampling_correction: false
+  truncated_importance_sampling_ratio: null  # e.g. 2.0
+  truncated_importance_sampling_type: null  # tis | icepop | seq-mask-tis
+  token_level_loss: true
+  # Zero-advantage rows add no gradient; skip their forward/backward (they still count in
+  # the loss normalization). Exact, and the learner chunks them separately.
+  skip_zero_advantage_rows: true
+
+policy:
+  model_name: Qwen/Qwen2.5-Math-1.5B-Instruct
+  max_total_sequence_length: 1024
+  train_global_batch_size: ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}
+  # Megatron micro-batches are CPU-launch bound at this size (~85 ms each), so
+  # fewer, larger ones are much faster (16x1024 tokens: 426 ms at 4 vs 283 ms at 8).
+  train_micro_batch_size: 8
+  # Round padded lengths so cuDNN fused attention reuses its plans instead of building a
+  # new one for every micro-batch (~120 ms CPU per micro-batch at 1.5B). Padding is masked.
+  make_sequence_length_divisible_by: 128
+  logprob_batch_size: 4
+  sequence_packing:
+    enabled: false
+  dynamic_batching:
+    enabled: false
+  megatron_cfg:
+    # The learner is non-colocated and never yields memory to inference, so skip
+    # the per-chunk torch.cuda.empty_cache() (costly with many small chunks).
+    empty_unused_memory_level: 0
+    optimizer:
+      lr: 1.0e-6
+      min_lr: 1.0e-6
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: true
+      overlap_param_gather: false
+  generation:
+    backend: megatron
+    refit_transport: null
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 2
+        num_nodes: 1
+    mcore_generation_config:
+      # Must agree with grpo.async_grpo.recompute_kv_cache_after_weight_updates=false (see above).
+      kv_cache_management_mode: persist
+      # Linear decode ladder step = cuda_graph_max_tokens / N; 4 pads the 1-8 request rollout
+      # tail to 128 tokens. 16 measured -30% decode time/token (auto/-1: same speed, 2x warmup).
+      num_cuda_graphs: 16
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 1
+
+logger:
+  log_dir: logs/thundersync
+  wandb_enabled: false
+  tensorboard_enabled: true
+
+checkpointing:
+  enabled: false

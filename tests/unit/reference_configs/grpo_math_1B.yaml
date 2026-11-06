@@ -125,6 +125,7 @@ loss_fn:
   positive_example_nll_weight: 0.0
   metrics_level: "full"
   enable_torch_compile: false
+  skip_zero_advantage_rows: false
 
 checkpointing:
   enabled: true

@@ -89,6 +89,9 @@ class MCoreGenerationSpecificArgs(TypedDict):
     ]
     # Token ceiling for captured prefill/mixed CUDA graphs. MCore default: 512.
     cuda_graph_max_tokens: NotRequired[int]
+    # Prefill/mixed CUDA graphs up to max_tokens (MCore InferenceConfig).
+    cuda_graph_all_prefills: NotRequired[bool]
+    cuda_graph_mixed_prefill_count: NotRequired[int]
     # Inference CUDA-graph scope. Options:
     # - 'none': inference runs in eager mode (no CUDA graphs).
     # - 'layer': graphs are owned at the per-layer boundary (TransformerLayer / MambaLayer).
@@ -111,6 +114,17 @@ class MCoreGenerationSpecificArgs(TypedDict):
     #   KV-cache pressure) mcore drops to a non-overlapped async ordering --
     #   not to legacy.
     async_sched_mode: NotRequired[Literal["legacy", "async"]]
+
+    # Generation progress line every N seconds (active / waiting / finished requests,
+    # generated tokens, tokens/s of the engine rank; plain counter reads, no device sync).
+    # Absent or null disables it. Logged on global rank 0 unless progress_log_all_ranks.
+    progress_log_interval_s: NotRequired[float | None]
+    progress_log_all_ranks: NotRequired[bool]
+    # Stall watchdog: a RUNNING engine rank with requests outstanding whose finished-request
+    # and generated-token counts do not grow for this many seconds dumps all thread stacks
+    # (faulthandler) and exits non-zero. Sampled at progress_log_interval_s. Absent or null
+    # disables it.
+    stall_timeout_s: NotRequired[float | None]
 
     vision_embedding_cache_max_bytes: NotRequired[int]
     allow_stale_multimodal_embeddings: NotRequired[bool]

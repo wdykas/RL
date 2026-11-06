@@ -72,6 +72,52 @@ from nemo_rl.distributed.model_utils import (
 )
 from nemo_rl.telemetry.vocabulary import TeedMetric, register_teed_metrics
 
+
+# -- deferred metric scalars ---------------------------------------------------
+# A learner micro-batch's loss metrics were ~15 ``.item()`` host syncs between its
+# forward and its backward (each drains the GPU queue). Under
+# ``deferred_metric_scalars()`` ClippedPGLossFn keeps them as 0-dim device tensors and
+# the caller turns every micro-batch's metrics into Python numbers with one copy at
+# the end of the learner call (``resolve_metric_scalars``): the same values (the
+# same tensors, read later), no host sync inside the call.
+_DEFER_SCALARS = [False]
+
+
+class deferred_metric_scalars:
+    """Within: ClippedPGLossFn metrics are device scalars (resolve them afterwards)."""
+
+    def __enter__(self):
+        self._prev = _DEFER_SCALARS[0]
+        _DEFER_SCALARS[0] = True
+        return self
+
+    def __exit__(self, *exc):
+        _DEFER_SCALARS[0] = self._prev
+        return False
+
+
+def _scalar(t: torch.Tensor):
+    """``t.item()``, or ``t`` itself (detached) inside ``deferred_metric_scalars``."""
+    return t.detach() if _DEFER_SCALARS[0] else t.item()
+
+
+def resolve_metric_scalars(metric_dicts) -> None:
+    """Replace 0-dim device tensors in the given metric dicts by ``.item()`` values, in place.
+
+    One device-to-host copy per (device, dtype) (values identical to per-scalar ``.item()``).
+    """
+    slots: dict = {}
+    for d in metric_dicts or []:
+        if not isinstance(d, dict):
+            continue
+        for k, v in d.items():
+            if isinstance(v, torch.Tensor) and v.dim() == 0:
+                slots.setdefault((v.device, v.dtype), []).append((d, k, v))
+    for items in slots.values():
+        vals = torch.stack([v for _, _, v in items]).cpu().tolist()
+        for (d, k, _), x in zip(items, vals):
+            d[k] = x
+
 if TYPE_CHECKING:
     # Import-time only: nemo_rl.algorithms.opd imports the data plane, which
     # would pull a heavy dependency chain into every loss-function consumer.
@@ -234,6 +280,11 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     # Compile the tensor-only actor objective when supported by the active
     # backend. The eager implementation remains the default path.
     enable_torch_compile: bool = False
+    # Skip forward/backward for rows whose advantages are all zero (e.g. GRPO groups with
+    # identical rewards). Exact: with no KL/NLL/distillation term their gradient is zero,
+    # and their tokens still count toward the loss normalization. Diagnostic metrics are
+    # averaged over the trained rows only. Supported by the Megatron split train API.
+    skip_zero_advantage_rows: bool = False
 
 
 class ClippedPGLossDataDict(TypedDict):
@@ -373,6 +424,17 @@ class ClippedPGLossFn(LossFunction):
         )
         self.use_on_policy_kl_approximation = cfg.use_on_policy_kl_approximation
         self.force_on_policy_ratio = cfg.force_on_policy_ratio  # Force ratio to 1.0
+        # THUNDERSYNC_TRAIN_LP_CHECK=1 (exactness check): force_on_policy_ratio sets the
+        # ratio to 1, which hides any difference between the TRAINING forward's log-probs
+        # and the rollout (verification / engine) log-probs. Report it per micro-batch:
+        # train_gen_lp_abs_diff_max (max |curr - generation| over trained tokens),
+        # train_gen_lp_inexact_tokens / train_gen_lp_tokens (counts). Device scalars only.
+        import os as _os
+
+        self.train_lp_check = (
+            self.force_on_policy_ratio
+            and _os.environ.get("THUNDERSYNC_TRAIN_LP_CHECK") == "1"
+        )
 
         # Whether to compute importance weights per-sequence instead of per-token.
         self.sequence_level_importance_ratios = cfg.sequence_level_importance_ratios
@@ -382,6 +444,22 @@ class ClippedPGLossFn(LossFunction):
         # Compile the actor objective lazily on the worker after Ray has
         # serialized the loss function.
         self._compiled_actor_objective = None
+        self.skip_zero_advantage_rows = cfg.skip_zero_advantage_rows
+        if self.skip_zero_advantage_rows:
+            # Every remaining loss term is advantage-weighted, so a zero-advantage
+            # row contributes exactly zero gradient.
+            nonzero_terms = {
+                "reference_policy_kl_penalty": self.reference_policy_kl_penalty != 0,
+                "positive_example_nll_weight": self.positive_example_nll_weight != 0,
+                "on_policy_distillation": self.opd_full is not None,
+                "seq_logprob_error_in_loss": self.seq_logprob_error_in_loss,
+            }
+            bad = [name for name, on in nonzero_terms.items() if on]
+            if bad:
+                raise ValueError(
+                    "loss_fn.skip_zero_advantage_rows requires a purely "
+                    f"advantage-weighted loss; disable: {bad}"
+                )
         self.loss_type = (
             LossType.TOKEN_LEVEL if cfg.token_level_loss else LossType.SEQUENCE_LEVEL
         )
@@ -514,6 +592,14 @@ class ClippedPGLossFn(LossFunction):
                 for name, normalizer in self.metric_normalizations.items()
                 if name in minimal_metrics
             }
+        if self.train_lp_check:
+            self.metric_normalizations.update(
+                {
+                    "train_gen_lp_abs_diff_max": MetricNormalizer.NONE,
+                    "train_gen_lp_inexact_tokens": MetricNormalizer.NONE,
+                    "train_gen_lp_tokens": MetricNormalizer.NONE,
+                }
+            )
         if self.truncated_importance_sampling_type is not None:
             # Keyed on the TIS type, NOT loss_type: seq-mask-tis masks whole
             # sequences (÷ global_valid_seqs); tis/icepop are token-level.
@@ -625,7 +711,25 @@ class ClippedPGLossFn(LossFunction):
 
         # For truly on-policy training, use curr_logprobs as prev_logprobs
         # This avoids computing prev_logprobs upstream
+        train_lp_metrics = {}
         if self.force_on_policy_ratio:
+            if self.train_lp_check:
+                # Before the ratio is forced to 1: the training forward's own log-probs
+                # against the rollout's (must be bitwise equal on an exact run).
+                live = mask.bool()
+                d = torch.where(
+                    live, (curr_logprobs.detach().float() - generation_logprobs.float()).abs(), 0.0
+                )
+                if "vit_logq" in data:
+                    # ThunderSync verify-in-train micro-batch: the batch was built before the decision
+                    # and carries the drafter's log q; a row kept for training was accepted whole by THIS forward,
+                    # so its rollout log-probs are this forward's (compare with itself; ts-longrun).
+                    d = torch.zeros_like(d)
+                train_lp_metrics = {
+                    "train_gen_lp_abs_diff_max": _scalar(d.max() if d.numel() else d.sum()),
+                    "train_gen_lp_inexact_tokens": _scalar((live & (d != 0)).sum().double()),
+                    "train_gen_lp_tokens": _scalar(live.sum().double()),
+                }
             prev_logprobs = curr_logprobs.detach()
 
         # Only top-k/top-p can mark -inf as an expected support mismatch.
@@ -651,12 +755,12 @@ class ClippedPGLossFn(LossFunction):
                 errors <= self.seq_logprob_error_threshold
             ).to(sample_mask.dtype)
             seq_error_metrics["num_masked_seqs_by_logprob_error"] = (
-                (sample_mask - filtered_sample_mask).sum().item()
+                _scalar((sample_mask - filtered_sample_mask).sum())
             )
             sample_mask = filtered_sample_mask
             mask = token_mask * sample_mask.unsqueeze(-1)
-            seq_error_metrics["seq_logprob_error_valid_tokens"] = mask.sum().item()
-            seq_error_metrics["seq_logprob_error_valid_seqs"] = sample_mask.sum().item()
+            seq_error_metrics["seq_logprob_error_valid_tokens"] = _scalar(mask.sum())
+            seq_error_metrics["seq_logprob_error_valid_seqs"] = _scalar(sample_mask.sum())
             # A rejected nonfinite logprob must not poison a zero-weight loss.
             curr_logprobs = torch.where(mask.bool(), curr_logprobs, 0.0)
             prev_logprobs = curr_logprobs.detach()
@@ -971,9 +1075,19 @@ class ClippedPGLossFn(LossFunction):
             }
         )
         metric_tensors["policy_support_excluded_tokens"] = (kl_mask - mask).sum()
+        if _DEFER_SCALARS[0]:
+            # deferred_metric_scalars: 0-dim device tensors, resolved once per learner call
+            # (resolve_metric_scalars); same values as materialize_scalar_metrics.
+            scalars = {
+                k: v.detach().to(dtype=loss.dtype).reshape(())
+                for k, v in metric_tensors.items()
+            }
+        else:
+            scalars = materialize_scalar_metrics(metric_tensors, loss.dtype)
         return loss, {
-            **materialize_scalar_metrics(metric_tensors, loss.dtype),
+            **scalars,
             **seq_error_metrics,
+            **train_lp_metrics,
         }
 
     def _opd_full_call(

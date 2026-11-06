@@ -1,0 +1,72 @@
+# Paper configuration, ThunderSync arm (paper/joint/CONFERENCE_PLAN.md §6): the architecture, default-on, from one
+# file. It is the Super-L22 gate configuration of research/verify0attr/GATE_CONFIG.md (go_gate3.sh SE=1 SA=1 V0=1:
+# cohort lanes LA2, keyed wide sampler, ⊥-BV K 1.75, BI + vocab-parallel canonical log-probs, sticky routing,
+# streamed verify0 with prefix-cache capture, hold-training and no-interleave, early handout, continuation pieces,
+# sentinel on every refit with the async digest, prod checks with the full set every 4th step) plus the past-only
+# adaptive draft age (D6) and NCCL_BUFFSIZE 1 MiB (coordinator 10-28). Layout (TP / EP / PP / engine EP, nodes,
+# EP-invariant combine when the engine EP differs), model, lengths, batch, seed and steps stay with the launcher.
+# Token budgets assume the paper's lengths (prompt cap 2048 + 8192 generated, train micro-batch 2):
+# 2 x (2048 + 8192) = 20480 for verify0_batch_tokens and the device-dispatch cap.
+# test_paper_config.py checks that this file resolves to the env-var gate configuration.
+defaults: ../ab/ab_ts_scale.yaml
+thundersync:
+  cohort_lanes: 2
+  cohort_lane_lookahead: 2
+  cohort_lane_lookahead_adaptive: true
+  learner_prefix_cache: true
+  learner_prefix_cache_verify0: true
+  short_fillers: true
+  plain_engine_sampler: wide
+  sticky_continuation_chunk_tokens: 16384
+  null_bv_drafts_per_output: 1.75
+  draft_cut_slack_s: 0.5
+  verify0_batch_tokens: 20480
+  verify0_stream: true
+  verify0_stream_window: 8
+  verify0_stream_order: drafting
+  verify0_stream_first_chunk_tokens: 2621440
+  verify0_stream_chunk_tokens: 2621440
+  driver_env:
+    THUNDERSYNC_SENTINEL_EVERY: "1"
+    THUNDERSYNC_SENTINEL_ASYNC: "1"
+    THUNDERSYNC_EARLY_HANDOUT: "1"
+    THUNDERSYNC_V0_HOLD_TRAINING: "1"
+    THUNDERSYNC_V0_NO_INTERLEAVE: "1"
+    NEMO_RL_VOCAB_LSE: canonical_block
+    # checks: production subset on every step (train-lp on every token, mismatch + law on 16 rows, emission law
+    # 1 in 4), the full set on every 4th step (checks_sched.py)
+    THUNDERSYNC_MISMATCH_CHECK: "1"
+    THUNDERSYNC_MISMATCH_CHECK_ROWS: "16"
+    THUNDERSYNC_LAW_CHECK: "1"
+    THUNDERSYNC_EMISSION_LAW_EVERY: "4"
+    THUNDERSYNC_TRAIN_LP_CHECK: "1"
+    THUNDERSYNC_CHECK_EVERY: "4"
+    THUNDERSYNC_CHECK_OFF_ENV: THUNDERSYNC_TRAIN_LP_CHECK=1
+    # logging for the paper's decompositions (engine step timing; learner per-call lines are worker-side below)
+    THUNDERSYNC_ENGINE_PROF: "1"
+    # learner host-sync-free MoE dispatch (driver side reads the cap for the verify0 budget)
+    NEMO_RL_MOE_DEVICE_DISPATCH: "1"
+    NEMO_RL_MOE_DEVICE_DISPATCH_TOKENS: "20480"
+    NEMO_RL_MOE_DEVICE_DISPATCH_CAPACITY: "2.0"
+    NEMO_RL_LEARNER_GRAPHS_SHARED_POOL: "0"
+policy:
+  megatron_cfg:
+    env_vars:
+      THUNDERSYNC_LEARNER_PROF: "1"
+      THUNDERSYNC_ENGINE_PROF: "1"
+      NEMO_RL_MOE_DEVICE_DISPATCH: "1"
+      NEMO_RL_MOE_DEVICE_DISPATCH_TOKENS: "20480"
+      NEMO_RL_MOE_DEVICE_DISPATCH_CAPACITY: "2.0"
+      NEMO_RL_LEARNER_DEFER_METRICS: "1"
+      NEMO_RL_LEARNER_GRAPHS_SHARED_POOL: "0"
+      THUNDERSYNC_TRAIN_LP_CHECK: "1"
+      THUNDERSYNC_LAW_CHECK: "1"
+      THUNDERSYNC_EMISSION_LAW_EVERY: "4"
+      NEMO_RL_VOCAB_LSE: canonical_block
+      THUNDERSYNC_V0_NO_INTERLEAVE: "1"
+      NCCL_BUFFSIZE: "1048576"
+  generation:
+    mcore_generation_config:
+      cuda_graph_all_prefills: true
+      max_requests: 512
+      cuda_graph_max_tokens: 512

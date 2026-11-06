@@ -353,6 +353,32 @@ def _get_free_port_local(
     return port
 
 
+def refit_store_port_candidates(
+    port_range_low: int,
+    port_range_high: int,
+    preferred_port: Optional[int] = None,
+    max_attempts: int = 64,
+    rng: Optional[random.Random] = None,
+) -> list[int]:
+    """Ports a store master tries to bind, in order: ``preferred_port`` first
+    (when in range), then distinct random ports of [low, high).
+
+    The random tail comes from a private ``random.Random`` (OS-seeded) unless
+    ``rng`` is given: the process-wide ``random`` module is seeded per run, so
+    every lane/rank would otherwise draw the same sequence.
+    """
+    if port_range_high <= port_range_low:
+        raise ValueError(f"empty port range [{port_range_low}, {port_range_high})")
+    rng = rng if rng is not None else random.Random()
+    out: list[int] = []
+    if preferred_port is not None and port_range_low <= preferred_port < port_range_high:
+        out.append(preferred_port)
+    rest = [p for p in range(port_range_low, port_range_high) if p != preferred_port]
+    rng.shuffle(rest)
+    out.extend(rest[: max(0, max_attempts - len(out))])
+    return out
+
+
 def _get_free_consecutive_ports_local(
     port_range_low: int,
     port_range_high: int,

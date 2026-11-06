@@ -40,6 +40,7 @@ from typing import Any, Optional
 
 import ray
 
+from nemo_rl.algorithms.grad_streaming import GradStreamingSpec
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.data_plane import (
     KVBatchMeta,
@@ -632,8 +633,17 @@ class TQPolicy(TQDriverMixin, Policy):
         loss_fn: LossFunction,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
+        grad_streaming: Optional[GradStreamingSpec] = None,
     ) -> None:
-        """Open a logical train step on every worker."""
+        """Open a logical train step on every worker.
+
+        Args:
+            loss_fn: Loss for every chunk of the step.
+            gbs: Logical global batch size.
+            mbs: Micro-batch size.
+            grad_streaming: Enables trajectory-level gradient streaming for
+                the step (see ``nemo_rl.algorithms.grad_streaming``).
+        """
         batch_size = gbs or self.cfg["train_global_batch_size"]
         micro_batch_size = mbs or self.cfg["train_micro_batch_size"]
         if self.flops_tracker is not None:
@@ -646,6 +656,7 @@ class TQPolicy(TQDriverMixin, Policy):
             loss_fn=loss_fn,
             gbs=batch_size,
             mbs=micro_batch_size,
+            grad_streaming=grad_streaming,
             **trace_context_kwargs(),
         )
         ray.get(futures)
@@ -713,6 +724,26 @@ class TQPolicy(TQDriverMixin, Policy):
             )
 
         self._dispatch_train_microbatches(dp_metas, timer=timer)
+
+    def close_stream_groups(self, closes: list[tuple[Any, dict[float, float]]]) -> None:
+        """Apply closed groups' advantages to their streamed gradients on every worker."""
+        ray.get(
+            self.worker_group.run_all_workers_single_data(
+                "close_stream_groups_presharded",
+                closes=closes,
+                **trace_context_kwargs(),
+            )
+        )
+
+    def discard_stream_groups(self, groups: list[Any]) -> None:
+        """Drop retried groups' streamed gradients on every worker."""
+        ray.get(
+            self.worker_group.run_all_workers_single_data(
+                "discard_stream_groups_presharded",
+                groups=groups,
+                **trace_context_kwargs(),
+            )
+        )
 
     def train_placed_microbatches(
         self,

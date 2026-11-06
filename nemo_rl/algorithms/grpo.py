@@ -1117,9 +1117,20 @@ def setup(
                 "when cluster.num_nodes > 1 and inference is non-colocated, "
                 f"but got {inference_nodes}."
             )
+            # Opt-in (ThunderSync lanes-k, default off): one inference engine smaller than a node
+            # (num_nodes 1, gpus_per_node < cluster.gpus_per_node) on the node(s) after the training
+            # nodes; further engine lanes are placed on the remaining GPUs by the caller.
+            partial_node = bool(inference_resources.get("allow_partial_node", False))
             assert (
                 inference_gpus_per_node is not None
-                and inference_gpus_per_node == cluster_config.gpus_per_node
+                and (
+                    inference_gpus_per_node == cluster_config.gpus_per_node
+                    or (
+                        partial_node
+                        and inference_nodes == 1
+                        and 0 < inference_gpus_per_node < cluster_config.gpus_per_node
+                    )
+                )
             ), (
                 "policy.generation.colocated.resources.gpus_per_node must be explicitly set and equal to cluster.gpus_per_node "
                 "when cluster.num_nodes > 1 and inference is non-colocated, "

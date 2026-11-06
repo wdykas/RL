@@ -1095,6 +1095,7 @@ def _mock_megatron_policy(**overrides):
     policy = _mock_policy(**overrides)
     policy.swap_weights_via_reshard.return_value = [MagicMock()]
     policy.init_collective_mcore_generation.return_value = [MagicMock()]
+    policy.reserve_refit_store.return_value = ("10.0.0.7", 1601)
     policy.preinit_nvshmem.return_value = [MagicMock()]
     return policy
 
@@ -1155,6 +1156,13 @@ class TestMegatronWeightSynchronizer:
         )
 
         sync.init_communicator()
+        # Learner rank 0 binds the store first; both sides get the bound port.
+        policy.reserve_refit_store.assert_called_once()
+        assert policy.init_collective_mcore_generation.call_args.args[:2] == (
+            "10.0.0.7",
+            1601,
+        )
+        assert gen.init_collective.call_args.args[:2] == ("10.0.0.7", 1601)
         policy.init_collective_mcore_generation.assert_called_once()
         assert (
             policy.init_collective_mcore_generation.call_args.kwargs[

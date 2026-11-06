@@ -14,6 +14,7 @@
 
 import asyncio
 import copy
+import dataclasses
 import gc
 import hashlib
 import json
@@ -50,6 +51,7 @@ from nemo_rl.data_plane.schema import (
     ROLLOUT_METRICS,
     ROUTE_PLAN_TAG,
     ROUTED_EXPERTS_FIELD,
+    STREAM_REWARD_TAG,
 )
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_TASK_INDEX_KEY,
@@ -1140,6 +1142,18 @@ class TQReplayBuffer:
         # Retain their metadata here so a periodic checkpoint can make an open
         # streamed step replayable without depending on the sibling lineage.
         self._training_claims: dict[str, TQReplayGroupMetadata] = {}
+        # Trajectory-level gradient streaming: sample_ids of published rows
+        # already handed to the trainer, per group. A slot whose rows were
+        # published one trajectory at a time keeps them in ``meta_list`` while
+        # ``ready_list`` stays False until ``seal_group``, so removal and
+        # eviction clear partial groups like complete ones.
+        self._trajectory_claims: dict[str, set[str]] = {}
+        # Claims of groups removed mid-step (rollout retry or eviction). The
+        # open train step still owns those rows: removal leaves them in TQ for
+        # the step's cleanup, and the group ID cannot be reserved again until
+        # :meth:`release_trajectory_claims` (a same-ID retry would rewrite the
+        # same sample IDs under the step).
+        self._retired_trajectory_claims: dict[str, set[str]] = {}
 
     def set_data_plane_checkpoint_barrier(
         self, barrier: DataPlaneCheckpointBarrier
@@ -1200,6 +1214,13 @@ class TQReplayBuffer:
             group_id = str(uuid.uuid4())
         if group_id in self._group_ids:
             raise ValueError(f"duplicate live group_id={group_id!r}")
+        if group_id in self._retired_trajectory_claims:
+            raise RuntimeError(
+                f"group_id={group_id!r} cannot be reserved again before the open "
+                "trajectory-streaming train step releases the rows it claimed "
+                "from the removed attempt (same-ID rollout retries are not "
+                "supported once a group's trajectories were trained)"
+            )
         self.meta_list.append(None)
         self.start_weight_list.append(weight_version)
         self.end_weight_list.append(-1)
@@ -1326,6 +1347,224 @@ class TQReplayBuffer:
                         [commit_error, rollback_error],
                     )
                 raise
+
+    async def commit_trajectories(
+        self,
+        group_id: str,
+        generation_indices: list[int],
+        record: PromptGroupRecord,
+        start_weight_version: int,
+    ) -> KVBatchMeta:
+        """Write finished trajectories of a still-open group to TQ in one put.
+
+        Each row keeps its in-group key ``{group_id}_g{generation_index}`` and
+        becomes selectable through :meth:`peek_trajectory_rows` before the
+        group completes. :meth:`seal_group` marks the slot ready once every
+        trajectory is published.
+
+        Args:
+            group_id: group_id returned by the matching reserve call.
+            generation_indices: Position of each trajectory within its group.
+            record: PromptGroupRecord holding exactly these completions, in
+                ``generation_indices`` order.
+            start_weight_version: Weight version stamped at reserve time.
+
+        Returns:
+            KVBatchMeta for the written rows.
+        """
+        if len(record.completions) != len(generation_indices) or not generation_indices:
+            raise ValueError(
+                f"commit_trajectories: {len(record.completions)} completions for "
+                f"generation_indices={generation_indices}"
+            )
+        if group_id not in self._group_ids:
+            raise ValueError(
+                f"TQReplayBuffer.commit_trajectories: group {group_id} has no live slot"
+            )
+        if self._data_plane_checkpoint_barrier is None:
+            raise RuntimeError(
+                "TQReplayBuffer must be bound to the controller data-plane "
+                "checkpoint barrier before committing samples"
+            )
+        # Off the event loop: this runs once per trajectory, while the train
+        # pump shares the loop.
+        train_batch = await asyncio.to_thread(
+            record_to_train_batch,
+            record,
+            pad_value_dict=self._pad_value_dict,
+            include_message_violation_fields=self._include_message_violation_fields,
+        )
+        sample_ids, fields, tags = await asyncio.to_thread(
+            pack_payload,
+            train_batch,
+            weight_version=start_weight_version,
+            group_id=group_id,
+            prompt_idx=record.prompt_idx,
+            generation_indices=list(generation_indices),
+        )
+        for tag, reward in zip(tags, train_batch["total_reward"].tolist()):
+            tag[STREAM_REWARD_TAG] = float(reward)
+        trace_rollout_payload(keys=sample_ids, data=train_batch)
+        async with self._data_plane_checkpoint_barrier.mutation("group_commits") as cut:
+            # Reject duplicates before writing: the failure path below clears
+            # the written keys, which for a duplicate are the original rows.
+            if group_id in self._group_ids:
+                current = self.meta_list[self._group_ids.index(group_id)]
+                if current is not None:
+                    duplicates = set(current.sample_ids).intersection(sample_ids)
+                    if duplicates:
+                        raise ValueError(
+                            f"duplicate trajectories {sorted(duplicates)!r}"
+                        )
+            try:
+                await call_data_plane(
+                    self._dp_client,
+                    "put_samples",
+                    sample_ids=sample_ids,
+                    partition_id=self._partition_id,
+                    fields=fields,
+                    tags=tags,
+                )
+                row_meta = KVBatchMeta(
+                    partition_id=self._partition_id,
+                    task_name="train",
+                    sample_ids=list(sample_ids),
+                    fields=list(fields.keys()),
+                    sequence_lengths=[
+                        int(x) for x in train_batch["input_lengths"].tolist()
+                    ],
+                    extra_info={},
+                    tags=[dict(t) for t in tags],
+                )
+                try:
+                    idx = self._group_ids.index(group_id)
+                except ValueError:
+                    raise ValueError(
+                        f"TQReplayBuffer.commit_trajectories: group {group_id} was "
+                        "evicted during the write; row cleared"
+                    ) from None
+                existing = self.meta_list[idx]
+                self.meta_list[idx] = (
+                    row_meta if existing is None else existing.concat(row_meta)
+                )
+                return row_meta
+            except BaseException:
+                await self._clear_samples_unlocked(cut, sample_ids=list(sample_ids))
+                raise
+
+    async def seal_group(
+        self,
+        group_id: str,
+        record: PromptGroupRecord,
+        end_weight_version: int,
+    ) -> KVBatchMeta:
+        """Mark a group whose trajectories were all published as ready.
+
+        Rows are not rewritten; the slot's metadata is reordered by
+        generation index and given the group's rollout metrics.
+
+        Args:
+            group_id: group_id returned by the matching reserve call.
+            record: The complete PromptGroupRecord (for metrics and enrichment).
+            end_weight_version: Weight version stamped after rollout.
+
+        Returns:
+            KVBatchMeta for the sealed group.
+        """
+        if self._data_plane_checkpoint_barrier is None:
+            raise RuntimeError(
+                "TQReplayBuffer must be bound to the controller data-plane "
+                "checkpoint barrier before sealing a group"
+            )
+        async with self._data_plane_checkpoint_barrier.mutation("group_commits"):
+            try:
+                idx = self._group_ids.index(group_id)
+            except ValueError:
+                raise ValueError(
+                    f"TQReplayBuffer.seal_group: group {group_id} has no live slot"
+                ) from None
+            partial = self.meta_list[idx]
+            expected = [f"{group_id}_g{i}" for i in range(len(record.completions))]
+            if partial is None or sorted(partial.sample_ids) != sorted(expected):
+                raise ValueError(
+                    f"seal_group: group {group_id} published "
+                    f"{[] if partial is None else partial.sample_ids}, expected {expected}"
+                )
+            order = [partial.sample_ids.index(sid) for sid in expected]
+            meta = dataclasses.replace(
+                partial.subset(order),
+                extra_info={ROLLOUT_METRICS: [dict(record.rollout_metrics)]},
+            )
+            if self._post_write_enricher is not None:
+                try:
+                    meta = await self._post_write_enricher(meta, record)
+                except Exception as error:
+                    raise PostWriteEnrichmentError(
+                        f"post-write enrichment failed for group_id={group_id!r}"
+                    ) from error
+            self.meta_list[idx] = meta
+            self.end_weight_list[idx] = end_weight_version
+            self.ready_list[idx] = True
+            return meta
+
+    def peek_trajectory_rows(
+        self, *, target_step: int
+    ) -> list[tuple[str, KVBatchMeta]]:
+        """Published, not-yet-claimed rows of ``target_step`` (nothing is claimed)."""
+        out: list[tuple[str, KVBatchMeta]] = []
+        for i, group_id in enumerate(self._group_ids):
+            meta = self.meta_list[i]
+            if (
+                meta is None
+                or self.target_step_list[i] != target_step
+                or group_id in self._retired_trajectory_claims
+            ):
+                continue
+            claimed = self._trajectory_claims.get(group_id, set())
+            out.extend(
+                (group_id, meta.subset([j]))
+                for j, sid in enumerate(meta.sample_ids)
+                if sid not in claimed
+            )
+        return out
+
+    def claim_trajectory_sample_ids(self, group_id: str, sample_ids: list[str]) -> None:
+        """Mark specific rows of a group as handed to the trainer."""
+        claimed = self._trajectory_claims.setdefault(group_id, set())
+        overlap = claimed.intersection(sample_ids)
+        if overlap:
+            raise ValueError(f"rows already claimed: {sorted(overlap)!r}")
+        claimed.update(sample_ids)
+
+    def trajectory_group_fully_claimed(self, group_id: str) -> bool:
+        """True once the group is sealed and every one of its rows was claimed."""
+        idx = self._group_ids.index(group_id)
+        meta = self.meta_list[idx]
+        return (
+            self.ready_list[idx]
+            and meta is not None
+            and set(meta.sample_ids) <= self._trajectory_claims.get(group_id, set())
+        )
+
+    def trajectory_step_groups(
+        self, target_step: int
+    ) -> list[tuple[str, bool, Optional[KVBatchMeta]]]:
+        """``(group_id, sealed, meta)`` for every live slot of ``target_step``."""
+        return [
+            (gid, self.ready_list[i], self.meta_list[i])
+            for i, gid in enumerate(self._group_ids)
+            if self.target_step_list[i] == target_step
+        ]
+
+    def release_trajectory_claims(self, group_ids: list[str]) -> None:
+        """Forget trajectory claims for groups whose step finished or aborted.
+
+        Also releases claims retired by a mid-step removal; call this only
+        after the step cleared the claimed rows.
+        """
+        for group_id in group_ids:
+            self._trajectory_claims.pop(group_id, None)
+            self._retired_trajectory_claims.pop(group_id, None)
 
     async def remove_group(self, group_id: str, *, remove_in_dp: bool = False) -> int:
         """Remove the live slot identified by ``group_id``.
@@ -1607,13 +1846,25 @@ class TQReplayBuffer:
         ]
         if missing_group_ids:
             raise ValueError(f"unknown group_ids={missing_group_ids!r}")
+        # Rows already claimed by an open trajectory-streaming step stay in TQ:
+        # the step may still be fetching them and clears them at its end.
+        # Retire the claims before any await so the group's rows can no longer
+        # be claimed while it is being removed.
+        retiring_claims: dict[str, set[str]] = {}
+        for group_id in group_ids:
+            retired = self._retired_trajectory_claims.setdefault(group_id, set())
+            retired.update(self._trajectory_claims.pop(group_id, ()))
+            retiring_claims[group_id] = retired
         dropped_sample_ids: list[str] = []
         dropped_staging_keys: list[str] = []
         for group_id in group_ids:
             i = index_by_group_id[group_id]
             meta = self.meta_list[i]
             if meta is not None:
-                dropped_sample_ids.extend(meta.sample_ids)
+                claimed = retiring_claims[group_id]
+                dropped_sample_ids.extend(
+                    sid for sid in meta.sample_ids if sid not in claimed
+                )
             staging_keys = self._staging_keys_list[i]
             if staging_keys:
                 dropped_staging_keys.extend(staging_keys)
@@ -1686,6 +1937,10 @@ class TQReplayBuffer:
         self._training_claims.update(new_training_claims)
         for i in current_drop_idxs:
             self._delete_slot(i)
+        for group_id, claims in retiring_claims.items():
+            if not claims:
+                # Nothing is owned by a train step: the ID is free again.
+                self._retired_trajectory_claims.pop(group_id, None)
 
         return len(current_drop_idxs)
 
