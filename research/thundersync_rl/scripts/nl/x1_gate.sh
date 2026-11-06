@@ -82,7 +82,7 @@ run1() {  # NAME CHECKS STEPS NEG [EXTRA_XA] [EXTRA_ENV] -> runs one arm; RC=125
     # prod / prod_stress: production shape -- lag 1, no gate-only admission hold / step sleep, the config's K
     if [ "$NAME" = prod ] || [ "$NAME" = prod_stress ]; then export LAG=1 XE="$XE_BASE"; unset KD; fi
     # EDV arms with forced surprises (gate tool, CHECKS only): every finished draft with eta_g <= 0.95 is deferred
-    if [ "$NAME" = edv_stress ] || [ "$NAME" = neg_defer_no_decide ] || [ "$NAME" = neg_content_m_edv ]; then export XE="${XE:-} THUNDERSYNC_NL_DEBUG_EDV_E=0.95"; fi
+    if [ "$NAME" = edv_stress ] || [ "$NAME" = neg_defer_no_decide ] || [ "$NAME" = neg_content_m_edv ] || [ "$NAME" = gz_edv_stress ]; then export XE="${XE:-} THUNDERSYNC_NL_DEBUG_EDV_E=0.95"; fi
     export TAG=$T CHECKS=$CK STEPS=$ST CUDA_VISIBLE_DEVICES=0,1,2,3 RAY_ADDRESS=local PYTHONDONTWRITEBYTECODE=1
     [ -n "$EXA" ] && export XA="${XA:-} $EXA"
     for kv in $EXE; do export "$kv"; done
@@ -213,6 +213,36 @@ case $ARMX in
   # ACCEPTANCE SANITY (R30): no weight update (lr 0): p == q bitwise at every version, so no draft may be rejected.
   sanity) run1 sanity 1 $STEPS "" "policy.megatron_cfg.optimizer.lr=0.0 policy.megatron_cfg.optimizer.min_lr=0.0 policy.megatron_cfg.scheduler.lr_warmup_init=0.0"; summary ;;
   neg) negs; summary ;;
+  # GRPO-Z train-on-arrival (thundersync.grpo_z; grpo_z.py, design DX): the stress positive (rejections, out-of-order
+  # tails) with row units; must be EXACT, trained-once ok, with row units > 0. gz_std: loo_std at mild lr (more whole
+  # rows). gz_neg: drop_late_group under GRPO-Z units; the trained-once check must fail.
+  gz) run1 gz 1 $STEPS "" "++thundersync.grpo_z=loo_c ++thundersync.train_overlap=true ++thundersync.edv_threshold=null $STRESS_XA" "TP=1 GEN_TP=1"; summary ;;
+  gz_std) run1 gz_std 1 $STEPS "" "++thundersync.grpo_z=loo_std ++thundersync.train_overlap=true ++thundersync.edv_threshold=null $MILD_XA" "TP=1 GEN_TP=1"; summary ;;
+  gz_neg) run1 neg_drop_late_group_gz 1 $FS drop_late_group "++thundersync.grpo_z=loo_c ++thundersync.train_overlap=true ++thundersync.edv_threshold=null $STRESS_XA" "TP=1 GEN_TP=1"; summary ;;
+  # GRPO-Z + EDV (k_drafts 1, nl_super: force_on_policy_ratio): surprises forced (e 0.95, stress lr): dropped unit
+  # captures relaunched as new units; must be EXACT with surprises > 0, trained-once ok.
+  gz_edv_stress) run1 gz_edv_stress 1 $STEPS "" "++thundersync.grpo_z=loo_c ++thundersync.train_overlap=true ++thundersync.edv_threshold=0.5 $STRESS_XA" "CFG_REL=research/thundersync_rl/configs/nl/nl_super.yaml KD=1.0 MBS=1"; summary ;;
+  gz_edv) run1 gz_edv 1 $STEPS "" "++thundersync.grpo_z=loo_c ++thundersync.train_overlap=true ++thundersync.edv_threshold=0.5 $MILD_XA" "CFG_REL=research/thundersync_rl/configs/nl/nl_super.yaml KD=1.0 MBS=1"; summary ;;
+  # DX engine verify (thundersync.verify_on=engine, GRPO-Z, train-on-arrival while the engine verifies): engine TP 1
+  # (TP 1 on both sides: BI needs equal TP), row seeds off, EDV off. CHECKS + THUNDERSYNC_ENGINE_VERIFY_CHECK=1: the
+  # learner also verifies every row and the engine's log p of every drafted token must equal the learner's bitwise.
+  # Negatives: cf_engine_m (engine routes with 2x the band: engine p != learner p), engine_q_genlp (accepted tokens
+  # keep log q as generation log-prob); both must FAIL.
+  ev|ev_mild|ev_neg)
+    EVXA="++thundersync.verify_on=engine ++thundersync.row_seeds=false ++thundersync.grpo_z=loo_c ++thundersync.train_overlap=true ++thundersync.edv_threshold=null"
+    EVENV="TP=1 GEN_TP=1 EP=2 GEN_EP=2 GPS=2 GEN_GPUS=2 XE=THUNDERSYNC_ENGINE_VERIFY_CHECK=1${ADMIT_HOLD_XE}"
+    [ $ARMX = ev ] && run1 ev 1 $STEPS "" "$EVXA $STRESS_XA" "$EVENV"
+    [ $ARMX = ev_mild ] && run1 ev_mild 1 $STEPS "" "$EVXA $MILD_XA" "$EVENV"
+    if [ $ARMX = ev_neg ]; then
+      run1 neg_cf_engine_m_ev 1 $FS cf_engine_m "$EVXA" "$EVENV"
+      run1 neg_engine_q_genlp_ev 1 $FS engine_q_genlp "$EVXA $MILD_XA" "$EVENV"
+    fi
+    summary ;;
+  # Learner TP 1 EP 2 = DP 2 (train units of 2 rows mixing groups; the 4-node Nano learner is DP 8).
+  gz_all) run1 gz 1 $STEPS "" "++thundersync.grpo_z=loo_c ++thundersync.train_overlap=true ++thundersync.edv_threshold=null $STRESS_XA" "TP=1 GEN_TP=1"
+          run1 gz_std 1 $STEPS "" "++thundersync.grpo_z=loo_std ++thundersync.train_overlap=true ++thundersync.edv_threshold=null $MILD_XA" "TP=1 GEN_TP=1"
+          run1 neg_drop_late_group_gz 1 $FS drop_late_group "++thundersync.grpo_z=loo_c ++thundersync.train_overlap=true ++thundersync.edv_threshold=null $STRESS_XA" "TP=1 GEN_TP=1"
+          summary ;;
   # EDV (DESIGN §22.9): deferred rows decided by the training forward, replayed by the verifier (CHECKS).
   edv) run1 edv 1 $STEPS "" "++thundersync.edv_threshold=0.5"; summary ;;
   # EDV surprise path: e forced to 0.95 and stress lr, so deferred rows are not whole: dropped captures, re-walks,

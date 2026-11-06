@@ -2260,6 +2260,7 @@ class TQReplayBuffer:
         extra_tags: Optional[dict[str, Any]] = None,
         prev_logprobs_from_generation: bool = False,
         extra_fields: Optional[dict[str, torch.Tensor]] = None,
+        generation_indices: Optional[list[int]] = None,
     ) -> KVBatchMeta:
         """Replace a claimed group's rows by ``record``'s (ThunderSync nolanes verify stage).
 
@@ -2268,7 +2269,9 @@ class TQReplayBuffer:
         consumed meta with the returned one. ``prev_logprobs_from_generation``: also write ``prev_logprobs`` =
         the rows' generation log-probs (they are the current policy's own log-probs, bitwise, by construction).
         ``extra_fields``: per-row columns ([n] tensors, row order of the record) written with the rows (ThunderSync
-        EDV's per-row decision fields).
+        EDV's per-row decision fields). ``generation_indices``: the slots of the record's rows within the group (the
+        ``_g{i}`` suffix; None = rows 0..n-1, the whole group), for a group written in parts as its rows become final
+        (ThunderSync GRPO-Z train-on-arrival).
         """
         if self._data_plane_checkpoint_barrier is None:
             raise RuntimeError("TQReplayBuffer must be bound to the data-plane checkpoint barrier")
@@ -2289,6 +2292,7 @@ class TQReplayBuffer:
             weight_version=weight_version,
             group_id=group_id,
             prompt_idx=record.prompt_idx,
+            generation_indices=generation_indices,
         )
         for t in tags:
             t.update(extra_tags or {})

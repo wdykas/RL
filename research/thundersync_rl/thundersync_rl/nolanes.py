@@ -204,6 +204,20 @@ class NolanesConfig:
     # rows and of the engine's iteration timing, never of the draft's later tokens), so block verification of the
     # cut prefix is exact (MODEL.md v2 §13; the async design's deadline cut, Corollary 1).
     wake_verify: bool = False
+    # GRPO-Z (grpo_z.py; FIRSTPRINCIPLES_D Lemma Z, design DX): each output row's GRPO baseline is the LOO mean of its
+    # group's DRAFT rewards (every draft except the row's own source), known before theta_k exists, so a row's
+    # advantage is final the moment the row is: rows train on arrival (no group wait). "loo_c": scale = mean
+    # within-group std of the previous step's final rewards (F_k-measurable; the on-policy LOO-c gradient exactly);
+    # "loo_std": stock's LOO std of the draft rewards (exact direction per prompt, prompt weight E[1/std(X_-i)]).
+    # Needs train_overlap. "off" = stock group-local advantages.
+    grpo_z: str = "off"
+    # Where theta_k's block verification runs (design DX, FIRSTPRINCIPLES_D §5.1 (2)). "learner": the learner's
+    # verify forward before training (as built). "engine": the inference pool prefills each draft (one-token requests,
+    # head inputs captured; BI prefill == learner forward bitwise) and decides ⊥-BV on the engine rank that holds the
+    # rows (engine_verify.py: q rows from the logged draft hidden x the stashed head of the drafting version, which
+    # every engine rank stashes at each refit); the learner trains from the start of the step while the engine
+    # verifies (GRPO-Z units / group units on arrival).
+    verify_on: str = "learner"
 
     @classmethod
     def from_config(cls, config: Any) -> "NolanesConfig":
@@ -316,6 +330,39 @@ def config_problems(config: Any) -> list[str]:
         p.append("async_rl.recompute_kv_cache_after_weight_updates must be false (persist refit)")
     # User rule 11-02: the MoE router (gate weights) and its expert bias are ALWAYS frozen. Hard error otherwise.
     p += router_frozen_problems(config)
+    if str(cfg.grpo_z) != "off":
+        from thundersync_rl import grpo_z as _gz
+
+        p += _gz.config_problems(config)
+        if not cfg.train_overlap:
+            p.append("thundersync.grpo_z needs thundersync.train_overlap (rows train on arrival into the exact accumulator)")
+        if cfg.edv_threshold is not None:
+            p.append("thundersync.grpo_z with EDV is not built for a learner DP > 1 (train units mix rows of several "
+                     "groups, so a surprise's dropped capture would drop other groups' rows): set edv_threshold null")
+        if int(cfg.spare_prompts):
+            p.append("thundersync.grpo_z with spare prompts is not built yet")
+        if cfg.wake_verify or _get(gen, "colocated.enabled", False):
+            p.append("thundersync.grpo_z is built for the non-colocated nolanes stage")
+        if int(_get(pol, "train_micro_batch_size", 1) or 1) != 1:
+            p.append("thundersync.grpo_z needs policy.train_micro_batch_size 1 (a row unit is one row; padding units to "
+                     "a micro-batch multiple per DP rank is not built yet)")
+        if _get(grpo, "advantage_clip_low") is not None or _get(grpo, "advantage_clip_high") is not None:
+            p.append("thundersync.grpo_z: advantage clipping is not built (row advantages skip the stage's clip)")
+    if str(cfg.verify_on) not in ("learner", "engine"):
+        p.append(f"thundersync.verify_on must be learner or engine (got {cfg.verify_on!r})")
+    if str(cfg.verify_on) == "engine":
+        if not cfg.train_overlap:
+            p.append("thundersync.verify_on=engine needs thundersync.train_overlap (the learner trains while the engine "
+                     "verifies)")
+        if cfg.edv_threshold is not None:
+            p.append("thundersync.verify_on=engine: EDV is a learner-side fused verify (set edv_threshold null)")
+        if cfg.row_seeds:
+            p.append("thundersync.verify_on=engine needs thundersync.row_seeds false (engine decisions draw a canonical "
+                     "per-call seed: speculative._engine_verify_rows)")
+        if int(cfg.spare_prompts) or cfg.wake_verify or _get(gen, "colocated.enabled", False):
+            p.append("thundersync.verify_on=engine is built for the non-colocated stage without spare prompts")
+        if int(_get(mcore, "tensor_model_parallel_size") or 1) != 1:
+            p.append("thundersync.verify_on=engine needs engine tensor_model_parallel_size 1 (engine_verify_decide)")
     if int(cfg.spare_prompts) < 0:
         p.append("thundersync.spare_prompts must be >= 0")
     if int(cfg.spare_prompts) > 0:
@@ -501,7 +548,11 @@ def config_problems(config: Any) -> list[str]:
         p += edv_problems(config, cfg)
     elif negative() == "defer_no_decide" or os.environ.get("THUNDERSYNC_NL_DEBUG_EDV_E", "") not in ("", "0"):
         p.append("THUNDERSYNC_NL_NEG=defer_no_decide / THUNDERSYNC_NL_DEBUG_EDV_E need thundersync.edv_threshold")
-    if int(cfg.verify_stream_chunks) > 1 and not cfg.row_seeds:
+    # Engine verify (DX) draws each call's coins from the canonical call seed (speculative._call_seed_ident: a hash of
+    # the call's row keys and verification ordinals; the chunks are fixed runs of the pool order, balanced by draft
+    # count), so a decision depends on its call's composition, never on contents or timing: exact, but not equal to a
+    # one-call run's outputs (the learner path keeps that stronger property with row seeds).
+    if int(cfg.verify_stream_chunks) > 1 and not cfg.row_seeds and str(cfg.verify_on) != "engine":
         p.append("thundersync.verify_stream_chunks > 1 needs row_seeds (a decision must not depend on its call)")
     if cfg.verify_batch_tokens is not None:
         vbt = int(cfg.verify_batch_tokens)
@@ -797,6 +848,9 @@ def configure_driver(config: dict) -> NolanesConfig:
             f"{int(cfg.tail_tree)}:{int(cfg.tail_tree_depth)}:{int(cfg.tail_tree_rows)}:{ref_cap}"))
         if cfg.tail_tree_mtp:
             mcfg["env_vars"]["THUNDERSYNC_TAIL_TREE_MTP"] = f"{cfg.tail_tree_mtp}:{int(cfg.tail_tree_mtp_slots)}"
+    if str(cfg.verify_on) == "engine":
+        # Engine workers capture the head inputs of tagged verification prefills (worker _install_verify_capture).
+        mcfg["engine_verify"] = True
     if neg == "cf_engine_m":
         # Negative control: the engine (inference mode only) routes with 2 x the band (crossfade_routing.py).
         mcfg.setdefault("env_vars", {})
