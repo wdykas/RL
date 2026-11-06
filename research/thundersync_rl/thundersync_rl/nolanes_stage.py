@@ -40,7 +40,7 @@ import numpy as np
 import ray
 import torch
 
-from thundersync_rl import edv, nolanes
+from thundersync_rl import bxsd_lane, edv, nolanes
 from thundersync_rl.nolanes import (
     VERIFIED_TAG,
     DraftRow,
@@ -161,6 +161,8 @@ class VerifyStage:
         # Colocated engine (research/colo/MODEL.md v2, XPR-1): set in setup() from the generation backend.
         self.colocated = False
         nolanes.apply_driver_env(cfg)
+        # BX-SD lane: a continuation with more than the bulk window (L / (K + 1) tokens) left is a fork row.
+        self._bx_lane_rows: set = set()  # (group, slot) of the current phase's lane rows (_bx_begin)
 
     # -- setup ----------------------------------------------------------------------------------------------
 
@@ -307,7 +309,7 @@ class VerifyStage:
         print(f"[nolanes] verify stage ready: G={self.g} N={self.n} lag={self.lag} version={version} "
               f"negative={self.neg or 'none'}", flush=True)
 
-    async def cut_drafts(self) -> dict:
+    async def cut_drafts(self, max_target: Optional[int] = None) -> dict:
         """wake_verify: cut every draft still decoding on the engine (``nl_cut_drafts``) and wait until each is back.
 
         Stop rule, counted: no draft request on any engine rank AND (with engine slots) every granted draft call's engine
@@ -321,15 +323,19 @@ class VerifyStage:
         are cut by the next round."""
         wg = self._gen_wg()
         t0 = time.perf_counter()
-        rounds, cut, waiting = 0, 0, 0
+        rounds, cut, waiting, kept = 0, 0, 0, 0
+        if max_target is not None and self.slots is None:
+            raise RuntimeError("[nolanes] lag-K wake_verify needs the engine slots (the counted stop rule)")
         while True:
-            rs = await asyncio.to_thread(ray.get, wg.run_all_workers_single_data("nl_cut_drafts"))
+            rs = await asyncio.to_thread(ray.get, wg.run_all_workers_single_data("nl_cut_drafts", max_target=max_target))
             rounds += 1
             # every TP / EP rank of an engine replica holds the same requests: the replica's count is the rank max
             cut = max(cut, max((int(r.get("cut", 0)) for r in rs if r), default=0))
             waiting = max(waiting, max((int(r.get("waiting", 0)) for r in rs if r), default=0))
+            kept = max(kept, max((int(r.get("kept", 0)) for r in rs if r), default=0))
             while True:
-                cnt = await asyncio.to_thread(ray.get, wg.run_all_workers_single_data("nl_draft_requests"))
+                cnt = await asyncio.to_thread(ray.get, wg.run_all_workers_single_data("nl_draft_requests",
+                                                                                       max_target=max_target))
                 left = sum(int(c[0]) for c in cnt if c)
                 unmarked = sum(int(c[1]) for c in cnt if c)
                 inflight = len(getattr(self.sc, "_inflight_by_group_id", {}) or {})
@@ -345,7 +351,8 @@ class VerifyStage:
                     pending = self.slots.drafts_not_engine_done()
                 if left == 0 and (pending == 0 if pending is not None else inflight == 0):
                     return {"cut_rounds": rounds, "cut_resident_max": cut, "cut_waiting_max": waiting,
-                            "cut_s": round(time.perf_counter() - t0, 2), "cut_inflight_groups": inflight}
+                            "cut_kept_max": kept, "cut_s": round(time.perf_counter() - t0, 2),
+                            "cut_inflight_groups": inflight}
                 if time.perf_counter() - t0 > 300:
                     raise RuntimeError(f"[nolanes] wake_verify cut: {left} draft requests on the engines and {inflight} "
                                        f"rollout groups in flight after {rounds} cut rounds / 300 s")
@@ -357,6 +364,70 @@ class VerifyStage:
         """wake_verify (colocated): the loop does not wake the engine after the optimizer step; the next step's stage
         verifies with the engine still stood down and its own wake installs theta_{k+1} (the announced version)."""
         return bool(getattr(self.cfg, "wake_verify", False) and self.colocated)
+
+    def _bx_begin(self, rows: list[tuple[str, int, int]], st: Any, n_drafts_next: int) -> None:
+        """BX-SD lane: choose the phase's lane rows (bxsd_lane.choose_lane: the k deepest continuations and b bulk rows
+        per lane rank, makespan-optimal on the measured t(rows) curve) and open the placement phase on the engine
+        (quotas on the request-building rank, the L1 bound on every rank). ``rows``: (group, slot, remaining) of the
+        continuations about to launch, in launch order; ``n_drafts_next``: the next batch's drafts (load only)."""
+        if self.__dict__.get("_bx_groups") is None:
+            infos = [x for x in ray.get(self._gen_wg().run_all_workers_single_data("nl_bx_info")) if x]
+            groups = bxsd_lane.lockstep_groups(infos)
+            if len(groups) < 2:
+                raise RuntimeError(f"[bx lane] the engine has {len(groups)} lockstep group(s): a lane needs >= 2 "
+                                   "(engine expert / model parallel size must be < the engine world size)")
+            self._bx_groups = [list(g) for g in groups]
+            print(f"[bx lane] engine lockstep groups (DP ranks) {self._bx_groups}; lane = group 0", flush=True)
+        layout = bxsd_lane.LaneLayout(groups=tuple(tuple(g) for g in self._bx_groups))
+        order = sorted(range(len(rows)), key=lambda i: (-rows[i][2], i))  # deepest first; ties in launch order
+        # Capacity: max_requests per engine rank (rows past it wait undecoded) and the tree's node rows, which share
+        # that budget (tree_spec lays nodes out in the room the rows leave). s_max: the best critical-tail rate
+        # measured so far in this run (2.0 before any).
+        mr = int(self.sc._gen.cfg["mcore_generation_config"]["max_requests"])
+        k, b, pred = bxsd_lane.choose_lane([x[2] for x in rows], int(n_drafts_next), layout,
+                                           bxsd_lane.curve(bxsd_lane.NANO_EP8_T1_MS), row_cap=mr,
+                                           node_cap=int(getattr(self.cfg, "tail_tree_rows", 0) or 0)
+                                           if int(getattr(self.cfg, "tail_tree", 0) or 0) else 0,
+                                           s_max=float(self.__dict__.get("_bx_s_max", 2.0)))
+        lane_idx = order[:k]
+        self._bx_lane_rows = {(rows[i][0], rows[i][1]) for i in lane_idx}
+        forks = [rows[i][2] for i in lane_idx]
+        r_next = rows[order[k]][2] if k < len(rows) else 0
+        n_bulk_new = len(rows) - k + int(n_drafts_next)
+        res = [r for r in ray.get(self._gen_wg().run_all_workers_single_data(
+            "nl_bx_begin_phase", n_bulk_new=n_bulk_new, n_fork_new=k, b=int(b), row_cap=mr, it_bulk=float(r_next),
+            fork_depth_max=float(max(forks, default=0)), groups=self._bx_groups)) if r]
+        st.crit["bx_pred_ms"] = round(pred, 1)
+        placer = [r for r in res if "b" in r]
+        if len(placer) != 1:
+            raise RuntimeError(f"[bx lane] expected one placing engine rank, got {len(placer)}: {res}")
+        st.crit["bx_fork_rows"] = st.crit.get("bx_fork_rows", 0) + len(forks)
+        st.crit["bx_bulk_new"] = st.crit.get("bx_bulk_new", 0) + n_bulk_new
+        st.crit["bx_lane_b"] = placer[0]["b"]
+        if float(placer[0]["s_hat"]) > 1.0:  # measured (1.0 = no critical tail iterations yet)
+            self._bx_s_max = max(float(self.__dict__.get("_bx_s_max", 0.0)), float(placer[0]["s_hat"]))
+        st.crit["bx_horizon"] = placer[0]["horizon"]
+        # cumulative over the run, every engine rank: requests that arrived on their target rank / on another rank
+        # (must stay 0), and L1 decisions on lane fork rows
+        bs = [x for x in ray.get(self._gen_wg().run_all_workers_single_data("nl_bx_stats")) if x]
+        for key in ("routed", "misrouted", "l1_on", "l1_off"):
+            st.crit[f"bx_{key}"] = int(sum(x.get(key, 0) for x in bs))
+        if st.crit["bx_misrouted"]:
+            raise RuntimeError(f"[bx lane] {st.crit['bx_misrouted']} requests ran on a DP rank other than their target "
+                               "(coordinator routing hook not installed in the coordinator process?)")
+        lane = set(self._bx_groups[0])
+        live = placer[0]["live"]
+        prev = placer[0]["prev_placed"]
+        off_lane = sum(prev[r][1] for r in range(len(prev)) if r not in lane)
+        st.crit["bx_prev_forks_off_lane"] = off_lane
+        if off_lane:
+            raise RuntimeError(f"[bx lane] {off_lane} fork rows of the previous phase were placed off the lane: {prev}")
+        print(f"[bx lane] previous phase placed (bulk, fork) per DP rank: {[tuple(x) for x in prev]}", flush=True)
+        print(f"[bx lane] phase lane_rows={k} (deepest {max(forks, default=0)}, next {r_next}) bulk_new={n_bulk_new} "
+              f"b={placer[0]['b']} predicted_phase_at_s1={pred / 1e3:.1f}s "
+              f"horizon={placer[0]['horizon']} s_hat={placer[0]['s_hat']} live lane (bulk, fork)="
+              f"{[tuple(live[r]) for r in sorted(lane)]} other bulk={[live[r][0] for r in range(len(live)) if r not in lane]}"
+              f" routed={st.crit['bx_routed']} l1 on/off={st.crit['bx_l1_on']}/{st.crit['bx_l1_off']}", flush=True)
 
     def stash_head(self, version: int) -> None:
         """Learner: stash theta_version's LM head (q rows of tokens drafted at version), keep lag + 1 versions."""
@@ -664,7 +735,7 @@ class VerifyStage:
             plen = len(drafts[g][0].prompt)
             rows = []
             count_specs(specs[g], +1)
-            for o in specs[g]:
+            for j, o in enumerate(specs[g]):
                 budget = continuation_budget(plen, len(o.prefix), self.max_new, self.max_seq)
                 complete = o.complete or budget == 0
                 n_gen_calls[0] += 0 if complete else 1
@@ -684,6 +755,8 @@ class VerifyStage:
                         refs.append(o.draft.tokens[len(o.prefix) - 1:])
                     refs += [d.tokens for d in drafts[g] if d is not o.draft]
                     gd["nl_mtd_refs"] = pack_refs(refs)
+                if self.cfg.bx_lane and not complete:
+                    gd["nl_lane"] = int((g, j) in self._bx_lane_rows)
                 rows.append(
                     {
                         "prefix": list(o.prefix),
@@ -732,6 +805,9 @@ class VerifyStage:
         dropped_pks: set = set()
         spare_sel: Optional[set] = None  # set after the verification (spec.null_selected_keys)
 
+        to_launch: list[str] = []
+        bx_phase = [False]  # BX-SD lane: the step's first publish opens the phase
+
         def publish(run_pks, has_pools: bool, plans_of: Optional[dict] = None, relaunch: bool = False) -> None:
             """Outputs per group of a verified run of pools, and their continuations started on the engine."""
             nonlocal t2, t_launch_total
@@ -763,8 +839,20 @@ class VerifyStage:
                     st.neg_tokens += sum(nolanes.accept_unverified(specs[g]) for g in groups)
                 if t2 is None:
                     t2 = time.perf_counter()
-                for g in groups:
-                    launch(g, relaunch=relaunch)
+                to_launch.extend(groups)
+            if self.cfg.bx_lane and to_launch:
+                # BX-SD lane (bxsd_lane.py): the run's rows are known before any of them is submitted; the placer's
+                # quotas for this phase are set first (row counts and remaining depths only).
+                rows_b = [
+                    (g, j, continuation_budget(len(drafts[g][0].prompt), len(o.prefix), self.max_new, self.max_seq))
+                    for g in to_launch for j, o in enumerate(specs[g]) if not o.complete
+                ]
+                self._bx_begin([x for x in rows_b if x[2] > 0], st,
+                               n_drafts_next=len(gids) * self.n if not bx_phase[0] else 0)
+                bx_phase[0] = True
+            for g in to_launch:
+                launch(g, relaunch=relaunch)
+            to_launch.clear()
             t_launch_total += time.perf_counter() - tl
 
         # Every chunk's call is posted up front; the learner runs them in posting order back to back (no driver
@@ -1096,14 +1184,17 @@ class VerifyStage:
                 # Stand down for training (the loop's own stand-down after this stage is then a no-op sleep).
                 tc = time.perf_counter()
                 self.sc._rollout_permitted.clear()
+                # Lag K > 1: only the batch that trains next (target step version + 1) is cut; later batches' drafts
+                # pause with the engine (KV persist) and resume at the wake, as stock SPR's lookahead (lag 1: all).
+                cut_max = int(version) + 1 if self.lag > 1 else None
                 if self.cfg.wake_verify and self.slots is not None:
                     # Drafts waiting for a slot end here with zero tokens, unsent (and so does any draft call reaching
                     # the gate before the next wake): only drafts holding a slot are on the engines to be cut.
-                    st.crit["cut_at_gate"] = self.slots.cut_waiting_drafts()
+                    st.crit["cut_at_gate"] = self.slots.cut_waiting_drafts(cut_max)
                 if self.cfg.wake_verify:
                     # The next batch's drafts end here, unfinished where they stand: that batch is complete at this
                     # stand-down and is verified against theta_{k+1} at the start of the next phase.
-                    st.crit.update(await self.cut_drafts())
+                    st.crit.update(await self.cut_drafts(cut_max))
                     st.times["colo_cut"] = time.perf_counter() - tc
                 await asyncio.to_thread(self.sc._gen.finish_generation)
                 st.times["colo_standdown2"] = time.perf_counter() - tc

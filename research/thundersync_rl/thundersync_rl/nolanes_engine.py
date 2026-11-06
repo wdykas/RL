@@ -43,6 +43,21 @@ KEY_RID_ATTR = "ts_nl_key_rid"
 # SamplingParams attribute set on the engine rank: the draft was cut at a stand-down (wake_verify); it travels back
 # with the result (SamplingParams serialize their __dict__) and marks the draft unfinished.
 CUT_ATTR = "ts_nl_cut"
+# BX-SD fork lane (bxsd_lane.py / bxsd_route.py): the request's target engine DP rank, and the fork-row bit (L1).
+BX_DP_RANK_ATTR = "ts_dp_rank"
+# Lag-K wake_verify: the training step a draft's group targets (the sampler's target_step stamp, driver data field
+# nl_target_step). A stand-down cuts only the drafts of the batch that trains next; later batches' drafts pause.
+TARGET_ATTR = "ts_nl_target"
+
+
+def cuttable(sp: Any, max_target: Optional[int]) -> bool:
+    """A draft is cut at this stand-down iff no bound is given (lag 1: every draft) or it targets <= max_target
+    (unstamped drafts are cut: the lag-1 rule)."""
+    if max_target is None:
+        return True
+    t = getattr(sp, TARGET_ATTR, None)
+    return t is None or int(t) <= int(max_target)
+BX_FORK_ATTR = "ts_bx_fork"
 
 
 def normalize_empty_results(result: Any) -> int:
@@ -59,18 +74,21 @@ def normalize_empty_results(result: Any) -> int:
     return n
 
 
-def mark_cut(engine: Any) -> dict[str, int]:
+def mark_cut(engine: Any, max_target: Optional[int] = None) -> dict[str, int]:
     """Mark every draft request (hidden-log key) of a PAUSED dynamic engine for a cut (``nl_cut_drafts``): resident
     requests finish at the engine's next step through the stop-word path (that step's sampled token is not appended);
     a waiting request (not prefilled) finishes after its first token. Each marked request carries ``CUT_ATTR`` back
     with its result. Continuations / fresh rows (no hidden-log key) are never touched."""
     from thundersync_rl.engine_q import HIDDEN_KEY_ATTR
 
-    counts = {"cut": 0, "waiting": 0, "marked": 0}
+    counts = {"cut": 0, "waiting": 0, "marked": 0, "kept": 0}
     waiting = {int(r) for r in engine.waiting_request_ids}
     for rid, entry in list(engine.requests.items()):
         sp = entry.record[-1].sampling_params
         if sp is None or getattr(sp, HIDDEN_KEY_ATTR, None) is None:
+            continue
+        if not cuttable(sp, max_target):
+            counts["kept"] += 1  # a later batch's draft (lag K): it pauses at the stand-down and resumes at the wake
             continue
         if getattr(sp, CUT_ATTR, 0):
             counts["marked"] += 1
@@ -265,7 +283,7 @@ class NolanesEngineMixin:
             engine, W=w, D=d, t_max=64, ref_cap=ref_cap, node_cap=rows, sample_rows=self._nl_tree_sample,
             key_check=getattr(self, "_wide_key_check", None), keyreg=nl["keyreg"],
             key_ids=lambda rids: self._nl_key_ids(engine, rids),
-            scores_rows=self._nl_tree_scores, uniform_rows=self._nl_tree_uniform,
+            scores_rows=self._nl_tree_scores, uniform_rows=self._nl_tree_uniform, top2_rows=self._nl_tree_top2,
         )
         print(f"[nolanes engine] rank={getattr(self, 'rank', '?')} tail_tree W={w} D={d} rows/step={rows} "
               f"ref tokens={ref_cap}", flush=True)
@@ -344,6 +362,26 @@ class NolanesEngineMixin:
         rows = logits if logits.stride(-1) == 1 else logits.contiguous()
         return keyed_scores(rows, kid_d, pos.to(device=logits.device, dtype=torch.int64),
                             temp.clamp(min=_min_sampling_temperature()), self._wide_salt)
+
+    def _nl_tree_top2(self, logits, kid_dev, pos_dev, temp):
+        """Proposals only (tree_spec's MTP depth-1 sibling): the runner-up of each row's keyed race (S's keys and
+        noise, fp32 scores), -1 where none. Device key ids and positions; fixed shapes (graph-capturable)."""
+        import torch
+
+        from thundersync_rl import keyed_sampling_s as s_mod
+        from thundersync_rl.worker import _min_sampling_temperature
+
+        rows = logits if logits.stride(-1) == 1 else logits.contiguous()
+        n, v = rows.shape
+        need = s_mod.top2_workspace_bytes(n, v)
+        ws = self.__dict__.get("_nl_top2_ws")
+        if ws is None or ws.numel() < need:
+            ws = self._nl_top2_ws = torch.empty(max(need, 1), dtype=torch.uint8, device=rows.device)
+        o1 = torch.empty(n, dtype=torch.int64, device=rows.device)
+        o2 = torch.empty(n, dtype=torch.int64, device=rows.device)
+        s_mod.keyed_top2(rows, kid_dev.to(torch.int64), pos_dev.to(torch.int64),
+                         temp.clamp(min=_min_sampling_temperature()), self._wide_salt, out1=o1, out2=o2, workspace=ws)
+        return o2
 
     def _nl_tree_uniform(self, kid_dev, pos_dev):
         from thundersync_rl.keyed_scores import keyed_uniform
@@ -482,19 +520,28 @@ class NolanesEngineMixin:
         nl["tags"].record(keys, ts, self._nl_tag_version())
 
     def _nl_key_ids(self, engine: Any, rids: np.ndarray) -> np.ndarray:
-        """Noise-key request ids of the sampled rows (the engine id; a key_reuse negative's override)."""
+        """Noise-key request ids of the sampled rows: the engine request id, or the request's KEY_RID_ATTR override
+        when it carries one (a consumer continuing a row under the original row's keys, e.g. a keyed check's
+        in-place continuation; INTERFACE.md). nolanes' own requests carry it only under the key_reuse negative, so its
+        fresh-key rule (E4) is unchanged; the negative's tokens are counted."""
         nl = self.__dict__.get("_nl")
-        if nl is None or nl["neg"] != "key_reuse":
-            return rids
+        cache = self.__dict__.setdefault("_nl_kid_cache", {})  # rid -> override or None (attributes are immutable)
+        if len(cache) > 1 << 16:
+            cache.clear()
         out = rids.copy()
         for i, rid in enumerate(rids.tolist()):
-            entry = engine.requests.get(int(rid))
-            if entry is None:
-                continue
-            k = getattr(entry.record[-1].sampling_params, KEY_RID_ATTR, None)
+            if rid in cache:
+                k = cache[rid]
+            else:
+                entry = engine.requests.get(int(rid))
+                if entry is None:
+                    continue
+                k = getattr(entry.record[-1].sampling_params, KEY_RID_ATTR, None)
+                cache[rid] = k
             if k is not None:
                 out[i] = int(k)
-                nl["neg_tokens"] += 1
+                if nl is not None and nl["neg"] == "key_reuse":
+                    nl["neg_tokens"] += 1
         return out
 
     def _nl_observe_keys(self, key_ids: np.ndarray, pos: Optional[np.ndarray]) -> None:
@@ -523,6 +570,9 @@ class NolanesEngineMixin:
             nl["cont_inflight"] = nl.get("cont_inflight", 0) + sum(1 for x in no_log if bool(x))
         key_rid = data.get("nl_key_rid") if data is not None and "nl_key_rid" in data else None
         mtd_refs = data.get("nl_mtd_refs") if data is not None and "nl_mtd_refs" in data else None
+        lane = data.get("nl_lane") if data is not None and "nl_lane" in data else None
+        tgt = data.get("nl_target_step") if data is not None and "nl_target_step" in data else None
+        placer = (self.__dict__.get("_bx") or {}).get("placer")
         for i, sp in enumerate(sps):
             attrs = {}
             if no_log is None or not bool(no_log[i]):
@@ -533,12 +583,26 @@ class NolanesEngineMixin:
                 from nemo_rl.models.generation.megatron.tail_mtd import MTD_REFS_ATTR
 
                 attrs[MTD_REFS_ATTR] = np.ascontiguousarray(mtd_refs[i], dtype=np.int32).tobytes()
+            if tgt is not None and tgt[i] is not None and attrs.get(HIDDEN_KEY_ATTR) is not None:
+                attrs[TARGET_ATTR] = int(tgt[i])  # lag-K wake_verify: the draft's training step (selective cut)
+            if placer is not None:
+                # BX-SD lane: the target engine DP rank (routed by bxsd_route in the coordinator); fork rows to the lane
+                fork = lane is not None and lane[i] is not None and bool(int(lane[i]))
+                attrs[BX_DP_RANK_ATTR] = int(placer.place(fork))
+                if fork:
+                    attrs[BX_FORK_ATTR] = 1
             if attrs:
                 sp.add_attributes(attrs)
 
     def _parse_result_to_batched_data_dict(self, data, result):
         normalize_empty_results(result)
         out = super()._parse_result_to_batched_data_dict(data, result)
+        placer = (self.__dict__.get("_bx") or {}).get("placer")
+        if placer is not None:
+            for r in result:
+                rk = getattr(r.sampling_params, BX_DP_RANK_ATTR, None)
+                if rk is not None and int(rk) >= 0:
+                    placer.release(int(rk), bool(getattr(r.sampling_params, BX_FORK_ATTR, 0)))
         nl = self.__dict__.get("_nl")
         if nl is not None and data is not None and "nl_call_id" in data:
             # The engine request finished: report the driver's call id (append-only; read by cursor, never cleared).
@@ -563,7 +627,7 @@ class NolanesEngineMixin:
 
     # -- wake_verify: cut the drafts at a stand-down ------------------------------------------------------------
 
-    def nl_cut_drafts(self) -> dict[str, int]:
+    def nl_cut_drafts(self, max_target: Optional[int] = None) -> dict[str, int]:
         """Cut every draft request on this engine rank where it stands (thundersync.wake_verify).
 
         All engine ranks pause through the coordinator (one step boundary for every TP / EP / DP rank, as at a
@@ -581,7 +645,7 @@ class NolanesEngineMixin:
         import torch
         from megatron.core.inference.engines.dynamic_engine import EngineState
 
-        counts = {"cut": 0, "waiting": 0, "marked": 0}
+        counts = {"cut": 0, "waiting": 0, "marked": 0, "kept": 0}
 
         async def pause():
             if torch.distributed.get_rank() == 0:
@@ -589,7 +653,7 @@ class NolanesEngineMixin:
             await engine.wait_until(EngineState.PAUSED)
 
         async def mark():
-            counts.update(mark_cut(engine))
+            counts.update(mark_cut(engine, max_target))
 
         async def unpause():
             if torch.distributed.get_rank() == 0:
@@ -615,7 +679,7 @@ class NolanesEngineMixin:
         n = len(ids)
         return list(ids[int(since):n]), n
 
-    def nl_draft_requests(self) -> list[int]:
+    def nl_draft_requests(self, max_target: Optional[int] = None) -> list[int]:
         """[draft requests (hidden-log key) this engine rank still holds, of which not marked for a cut]
         (wake_verify: [0, 0] once the cut ones are out)."""
         engine = getattr(self, "dynamic_inference_engine", None)
@@ -629,7 +693,7 @@ class NolanesEngineMixin:
             tot = unmarked = 0
             for e in list(engine.requests.values()):
                 sp = e.record[-1].sampling_params
-                if sp is None or getattr(sp, HIDDEN_KEY_ATTR, None) is None:
+                if sp is None or getattr(sp, HIDDEN_KEY_ATTR, None) is None or not cuttable(sp, max_target):
                     continue
                 tot += 1
                 unmarked += 0 if getattr(sp, CUT_ATTR, 0) else 1
@@ -670,6 +734,112 @@ class NolanesEngineMixin:
         for k in keys:
             nl["tags"].close(k)
         self.close_draft_logs(keys)
+
+    # -- BX-SD fork lane ------------------------------------------------------------------------------------------
+
+    def nl_bx_info(self) -> Optional[dict]:
+        """This engine rank's DP rank (the coordinator identity mp-coord-<dp_rank>) and the global ranks it steps in
+        lockstep with (its expert-parallel and model-parallel groups). Read by the driver to build the lane layout
+        without a collective (an engine-time collective could interleave with the engine loop's)."""
+        engine = getattr(self, "dynamic_inference_engine", None)
+        if engine is None:
+            return None
+        import torch.distributed as dist
+        from megatron.core.utils import get_pg_rank
+
+        pgc = engine.pg_collection
+        return {
+            "global_rank": int(dist.get_rank()),
+            "dp_rank": int(get_pg_rank(pgc.dp)),
+            "lockstep": [sorted(int(x) for x in dist.get_process_group_ranks(g)) for g in (pgc.ep, pgc.mp)],
+        }
+
+    def nl_bx_begin_phase(self, n_bulk_new: int, n_fork_new: int, b: int, it_bulk: float, fork_depth_max: float,
+                          groups: list, row_cap: Optional[int] = None) -> dict:
+        """Open a BX-SD phase. Every rank: the L1 horizon (lane rows draft only while behind it). The
+        request-building rank (global rank 0, which owns the inference client): the placer's quotas."""
+        import torch.distributed as dist
+
+        from thundersync_rl import bxsd_lane
+
+        bx = self.__dict__.setdefault("_bx", {"iters": 0, "horizon": 0.0, "bulk": 0.0, "l1_on": 0, "l1_off": 0, "routed": 0,
+                                              "misrouted": 0})
+        engine = getattr(self, "dynamic_inference_engine", None)
+        if engine is not None and "dp_rank" not in bx:
+            self._bx_install(engine)
+        ts = self.__dict__.get("_nl_tree")
+        s_hat = 1.0
+        if ts is not None and int(ts.stats.get("crit_iters", 0)) > 0:
+            # measured tokens per iteration of the critical tails so far (run total); 1 before any (report only)
+            s_hat = max(1.0, float(ts.stats["crit_tokens"]) / float(ts.stats["crit_iters"]))
+        bx["bulk"] = float(it_bulk)  # L1: the deepest non-lane deadline row (tokens; an upper bound in iterations)
+        bx["horizon"] = max(float(it_bulk), float(fork_depth_max) / s_hat)  # report: the predicted lane phase
+        bx["iters"] = 0
+        if int(dist.get_rank()) != 0:
+            return {}
+        if bx.get("placer") is None:
+            layout = bxsd_lane.LaneLayout(groups=tuple(tuple(int(r) for r in g) for g in groups))
+            bx["placer"] = bxsd_lane.LanePlacer(layout, row_cap=None if row_cap is None else int(row_cap))
+        p = bx["placer"]
+        prev = [list(p.phase_placed[r]) for r in range(p.layout.dp_size)]  # where the previous phase's rows went
+        b = p.begin_phase(int(n_bulk_new), int(n_fork_new), int(b))
+        return {"b": int(b), "live": [list(v) for v in p.loads().values()], "prev_placed": prev, "placed": p.placed,
+                "released": p.released, "horizon": round(bx["horizon"], 1), "s_hat": round(s_hat, 3)}
+
+    def _bx_install(self, engine: Any) -> None:
+        """Every engine rank, once: count routed / misrouted requests (a request carrying another rank's target is a
+        routing bug), and the L1 rule before each tree plan (lane fork rows: width cap W while behind the horizon,
+        0 otherwise; proposals only, exact by construction)."""
+        from megatron.core.utils import get_pg_rank
+
+        from thundersync_rl import bxsd_lane
+
+        bx = self._bx
+        bx["dp_rank"] = int(get_pg_rank(engine.pg_collection.dp))
+        orig_add = engine.add_request
+
+        def add_request(request_id, prompt, sampling_params=None, *a, **kw):
+            tgt = getattr(sampling_params, BX_DP_RANK_ATTR, None) if sampling_params is not None else None
+            if tgt is not None and int(tgt) >= 0:
+                bx["routed" if int(tgt) == bx["dp_rank"] else "misrouted"] += 1
+            return orig_add(request_id, prompt, sampling_params, *a, **kw)
+
+        engine.add_request = add_request
+        ts = self.__dict__.get("_nl_tree")
+        l1 = os.environ.get("THUNDERSYNC_BX_LANE", "").strip() == "l1"
+        if ts is None or not l1:
+            return
+        orig_plan = ts.plan
+        cap0: dict[int, int] = {}
+
+        def plan(ctx, is_dummy):
+            # one count per engine step on every rank of a lockstep group (dummy steps included: they are steps)
+            it = bx["iters"]
+            bx["iters"] = it + 1
+            if not is_dummy and ts.tails:
+                if len(cap0) > 4 * max(len(ts.tails), 1024):
+                    for k in [k for k in cap0 if k not in ts.tails]:
+                        del cap0[k]
+                forks = []
+                for rid, t in list(ts.tails.items()):
+                    req = engine.get_request(int(rid))
+                    if getattr(req.sampling_params, BX_FORK_ATTR, 0):
+                        forks.append((int(rid), cap0.setdefault(int(rid), int(t.w_cap)),
+                                      t.budget_end - (t.plen + len(req.generated_tokens))))
+                if forks:
+                    ci = int(ts.stats.get("crit_iters", 0))
+                    s_crit = float(ts.stats["crit_tokens"]) / ci if ci > 0 else 1.0
+                    on = bxsd_lane.l1_drafts([r for _, _, r in forks], s_crit, max(bx["bulk"] - it, 0.0))
+                    for (rid, w0, _r), d in zip(forks, on):
+                        ts.set_width_cap(rid, w0 if d else 0)
+                        bx["l1_on" if d else "l1_off"] += 1
+            return orig_plan(ctx, is_dummy)
+
+        ts.plan = plan
+
+    def nl_bx_stats(self) -> dict:
+        bx = self.__dict__.get("_bx") or {}
+        return {k: bx[k] for k in ("routed", "misrouted", "l1_on", "l1_off", "iters") if k in bx}
 
     def nl_engine_stats(self) -> dict[str, Any]:
         nl = self.__dict__.get("_nl")

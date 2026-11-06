@@ -971,12 +971,12 @@ def test_mark_cut_marks_drafts_only_and_once():
     sps = {1: SP(**{HIDDEN_KEY_ATTR: "nl0"}), 2: SP(**{HIDDEN_KEY_ATTR: "nl1"}), 3: SP(), 4: SP(**{HIDDEN_KEY_ATTR: "nl2"})}
     eng = SimpleNamespace(requests={k: SimpleNamespace(record=Rec(v)) for k, v in sps.items()},
                           waiting_request_ids=[4], stop_word_finished_request_ids=set())
-    assert mark_cut(eng) == {"cut": 2, "waiting": 1, "marked": 0}
+    assert mark_cut(eng) == {"cut": 2, "waiting": 1, "marked": 0, "kept": 0}
     assert eng.stop_word_finished_request_ids == {1, 2}  # resident drafts: finished at the next step, no new token
     assert sps[4].num_tokens_to_generate == 1  # waiting draft: one token, then finished
     assert getattr(sps[3], CUT_ATTR, 0) == 0 and 3 not in eng.stop_word_finished_request_ids  # continuation untouched
     assert all(getattr(sps[k], CUT_ATTR) == 1 for k in (1, 2, 4))
-    assert mark_cut(eng) == {"cut": 0, "waiting": 0, "marked": 3}  # a second round marks nothing twice
+    assert mark_cut(eng) == {"cut": 0, "waiting": 0, "marked": 3, "kept": 0}  # a second round marks nothing twice
 
 
 def test_parse_result_hands_back_the_cut_flag():
@@ -1014,12 +1014,16 @@ def _colocated_wake_verify(nps=16, inflight=None, buffered=None, lag=1):
 
 def test_wake_verify_needs_the_whole_lookahead_batch_in_flight():
     """Review F1: with the post-step wake deferred, a lookahead group not in flight at the cut would wait for a wake
-    only the next stage gives (hang): lag 1 and inflight / buffered >= 2 x num_prompts_per_step are required."""
+    only the next stage gives (hang): lag K in 1..4 and inflight / buffered >= (K + 1) x num_prompts_per_step."""
     ok = nolanes.config_problems(_colocated_wake_verify(inflight=32, buffered=32))
     assert not any("wake_verify needs" in p for p in ok), ok
+    for lag in (2, 4):
+        ok = nolanes.config_problems(_colocated_wake_verify(inflight=16 * (lag + 1), buffered=16 * (lag + 1), lag=lag))
+        assert not any("wake_verify needs" in p for p in ok), (lag, ok)
     for kw, needle in ((dict(inflight=31, buffered=32), "max_inflight_prompts"),
                        (dict(inflight=32, buffered=16), "max_buffered_rollouts"),
-                       (dict(inflight=32, buffered=32, lag=2), "max_lookahead_versions"),
+                       (dict(inflight=32, buffered=48, lag=2), "max_inflight_prompts"),
+                       (dict(inflight=96, buffered=96, lag=5), "max_lookahead_versions"),
                        (dict(inflight=32, buffered=32, lag=0), "max_lookahead_versions"),
                        (dict(inflight=None, buffered=32), "max_inflight_prompts")):
         probs = nolanes.config_problems(_colocated_wake_verify(**kw))
@@ -1195,3 +1199,17 @@ def test_colo_tree_xssd_mtp_validator(tmp_path):
     assert any("slots" in p for p in probs({"tree_xssd": "8:7:256", "tree_xssd_mtp": f"{head}:0"}))
     assert any("tensor_model_parallel_size 1" in p
                for p in probs({"tree_xssd": "8:7:256", "tree_xssd_mtp": f"{head}:128"}, tp=2))
+
+
+def test_bx_lane_validator():
+    """thundersync.bx_lane (BX-SD fork lane): valid on the colocated wake_verify path whatever the (unused, caching
+    off) prefix-affinity policy says; refused without wake_verify; bx_lane_l1 off only with bx_lane."""
+    c = _colocated_wake_verify(inflight=32, buffered=32)
+    c["thundersync"]["bx_lane"] = True
+    c["policy"]["generation"]["mcore_generation_config"]["prefix_caching_coordinator_policy"] = "longest_prefix"
+    assert not any("bx_lane" in p for p in nolanes.config_problems(c)), nolanes.config_problems(c)
+    c["thundersync"]["wake_verify"] = False
+    assert any("bx_lane places the wake's continuations" in p for p in nolanes.config_problems(c))
+    c = _colocated_wake_verify(inflight=32, buffered=32)
+    c["thundersync"]["bx_lane_l1"] = False
+    assert any("bx_lane_l1 needs thundersync.bx_lane" in p for p in nolanes.config_problems(c))

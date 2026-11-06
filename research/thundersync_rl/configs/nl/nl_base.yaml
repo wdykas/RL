@@ -247,6 +247,12 @@ thundersync:
   # MTP draft source of tail_tree (tree_mtp): path to a trained MCore MTP head (head_mcore.pt); "" = off. TP 1 only.
   tail_tree_mtp: ""
   tail_tree_mtp_slots: 64
+  # BX-SD balanced fork lane (FIRSTPRINCIPLES_A §10.1 (c)(iii); thundersync_rl/bxsd_lane.py): at the wake, continuations
+  # with more than L/(K+1) tokens left go to one lockstep engine group (the lane), the bulk fills balanced per-rank
+  # quotas; placement only (every group is the same BI forward). Needs wake_verify. bx_lane_l1: lane fork rows lay out
+  # tree nodes only while behind the phase horizon.
+  bx_lane: false
+  bx_lane_l1: true
 
 checkpointing:
   enabled: false

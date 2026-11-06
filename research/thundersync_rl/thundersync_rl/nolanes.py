@@ -204,6 +204,14 @@ class NolanesConfig:
     # rows and of the engine's iteration timing, never of the draft's later tokens), so block verification of the
     # cut prefix is exact (MODEL.md v2 §13; the async design's deadline cut, Corollary 1).
     wake_verify: bool = False
+    # BX-SD balanced fork lane (research/colo/FIRSTPRINCIPLES_A.md §10.1 (c)(iii); bxsd_lane.py, bxsd_route.py): at the
+    # wake, continuations with more than the bulk window left (L / (K + 1) tokens; tau < L/2 at K = 1) are placed on
+    # one lockstep engine group (the lane: group 0 of the engine's EP x model-parallel layout); the bulk fills
+    # per-rank quotas that balance the groups' predicted finish times. Placement only: every lockstep group is the
+    # same BI forward of the same layout, so outputs are bitwise unchanged. bx_lane_l1: lane fork rows lay out tree
+    # nodes only while behind the phase horizon (FIRSTPRINCIPLES_A §8.3; proposals only).
+    bx_lane: bool = False
+    bx_lane_l1: bool = True
 
     @classmethod
     def from_config(cls, config: Any) -> "NolanesConfig":
@@ -226,6 +234,9 @@ def apply_driver_env(cfg: "NolanesConfig") -> None:
     (``null_wave_size``): the lazy-wave multiplier override is cleared."""
     os.environ["THUNDERSYNC_ROW_SEEDS"] = "1" if cfg.row_seeds else "0"
     os.environ.pop("THUNDERSYNC_NULL_WAVE_MULT", None)
+    # wake_verify: every draft request carries its group's target step (rollout_manager), so a lag-K stand-down cuts
+    # only the batch that trains next (VerifyStage.cut_drafts).
+    os.environ["THUNDERSYNC_NL_STAMP_TARGET"] = "1" if cfg.wake_verify else "0"
 
 
 def enabled(config: Any) -> bool:
@@ -300,15 +311,18 @@ def config_problems(config: Any) -> list[str]:
             # The cut ends phase k only once batch k+1 is fully dispatched: with the loop's post-step wake deferred,
             # a group of batch k+1 that is not in flight at the stand-down would wait for a wake only the next
             # stage gives (a hang). So the lookahead batch must be admissible as a whole.
+            # Lag K (1..4): the stand-down cuts only the batch that trains next (drafts carry their target step);
+            # the K - 1 later batches pause and resume, so K lookahead batches must be admissible whole.
             nps = int(_get(grpo, "num_prompts_per_step", 0) or 0)
             lag = _get(async_rl, "sampler.max_lookahead_versions")
-            if lag is None or int(lag) != 1:
-                p.append(f"thundersync.wake_verify needs async_rl.sampler.max_lookahead_versions = 1 (got {lag})")
+            if lag is None or not 1 <= int(lag) <= 4:
+                p.append(f"thundersync.wake_verify needs async_rl.sampler.max_lookahead_versions in 1..4 (got {lag})")
+            k1 = (int(lag) if lag is not None and 1 <= int(lag) <= 4 else 1) + 1
             for key in ("max_inflight_prompts", "max_buffered_rollouts"):
                 v = _get(async_rl, key)
-                if v is None or int(v) < 2 * max(nps, 1):
-                    p.append(f"thundersync.wake_verify needs async_rl.{key} >= 2 x num_prompts_per_step "
-                             f"({v} < {2 * nps}): the lookahead batch must be in flight whole at the cut")
+                if v is None or int(v) < k1 * max(nps, 1):
+                    p.append(f"thundersync.wake_verify needs async_rl.{key} >= (lag + 1) x num_prompts_per_step "
+                             f"({v} < {k1 * nps}): the lookahead batches must be in flight whole at the cut")
     elif cfg.wake_verify:
         p.append("thundersync.wake_verify needs a colocated engine (policy.generation.colocated.enabled)")
     p += kv_mode_problems(mcore)
@@ -381,6 +395,13 @@ def config_problems(config: Any) -> list[str]:
                 p.append("thundersync.tail_tree_mtp needs tensor_model_parallel_size 1 (full-vocab output layer)")
     elif cfg.tail_tree_mtp:
         p.append("thundersync.tail_tree_mtp needs thundersync.tail_tree")
+    if cfg.bx_lane:
+        # (untargeted requests route by load: the colocated wake_verify stage already requires least-loaded routing,
+        # engine_slots.require_least_loaded)
+        if not cfg.wake_verify:
+            p.append("thundersync.bx_lane places the wake's continuations: it needs thundersync.wake_verify")
+    elif cfg.bx_lane_l1 is not True:
+        p.append("thundersync.bx_lane_l1 needs thundersync.bx_lane")
     # A continuation re-prefills prompt + kept prefix in ONE engine step (chunked prefill is off): the engine's token
     # budget must cover the longest sequence (DESIGN §18.3 lowered it to max_model_len at Super).
     mt, mseq = _get(mcore, "max_tokens"), _get(pol, "max_total_sequence_length")
@@ -797,6 +818,11 @@ def configure_driver(config: dict) -> NolanesConfig:
             f"{int(cfg.tail_tree)}:{int(cfg.tail_tree_depth)}:{int(cfg.tail_tree_rows)}:{ref_cap}"))
         if cfg.tail_tree_mtp:
             mcfg["env_vars"]["THUNDERSYNC_TAIL_TREE_MTP"] = f"{cfg.tail_tree_mtp}:{int(cfg.tail_tree_mtp_slots)}"
+    if cfg.bx_lane:
+        # Engine workers: the coordinator routing hook (installed before the engine spawns its coordinator) and the
+        # L1 rule on the lane's fork rows.
+        mcfg["env_vars"] = dict(mcfg.get("env_vars") or {},
+                                THUNDERSYNC_BX_LANE="l1" if cfg.bx_lane_l1 and cfg.tail_tree else "1")
     if neg == "cf_engine_m":
         # Negative control: the engine (inference mode only) routes with 2 x the band (crossfade_routing.py).
         mcfg.setdefault("env_vars", {})
@@ -806,7 +832,8 @@ def configure_driver(config: dict) -> NolanesConfig:
         f"ramp_stopgrad={cfg.crossfade_routing_ramp_stopgrad} train_overlap={int(cfg.train_overlap)} "
         f"tail_mtd={int(cfg.tail_mtd)}x{int(cfg.tail_mtd_rows)} "
         f"tail_tree={int(cfg.tail_tree)}d{int(cfg.tail_tree_depth)}x{int(cfg.tail_tree_rows)}"
-        f"{' mtp=' + str(int(cfg.tail_tree_mtp_slots)) if cfg.tail_tree_mtp else ''} lag="
+        f"{' mtp=' + str(int(cfg.tail_tree_mtp_slots)) if cfg.tail_tree_mtp else ''}"
+        f"{' bx_lane=' + ('l1' if cfg.bx_lane_l1 else 'on') if cfg.bx_lane else ''} lag="
         f"{_get(config, 'async_rl.sampler.max_lookahead_versions')} checks={int(checks_on())}"
         + (f" NEGATIVE CONTROL {neg}" if neg else ""),
         flush=True,

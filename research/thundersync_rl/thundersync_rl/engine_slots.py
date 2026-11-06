@@ -77,18 +77,21 @@ class PrioritySlots:
         # Stand-down cut (wake_verify, ``cut_waiting_drafts``): from the cut until the next wake a draft call is not sent;
         # it ends with zero tokens at the gate (``acquire`` returns False), so no draft reaches a stood-down engine.
         self.cutting = False
+        # Lag-K wake_verify: the stand-down cuts only drafts whose training step <= cut_max (None: every draft, lag 1);
+        # a later batch's draft waits through the stand-down and is sent after the wake.
+        self.cut_max: Optional[int] = None
         self.draft_holding = 0  # draft calls granted a slot and not yet returned (sent / on an engine / result in transit)
         self.cut_at_gate = 0  # draft calls ended at the gate by the cut (this step)
         # Counted stand-down stop: every granted draft call carries an id (``nl_call_id``); the engine's rank 0 reports
         # the ids whose engine request finished (``nl_done_call_ids``). A granted call not yet reported is the only kind
         # that can still be on (or reach) an engine; one reported finished but not yet returned is a result in transit.
         self._call_ids = itertools.count(1)
-        self.draft_calls: set[int] = set()  # granted, not yet returned
+        self.draft_calls: dict[int, Optional[int]] = {}  # granted, not yet returned -> the draft's training step
         self.engine_done: set[int] = set()  # of those, reported finished by the engine
         self.cont_arrivals = 0  # continuation / fresh / verify calls that reached the gate (held or granted)
         self._arrival_target: Optional[int] = None
         self._arrival_event: Optional[asyncio.Event] = None
-        self._heap: list[tuple[int, int, int, asyncio.Future]] = []  # (prio, seq, n, future)
+        self._heap: list[tuple[int, int, int, asyncio.Future, Optional[int]]] = []  # (prio, seq, n, future, target)
         self._live = 0  # waiters in the heap neither granted nor cancelled
         self._seq = itertools.count()
         self.stats = self._fresh_stats()
@@ -116,20 +119,26 @@ class PrioritySlots:
         """Wake: a new phase. Drafts wait until ``open_drafts``; the previous stand-down's cut mode ends."""
         self.drafts_open = False
         self.cutting = False
+        self.cut_max = None
 
-    def cut_waiting_drafts(self) -> int:
+    def _cuttable(self, target: Optional[int]) -> bool:
+        return self.cut_max is None or target is None or int(target) <= self.cut_max
+
+    def cut_waiting_drafts(self, max_target: Optional[int] = None) -> int:
         """Stand-down (wake_verify cut): every draft call waiting for a slot ends now with zero tokens, unsent, and every
         draft call that reaches the gate until the next wake (``hold_drafts``) does too. Draft calls holding a slot are
         on the engines (or in transit) and are cut there. Returns the waiting drafts ended."""
         self.cutting = True
+        self.cut_max = None if max_target is None else int(max_target)
+        self.drafts_open = False  # later batches' drafts (lag K) wait at the gate until the wake opens them
         n = 0
         keep = []
         while self._heap:
             item = heapq.heappop(self._heap)
-            prio, _sq, k, fut = item
+            prio, _sq, k, fut, tgt = item
             if fut.done():
                 continue
-            if prio == PRIO_CONT:
+            if prio == PRIO_CONT or not self._cuttable(tgt):
                 keep.append(item)
                 continue
             self._live -= 1
@@ -152,15 +161,17 @@ class PrioritySlots:
         The granted calls are sent after this returns, so the cut loop may still need a further round for the last
         arrivals (it re-cuts any unmarked draft). Rows per engine rank can exceed max_requests during the cut.
         Returns the drafts granted."""
-        self.drafts_open = True
+        lag1 = self.cut_max is None
+        if lag1:
+            self.drafts_open = True
         n = 0
         keep = []
         while self._heap:
             item = heapq.heappop(self._heap)
-            prio, _sq, k, fut = item
+            prio, _sq, k, fut, tgt = item
             if fut.done():
                 continue
-            if prio == PRIO_CONT:
+            if prio == PRIO_CONT or not self._cuttable(tgt):
                 keep.append(item)
                 continue
             self._live -= 1
@@ -190,7 +201,7 @@ class PrioritySlots:
         finally:
             self._arrival_target, self._arrival_event = None, None
 
-    async def acquire(self, prio: int, n: int = 1) -> bool:
+    async def acquire(self, prio: int, n: int = 1, target: Optional[int] = None) -> bool:
         """Take ``n`` slots at once (n <= capacity). Returns False, holding nothing, for a draft ended by a stand-down
         cut (``cut_waiting_drafts``): the call must not be sent."""
         n = int(n)
@@ -198,7 +209,7 @@ class PrioritySlots:
             raise ValueError(f"engine slots: {n} slots asked of capacity {self.capacity}")
         if prio == PRIO_CONT:
             self._note_cont_arrival()
-        elif self.cutting:
+        elif self.cutting and self._cuttable(target):
             self.cut_at_gate += 1
             return False
         if self.used + n <= self.capacity and (prio == PRIO_CONT or self.drafts_open) and self._live == 0:
@@ -206,7 +217,7 @@ class PrioritySlots:
             return True
         fut = asyncio.get_running_loop().create_future()
         t0 = time.perf_counter()
-        heapq.heappush(self._heap, (int(prio), next(self._seq), n, fut))
+        heapq.heappush(self._heap, (int(prio), next(self._seq), n, fut, None if target is None else int(target)))
         self._live += 1
         self._dispatch()
         try:
@@ -231,7 +242,7 @@ class PrioritySlots:
 
     def _dispatch(self) -> None:
         while self._heap:
-            prio, _s, n, fut = self._heap[0]
+            prio, _s, n, fut, _t = self._heap[0]
             if fut.done():  # cancelled waiter (already uncounted)
                 heapq.heappop(self._heap)
                 continue
@@ -244,14 +255,14 @@ class PrioritySlots:
             self._grant(prio, n)
             fut.set_result(None)
 
-    def new_draft_call(self) -> int:
+    def new_draft_call(self, target: Optional[int] = None) -> int:
         cid = next(self._call_ids)
-        self.draft_calls.add(cid)
+        self.draft_calls[cid] = None if target is None else int(target)
         return cid
 
     def end_draft_call(self, cid: Optional[int]) -> None:
         if cid is not None:
-            self.draft_calls.discard(cid)
+            self.draft_calls.pop(cid, None)
             self.engine_done.discard(cid)
 
     def note_engine_done(self, ids) -> None:
@@ -259,8 +270,9 @@ class PrioritySlots:
         self.engine_done.update(i for i in ids if i in self.draft_calls)
 
     def drafts_not_engine_done(self) -> int:
-        """Granted draft calls whose engine request has not been reported finished (may still be on / reach an engine)."""
-        return len(self.draft_calls) - len(self.engine_done)
+        """Granted draft calls of the batch being cut (every draft at lag 1) whose engine request has not been reported
+        finished (may still be on / reach an engine). A later batch's draft (lag K) stays on its engine, paused."""
+        return sum(1 for c, t in self.draft_calls.items() if self._cuttable(t) and c not in self.engine_done)
 
     def release(self, n: int = 1, prio: int = PRIO_CONT) -> None:
         if self.used < n or (prio != PRIO_CONT and self.draft_holding < n):
@@ -293,6 +305,19 @@ def row_priority(data: Any) -> int:
     if flags is not None and any(bool(x) for x in flags):
         return PRIO_CONT
     return PRIO_DRAFT
+
+
+def row_target(data: Any) -> Optional[int]:
+    """The training step a draft call's group targets (``nl_target_step``, stamped by the rollout manager under lag-K
+    wake_verify), or None."""
+    try:
+        t = data["nl_target_step"] if "nl_target_step" in data else None
+    except (KeyError, TypeError):
+        t = None
+    if t is None:
+        return None
+    t = t[0] if isinstance(t, (list, tuple)) else t
+    return None if t is None else int(t)
 
 
 def capacity_of(mc: dict, n_workers: int) -> tuple[int, int, int]:
@@ -375,14 +400,15 @@ def _wrap(gen: Any, slots: PrioritySlots) -> None:
         if n != 1:
             raise RuntimeError(f"engine slots: a generation call of {n} rows (one row per call under the slot gate)")
         prio = row_priority(data)
-        if not await slots.acquire(prio):
+        target = row_target(data)
+        if not await slots.acquire(prio, target=target):
             # A draft ended by the stand-down cut before it was sent: zero tokens, no engine row, no hidden log (the
             # stage's empty-draft path: fixed G decodes the slot fresh, VG gives the draft its keyed ⊥ coin).
             yield 0, cut_result(data)
             return
         cid = None
         if prio != PRIO_CONT:
-            cid = slots.new_draft_call()
+            cid = slots.new_draft_call(target)
             data["nl_call_id"] = [cid]  # the engine's rank 0 reports it when the request finishes (nl_done_call_ids)
         # The slot is returned when the call ends: with its result, on an error, or on a cancel (the engine's abort of
         # the request is sent by the cancelled call; the slot may be reused before the engine has dropped the row).

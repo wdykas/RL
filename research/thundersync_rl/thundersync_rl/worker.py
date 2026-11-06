@@ -4054,6 +4054,12 @@ class ThunderSyncMegatronPolicyWorker(
         """
         from megatron.core.inference.engines import dynamic_engine as de
 
+        if os.environ.get("THUNDERSYNC_BX_LANE", "").strip():
+            # BX-SD lane: per-request target DP ranks honoured by the DP coordinator, which the engine spawns
+            # below (start_listening_to_data_parallel_coordinator); the hook rides the spawned process's target.
+            from thundersync_rl import bxsd_route
+
+            bxsd_route.install()
         orig = de.DynamicInferenceEngine
         de.DynamicInferenceEngine = self._engine_class(orig)
         try:
@@ -4679,6 +4685,7 @@ class ThunderSyncMegatronPolicyWorker(
             engine, W=w, D=d, t_max=int(engine.context.max_requests), ref_cap=1, node_cap=rows,
             sample_rows=self._nl_tree_sample, key_check=self._wide_key_check, keyreg=None, key_ids=key_ids,
             scores_rows=self._nl_tree_scores, uniform_rows=self._nl_tree_uniform, own_history=True,
+            top2_rows=self._nl_tree_top2,
         )
         self._xssd_tree_attr = np.asarray([w, d, 2], dtype=np.int32).tobytes()  # src bit1: own history
         mtp = os.environ.get("THUNDERSYNC_TAIL_TREE_MTP", "").strip()

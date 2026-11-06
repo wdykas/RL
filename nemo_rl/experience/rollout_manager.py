@@ -15,8 +15,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import copy
 import enum
+import os
 import json
 import math
 import uuid
@@ -615,6 +617,9 @@ class AsyncRolloutImpl:
             for key in VLLM_PROMPT_KEYS
             if key in input_sample_data
         }
+        nl_target = _NL_TARGET_STEP.get()
+        if nl_target is not None and forced is None and os.environ.get("THUNDERSYNC_NL_STAMP_TARGET") == "1":
+            native_generation_data["nl_target_step"] = int(nl_target)
         current_extra_env_info = copy.deepcopy(input_sample["extra_env_info"])
         current_stop_strings = input_sample.get("stop_strings", None)
         task_name = input_sample["task_name"]
@@ -1808,6 +1813,12 @@ class _TrajectoryPublisher:
             task.cancel()
 
 
+
+# ThunderSync lag-K wake_verify (research/thundersync_rl nolanes): the training step the dispatching group targets,
+# set around a group's rollout by ``RolloutManager.generate_and_push`` and stamped on each of its generation requests
+# as ``nl_target_step`` when THUNDERSYNC_NL_STAMP_TARGET=1, so a stand-down can cut only the batch that trains next.
+_NL_TARGET_STEP: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar("nl_target_step", default=None)
+
 class RolloutManager:
     """Routes to AsyncRolloutImpl (native async) or AsyncNemoGymRolloutImpl (NeMo-Gym), and pushes results to a TQReplayBuffer."""
 
@@ -2213,10 +2224,14 @@ class RolloutManager:
                             start_weight_version=start_version,
                             coalesce_s=self._trajectory_publish_coalesce_s,
                         )
-                    record = await self.run_rollout(
-                        attempt_input_sample,
-                        on_completion=None if publisher is None else publisher.add,
-                    )
+                    nl_token = _NL_TARGET_STEP.set(target_step)
+                    try:
+                        record = await self.run_rollout(
+                            attempt_input_sample,
+                            on_completion=None if publisher is None else publisher.add,
+                        )
+                    finally:
+                        _NL_TARGET_STEP.reset(nl_token)
                 finally:
                     if inflight_registry is not None:
                         inflight_registry.pop(tq_group_id, None)

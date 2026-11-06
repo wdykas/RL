@@ -181,7 +181,7 @@ if HAVE_TRITON:
             tl.store(ncand + j, tl.minimum(total, CMAXC))
 
     @triton.jit
-    def _build_kernel(H, R, RLEN, P, OWN, BUD, lay, cand, ncand, ntok, npar, ndep, nn, p_out, mtok, mlen, nm_out,
+    def _build_kernel(H, R, RLEN, P, OWN, BUD, lay, cand, ncand, ntok, npar, ndep, nn, p_out, mtok, mlen, msib, nm_out,
                       stride_h, stride_r, stride_lay, stride_m, D, CHUNK: tl.constexpr, BS: tl.constexpr,
                       WPOW: tl.constexpr, CMAXC: tl.constexpr, LOOK: tl.constexpr, ALWAYS: tl.constexpr,
                       KM: tl.constexpr):
@@ -228,6 +228,15 @@ if HAVE_TRITON:
                 dep_v = tl.where(ok & (idx == n), d, dep_v)
                 cur = tl.where(ok, n, cur)
                 n = tl.where(ok, n + 1, n)
+        # the MTP depth-1 sibling (the depth-1 race's runner-up), right after the chain: a second child of the root
+        sb = tl.load(msib + tid64)
+        if (w > 0) & (pf != 1) & (dmax > 0) & (ml > 0) & (sb >= 0) & (n < w):
+            first = tl.sum(tl.where((idx == 0) & (n > 0), tok_v, 0), axis=0)
+            if (n == 0) | (first != sb):
+                tok_v = tl.where(idx == n, sb, tok_v)
+                par_v = tl.where(idx == n, -1, par_v)
+                dep_v = tl.where(idx == n, 1, dep_v)
+                n = n + 1
         tl.store(nm_out + j, n)  # MTP nodes = insertion indices 0 .. n - 1 (per-source acceptance counters)
         for c in range(0, nc):
             e = tl.load(cand + j * CMAXC + c)
@@ -604,7 +613,7 @@ class TreeSpec:
     RING = 4
 
     def __init__(self, engine, W: int, D: int, t_max: int, ref_cap: int, node_cap: int, sample_rows, scores_rows=None,
-                 uniform_rows=None, own_history: bool = False):
+                 uniform_rows=None, own_history: bool = False, top2_rows=None):
         from nemo_rl.models.generation.megatron import tree_kv
         from nemo_rl.models.megatron import mamba_bi_lookahead as la
 
@@ -618,6 +627,7 @@ class TreeSpec:
         self.sample_rows = sample_rows
         # checks / negatives only: the full keyed race scores and a keyed uniform (thundersync_rl.keyed_scores)
         self.scores_rows, self.uniform_rows = scores_rows, uniform_rows
+        self.top2_rows = top2_rows  # keyed runner-up of rows (the MTP depth-1 sibling; None: no sibling)
         dev = torch.device("cuda", torch.cuda.current_device())
         self.dev = dev
         S = int(ctx.max_sequence_length) + 8 * LOOK_MAX + 8
@@ -635,6 +645,7 @@ class TreeSpec:
         # MTP draft per tail id (tree_mtp): the chain drafted after the last accept, read by the next trie build
         self.mtp_tok = torch.full((self.t_max + 1, KMTP), -1, **i32)  # row t_max: the sink of rows without a tail
         self.mtp_len = torch.zeros(self.t_max + 1, **i32)
+        self.mtp_sib = torch.full((self.t_max + 1,), -1, **i32)  # depth-1 sibling: the keyed race's runner-up
         self.mtp = None  # tree_mtp.MTPHead (attach_mtp)
         self._mtp_new_q: list = []  # per forward: tails registered in it (tail, token start, length), FIFO
         # candidate blocks cover the references, and the whole history when own-history tails are enabled
@@ -711,9 +722,14 @@ class TreeSpec:
         self.stats = {"iters": 0, "tail_iters": 0, "tokens": 0, "nodes": 0, "accepted_nodes": 0, "registered": 0,
                       "forwards_with_nodes": 0, "attaches": 0, "detaches": 0, "widths": [0] * (WMAX + 1),
                       "neg_tokens": 0, "crit_tokens": 0, "crit_iters": 0, "pc_tail_shared_blocks": 0,
+                      "pc_tail_stale_blocks": 0, "plan_no_room": 0, "layout_dropped_no_graph": 0,
                       "mtp_nodes": 0, "mtp_accepted": 0, "other_nodes": 0, "other_accepted": 0,
                       "mtp_d1_n_a1": 0, "mtp_d1_ok_a1": 0, "mtp_d1_n_a2": 0, "mtp_d1_ok_a2": 0}
         self._seen: set = set()
+        self._blk_epoch: dict = {}  # prefix cache: block id -> weight epoch it was registered under (install_epoch_map)
+        rank0 = (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0
+        self._log_s = float(os.environ.get("THUNDERSYNC_TREE_LOG_S", "0") or 0) if rank0 else 0.0
+        self._log_t, self._log_it, self._log_prev = None, 0, None
         fk = os.environ.get("THUNDERSYNC_TAIL_MTD_DEBUG_FORCE_K", "").strip()
         self.force_w = int(fk) if fk else None  # gate tool (CHECKS only): every tail gets this width
         neg = os.environ.get("THUNDERSYNC_NL_NEG", "").strip()
@@ -748,8 +764,33 @@ class TreeSpec:
             # src bit1 without refs: the request's own history is its reference (XS-SD). With refs the refs are
             # the source (one source per tail for now).
             own = v.size > 2 and (int(v[2]) & 2) != 0 and refs is None
-        if (refs is None and not own) or w_cap <= 0 or not self.free_tids:
+        if (refs is None and not own) or w_cap <= 0:
             return None
+        return self._new_tail(rid, req, refs, own, w_cap, d_cap)
+
+    def register_tail(self, rid: int, refs: list, w: int, d: int = 0) -> bool:
+        """Make an already-decoding request a tail from its next decode step (e.g. a verified row continued in place
+        after its first rejection: refs = the rejected draft's suffix and its siblings' drafts). Its history is
+        uploaded from the request record on attach, as for any tail; refs are proposals only. False if the request
+        is unknown, already a tail, or no tail id is free."""
+        rid = int(rid)
+        if rid in self.tails:
+            return False
+        try:
+            req = self.engine.get_request(rid)
+        except KeyError:  # not (or no longer) in the engine
+            return False
+        if req is None or w <= 0:
+            return False
+        packed = pack_refs(refs).tobytes() if not isinstance(refs, (bytes, bytearray)) else refs
+        t = self._new_tail(rid, req, packed, False, min(int(w), self.W), min(int(d), self.D) if d else self.D)
+        self._seen.add(rid)
+        return t is not None
+
+    def _new_tail(self, rid: int, req, refs, own: bool, w_cap: int, d_cap: int) -> Optional[_Tail]:
+        if not self.free_tids:
+            return None
+        sp = req.sampling_params
         plen = len(req.prompt_tokens)
         ntg = sp.num_tokens_to_generate if sp.num_tokens_to_generate is not None else (
             (sp.num_tokens_total or self.ctx.max_sequence_length) - plen)
@@ -837,6 +878,10 @@ class TreeSpec:
         ids = ctx.request_to_kv_block_ids[idx, :nb].long().cpu()
         ids = ids[ids >= 0]
         self.stats["pc_tail_shared_blocks"] += int((refs[ids] > 1).sum())
+        # strict cross-epoch evidence: blocks this tail uses that were registered under an older weight epoch
+        # (production: never, the cache is salted per epoch; NEGATIVE tree_stale_cache: its stale hits)
+        ep = int(getattr(self.engine, "_weight_epoch", 0))
+        self.stats["pc_tail_stale_blocks"] += sum(1 for b in ids.tolist() if self._blk_epoch.get(b, ep) < ep)
 
     def set_width_cap(self, rid: int, w: int) -> bool:
         """Per-request node cap between iterations (host; e.g. a fork-lane rule turning a row's drafting on / off).
@@ -861,6 +906,9 @@ class TreeSpec:
                 self.mtp_free.append(t.mslot)
                 self._mslot_host[t.tid] = -1
                 t.mslot = -1
+            if self.mtp is not None:  # a reused tail id must not propose the last request's drafts
+                self.mtp_len[t.tid] = 0
+                self.mtp_sib[t.tid] = -1
 
     def on_post_process(self, finished, evicted) -> None:
         """Finished and evicted requests leave: their tail state is released. An evicted request is re-admitted from
@@ -944,8 +992,17 @@ class TreeSpec:
         rows = rows[live]
         if rows.size == 0:
             return 0
+        # node rows are attention rows of the forward: they fit in the context's request capacity and the largest
+        # decode graph next to the n request rows (an engine sized for exactly its admitted rows has no room)
         room = min(int(ctx.max_requests), self._max_graph_rows(ctx)) - n
         budget = max(0, min(self.node_cap, room))
+        if decode_only and budget == 0:
+            self.stats["plan_no_room"] += 1
+            if self.stats["plan_no_room"] == 1:
+                print(f"[tree_spec] WARNING: no room for node rows ({n} request rows, max_requests "
+                      f"{int(ctx.max_requests)}, largest decode graph {self._max_graph_rows(ctx)}): node rows are "
+                      "attention rows next to the requests; size max_requests >= live rows + node budget "
+                      "([tree] plan_no_room counts these forwards)", flush=True)
         cands = []
         for row in rows.tolist():
             t = self.tails[int(rids[row])]
@@ -1015,6 +1072,7 @@ class TreeSpec:
             return
         padded = int(ctx.padded_active_token_count)
         if lay.E > 0 and (lay.n_rows + lay.E > padded or not ctx.using_cuda_graph_this_step()):
+            self.stats["layout_dropped_no_graph"] += 1
             lay.tails = [(t, row, 0, pf) for t, row, _, pf in lay.tails]
             lay.E = 0
             for t, _row, _k, _pf in lay.tails:
@@ -1121,7 +1179,7 @@ class TreeSpec:
                 one()
             torch.cuda.current_stream().wait_stream(st)
             g = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(g):
+            with torch.cuda.graph(g, capture_error_mode="thread_local"):
                 one()
             run = g.replay
             run()
@@ -1155,7 +1213,8 @@ class TreeSpec:
         from nemo_rl.models.generation.megatron import tree_mtp
 
         return self._sig_common(ctx) + (ctx.gpu_view.temperature.data_ptr(), tree_mtp.hidden_buffer().data_ptr(),
-                                        self.mtp.kc.data_ptr(), self.mtp_tok.data_ptr())
+                                        self.mtp.kc.data_ptr(), self.mtp_tok.data_ptr(), self.mtp_sib.data_ptr(),
+                                        self.top2_rows is not None)
 
     def _mtp_prefill(self, ctx, ctrl) -> None:
         """Tails with a prefill chunk in this forward: the head's KV of the chunk's positions off .. off + q - 1
@@ -1236,9 +1295,12 @@ class TreeSpec:
         temp = ctx.gpu_view.temperature.index_select(0, r["row_now"].long().clamp(min=0))
         drafts = []
         u, x = lh, ltok
+        sib = None
         for depth in range(depth_k):
             u, logits = self.mtp.forward_rows(lsl, lpos + depth, u, x)
             d = self.sample_rows(logits, r["tk"], p + acc + depth, temp).to(torch.int64)
+            if depth == 0 and self.top2_rows is not None:
+                sib = self.top2_rows(logits, r["tk"], p + acc, temp)  # same key and position as the depth-1 draw
             drafts.append(d)
             x = d
         live = ok & (r["done"] == 0)
@@ -1249,6 +1311,8 @@ class TreeSpec:
         self.mtp_tok.index_copy_(0, dst, torch.where(live[:, None], dt, torch.full_like(dt, -1)))
         self.mtp_len.index_copy_(0, dst, torch.where(live, torch.full_like(acc, depth_k),
                                                      torch.zeros_like(acc)).to(torch.int32))
+        sv = sib.to(torch.int32) if sib is not None else torch.full_like(tid, -1, dtype=torch.int32)
+        self.mtp_sib.index_copy_(0, dst, torch.where(live, sv, torch.full_like(sv, -1)))
 
     # ------------------------------------------------------------------ device stages (graph-replayable)
     def _graphs_on(self) -> bool:
@@ -1269,7 +1333,10 @@ class TreeSpec:
             return
         g = torch.cuda.CUDAGraph()
         try:
-            with torch.cuda.graph(g, pool=self.graph_pool):
+            # thread_local: other engine-process threads (e.g. a hidden-log seal thread's event.synchronize) may make
+            # unsafe CUDA calls while a tree stage is captured lazily mid-run (a new ring slot / MTP depth); global
+            # mode would invalidate the capture and fail their call (BX-SD)
+            with torch.cuda.graph(g, pool=self.graph_pool, capture_error_mode="thread_local"):
                 body()
         except Exception as ex:  # a stage that cannot be captured: eager from now on (correct, slower), loudly
             print(f"[tree_spec] CUDA graph capture of {name} failed ({type(ex).__name__}: {ex}); eager stages",
@@ -1324,7 +1391,8 @@ class TreeSpec:
                                     r["ncand"], self.H.stride(0), self.R.stride(0), r["lay"].stride(0), self.NB,
                                     BLOCKC=BLOCK, NMAXC=NMAX, NBPOW=triton.next_power_of_2(self.NB), CMAXC=CMAX)
         _build_kernel[(TG,)](self.H, self.R, self.RLEN, self.P, self.OWN, self.BUD, r["lay"], r["cand"], r["ncand"],
-                             r["ntok"], r["npar"], r["ndep"], r["nn"], r["p"], self.mtp_tok, self.mtp_len, r["nmtp"],
+                             r["ntok"], r["npar"], r["ndep"], r["nn"], r["p"], self.mtp_tok, self.mtp_len, self.mtp_sib,
+                             r["nmtp"],
                              self.H.stride(0), self.R.stride(0), r["lay"].stride(0), self.mtp_tok.stride(0),
                              self.D if self.force_w is None else LOOK_MAX - 1,
                              CHUNK=self._chunk(), BS=int(ctx.block_size_tokens), WPOW=WMAX, CMAXC=CMAX,
@@ -1703,6 +1771,7 @@ class TreeSpec:
                 st[0] += 1
                 st[1] += a - 1
                 st[2] += int(nn[j])
+        self.maybe_log()
         return res
 
     def _commit_keys(self) -> None:
@@ -1725,6 +1794,26 @@ class TreeSpec:
 
                     raise SamplerKeyError(f"[tree_spec] committed noise key reused: {bad[:3]}")
 
+    def maybe_log(self) -> None:
+        """Worker-side [tree] line every THUNDERSYNC_TREE_LOG_S seconds on rank 0 (paths without a stage line, e.g. the
+        stock SPR-SD loop): this rank's per-interval deltas plus the engine's ms per iteration."""
+        import time
+
+        iv = self._log_s
+        if iv <= 0:
+            return
+        now = time.perf_counter()
+        if self._log_t is None:
+            self._log_t, self._log_it = now, self.stats["iters"]
+            return
+        if now - self._log_t < iv:
+            return
+        line, self._log_prev = stats_line(self.stats["iters"], [self.summary()], self._log_prev)
+        it = self.stats["iters"] - self._log_it
+        print(f"{line} ms/iter={1e3 * (now - self._log_t) / max(it, 1):.3f} (rank 0, last {now - self._log_t:.0f} s)",
+              flush=True)
+        self._log_t, self._log_it = now, self.stats["iters"]
+
     def pop_request_stats(self, rid: int) -> Optional[list]:
         return self.req_stats.pop(int(rid), None)
 
@@ -1741,7 +1830,8 @@ class TreeSpec:
 
 STAT_KEYS = ("tail_iters", "tokens", "nodes", "accepted_nodes", "forwards_with_nodes", "registered", "attaches",
              "neg_tokens", "crit_tokens", "crit_iters", "graph_captures", "graph_fallbacks", "mtp_nodes", "mtp_accepted",
-             "other_nodes", "other_accepted", "mtp_tails", "pc_tail_shared_blocks")
+             "other_nodes", "other_accepted", "mtp_tails", "pc_tail_shared_blocks", "pc_tail_stale_blocks",
+             "plan_no_room", "layout_dropped_no_graph")
 
 
 def stats_line(step: int, ms: list, prev: Optional[dict]) -> tuple:
@@ -1761,6 +1851,8 @@ def stats_line(step: int, ms: list, prev: Optional[dict]) -> tuple:
             f"other_accepted={d['other_accepted']} mtp_tails={d['mtp_tails']} mtp_depths={depths} "
             f"fwd_with_nodes={d['forwards_with_nodes']} registered={d['registered']} attaches={d['attaches']} "
             f"neg_tokens={d['neg_tokens']} pc_tail_shared_blocks={d['pc_tail_shared_blocks']} "
+            f"pc_tail_stale_blocks={d['pc_tail_stale_blocks']} plan_no_room={d['plan_no_room']} "
+            f"layout_dropped_no_graph={d['layout_dropped_no_graph']} "
             f"graph_captures={tot['graph_captures']} graph_fallbacks={tot['graph_fallbacks']} rates_rank0={rates}")
     return line, tot
 
@@ -1768,6 +1860,31 @@ def stats_line(step: int, ms: list, prev: Optional[dict]) -> tuple:
 def is_tree_request(sp) -> bool:
     """A request that would become a tree tail (references or a ts_tree spec on its sampling params)."""
     return getattr(sp, MTD_REFS_ATTR, None) is not None or getattr(sp, TREE_ATTR, None) is not None
+
+
+def install_epoch_map(engine, ts: "TreeSpec") -> None:
+    """Record the weight epoch each prefix-cache block is registered under (cleared when the block is re-allocated),
+    so a tail can count blocks it uses from an older epoch ([tree] pc_tail_stale_blocks). Host-side, per
+    registration call; no device work."""
+    alloc = engine.context.kv_block_allocator
+    orig_reg, orig_alloc = alloc.register_kv_block_hashes, alloc.allocate_memory_blocks
+
+    def register_kv_block_hashes(block_ids, block_hashes, *a, **kw):
+        out = orig_reg(block_ids, block_hashes, *a, **kw)
+        ep = int(getattr(engine, "_weight_epoch", 0))
+        for b in (out if out is not None else block_ids):
+            ts._blk_epoch[int(b)] = ep
+        return out
+
+    def allocate_memory_blocks(num_blocks):
+        ids = orig_alloc(num_blocks)
+        if ids is not None:
+            for b in ids.tolist():
+                ts._blk_epoch.pop(int(b), None)
+        return ids
+
+    alloc.register_kv_block_hashes = register_kv_block_hashes
+    alloc.allocate_memory_blocks = allocate_memory_blocks
 
 
 def install_stale_cache_negative(engine) -> None:
@@ -1792,7 +1909,8 @@ def install_stale_cache_negative(engine) -> None:
 
 
 def install(engine, *, W: int, D: int, t_max: int, ref_cap: int, node_cap: int, sample_rows, key_check=None,
-            keyreg=None, key_ids=None, scores_rows=None, uniform_rows=None, own_history: bool = False) -> TreeSpec:
+            keyreg=None, key_ids=None, scores_rows=None, uniform_rows=None, own_history: bool = False,
+            top2_rows=None) -> TreeSpec:
     """Hook a built DynamicInferenceEngine (idempotent per engine), as tail_mtd.install. ``sample_rows(logits,
     key_rids np, positions (device int64), temperature)`` draws rows with the engine's keyed sampler."""
     from megatron.core.inference.batch_dimensions_utils import (
@@ -1804,9 +1922,11 @@ def install(engine, *, W: int, D: int, t_max: int, ref_cap: int, node_cap: int, 
     if existing is not None:
         return existing
     ts = TreeSpec(engine, W, D, t_max, ref_cap, node_cap, sample_rows, scores_rows, uniform_rows,
-                  own_history=own_history)
+                  own_history=own_history, top2_rows=top2_rows)
     ts._key_check, ts._keyreg, ts._key_ids = key_check, keyreg, key_ids
     engine._tree_spec = ts
+    if getattr(engine.context, "enable_prefix_caching", False):
+        install_epoch_map(engine, ts)
     if ts.neg == "tree_stale_cache":
         install_stale_cache_negative(engine)
     buf = engine.context.memory_buffer

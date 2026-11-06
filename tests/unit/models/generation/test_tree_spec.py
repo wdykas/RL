@@ -119,6 +119,67 @@ def test_set_width_cap():
     assert not spec.set_width_cap(6, 3)
 
 
+def _stub_spec(n_tids=4):
+    spec = object.__new__(ts.TreeSpec)
+    spec.tails, spec.W, spec.D, spec.S = {}, 16, 4, 4096 + 8 * ts.LOOK_MAX + 8
+    spec.free_tids = list(range(n_tids - 1, -1, -1))
+    spec._rid_of = np.full(n_tids, -1, dtype=np.int64)
+    spec._trk = np.zeros(n_tids, dtype=bool)
+    spec._wlast = np.zeros(n_tids, dtype=np.int64)
+    spec._sorted, spec._seen, spec.stats = None, set(), {"registered": 0}
+    spec.ctx = type("C", (), {"max_sequence_length": 4096})()
+    return spec
+
+
+def test_register_tail_for_a_decoding_request():
+    """register_tail makes an already-decoding request a tail (packed refs, caps clamped); unknown / repeated
+    requests and a full tail table are refused."""
+    sp = type("SP", (), {"num_tokens_to_generate": 100, "num_tokens_total": None, "termination_id": 2})()
+    req = type("R", (), {"sampling_params": sp, "prompt_tokens": [5] * 30})()
+
+    class Eng:
+        def get_request(self, rid):
+            if rid != 7:
+                raise KeyError(rid)
+            return req
+
+    spec = _stub_spec(n_tids=1)
+    spec.engine = Eng()
+    assert spec.register_tail(7, [[1, 2, 3], [4, 5]], w=99, d=2)
+    t = spec.tails[7]
+    assert t.w_cap == 16 and t.d_cap == 2 and t.budget_end == 130 and t.eos == 2 and not t.own
+    assert np.array_equal(np.frombuffer(t.refs, dtype=np.int32), ts.pack_refs([[1, 2, 3], [4, 5]]))
+    assert 7 in spec._seen and spec._rid_of[t.tid] == 7 and not spec._trk[t.tid]
+    assert not spec.register_tail(7, [[1]], w=4)  # already a tail
+    assert not spec.register_tail(8, [[1]], w=4)  # unknown request
+    spec.engine = type("E2", (), {"get_request": lambda self, rid: req})()
+    assert not spec.register_tail(9, [[1]], w=4)  # no free tail id
+
+
+def test_epoch_map_counts_blocks_registered_under_an_older_epoch():
+    """install_epoch_map: blocks keep the epoch they were registered under until re-allocated."""
+
+    class Alloc:
+        def register_kv_block_hashes(self, block_ids, block_hashes, parent_hashes=None):
+            return list(block_ids)
+
+        def allocate_memory_blocks(self, n):
+            return torch.arange(10, 10 + n)
+
+    eng = type("E", (), {})()
+    eng._weight_epoch = 0
+    eng.context = type("C", (), {"kv_block_allocator": Alloc()})()
+    spec = object.__new__(ts.TreeSpec)
+    spec._blk_epoch = {}
+    ts.install_epoch_map(eng, spec)
+    eng.context.kv_block_allocator.register_kv_block_hashes([3, 4, 10], [1, 2, 3])
+    eng._weight_epoch = 1
+    eng.context.kv_block_allocator.register_kv_block_hashes([5], [9])
+    assert spec._blk_epoch == {3: 0, 4: 0, 10: 0, 5: 1}
+    eng.context.kv_block_allocator.allocate_memory_blocks(1)  # block 10 re-allocated: its old epoch is gone
+    assert 10 not in spec._blk_epoch and spec._blk_epoch[3] == 0
+
+
 def test_mtp_depth_rule():
     """The MTP draft depth stops at the first depth whose marginal node is not worth one depth's price."""
     r = np.array([0.71, 0.17, 0.025, 0.001, 0.0])
@@ -133,7 +194,7 @@ def test_mtp_depth_rule():
 # ---------------------------------------------------------------------------- Python reference of the device rule
 
 
-def py_tree(h, refs, p, w, dmax, nmax=4, cmax=32, mtp=()):
+def py_tree(h, refs, p, w, dmax, nmax=4, cmax=32, mtp=(), sib=-1):
     """Candidates (n desc, reference position asc) of the suffix match (n <= nmax) of h[:p] in refs, first cmax,
     inserted best first into a trie of <= w nodes and depth <= dmax. Returns [(token, parent, depth)]."""
     rl = len(refs)
@@ -157,6 +218,8 @@ def py_tree(h, refs, p, w, dmax, nmax=4, cmax=32, mtp=()):
             break
         nodes.append((x, cur, d))
         cur = len(nodes) - 1
+    if mtp and dmax >= 1 and sib >= 0 and len(nodes) < w and (not nodes or nodes[0][0] != sib):
+        nodes.append((sib, -1, 1))  # the MTP depth-1 sibling (the depth-1 race's runner-up)
     for _negn, e in cands[:cmax]:
         cur = -1
         for d in range(1, ts.LOOK_MAX):
@@ -175,7 +238,7 @@ def py_tree(h, refs, p, w, dmax, nmax=4, cmax=32, mtp=()):
     return nodes
 
 
-def _device_trees(H, R, RLEN, P, BUD, lay, D, chunk=128, bs=256, mtp=None, own=()):
+def _device_trees(H, R, RLEN, P, BUD, lay, D, chunk=128, bs=256, mtp=None, own=(), sib=None):
     T = lay.shape[1]
     nb = -(-max(R.shape[1], H.shape[1] if own else 0) // ts.BLOCK)  # own-history tails: blocks cover H too
     dev = H.device
@@ -200,7 +263,10 @@ def _device_trees(H, R, RLEN, P, BUD, lay, D, chunk=128, bs=256, mtp=None, own=(
         mtok[j, : len(chain)] = torch.tensor(chain, dtype=torch.int32)
         mlen[j] = len(chain)
     nm = torch.zeros(T, dtype=torch.int64, device=dev)
-    ts._build_kernel[(T,)](H, R, RLEN, P, OWN, BUD, lay, cand, ncand, ntok, npar, ndep, nn, pout, mtok, mlen, nm,
+    msib = torch.full((T,), -1, **i32)
+    for j, x in (sib or {}).items():
+        msib[j] = int(x)
+    ts._build_kernel[(T,)](H, R, RLEN, P, OWN, BUD, lay, cand, ncand, ntok, npar, ndep, nn, pout, mtok, mlen, msib, nm,
                            H.stride(0), R.stride(0), lay.stride(0), mtok.stride(0), D, CHUNK=chunk, BS=bs,
                            WPOW=ts.WMAX, CMAXC=ts.CMAX, LOOK=ts.LOOK_MAX, ALWAYS=False, KM=ts.KMTP)
     _device_trees.nm = nm.cpu()
@@ -238,14 +304,16 @@ def test_device_tree_equals_python_rule(seed, vocab):
     dev = torch.device("cuda")
     mtp = {j: [int(x) for x in rng.integers(0, vocab, int(rng.integers(1, ts.KMTP + 1)))] for j in range(0, T, 2)}
     own = (1, 4)  # src bit1 (XS-SD): candidates from the tail's own history h[:p] (tail 4 also has an MTP chain)
+    # depth-1 siblings: a fresh token on tail 0, the chain's own first token on tail 2 (deduplicated), none on 4
+    sib = {0: vocab + 1, 2: mtp[2][0]}
     for D in (4, 7):
         out = _device_trees(H.to(dev), R.to(dev), RLEN.to(dev), P.to(dev), BUD.to(dev), lay.to(dev), D, mtp=mtp,
-                            own=own)
+                            own=own, sib=sib)
         ntok, npar, ndep, nn, pout = out
         for j, (h, refs, p, w) in enumerate(cases):
             dmax = min(D, 128 - 2 - (p - 1) % 128, 256 - 1 - (p - 1) % 256, int(BUD[j]) - 1 - p, ts.LOOK_MAX - 1)
             src = list(h[:p]) if j in own else list(refs)
-            ref = py_tree(list(h), src, p, w, dmax, mtp=mtp.get(j, ()))
+            ref = py_tree(list(h), src, p, w, dmax, mtp=mtp.get(j, ()), sib=sib.get(j, -1))
             got = [(int(ntok[j, i]), int(npar[j, i]), int(ndep[j, i])) for i in range(int(nn[j]))]
             assert got == ref, (j, D, got[:6], ref[:6])
             assert int(pout[j]) == p
@@ -255,6 +323,8 @@ def test_device_tree_equals_python_rule(seed, vocab):
                 if tk != x or dd != n_mtp + 1:
                     break
                 n_mtp += 1
+            if n_mtp < len(ref) and n_mtp and ref[n_mtp] == (sib.get(j, -1), -1, 1):
+                n_mtp += 1  # the sibling counts as an MTP node
             assert int(_device_trees.nm[j]) == n_mtp, (j, D, int(_device_trees.nm[j]), n_mtp)
 
 
@@ -523,3 +593,40 @@ def test_accept_walk_draft_prob_negative(seed):
         CHUNK=128, BS=256, WPOW=W, LOOK=ts.LOOK_MAX, KPOW=8, TOPK=False, ACCEPT_ALL=False, DRAFTPROB=True)
     for j, (p, em) in enumerate(exp):
         assert tok[j, : int(acc[j])].tolist() == em, (j, tok[j].tolist(), em)
+
+
+@cuda
+def test_lazy_capture_tolerates_another_threads_sync():
+    """A tree stage captured lazily mid-run (thread_local capture mode) neither fails nor breaks another thread's
+    event.synchronize issued during the capture (BX-SD: a hidden-log seal thread's sync invalidated a global
+    capture and died)."""
+    import threading
+
+    spec = object.__new__(ts.TreeSpec)
+    spec.graph_pool = torch.cuda.graph_pool_handle()
+    spec.stats = {"graph_captures": 0, "graph_fallbacks": 0}
+    spec.use_graphs = True
+    x = torch.zeros(1024, device="cuda")
+    ev = torch.cuda.Event()
+    ev.record()
+    errs = []
+
+    def other():
+        try:
+            ev.synchronize()
+        except Exception as e:  # noqa: BLE001 -- the test records whatever the other thread hits
+            errs.append(e)
+
+    def body():
+        x.add_(1.0)
+        th = threading.Thread(target=other)
+        th.start()
+        th.join()
+
+    r = {}
+    for _ in range(3):  # eager warm-up, capture (+ replay), replay
+        spec._run_graph(r, "gT", body, ("sig",))
+    torch.cuda.synchronize()
+    assert spec.stats["graph_fallbacks"] == 0 and spec.stats["graph_captures"] == 1
+    assert not errs, errs
+    assert float(x[0]) == 3.0
