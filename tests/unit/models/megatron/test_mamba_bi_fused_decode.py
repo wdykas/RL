@@ -44,6 +44,25 @@ def _pin():
     mbd.install()  # installs the decode step
 
 
+def _main_pin() -> bool:
+    """Megatron-LM main (#8221): MCore allocates and seeds z-free decode buffers itself and its own buffered scan is the
+    batch-invariant reference; there is no z-buffer path any more."""
+    mbd.install()
+    return bool(mbd._ORIG.get("mcore_z_free", False))
+
+
+def _reference():
+    """(allocate, seed, scan) of the reference decode: MCore's z-buffer path before #8221; Megatron-LM main's own z-free
+    buffered decode on main (the function this step replaced: mamba_bi_fused_decode._ORIG["scan"])."""
+    from megatron.core.ssm.ops.mamba2 import batch_invariant_decode as bid
+
+    cls = bid.BatchInvariantDecodeBuffers
+    alloc = mbd._ORIG["allocate"].__get__(None, cls)
+    if _main_pin():
+        return alloc, cls.seed, fd._ORIG["scan"]
+    return alloc, mbd._ORIG["seed"], mbd._ORIG["scan"]
+
+
 @contextlib.contextmanager
 def _path(small):
     """Force the small (CB + boundary in the scan program) or the large path; None = the one-wave rule."""
@@ -77,7 +96,7 @@ def _setup(R, nh, hd, ng, ds, seed, scale, signed_zeros=False, cursor=None, chun
 
     g = torch.Generator(device="cuda").manual_seed(seed)
     buf = bid.BatchInvariantDecodeBuffers.allocate(R, chunk, nh, hd, ng, ds, torch.device("cuda"), torch.float32)
-    assert buf.z is None, "the decode step must serve this shape"
+    assert getattr(buf, "z", None) is None, "the decode step must serve this shape"
     for t in (buf.x, buf.dt, buf.B, buf.C):
         t.copy_(torch.randn(t.shape, device="cuda", generator=g) * scale)
     buf.dt.sub_(2.0)
@@ -111,16 +130,12 @@ def _clone_buf(buf):
 
 
 def _mcore_twin(buf):
-    """MCore's buffers (with z) holding the same replay rows and cursors; z rows 0 (only the current token's z,
-    written by the step, reaches an output)."""
-    from megatron.core.ssm.ops.mamba2 import batch_invariant_decode as bid
-
+    """The reference path's buffers (MCore's, with z before Megatron-LM #8221; MCore main's z-free ones on main) holding
+    the same replay rows and cursors; z rows 0 (only the current token's z, written by the step, reaches an output)."""
     R, chunk, nh, hd = buf.x.shape
     ng, ds = buf.B.shape[-2:]
-    twin = mbd._ORIG["allocate"].__get__(None, bid.BatchInvariantDecodeBuffers)(
-        R, chunk, nh, hd, ng, ds, buf.x.device, buf.x.dtype
-    )
-    assert twin.z is not None
+    twin = _reference()[0](R, chunk, nh, hd, ng, ds, buf.x.device, buf.x.dtype)
+    assert _main_pin() or twin.z is not None
     for k in ("x", "dt", "B", "C", "num_buffered"):
         getattr(twin, k).copy_(getattr(buf, k))
     return twin
@@ -131,7 +146,7 @@ def _step(buf, state, ins, A, D, dtb, bi, small=None):
     from megatron.core.ssm.ops.mamba2 import batch_invariant_decode as bid
 
     twin, st_ref = _mcore_twin(buf), state.clone()
-    out_ref = mbd._ORIG["scan"](twin, *ins, A, D, dtb, bi, st_ref).clone()
+    out_ref = _reference()[2](twin, *ins, A, D, dtb, bi, st_ref).clone()
     b, st = _clone_buf(buf), state.clone()
     with _path(small):
         out = bid.batch_invariant_decode_buffered_scan(b, *ins, A, D, dtb, bi, st).clone()
@@ -317,7 +332,8 @@ def test_support_rule():
     assert not fd.supported_config(16, 64, 2, 96, 128, torch.float32, dev)  # d_state 96
     assert not fd.supported_config(64, 64, 4, 128, 128, torch.bfloat16, dev)  # 16-bit buffers keep z
     buf = bid.BatchInvariantDecodeBuffers.allocate(4, 128, 16, 40, 2, 128, dev, torch.float32)
-    assert buf.z is not None
+    # a shape the step does not serve keeps MCore's path: z buffers before #8221, MCore main's own scan on main
+    assert (not fd._serves(buf)) if _main_pin() else (buf.z is not None)
     scan = mamba_bi_scan_cuda.module(64, 128, 128, 32)
     assert fd.small_step(1, 64, dev, scan) and not fd.small_step(4096, 64, dev, scan)
 
@@ -382,5 +398,5 @@ def test_learner_training_forward_matches_decode(grouped_mixer, small):
     with torch.no_grad(), _path(small):
         y_train, y_gen = _train_and_generate(grouped_mixer, zxBCdt)
         dec = grouped_mixer._get_batch_invariant_decoder()
-        assert dec.buffers is not None and dec.buffers.z is None
+        assert dec.buffers is not None and getattr(dec.buffers, "z", None) is None
     assert torch.equal(_bits(y_train), _bits(y_gen))

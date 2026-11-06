@@ -102,15 +102,21 @@ def test_no_duplicate_keys_across_finishing_and_compacted_requests(monkeypatch):
     slots (rows, temperatures and host request ids move; the gpu_view lengths do not, as in the controller). Every
     (request, position) key the sampler draws must be new and each request's positions contiguous."""
     import thundersync_rl.keyed_sampling as ks
+    import thundersync_rl.keyed_sampling_s as ks_s
 
     seen = []
-    real = ks.wide_sample_logits
+    real, real_s = ks.wide_sample_logits, ks_s.wide_sample
 
     def spy(rows, rids, pos, temp, salt, **kw):
         seen.extend(zip(rids.tolist(), pos.tolist()))
         return real(rows, rids, pos, temp, salt, **kw)
 
+    def spy_s(rows, rids, pos, temp, salt, **kw):  # the keyed sampler S (key64 rows): bitwise the wide kernel's draws
+        seen.extend(zip(rids.tolist(), pos.tolist()))
+        return real_s(rows, rids, pos, temp, salt, **kw)
+
     monkeypatch.setattr(ks, "wide_sample_logits", spy)
+    monkeypatch.setattr(ks_s, "wide_sample", spy_s)
     rng = np.random.default_rng(0)
     n0, V = 16, 512
     prompt = {r: int(rng.integers(50, 200)) for r in range(n0)}
