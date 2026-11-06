@@ -240,7 +240,7 @@ class _OldEngine:
 
 @pytest.mark.parametrize("main", [True, False])
 def test_tails_tokens_reach_finished_and_surviving_rows(main):
-    """Regression (main-pin in-loop : a finished tail's log-probs outnumbered its tokens by a - 1): the tails'
+    """Regression (main-pin in-loop: a finished tail's log-probs outnumbered its tokens by a - 1): the tails'
     accepted tokens replace the sample wherever MCore applies it, the finalize path of finished rows included."""
     t = _spec()
     t.on_post_process = lambda fin, ev: None
@@ -775,7 +775,7 @@ def test_accept_walk_draft_prob_negative(seed):
 @cuda
 def test_lazy_capture_tolerates_another_threads_sync():
     """A tree stage captured lazily mid-run (thread_local capture mode) neither fails nor breaks another thread's
-    event.synchronize issued during the capture (BX-SD : a hidden-log seal thread's sync invalidated a global
+    event.synchronize issued during the capture (BX-SD: a hidden-log seal thread's sync invalidated a global
     capture and died)."""
     import threading
 
