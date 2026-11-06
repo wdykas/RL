@@ -180,11 +180,15 @@ def test_validate_rejects_a_missing_required_megatron_value():
     assert any("moe_permute_fusion must be False" in v for v in result.violations)
 
 
-def test_validate_rejects_chunked_prefill():
+@pytest.mark.parametrize("key", ["enable_chunked_prefill", "enable_prefix_caching"])
+def test_validate_accepts_chunked_prefill_and_prefix_caching(key):
+    # Megatron-Core's batch-invariant engine keeps prefill chunks and restored prefix
+    # states on SSM chunk boundaries, so neither knob changes the engine's log-probs.
     config = _policy_config()
-    config["generation"]["mcore_generation_config"]["enable_chunked_prefill"] = True
+    config["generation"]["mcore_generation_config"][key] = True
     result = _validate(config)
-    assert any("enable_chunked_prefill must be False" in v for v in result.violations)
+    assert not any(key in v for v in result.violations)
+    assert not result.violations
 
 
 # --------------------------------------------------------------------------- #

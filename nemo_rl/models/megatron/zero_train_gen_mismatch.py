@@ -66,9 +66,10 @@ _ZERO_KL_MEGATRON_REQUIRED: dict[str, Any] = {
     "batch_invariant_collective": "ordered",
 }
 
-_ZERO_KL_GENERATION_REQUIRED: dict[str, Any] = {
-    "enable_chunked_prefill": False,
-}
+# No generation-side requirement on chunked prefill or prefix caching: Megatron-Core's batch-invariant dynamic engine
+# keeps a hybrid model's prefill chunks on SSM chunk boundaries (dynamic_engine._mamba_batch_invariant_prefill_chunk_
+# length) and restores cached Mamba states only at block boundaries that are SSM chunk boundaries (NVIDIA/Megatron-LM
+# #8214), so the engine's log-probs do not depend on how a prompt is split or which prefix blocks were cached.
 
 # Workspace-free cuBLAS (fixed reduction order) for the te_native backend.
 _TE_NATIVE_ENV_VARS = {
@@ -1036,17 +1037,6 @@ def _validate_required_values(
             out.violations.append(
                 f"policy.megatron_cfg.{key} must be {value!r} "
                 f"(got {megatron_cfg.get(key)!r})."
-            )
-
-    generation = config.get("generation")
-    if generation is None or generation.get("backend") != "megatron":
-        return  # reported by _validate_backend
-    mcore_generation_config = generation["mcore_generation_config"]
-    for key, value in _ZERO_KL_GENERATION_REQUIRED.items():
-        if mcore_generation_config.get(key) != value:
-            out.violations.append(
-                f"policy.generation.mcore_generation_config.{key} must be "
-                f"{value!r} (got {mcore_generation_config.get(key)!r})."
             )
 
 

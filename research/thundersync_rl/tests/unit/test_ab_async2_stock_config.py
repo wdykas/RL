@@ -100,22 +100,29 @@ def test_stock_ssm_state_dtype_matches_bi_forced_fp32():
     assert stock["policy.generation.mcore_generation_config.mamba_inference_ssm_states_dtype"] == "float32"
 
 
-def test_validator_refuses_keyed_sampler_with_chunked_prefill():
+def test_key_checks_skip_the_discarded_partial_prefill_draw():
+    """Chunked prefill: MCore samples (then discards) the row of a request whose prompt is not done; the key checks
+    skip that row, so the final chunk's kept draw at the same position is not a reuse (was: chunked prefill refused
+    with the keyed samplers, async2_stock Super-L22)."""
+    import numpy as np
     import pytest
     from types import SimpleNamespace
 
-    grpo_loop = pytest.importorskip("thundersync_rl.grpo_loop")
+    worker = pytest.importorskip("thundersync_rl.worker")
+    from thundersync_rl.key_check import KeyContinuity
 
-    def cfg(sampler, chunked, speculate=False):
-        return SimpleNamespace(
-            thundersync=SimpleNamespace(speculate=speculate, plain_engine_sampler=sampler, engine_sampler=sampler),
-            policy={"generation": {"mcore_generation_config": {"enable_chunked_prefill": chunked}}},
-        )
-
-    for sampler in ("wide", "exact_int"):
-        with pytest.raises(ValueError, match="enable_chunked_prefill"):
-            grpo_loop.validate_sampler_chunked_prefill(cfg(sampler, True))
-        with pytest.raises(ValueError, match="enable_chunked_prefill"):
-            grpo_loop.validate_sampler_chunked_prefill(cfg(sampler, True, speculate=True))
-        grpo_loop.validate_sampler_chunked_prefill(cfg(sampler, False))  # every BI / A/B arm
-    grpo_loop.validate_sampler_chunked_prefill(cfg("engine", True))  # the engine's own sampler has no key check
+    kc = KeyContinuity("test")
+    ids = np.array([7, 9], dtype=np.int64)
+    # step 1: request 9 decodes at 20; request 7 prefills its first chunk (prompt length 300: position 300)
+    pos = worker._key_check_positions(SimpleNamespace(chunked_prefill_request_id=7), ids, np.array([300, 20]))
+    assert pos.tolist() == [-1, 20]
+    kc.observe(ids, pos)
+    # step 2: request 7's final chunk draws position 300 again, kept; request 9 continues
+    pos = worker._key_check_positions(SimpleNamespace(chunked_prefill_request_id=-1), ids, np.array([300, 21]))
+    assert pos.tolist() == [300, 21]
+    kc.observe(ids, pos)
+    kc.observe(ids, np.array([301, 22]))
+    assert kc.violations == 0
+    # a real reuse still raises
+    with pytest.raises(Exception, match="out of sequence"):
+        kc.observe(ids, np.array([301, 23]))

@@ -28,8 +28,13 @@ What this mode adds to the stock colocated loop:
 
 Exactness conditions of the mode (validator): colocated Megatron generation, batch-invariant numerics on learner and
 engine (zero_train_gen_mismatch), router weights + bias frozen, persist KV (or offload with the TMS=1
-torch_memory_saver overlay), lag 0 (every row of batch k is admitted after the wake that installs theta_k), no prefix
-cache.
+torch_memory_saver overlay), lag 0 (every row of batch k is admitted after the wake that installs theta_k).
+
+Prefix caching and chunked prefill are allowed on a Megatron-Core whose prefix cache is scoped by weight version: it
+salts the cache with a weight epoch bumped at every engine resume (the wake that installs theta_k), so a row of batch k
+can only match blocks computed under theta_k, and its batch-invariant engine keeps prefill chunks and restored Mamba
+states on SSM chunk boundaries (bitwise the unsplit prefill). The wide sampler skips the discarded draw of a partial
+prefill chunk (worker.install_wide_sampler).
 """
 
 from __future__ import annotations
@@ -70,6 +75,9 @@ class ColoConfig:
     # T1 tools (as on the xssd branch): stable_keys = noise keys from (seed, step, prompt idx, sample index), so two
     # runs draw the same rows; row_dump = directory for each step's rows (tokens + generation log-prob bits).
     stable_keys: bool = False
+    # report_only: failed CHECKS and the train-lp sentinel are printed but do not stop the run (diagnostics only, e.g.
+    # a multi-step T1 of a path with a known defect).
+    report_only: bool = False
     row_dump: str | None = None
 
     @classmethod
@@ -106,8 +114,14 @@ def config_problems(config: Any) -> list[str]:
         p.append("colo needs batch-invariant numerics (policy.megatron_cfg.batch_invariant_mode and "
                  "zero_train_gen_mismatch): the batch is exact only if engine log-probs == learner log-probs")
     p += nolanes.kv_mode_problems(mcore)
-    if _get(mcore, "enable_prefix_caching", False):
-        p.append("prefix caching must be off (the cache is not version-keyed)")
+    # Prefix caching: only on a Megatron-Core whose prefix cache is scoped by weight version (every wake that installs
+    # theta_k bumps the epoch salted into the block hashes, so no block computed under theta_{k-1} is ever matched).
+    if _get(mcore, "enable_prefix_caching", False) and not nolanes.mcore_prefix_cache_weight_scoped():
+        p.append("prefix caching needs a Megatron-Core whose prefix cache is scoped by weight version (the installed "
+                 "one is not: a cached block from theta_{k-1} would be read at theta_k)")
+    if nolanes.negative() == "tree_stale_cache" and not (
+            _get(config, "thundersync.tree_xssd") and _get(mcore, "enable_prefix_caching", False)):
+        p.append("THUNDERSYNC_NL_NEG=tree_stale_cache needs tree_xssd and enable_prefix_caching (else it is vacuous)")
     xm = _get(config, "thundersync.tree_xssd_mtp")
     if xm:
         path, _, slots = str(xm).rpartition(":")

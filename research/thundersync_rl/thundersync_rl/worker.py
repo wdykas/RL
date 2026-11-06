@@ -535,6 +535,25 @@ class KeyedBatchError(RuntimeError):
     """A request whose sampling parameters the keyed sampler cannot serve reached a keyed engine."""
 
 
+def _key_check_positions(context: Any, ids: np.ndarray, pos: np.ndarray) -> np.ndarray:
+    """``pos`` with the partial prefill chunk's row set to -1 (unknown: the key checks skip it).
+
+    With chunked prefill, MCore samples the row of a request whose prompt is not done yet
+    (``context.chunked_prefill_request_id``: more prompt tokens follow this step) and discards the draw: the next
+    chunk's first prompt token replaces it. Its key position len(prompt) is drawn again, and kept, by the request's
+    final chunk, so the discarded draw is not a key reuse. The draw itself is unchanged (same noise as unchunked).
+    """
+    cid = int(getattr(context, "chunked_prefill_request_id", -1))
+    if cid < 0:
+        return pos
+    hit = ids == cid
+    if not hit.any():
+        return pos
+    out = pos.copy()
+    out[hit] = -1
+    return out
+
+
 def _request_positions(engine: Any, ids: np.ndarray, lens: Optional["_RequestLengths"] = None) -> np.ndarray:
     """Index of the token each engine request samples now: len(prompt_tokens) + len(generated_tokens) of its latest
     record (an eviction checkpoint moves generated tokens into the prompt: the sum is unchanged); -1 if unknown.
@@ -2515,7 +2534,8 @@ class ThunderSyncMegatronPolicyWorker(
             # an async H2D (the context rewrites its array next step).
             host_rids = context.request_ids[lo : lo + n].to(torch.int64)
             hpos = _request_positions(engine, host_rids.numpy(), lens)
-            key_check.observe(host_rids.numpy(), hpos)
+            cpos = _key_check_positions(context, host_rids.numpy(), hpos)
+            key_check.observe(host_rids.numpy(), cpos)
             stats.update(key_check.stats())
             # The per-row host arrays (key ids, key positions, per-row salts) reach the device in ONE pinned
             # [k, n] int64 block and one async H2D (was one fresh pinned buffer + H2D each): same values.
@@ -2523,7 +2543,7 @@ class ThunderSyncMegatronPolicyWorker(
             if self.__dict__.get("_nl") is not None:
                 # nolanes (nolanes_engine.py): the noise-key registry (E4: each (key, position) drawn once).
                 h_rids = self._nl_key_ids(engine, h_rids)
-                self._nl_observe_keys(h_rids, hpos)
+                self._nl_observe_keys(h_rids, cpos)
             known = hpos >= 0
             if fresh_salt is not None:
                 keys = fresh_keys.lookup(h_rids)
@@ -2667,7 +2687,7 @@ class ThunderSyncMegatronPolicyWorker(
             # Request-derived positions (_request_positions; the gpu_view lengths are not compacted with the rows
             # under async scheduling).
             hpos = _request_positions(engine, host_rids.numpy(), lens)
-            key_check.observe(host_rids.numpy(), hpos)
+            key_check.observe(host_rids.numpy(), _key_check_positions(context, host_rids.numpy(), hpos))
             stats.update(key_check.stats())
             pos = gv.request_kv_length_offsets[:n].long() + gv.request_query_lengths[:n].long()
             if (hpos >= 0).any():
@@ -4060,6 +4080,15 @@ class ThunderSyncMegatronPolicyWorker(
             super()._initialize_inference_engine(mcore_generation_config)
         finally:
             de.DynamicInferenceEngine = orig
+        from thundersync_rl.sprsd import SALT_ENV
+
+        salt = os.environ.get(SALT_ENV, "").strip()
+        if salt and getattr(self, "dynamic_inference_engine", None) is not None:
+            # thundersync.mode=sprsd (SPR-SD: the stock loop has no ThunderSync stage to install them): the keyed
+            # sampler and XS-SD's tree (+ MTP head) on this engine, as colo's stage setup does for XS-SD
+            self.install_wide_sampler(salt=int(salt), key64=True)
+            info = self.install_tree_xssd()
+            print(f"[sprsd] rank={getattr(self, 'rank', '?')} keyed sampler + tree {info}", flush=True)
 
     def _engine_class(self, orig: type) -> type:
         """``orig`` (MCore's DynamicInferenceEngine) with the draft logs armed.
