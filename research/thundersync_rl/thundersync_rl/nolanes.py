@@ -1039,13 +1039,13 @@ def stream_chunks(keys: list, sizes: list[int], n: int) -> list[list]:
     return out
 
 
-# spec/null_* statistics that are counts over a call's pools (summed over streamed calls); waves take the max; the
-# rest are ratios, weighted by the call's drafts.
+# spec/null_* statistics that are counts over a call's pools (summed over streamed calls); waves and run totals
+# (``*_total``) take the max; the rest are ratios, weighted by the call's drafts.
 NULL_COUNT_STATS = frozenset(
     "spec/null_" + k
     for k in (
         "skipped_drafts", "drafts", "slots", "outputs",
-        "fresh_slots", "unused_drafts", "empty_dropped", "live_groups",
+        "fresh_slots", "unused_drafts", "empty_walked", "live_groups",
     )
 )
 # Fractions of a call's live groups: merged weighted by live groups (summing them exceeded 1 with several calls, R36).
@@ -1066,7 +1066,8 @@ def merge_call_stats(calls: list[dict]) -> dict:
             lw = [(c[k], float(c.get("spec/null_live_groups", 0.0))) for c in calls if k in c]
             n = sum(x for _, x in lw)
             out[k] = float(sum(v * x for v, x in lw) / n) if n > 0 else float(lw[-1][0])
-        elif k in ("spec/null_waves", "spec/null_longest_len_cut"):
+        elif k in ("spec/null_waves", "spec/null_longest_len_cut") or k.endswith("_total"):
+            # run totals (one cumulative counter read after each call): the last call's value is the largest
             out[k] = float(max(v for v, _ in vals))
         else:
             ws = sum(wi for _, wi in vals)

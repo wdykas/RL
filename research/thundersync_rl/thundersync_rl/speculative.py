@@ -3681,7 +3681,10 @@ class SpeculativeGeneration:
             u = empty_draft_uniform(seed, stream, self.current_step, _key(flat[i][1][0]), run.pos[i])
             out[i] = empty_draft_result(u, run.env[i])
         if idx:
-            self.stats["spec/null_empty_walked"] = self.stats.get("spec/null_empty_walked", 0.0) + float(len(idx))
+            # running total over the run (the per-verify count is spec/null_empty_walked)
+            self.stats["spec/null_empty_walked_total"] = (
+                self.stats.get("spec/null_empty_walked_total", 0.0) + float(len(idx))
+            )
         return out
 
     def _null_apply(self, pools, groups, flat, results: dict[int, dict[str, Any]]) -> None:
@@ -3849,7 +3852,7 @@ class SpeculativeGeneration:
                 "spec/null_tail_frac": n_tail / max(n_out, 1),
                 "spec/null_fresh_slots": float(fresh),
                 "spec/null_unused_drafts": float(n_unused),
-                "spec/null_empty_dropped": float(n_empty),
+                "spec/null_empty_walked": float(n_empty),  # empty drafts of this verify, each walked by its coin
                 "spec/null_drafts_per_output": decided / max(n_out, 1),
                 "spec/null_mean_m": m_sum / max(decided, 1),
                 "spec/null_longest_len_cut": float(cut),

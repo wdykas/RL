@@ -194,14 +194,15 @@ if HAVE_TRITON:
         pid = tl.program_id(0)
         step = tl.num_programs(0).to(tl.int64) * BLOCK
         first = pid.to(tl.int64) * BLOCK
+        n64 = first * 0 + n  # int64 slice offsets d * n: the staging holds WS * n elements (may pass 2^31)
         lane = tl.arange(0, BLOCK)
         for start in range(first, n, step):
             offs = start + lane
             mask = offs < n
             for d in tl.static_range(WS):
                 if d != RANK:
-                    v = tl.load(src + d * n + offs, mask=mask)
-                    tl.store(_peer(d, s0, s1, s2, s3, s4, s5, s6, s7) + RANK * n + offs, v, mask=mask)
+                    v = tl.load(src + d * n64 + offs, mask=mask)
+                    tl.store(_peer(d, s0, s1, s2, s3, s4, s5, s6, s7) + RANK * n64 + offs, v, mask=mask)
         sync_threads()
         symm_mem_sync(signal_pad_ptrs, None, RANK, WS, hasPreviousMemAccess=True, hasSubsequentMemAccess=True)
         sync_threads()
@@ -215,9 +216,9 @@ if HAVE_TRITON:
                 acc = tl.load(mine + offs, mask=mask)
             for r in tl.static_range(1, WS):
                 if r == RANK:
-                    acc = acc + tl.load(src + RANK * n + offs, mask=mask)
+                    acc = acc + tl.load(src + RANK * n64 + offs, mask=mask)
                 else:
-                    acc = acc + tl.load(mine + r * n + offs, mask=mask)
+                    acc = acc + tl.load(mine + r * n64 + offs, mask=mask)
             tl.store(out + offs, acc, mask=mask)
 
     @triton.jit
@@ -232,13 +233,14 @@ if HAVE_TRITON:
         pid = tl.program_id(0)
         step = tl.num_programs(0).to(tl.int64) * BLOCK
         first = pid.to(tl.int64) * BLOCK
+        n64 = first * 0 + n  # int64 slice offsets d * n: the staging holds WS * n elements (may pass 2^31)
         lane = tl.arange(0, BLOCK)
         for start in range(first, n, step):
             offs = start + lane
             mask = offs < n
             v = tl.load(src + offs, mask=mask)
             for d in tl.static_range(WS):
-                tl.store(_peer(d, s0, s1, s2, s3, s4, s5, s6, s7) + RANK * n + offs, v, mask=mask)
+                tl.store(_peer(d, s0, s1, s2, s3, s4, s5, s6, s7) + RANK * n64 + offs, v, mask=mask)
         sync_threads()
         symm_mem_sync(signal_pad_ptrs, None, RANK, WS, hasPreviousMemAccess=True, hasSubsequentMemAccess=True)
         if COPY_OUT:
@@ -248,7 +250,7 @@ if HAVE_TRITON:
                 offs = start + lane
                 mask = offs < n
                 for r in tl.static_range(WS):
-                    tl.store(out + r * n + offs, tl.load(mine + r * n + offs, mask=mask), mask=mask)
+                    tl.store(out + r * n64 + offs, tl.load(mine + r * n64 + offs, mask=mask), mask=mask)
 
 
 def _launch(kernel, src: torch.Tensor, out: torch.Tensor, n: int, staging_dtype: torch.dtype, region: int,

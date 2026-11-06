@@ -681,8 +681,9 @@ def test_driver_pools_drafts_and_fills_slots_in_order(monkeypatch):
     st = s.stats
     assert st["spec/null_slots"] == 4.0 and st["spec/null_outputs"] == 4.0
     assert st["spec/null_fresh_slots"] == 0.0
-    assert st["spec/null_empty_dropped"] == 1.0  # empties seen (walked, not dropped)
-    assert st["spec/null_empty_walked"] == 1.0
+    assert st["spec/null_empty_walked"] == 1.0  # empties of this verify, walked by their coins
+    assert "spec/null_empty_dropped" not in st
+    assert st["spec/null_empty_walked_total"] == 1.0
     assert st["spec/null_unused_drafts"] == 1.0  # B2
     assert st["spec/null_bot_frac"] == pytest.approx(1 / 5)
     assert st["spec/null_tail_frac"] == pytest.approx(1 / 4)

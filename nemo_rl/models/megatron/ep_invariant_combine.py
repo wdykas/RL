@@ -224,6 +224,7 @@ if HAVE_SYMM:
         buffer_ptrs = buffer_ptrs_dev.to(tl.pointer_type(tl.uint64))
         for token_offset in range(pid, local_tokens, tl.num_programs(axis=0)):
             global_token = (rank_token_offset + token_offset).to(tl.int64)
+            tok64 = global_token - rank_token_offset  # int64 local row (local_tokens x HIDDEN_SIZE may pass 2^31)
             for channel_offset in range(0, HIDDEN_SIZE, BLOCK_SIZE):
                 offsets = channel_offset + tid
                 mask = offsets < HIDDEN_SIZE
@@ -235,7 +236,7 @@ if HAVE_SYMM:
                     acc_hi += tl.load(base + offsets, mask=mask, other=0.0)
                     acc_lo += tl.load(base + HIDDEN_SIZE + offsets, mask=mask, other=0.0)
                 tl.store(
-                    local_ptr + token_offset * HIDDEN_SIZE + offsets,
+                    local_ptr + tok64 * HIDDEN_SIZE + offsets,
                     _finalize(acc_hi, acc_lo),
                     mask=mask,
                 )

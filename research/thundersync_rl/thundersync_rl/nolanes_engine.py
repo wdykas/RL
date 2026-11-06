@@ -173,6 +173,12 @@ class NolanesEngineMixin:
             kv = check_engine_reservation(self.dynamic_inference_engine,
                                           reserved_blocks=int(tree.split(":")[2]) if tree else 0)
             print(f"[nolanes engine] rank={getattr(self, 'rank', '?')} kv reservation {kv}", flush=True)
+        # Every nolanes engine: the pools' largest block / slot / row offsets must fit the loaded kernels' index width
+        # (an int32 offset past 2^31 elements wraps to a wrong block, silently inexact:).
+        from thundersync_rl.index_width import check_engine
+
+        iw = check_engine(self.dynamic_inference_engine)
+        print(f"[nolanes engine] rank={getattr(self, 'rank', '?')} index width {iw}", flush=True)
         self.install_wide_sampler(salt=int(salt), key64=bool(key64), fresh_salt=None)
         logging_rank = self.install_draft_hidden_log(seal_blocks=bool(seal_blocks))
         if logging_rank is False:
