@@ -62,6 +62,18 @@ NEGATIVES = (
     "key_reuse",  # E4: a continuation reuses the rejected draft's request id as its noise key
     "engine_q_genlp",  # E7: accepted draft tokens keep the engine q as their generation log-prob
     "cf_engine_m",  # E5/E2: the engine routes with twice the learner's cross-fade band (target tokens off p)
+    "tree_accept_all",  # tail_tree: every child accepted whatever the keyed draws (tokens off p)
+    "tree_accept_by_draft_prob",  # tail_tree: first child accepted with keyed prob p(c), else the residual race
+    "tree_accept_topk",  # tail_tree: a node accepted when its token is its parent row's runner-up (not the keyed draw)
+    "tree_stale_mamba",  # tail_tree: the accepted path's scratch replay rows are not copied into the slot at commit
+    "tree_key_off_by_one",  # tail_tree: node at depth d keyed at P + d + 1
+    "tree_key_reuse",  # tail_tree: node at depth d keyed at P + d - 1 (its parent's key, reused)
+    "tree_fresh_keys",  # tail_tree: node rows keyed with another key id
+    "tree_skip_kv_rollback",  # tail_tree: the accepted path's K / V are not copied into the request's block
+    "tree_non_bi_verify",  # tail_tree: node rows drawn / scored from bf16-rounded logits (not one-token decode's)
+    "tree_stale_cache",  # tail_tree + prefix caching: tree requests hash their prompt blocks with the previous epoch
+    "tree_stale_version",  # tail_tree: tail state (P / H, plen, key id) kept across an engine weight epoch (resume)
+    "tree_straddle_commit",  # tail_tree: a forward laid out before a resume commits its node tokens after it (old weights)
     "carry_unverified",  # colocated partial rollout: carried (stale-version) draft tokens trained without verification
     "spare_by_content",  # XPR-S: the trained prompts are the P pools with the fewest continued rows (selection on content)
     "spare_tail_drop",  # XPR-S: an output that needs a tail does not fill a slot (the next draft does), no IS weight
@@ -155,6 +167,21 @@ class NolanesConfig:
     prev_logprobs_from_verify: bool = True
     wide_sampler_key64: bool = True
     seed_stream: str = "nl0"
+    # Exact tree speculation on the continuation rows (tree_spec; research/colo/ext/INTERFACE.md): up to tail_tree
+    # nodes per tail per iteration (a token trie of the reference continuations, depth <= tail_tree_depth), each a
+    # one-token decode row, accepted along the keyed draws: emitted tokens and log-probs are bitwise one-token
+    # decode's. Nodes go to the rank's critical tails first (water-filling, past acceptance only); tail_tree_rows =
+    # node rows per engine iteration and rank (scratch conv / replay rows, private KV blocks). 0 = off. A single
+    # proposal chain is the 1-branch tree.
+    tail_tree: int = 0
+    tail_tree_depth: int = 4
+    tail_tree_rows: int = 32
+    # MTP draft source of tail_tree (tree_mtp; INTERFACE.md v2): a trained 1-layer MCore MTP head ("*-", head_mcore.pt)
+    # drafts a keyed chain per tail as the trie's first candidate. Per rank: the head (~48M params at Nano) + its K / V
+    # for tail_tree_mtp_slots requests ([slots, max seq, kv heads, head dim] x 2, bf16) + a [max_tokens, hidden] capture
+    # of the decoder output. "" = off. TP 1 engines only (the head's logits use the full-vocab output layer).
+    tail_tree_mtp: str = ""
+    tail_tree_mtp_slots: int = 64
     # Spare prompts (XPR-S; research/colo/TAIL_FLOOR.md Theorem S): the step admits num_prompts_per_step = P + S prompt
     # groups, each pool walked by ⊥-BV at the constant envelope null_bv_fixed_m with prompt drop (a pool that can no
     # longer fill its G slots is dropped: a function of ⊥ counts only, whose law is the same for every prompt), and the
@@ -295,6 +322,41 @@ def config_problems(config: Any) -> list[str]:
                      f"trained prompts policy.train_global_batch_size / G ({gbs} / {g}) plus the spares")
         if int(cfg.verify_stream_chunks) != 1:
             p.append("thundersync.spare_prompts is built for one verify call per step (verify_stream_chunks 1)")
+    if cfg.tail_tree:
+        if not 1 <= int(cfg.tail_tree) <= 64:
+            p.append("thundersync.tail_tree must be 0 (off) or 1..64 (nodes per tail per iteration)")
+        if not 1 <= int(cfg.tail_tree_depth) <= 7:
+            p.append("thundersync.tail_tree_depth must be in 1..7")
+        if not int(cfg.tail_tree) <= int(cfg.tail_tree_rows) <= 256:
+            p.append("thundersync.tail_tree_rows must be in tail_tree..256")
+        if not _get(mcfg, "batch_invariant_mode", False):
+            p.append("thundersync.tail_tree needs the batch-invariant engine (policy.megatron_cfg.batch_invariant_mode)")
+        if int(_get(mcore, "pipeline_model_parallel_size") or 1) != 1:
+            p.append("thundersync.tail_tree needs engine pipeline_model_parallel_size 1")
+        if _get(mcore, "async_sched_mode") not in (None, "async"):
+            p.append("thundersync.tail_tree needs async_sched_mode async")
+        if _get(mcore, "num_speculative_tokens"):
+            p.append("thundersync.tail_tree and MCore num_speculative_tokens are exclusive")
+        # Prefix caching (on a weight-scoped cache) and chunked prefill are supported: node rows' private blocks are
+        # allocated (ref-held, never hashed), tree K / V commits land in the request's own partial / decode blocks,
+        # and the tree registers a tail chunk by chunk from MCore's per-request query length and offset.
+        # tree_kv copies K / V rows of MCore's [2, layers, blocks, block, heads, dim] cache (no MLA latent cache, no
+        # quantized KV): refuse the other layouts here, before the model loads
+        if _get(mcfg, "multi_latent_attention", False) or _get(mcore, "cache_mla_latents", False):
+            p.append("thundersync.tail_tree supports MCore's K / V cache only (no MLA latent cache)")
+        if str(_get(mcore, "kv_cache_dtype", "auto") or "auto") not in ("auto", "bfloat16", "bf16"):
+            p.append("thundersync.tail_tree supports a bf16 K / V cache only (kv_cache_dtype)")
+        if int(_get(mcore, "block_size_tokens") or 256) % 128:
+            p.append("thundersync.tail_tree needs block_size_tokens a multiple of the Mamba chunk (128)")
+        if cfg.tail_tree_mtp:
+            if not os.path.isfile(str(cfg.tail_tree_mtp)):
+                p.append(f"thundersync.tail_tree_mtp: no head file {cfg.tail_tree_mtp}")
+            if not 1 <= int(cfg.tail_tree_mtp_slots) <= 1024:
+                p.append("thundersync.tail_tree_mtp_slots must be in 1..1024")
+            if int(_get(mcfg, "tensor_model_parallel_size", 1) or 1) != 1:
+                p.append("thundersync.tail_tree_mtp needs tensor_model_parallel_size 1 (full-vocab output layer)")
+    elif cfg.tail_tree_mtp:
+        p.append("thundersync.tail_tree_mtp needs thundersync.tail_tree")
     if cfg.variable_group:
         if cfg.null_bv_fixed_m is None or not float(cfg.null_bv_fixed_m) > 1.0:
             p.append("thundersync.variable_group needs a constant envelope thundersync.null_bv_fixed_m > 1")
@@ -435,6 +497,10 @@ def config_problems(config: Any) -> list[str]:
         if eff > cap:
             p.append(f"verify batch tokens {eff} exceed NEMO_RL_MOE_DEVICE_DISPATCH_TOKENS={cap} "
                      "(thundersync.verify_batch_tokens)")
+    if negative().startswith("tree_") and not cfg.tail_tree:
+        p.append(f"THUNDERSYNC_NL_NEG={negative()} needs thundersync.tail_tree")
+    if negative() == "tree_stale_cache" and not _get(mcore, "enable_prefix_caching", False):
+        p.append("THUNDERSYNC_NL_NEG=tree_stale_cache needs enable_prefix_caching (else it is vacuous)")
     return p
 
 
@@ -622,13 +688,26 @@ def configure_driver(config: dict) -> NolanesConfig:
     # SC loop raises on any inexact token (VerifyStage.check_train_lp). A loss config field.
     config.setdefault("loss_fn", {})["train_lp_check"] = True
     neg = negative()
+    if cfg.tail_tree:
+        # Engine workers: tree node rows in the Mamba layers + private KV blocks (before the context is sized and
+        # the graphs captured) and the tree runtime.
+        gen_new = int(_get(config, "policy.generation.max_new_tokens") or 0)
+        n_drafts = max(int(_get(config, "grpo.num_generations_per_prompt") or 1),
+                       int(round(float(cfg.k_drafts) * int(_get(config, "grpo.num_generations_per_prompt") or 1))))
+        ref_cap = max(1024, n_drafts * (gen_new + 1))
+        mcfg["env_vars"] = dict(mcfg.get("env_vars") or {}, THUNDERSYNC_TAIL_TREE=(
+            f"{int(cfg.tail_tree)}:{int(cfg.tail_tree_depth)}:{int(cfg.tail_tree_rows)}:{ref_cap}"))
+        if cfg.tail_tree_mtp:
+            mcfg["env_vars"]["THUNDERSYNC_TAIL_TREE_MTP"] = f"{cfg.tail_tree_mtp}:{int(cfg.tail_tree_mtp_slots)}"
     if neg == "cf_engine_m":
         # Negative control: the engine (inference mode only) routes with 2 x the band (crossfade_routing.py).
         mcfg.setdefault("env_vars", {})
         mcfg["env_vars"] = dict(mcfg["env_vars"] or {}, THUNDERSYNC_DEBUG_CF_ENGINE_M_SCALE="2")
     print(
         f"[nolanes] mode=nolanes K={cfg.k_drafts} cf m={cfg.crossfade_routing_m} profile={cfg.crossfade_routing_m_profile} extra={cfg.crossfade_routing_extra} "
-        f"ramp_stopgrad={cfg.crossfade_routing_ramp_stopgrad} lag="
+        f"ramp_stopgrad={cfg.crossfade_routing_ramp_stopgrad} "
+        f"tail_tree={int(cfg.tail_tree)}d{int(cfg.tail_tree_depth)}x{int(cfg.tail_tree_rows)}"
+        f"{' mtp=' + str(int(cfg.tail_tree_mtp_slots)) if cfg.tail_tree_mtp else ''} lag="
         f"{_get(config, 'async_rl.sampler.max_lookahead_versions')} checks={int(checks_on())}"
         + (f" NEGATIVE CONTROL {neg}" if neg else ""),
         flush=True,

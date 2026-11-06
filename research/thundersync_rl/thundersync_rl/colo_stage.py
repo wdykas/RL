@@ -49,8 +49,20 @@ class ColoStage(VerifyStage):
         import ray
 
         salt = zlib.crc32(f"wide/{self.seed}/{self.cfg.seed_stream}".encode()) | ((self.seed & 0x7FFFFFFF) << 32)
+        fresh_salt = None
+        if getattr(self.cfg, "stable_keys", False):
+            from thundersync_rl.speculative import wide_fresh_salt
+
+            fresh_salt = wide_fresh_salt(self.seed)
+            self._install_stable_keys()
         out = ray.get(self._gen_wg().run_all_workers_single_data(
-            "install_wide_sampler", salt=salt, key64=bool(self.cfg.wide_sampler_key64), fresh_salt=None))
+            "install_wide_sampler", salt=salt, key64=bool(self.cfg.wide_sampler_key64), fresh_salt=fresh_salt))
+        if getattr(self.cfg, "tree_xssd", None):
+            tr = [x for x in ray.get(self._gen_wg().run_all_workers_single_data(
+                "install_tree_xssd", fresh_salt=fresh_salt)) if x]
+            if not tr:
+                raise RuntimeError("[colo] tree_xssd: tree_spec not installed on any engine rank")
+            print(f"[colo] XS-SD on tree_spec: {tr[0]} on {len(tr)} ranks", flush=True)
         if not any(isinstance(x, dict) for x in out):
             raise RuntimeError(f"[colo] keyed sampler not installed on any engine rank: {out}")
         print(f"[colo] stage ready: G={self.g} version={version} engine sampler=wide on "
@@ -68,7 +80,48 @@ class ColoStage(VerifyStage):
     def admission_version(self, engine_version: int, trainer_version: int) -> int:
         # Lag 0: the in_order gate admits batch k at trainer version k, which a colocated loop installs in the engine
         # at the wake before any rollout of batch k runs (rollouts are stood down while training).
+        self._key_version = int(trainer_version)
         return int(trainer_version)
+
+    def _install_stable_keys(self) -> None:
+        """Rows keyed by (seed, step, prompt idx, sample index): ``noise_seed`` in each fresh row's generation data."""
+        impl = self.sc._rollout_manager._impl
+        if getattr(impl, "_colo_stable_keys", False):
+            return
+        orig = impl._run_single_rollout
+        stage = self
+
+        async def run_single(input_sample, traj_idx, forced=None):
+            if forced is None:
+                idx = int(input_sample["idx"])
+                key = zlib.crc32(f"colo/{stage.seed}/{stage._key_version}/{idx}/{int(traj_idx)}".encode())
+                key |= (zlib.crc32(f"{idx}/{stage._key_version}".encode()) & 0x3FFFFFFF) << 32
+                forced = {"generation_data": {"noise_seed": int(key)}}
+            return await orig(input_sample, traj_idx, forced=forced)
+
+        impl._run_single_rollout = run_single
+        impl._colo_stable_keys = True
+        self._key_version = 0
+
+    def dump_rows(self, recs: list[Any], gids: list[str], step: int) -> None:
+        """T1 material: every trained row's tokens and generation log-prob bits, keyed by (step, prompt idx, j)."""
+        import json
+
+        import numpy as np
+
+        from thundersync_rl import nolanes
+
+        d = self.cfg.row_dump
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, f"rows_{step}.jsonl"), "w") as f:
+            for gid, rec in zip(gids, recs):
+                idx = getattr(rec, "prompt_idx", None)
+                for j, c in enumerate(rec.completions):
+                    m = nolanes._assistant(c.message_log)
+                    lp = np.asarray(m["generation_logprobs"].float().numpy(), dtype=np.float32)
+                    f.write(json.dumps({"step": step, "gid": gid, "idx": None if idx is None else str(idx), "j": j,
+                                        "tokens": [int(t) for t in m["token_ids"].tolist()],
+                                        "lp_bits": lp.view(np.uint32).tolist()}) + "\n")
 
     async def run(self, meta: Any, version: int) -> Any:
         from nemo_rl.data_plane.schema import GROUP_ID_TAG
@@ -95,6 +148,17 @@ class ColoStage(VerifyStage):
         toks = sum(len(nolanes._assistant(c.message_log)["token_ids"]) for r in recs for c in r.completions)
         print(f"[colo stage] step={int(version)} groups={len(gids)} rows={rows} gen_tokens={toks} "
               f"t={time.perf_counter() - t0:.2f}s", flush=True)
+        if getattr(self.cfg, "tree_xssd", None):  # per-step tree acceptance (tree_spec counters of every engine rank)
+            import ray
+
+            from nemo_rl.models.generation.megatron import tree_spec as _ts
+
+            ms = [x for x in await asyncio.to_thread(
+                ray.get, self._gen_wg().run_all_workers_single_data("nl_tree_stats")) if x]
+            line, self._tree_prev = _ts.stats_line(int(version), ms, getattr(self, "_tree_prev", None))
+            print(line, flush=True)
+        if getattr(self.cfg, "row_dump", None):
+            self.dump_rows(recs, gids, int(version))
         self.history.append({"step": int(version), "groups": len(gids), "rows": rows, "gen_tokens": toks})
         if nolanes.checks_on():
             # Learner forwards need the colocated engine stood down: megatron's InferenceMode flag is process-wide and
@@ -138,12 +202,15 @@ class ColoStage(VerifyStage):
                 failures.append(f"{name} law")
         negative = bool(os.environ.get("THUNDERSYNC_NL_NEG", "").strip()) or os.environ.get(SKIP_RESHARD_ENV) == "1"
         print(f"[colo checks] step={step} {'FAIL ' + str(failures) if failures else 'EXACT'}", flush=True)
-        if failures and not negative:
+        # thundersync.report_only (diagnostic runs, e.g. a multi-step T1 of a path with a known defect): failed
+        # checks are printed (FAIL above) but do not stop the run, so later steps can still be compared.
+        report_only = bool(getattr(self.cfg, "report_only", False))
+        if failures and not negative and not report_only:
             raise RuntimeError(f"[colo] CHECKS step {step} failed: {failures}")
         del torch
 
     def check_train_lp(self, step_metrics: dict, version: int) -> None:
-        if os.environ.get(SKIP_RESHARD_ENV) == "1":
+        if os.environ.get(SKIP_RESHARD_ENV) == "1" or bool(getattr(self.cfg, "report_only", False)):
             # Negative control: report the sentinel, never stop on it (the run must reach its later steps).
             bad = float(step_metrics.get("train_gen_lp_inexact_tokens", -1))
             print(f"[nolanes sentinel] step={version} train-lp tokens={float(step_metrics.get('train_gen_lp_tokens', 0)):.0f} "

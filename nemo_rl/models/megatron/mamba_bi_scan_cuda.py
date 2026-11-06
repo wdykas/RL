@@ -106,6 +106,8 @@ __global__ void __launch_bounds__(NT) scan_rows_kernel(
     const void* __restrict__ Dp, float* __restrict__ states, float* __restrict__ out,
     const int* __restrict__ slots, const int* __restrict__ rows, const int* __restrict__ starts,
     const int* __restrict__ flags, int* __restrict__ nbuf, const float* __restrict__ Bb,
+    const int* __restrict__ look_off, const int* __restrict__ look_srow, int64_t s_srow,
+    const float* __restrict__ scr_x, const float* __restrict__ scr_C, const float* __restrict__ scr_B,
     int64_t sx_seq, int64_t sx_head, int64_t sc_seq, int64_t sc_head, int64_t sb_seq, int64_t sb_head,
     int64_t sdt_head, int64_t sdt_chunk, int64_t sdA_head, int64_t sdA_chunk,
     int64_t scb_row, int64_t scb_grp, int64_t sz_row, int64_t sz_head, int64_t sD_head,
@@ -132,6 +134,14 @@ __global__ void __launch_bounds__(NT) scan_rows_kernel(
   const int grp = h / ratio;
   const int K_MAX = min((tr / REF_M + 1) * REF_M, CHUNK);
   const int nks = K_MAX / 8;
+  // Tree / lookahead node rows (tree_spec): entry c is the node at depth `off` of a path whose root targets the slot's
+  // cursor w0 = tr - off. Chunk rows w0 + 1 .. tr of that path live in per-node scratch replay rows
+  // (look_srow[c, j] holds depth j + 1), written by the prep launch; rows <= w0 are the slot's. A scratch row of -1
+  // (tail_mtd chains) means the slot's own row, as before. Only addresses change: the arithmetic is the one-token
+  // decode's.
+  const int off = look_off != nullptr ? look_off[c] : 0;
+  const int w0 = tr - off;
+  const int* srow_c = look_srow + c * s_srow;
   // ---- the head's state and the replay rows below K_MAX -> padded smem (cp.async, all issued first) ----
   float* S = states + slot * sst_batch + h * sst_head;   // [HD][DS] contiguous
   for (int j = tid; j < HD * (DS / 4); j += NT) {
@@ -141,12 +151,18 @@ __global__ void __launch_bounds__(NT) scan_rows_kernel(
   const float* xh = x + start * sx_seq + h * sx_head;
   for (int j = tid; j < K_MAX * (HD / 4); j += NT) {
     const int r = j / (HD / 4), c4 = j % (HD / 4);
-    cp_async16(&sX[r * XP + c4 * 4], xh + (int64_t)r * sx_seq + c4 * 4);
+    const float* src = xh + (int64_t)r * sx_seq;
+    if (off > 0 && r > w0 && r <= tr) {
+      const int sr = srow_c[r - w0 - 1];
+      if (sr >= 0) src = scr_x + (int64_t)sr * sx_seq + h * sx_head;
+    }
+    cp_async16(&sX[r * XP + c4 * 4], src + c4 * 4);
   }
   asm volatile("cp.async.commit_group;\n" ::);
   const float* dth = dt + c * sdt_chunk + h * sdt_head;
   const float* dAh = dA + c * sdA_chunk + h * sdA_head;
-  const float* Cr = C + (start + tr) * sc_seq + grp * sc_head;
+  const int own = off > 0 ? srow_c[off - 1] : -1;
+  const float* Cr = own >= 0 ? scr_C + (int64_t)own * sc_seq + grp * sc_head : C + (start + tr) * sc_seq + grp * sc_head;
   const float* Bg = Bb + start * sb_seq + grp * sb_head;
   const float dA_m = dAh[tr];
   const float* cbr = cb + c * scb_row + grp * scb_grp;
@@ -160,7 +176,12 @@ __global__ void __launch_bounds__(NT) scan_rows_kernel(
       for (int ks = 0; ks < DS / 8; ++ks) {
         const uint32_t a0 = g == 0 ? __float_as_uint(sC[ks * 8 + t]) : 0u;
         const uint32_t a2 = g == 0 ? __float_as_uint(sC[ks * 8 + t + 4]) : 0u;
-        const float* br = Bg + (int64_t)(jt * 8 + g) * sb_seq + ks * 8 + t;
+        const int rr = jt * 8 + g;
+        const float* br = Bg + (int64_t)rr * sb_seq + ks * 8 + t;
+        if (off > 0 && rr > w0 && rr <= tr) {
+          const int sr = srow_c[rr - w0 - 1];
+          if (sr >= 0) br = scr_B + (int64_t)sr * sb_seq + grp * sb_head + ks * 8 + t;
+        }
         mma_row0(d, a0, a2, __float_as_uint(br[0]), __float_as_uint(br[4]));
       }
       if (g == 0) { sCB[jt * 8 + 2 * t] = d[0]; sCB[jt * 8 + 2 * t + 1] = d[1]; }
@@ -188,7 +209,7 @@ __global__ void __launch_bounds__(NT) scan_rows_kernel(
 #pragma unroll
     for (int e = 0; e < 2; ++e) {
       zz[e] = z[c * sz_row + h * sz_head + p0 + e];
-      xr[e] = xh[(int64_t)tr * sx_seq + p0 + e];
+      xr[e] = own >= 0 ? scr_x[(int64_t)own * sx_seq + h * sx_head + p0 + e] : xh[(int64_t)tr * sx_seq + p0 + e];
       Dv[e] = has_D ? load_D(Dp, D_hdim ? h * sD_head + p0 + e : h * sD_head, D_dtype) : 0.f;
     }
   }
@@ -295,7 +316,10 @@ int64_t resident_programs_per_sm(bool small) {
 void scan_rows(torch::Tensor x, torch::Tensor C, torch::Tensor dt, torch::Tensor dA, torch::Tensor cb,
                torch::Tensor z, c10::optional<torch::Tensor> D, torch::Tensor states, torch::Tensor out,
                torch::Tensor slots, torch::Tensor rows, torch::Tensor starts, torch::Tensor flags,
-               torch::Tensor nbuf, torch::Tensor B, int64_t n, int64_t ratio, bool small) {
+               torch::Tensor nbuf, torch::Tensor B, int64_t n, int64_t ratio, bool small,
+               c10::optional<torch::Tensor> look_off, c10::optional<torch::Tensor> look_srow,
+               c10::optional<torch::Tensor> scr_x, c10::optional<torch::Tensor> scr_C,
+               c10::optional<torch::Tensor> scr_B) {
   const int nheads = x.size(1);
   TORCH_CHECK(x.size(2) == HD && C.size(2) == DS && states.size(2) == HD && states.size(3) == DS && B.size(2) == DS);
   TORCH_CHECK(states.stride(3) == 1 && states.stride(2) == DS && x.stride(2) == 1 && C.stride(2) == 1 && B.stride(2) == 1);
@@ -312,12 +336,27 @@ void scan_rows(torch::Tensor x, torch::Tensor C, torch::Tensor dt, torch::Tensor
     TORCH_CHECK(D->stride(-1) == 1, "D: contiguous last dim");
     D_dtype = st == at::kFloat ? 0 : (st == at::kBFloat16 ? 1 : 2);
   }
+  const bool tree = look_off.has_value();
+  if (tree) {
+    TORCH_CHECK(look_srow.has_value() && scr_x.has_value() && scr_C.has_value() && scr_B.has_value());
+    TORCH_CHECK(look_off->scalar_type() == at::kInt && look_srow->scalar_type() == at::kInt && look_srow->stride(1) == 1);
+    TORCH_CHECK(scr_x->stride(0) == x.stride(0) && scr_x->stride(1) == x.stride(1), "scratch x: the buffer's row strides");
+    TORCH_CHECK(scr_C->stride(0) == C.stride(0) && scr_C->stride(1) == C.stride(1), "scratch C: the buffer's row strides");
+    TORCH_CHECK(scr_B->stride(0) == B.stride(0) && scr_B->stride(1) == B.stride(1), "scratch B: the buffer's row strides");
+  }
+  const int* lo_p = tree ? look_off->data_ptr<int>() : nullptr;
+  const int* ls_p = tree ? look_srow->data_ptr<int>() : nullptr;
+  const int64_t ls_s = tree ? look_srow->stride(0) : 0;
+  const float* sx_p = tree ? scr_x->data_ptr<float>() : nullptr;
+  const float* sc_p = tree ? scr_C->data_ptr<float>() : nullptr;
+  const float* sb_p = tree ? scr_B->data_ptr<float>() : nullptr;
   dim3 grid(n, nheads);
   auto stream = at::cuda::getCurrentCUDAStream();
 #define SCAN_ARGS                                                                                                  \
   x.data_ptr<float>(), C.data_ptr<float>(), dt.data_ptr<float>(), dA.data_ptr<float>(), cb.data_ptr<float>(),      \
       z.data_ptr<float>(), Dp, states.data_ptr<float>(), out.data_ptr<float>(), slots.data_ptr<int>(),           \
       rows.data_ptr<int>(), starts.data_ptr<int>(), flags.data_ptr<int>(), nbuf.data_ptr<int>(), B.data_ptr<float>(), \
+      lo_p, ls_p, ls_s, sx_p, sc_p, sb_p,                                                                         \
       x.stride(0), x.stride(1), C.stride(0), C.stride(1), B.stride(0), B.stride(1), dt.stride(0), dt.stride(1),    \
       dA.stride(0), dA.stride(1), cb.stride(0), cb.stride(1), z.stride(0), z.stride(1), has_D ? D->stride(0) : 0, \
       states.stride(0), states.stride(1), out.stride(0), out.stride(1), (int)ratio, (int)has_D, D_hdim, D_dtype
@@ -337,7 +376,9 @@ _CPP = (
     "void scan_rows(torch::Tensor x, torch::Tensor C, torch::Tensor dt, torch::Tensor dA, torch::Tensor cb,"
     " torch::Tensor z, c10::optional<torch::Tensor> D, torch::Tensor states, torch::Tensor out,"
     " torch::Tensor slots, torch::Tensor rows, torch::Tensor starts, torch::Tensor flags,"
-    " torch::Tensor nbuf, torch::Tensor B, int64_t n, int64_t ratio, bool small);\n"
+    " torch::Tensor nbuf, torch::Tensor B, int64_t n, int64_t ratio, bool small,"
+    " c10::optional<torch::Tensor> look_off, c10::optional<torch::Tensor> look_srow,"
+    " c10::optional<torch::Tensor> scr_x, c10::optional<torch::Tensor> scr_C, c10::optional<torch::Tensor> scr_B);\n"
     "int64_t resident_programs_per_sm(bool small);"
 )
 
@@ -373,7 +414,7 @@ def module(hd: int, ds: int, chunk: int, ref_m: int, device=None):
 
             arch = f"{major}{minor}"
             _MODS[key] = load_inline(
-                name=f"mamba_bi_scan_cuda_h{hd}d{ds}c{chunk}m{ref_m}_sm{arch}",
+                name=f"mamba_bi_scan_cuda_t1_h{hd}d{ds}c{chunk}m{ref_m}_sm{arch}",
                 cpp_sources=_CPP,
                 cuda_sources=_SRC,
                 functions=["scan_rows", "resident_programs_per_sm"],

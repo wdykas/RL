@@ -225,6 +225,15 @@ thundersync:
   engine_sampler: wide
   row_seeds: true        # F3 per-row verification seeds
   prev_logprobs_from_verify: true  # the verify pass is the prev-logprob pass (gen log-probs are theta_k's own)
+  # Exact tree speculation (tree_spec; research/colo/ext/INTERFACE.md): up to tail_tree nodes per tail and iteration (a
+  # trie of the references' continuations, depth <= tail_tree_depth), each a one-token decode row, accepted along the
+  # keyed draws; nodes go to the critical tails first at break-even. 0 = off.
+  tail_tree: 0
+  tail_tree_depth: 4
+  tail_tree_rows: 32
+  # MTP draft source of tail_tree (tree_mtp): path to a trained MCore MTP head (head_mcore.pt); "" = off. TP 1 only.
+  tail_tree_mtp: ""
+  tail_tree_mtp_slots: 64
 
 checkpointing:
   enabled: false

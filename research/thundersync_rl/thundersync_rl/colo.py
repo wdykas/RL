@@ -62,6 +62,20 @@ class ColoConfig:
     mode: Literal["colo"] = MODE
     seed_stream: str = "colo"
     wide_sampler_key64: bool = True
+    # XS-SD on tree_spec (research/colo/NEXT.md "XS-SD on the single path"): "W:D:rows" opts EVERY fresh row into the
+    # engine's exact tree speculation with candidates from the row's own history (ts_tree src bit1). Same keys as
+    # one-token decode, so the rows are XS's token for token. None: plain XS.
+    tree_xssd: str | None = None
+    # MTP draft source of the tree (tree_mtp, "path:slots": a trained MCore MTP head, K / V slots for that many
+    # concurrent rows; TP 1). The chain is the trie's first candidate on every tree row. None: own history only.
+    tree_xssd_mtp: str | None = None
+    # T1 tools: stable_keys = noise keys from (seed, step, prompt idx, sample index), so two runs draw the same rows;
+    # row_dump = directory for each step's rows (tokens + generation log-prob bits).
+    stable_keys: bool = False
+    # report_only: failed CHECKS and the train-lp sentinel are printed but do not stop the run (diagnostics only, e.g.
+    # a multi-step T1 of a path with a known defect).
+    report_only: bool = False
+    row_dump: str | None = None
 
     @classmethod
     def from_config(cls, config: Any) -> "ColoConfig":
@@ -97,6 +111,25 @@ def config_problems(config: Any) -> list[str]:
         p.append("colo needs batch-invariant numerics (policy.megatron_cfg.batch_invariant_mode and "
                  "zero_train_gen_mismatch): the batch is exact only if engine log-probs == learner log-probs")
     p += nolanes.kv_mode_problems(mcore)
+    # Prefix caching: only on a Megatron-Core whose prefix cache is scoped by weight version (every wake that installs
+    # theta_k bumps the epoch salted into the block hashes, so no block computed under theta_{k-1} is ever matched).
+    if _get(mcore, "enable_prefix_caching", False) and not nolanes.mcore_prefix_cache_weight_scoped():
+        p.append("prefix caching needs a Megatron-Core whose prefix cache is scoped by weight version (the installed "
+                 "one is not: a cached block from theta_{k-1} would be read at theta_k)")
+    if nolanes.negative() == "tree_stale_cache" and not (
+            _get(config, "thundersync.tree_xssd") and _get(mcore, "enable_prefix_caching", False)):
+        p.append("THUNDERSYNC_NL_NEG=tree_stale_cache needs tree_xssd and enable_prefix_caching (else it is vacuous)")
+    xm = _get(config, "thundersync.tree_xssd_mtp")
+    if xm:
+        path, _, slots = str(xm).rpartition(":")
+        if not _get(config, "thundersync.tree_xssd"):
+            p.append("thundersync.tree_xssd_mtp needs thundersync.tree_xssd")
+        if not path or not os.path.isfile(path):
+            p.append(f"thundersync.tree_xssd_mtp: no head file {path!r} (format path:slots)")
+        if not slots.isdigit() or not 1 <= int(slots) <= 1024:
+            p.append("thundersync.tree_xssd_mtp slots must be in 1..1024 (format path:slots)")
+        if int(_get(mcfg, "tensor_model_parallel_size", 1) or 1) != 1:
+            p.append("thundersync.tree_xssd_mtp needs tensor_model_parallel_size 1 (full-vocab output layer)")
     if _get(pol, "offload_optimizer_for_refit", True):
         p.append("policy.offload_optimizer_for_refit must be false (resident colocated learner: MODEL.md v2 §11)")
     lag = _get(config, "async_rl.sampler.max_lookahead_versions", 0)
@@ -137,6 +170,16 @@ def configure_driver(config: dict) -> ColoConfig:
     config.setdefault("loss_fn", {})["train_lp_check"] = True
     if os.environ.get(SKIP_RESHARD_ENV) == "1":
         mcfg["env_vars"] = dict(mcfg.get("env_vars") or {}, **{SKIP_RESHARD_ENV: "1"})
+    if cfg.tree_xssd:
+        w, d, rows = (int(x) for x in str(cfg.tree_xssd).split(":"))
+        # the engine-side node rows (tree_kv: KV gather and Mamba scratch rows) are sized from this before the context
+        # exists; ref tokens 1: own-history tails carry no references
+        mcfg["env_vars"] = dict(mcfg.get("env_vars") or {}, THUNDERSYNC_TAIL_TREE=f"{w}:{d}:{rows}:1")
+        os.environ["THUNDERSYNC_TAIL_TREE"] = f"{w}:{d}:{rows}:1"
+        if cfg.tree_xssd_mtp:
+            # the decoder-output capture is installed on the engine model before the engine is built (megatron_worker)
+            mcfg["env_vars"]["THUNDERSYNC_TAIL_TREE_MTP"] = str(cfg.tree_xssd_mtp)
+            os.environ["THUNDERSYNC_TAIL_TREE_MTP"] = str(cfg.tree_xssd_mtp)
     neg = nolanes.negative()
     print(f"[colo] mode=colo sync (lag 0) engine sampler=wide key64={int(cfg.wide_sampler_key64)} "
           f"checks={int(nolanes.checks_on())}" + (f" NEGATIVE CONTROL {neg}" if neg else "")

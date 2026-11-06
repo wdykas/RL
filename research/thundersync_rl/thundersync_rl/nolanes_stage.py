@@ -581,6 +581,16 @@ class VerifyStage:
                     st.neg_tokens += 1
                 else:
                     gd["nl_key_rid"] = -1
+                if getattr(self.cfg, "tail_tree", 0) and not complete:
+                    # Tree speculation: lookup references (proposals only; any content is exact, DESIGN E6 concerns
+                    # targets): the rejected draft from tau on, then the group's other drafts.
+                    from nemo_rl.models.generation.megatron.tree_spec import pack_refs
+
+                    refs = []
+                    if o.kind == "continued" and o.draft is not None and o.prefix:
+                        refs.append(o.draft.tokens[len(o.prefix) - 1:])
+                    refs += [d.tokens for d in drafts[g] if d is not o.draft]
+                    gd["nl_mtd_refs"] = pack_refs(refs)
                 rows.append(
                     {
                         "prefix": list(o.prefix),
@@ -813,6 +823,21 @@ class VerifyStage:
                 tail_max_s=round(dur, 2), tail_max_tok=int(cont_max.get(gt, 0)),
                 tail_ms_per_tok=round(1000.0 * dur / max(cont_max.get(gt, 0), 1), 2),
             )
+        if getattr(self.cfg, "tail_tree", 0):
+            # Tree speculation: per-engine-rank totals since the start; the step's deltas. crit = each rank's tail
+            # with the longest remaining budget (the critical row's tokens per iteration).
+            ms = [x for x in await asyncio.to_thread(
+                ray.get, self._gen_wg().run_all_workers_single_data("nl_tree_stats")) if x]
+            from nemo_rl.models.generation.megatron import tree_spec as _ts
+
+            line, tot = _ts.stats_line(int(version), ms, getattr(self, "_tree_prev", None))
+            prev = getattr(self, "_tree_prev", None) or {k: 0 for k in tot}
+            self._tree_prev = tot
+            d_tok, d_it = tot["tokens"] - prev["tokens"], tot["tail_iters"] - prev["tail_iters"]
+            d_ct, d_ci = tot["crit_tokens"] - prev["crit_tokens"], tot["crit_iters"] - prev["crit_iters"]
+            st.crit.update(tree_tok_per_iter=round(d_tok / max(d_it, 1), 4),
+                           tree_crit_tok_per_iter=round(d_ct / max(d_ci, 1), 4))
+            print(line, flush=True)
         new_meta = None
         batch_rows = []
         for g in gids:  # fixed group order (R2) for the step's metadata and checks
