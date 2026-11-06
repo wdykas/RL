@@ -381,6 +381,32 @@ def test_loss_problems():
     assert len(gen_probs({"mcore_generation_config": {"num_speculative_tokens": 2}})) == 1
 
 
+def test_learner_resident_only_where_a_mode_sets_it():
+    """xspr / isspr offload before the refit as stock / SPR-BI (the K = 4 isspr arms OOMed at the TMS resume with
+    the grad buffers resident); colo / nolanes set megatron_cfg.resident_learner and keep them."""
+    import thundersync_rl.worker as w
+
+    calls = []
+    stock = w.MegatronPolicyWorkerImpl.offload_before_refit
+    w.MegatronPolicyWorkerImpl.offload_before_refit = lambda self: calls.append("stock")
+    try:
+        cls = w.ThunderSyncMegatronPolicyWorker.__ray_metadata__.modified_class  # the class behind the Ray actor
+
+        def worker(**mcfg):
+            obj = object.__new__(cls)  # no constructor: only the attributes it reads
+            obj.__dict__.update(is_generation_colocated=True, cfg={"megatron_cfg": mcfg},
+                                finalize_async_save=lambda: calls.append("finalize"))
+            return obj
+
+        cls.offload_before_refit(worker(engine_verify=True))
+        assert calls == ["stock"]
+        calls.clear()
+        cls.offload_before_refit(worker(resident_learner=True))
+        assert calls == ["finalize"]
+    finally:
+        w.MegatronPolicyWorkerImpl.offload_before_refit = stock
+
+
 def test_advantages_must_be_group_local():
     from types import SimpleNamespace
 

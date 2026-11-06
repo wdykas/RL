@@ -859,7 +859,16 @@ class SingleControllerActor:
             from thundersync_rl.isspr import IsSprConfig
             from thundersync_rl.isspr_stage import IsSprStage
 
-            return IsSprStage(self, master_config, IsSprConfig.from_config({"thundersync": ts}))
+            # IsSprConfig resolves the lag (weight auto: group at K <= 1, row at K >= 2) and L_c (the constant
+            # normalizer) from these two keys; the thundersync block alone would resolve both to 0.
+            resolved = {
+                "thundersync": ts,
+                "async_rl": {"sampler": {"max_lookahead_versions": int(
+                    getattr(self._async_cfg.sampler, "max_lookahead_versions", 0) or 0)}},
+                "policy": {"generation": {
+                    "max_new_tokens": int(master_config.policy["generation"]["max_new_tokens"])}},
+            }
+            return IsSprStage(self, master_config, IsSprConfig.from_config(resolved))
         if ts.get("mode") == "xspr":
             # Exact SPR (research/colo/SIMPLE_EXACT_SPR.md): the stock loop; rows are checked in the rollout path.
             from thundersync_rl.xspr import XsprConfig

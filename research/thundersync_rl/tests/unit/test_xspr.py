@@ -704,7 +704,7 @@ def test_check_cache_rule_on_mcore_requests():
 
 
 def test_check_cache_rule_multi_block_prompts():
-    # Regression (IndexError in MCore's _register_range): prompts of several KV blocks, two check
+    # Regression (isP : IndexError in MCore's _register_range): prompts of several KV blocks, two check
     # requests on one prompt (siblings) share its leading blocks -- a cache hit on a partial prefix -- and every
     # request carries one hash per complete block, the index contract MCore's registration chain relies on.
     from megatron.core.inference.engines import dynamic_engine as de
@@ -748,6 +748,10 @@ def test_engine_thread_failures_are_recorded_then_raised():
     raise_failure(None)
     record_failure(xs, RuntimeError("first"))
     record_failure(xs, RuntimeError("second"))  # the first failure is the one reported
-    with pytest.raises(RuntimeError, match="^first$"):
+    with pytest.raises(RuntimeError, match="^RuntimeError: first$"):
+        raise_failure(xs)
+    xs = {}
+    record_failure(xs, IndexError("list index out of range"))  # any exception type, named in the report
+    with pytest.raises(RuntimeError, match="^IndexError: list index out of range$"):
         raise_failure(xs)
 

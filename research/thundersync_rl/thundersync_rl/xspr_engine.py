@@ -239,7 +239,7 @@ def check_capture(overflow_before: int, overflow_after: int) -> None:
 def record_failure(xs: dict, err: Exception) -> None:
     """A guard failed on the engine loop thread: keep the first failure for raise_failure (printing it once)."""
     if "error" not in xs:
-        xs["error"] = str(err)
+        xs["error"] = f"{type(err).__name__}: {err}"
         print(f"[xspr engine] FAILURE (raised on the worker's next result / stats / wake call): {err}", flush=True)
 
 
@@ -417,7 +417,7 @@ class XsprEngineMixin:
             if selected.shape[0] == n and not bool(torch.isfinite(selected).all()):
                 try:
                     nonfinite_dump(self, engine, logits, new_tokens, selected, dump_dir)
-                except RuntimeError as err:  # the engine loop thread: recorded, raised on the worker path
+                except Exception as err:  # the engine loop thread: recorded, raised on the worker path
                     record_failure(self._xspr, err)
             return selected, log_probs
 
@@ -707,14 +707,14 @@ class XsprEngineMixin:
             if "error" not in xs:
                 try:
                     picked = select()
-                except RuntimeError as err:
+                except Exception as err:  # any error on the engine loop thread would kill it: record, raise later
                     record_failure(xs, err)
             ovf0 = cap["overflow"][0]
             out = orig(*args, **kwargs)
             if picked is not None:
                 try:
                     score(*picked, ovf0)
-                except RuntimeError as err:
+                except Exception as err:
                     record_failure(xs, err)
             if len(tags.by_rid) > 1024:
                 tags.prune()

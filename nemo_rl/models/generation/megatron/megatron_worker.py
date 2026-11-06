@@ -1092,9 +1092,6 @@ class MegatronGenerationMixin:
             self._wake_engine(), self._inference_loop
         )
         future.result()
-        from nemo_rl.models.megatron import kv_live_offload
-
-        kv_live_offload.raise_if_check_failed()
         self._inference_engine_asleep = False
         print(f"[Rank {self.rank}] resumed inference engine")
 

@@ -136,7 +136,8 @@ def config_problems(config: Any) -> list[str]:
     if _get(gen, "stop_strings"):
         p.append("xspr: no stop strings (a continuation's stop match would not see the kept prefix)")
     if _get(pol, "offload_optimizer_for_refit", True):
-        p.append("policy.offload_optimizer_for_refit must be false (resident colocated learner)")
+        p.append("policy.offload_optimizer_for_refit must be false (as SPR-BI: the optimizer stays, stock "
+                 "offload_before_refit moves the grad buffers off for the engine phase)")
     if _get(config, "async_rl.sampler.name") != "in_order":
         p.append("xspr needs the in_order sampler (batch k complete before the stand-down of step k)")
     lag = int(_get(config, "async_rl.sampler.max_lookahead_versions", 0) or 0)

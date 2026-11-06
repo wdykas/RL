@@ -1,0 +1,23 @@
+# IS-RLOO at lag K (thundersync_rl/isspr.py docstring "IS-RLOO"): IS-SPR with the weight unit resolved by lag (group
+# at K <= 1, row at K >= 2) and the objective the row weight is exact for: RLOO advantage (LOO mean, GRPO's std
+# dropped), constant length normalizer L_c = policy.generation.max_new_tokens (folded into the is_weight column).
+# Differences to colo_isspr.yaml (all method):
+#   thundersync.weight auto                       group at lag <= 1, row at lag >= 2
+#   thundersync.length_normalizer constant        row loss sum_t / L_c
+#   grpo.adv_estimator normalize_rewards false    RLOO: no std. The estimator reads only this block (the nano recipe
+#   grpo.adv_estimator use_leave_one_out_baseline  chain has none: AdvEstimatorConfig defaults, std on); the flat
+#                                                 grpo.* keys mirror it
+defaults:
+  - colo_isspr.yaml
+
+grpo:
+  normalize_rewards: false
+  use_leave_one_out_baseline: true
+  adv_estimator:
+    name: grpo
+    normalize_rewards: ${grpo.normalize_rewards}
+    use_leave_one_out_baseline: ${grpo.use_leave_one_out_baseline}
+
+thundersync:
+  weight: auto
+  length_normalizer: constant

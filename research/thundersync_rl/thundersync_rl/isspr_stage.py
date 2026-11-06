@@ -54,6 +54,7 @@ class IsSprStage(XsprStage):
 
     def __init__(self, sc: Any, master_config: Any, cfg: isspr.IsSprConfig):  # noqa: D107
         isspr.require_group_local(sc._advantage_stage_config)
+        isspr.require_rloo(sc._advantage_stage_config, cfg)
         super().__init__(sc, master_config, cfg)
 
     async def run(self, meta: Any, version: int) -> Any:
@@ -76,7 +77,7 @@ class IsSprStage(XsprStage):
         flat = [c for cs in certs for c in cs]
         s = [math.fsum(c.s for c in cs) for cs in certs]
         s_rows = [c.s for c in flat]
-        row = self.cfg.weight == "row"
+        row = self.cfg.unit == "row"
         st = isspr.weight_stats(s_rows if row else s, self.cfg.clip_c)
         st_other = isspr.weight_stats(s if row else s_rows, self.cfg.clip_c)
         dp = isspr.reward_shift(s_rows, [float(c.reward) for _, rec in groups for c in rec.completions])
@@ -85,7 +86,7 @@ class IsSprStage(XsprStage):
         evicted = sum(int(x.get("evicted", 0)) for x in eng)
         now = time.perf_counter()
         print(f"[isspr] step={int(version)} groups={len(s)} rows={len(flat)} uncertified={len(bad)} "
-              f"weight={self.cfg.weight} {'group' if row else 'row'}_ess={st_other['ess']:.6f} "
+              f"weight={self.cfg.weight} unit={self.cfg.unit} {'group' if row else 'row'}_ess={st_other['ess']:.6f} "
               f"{'group' if row else 'row'}_s_var={st_other['s_var']:.6g} dp_hat={dp:.6g} "
               f"eps_hat={st['eps_hat']:.6g} s_mean={st['s_mean']:.6g} s_var={st['s_var']:.6g} "
               f"s_min={st['s_min']:.6g} s_max={st['s_max']:.6g} ess={st['ess']:.6f} ess_clip={st['ess_clip']:.6f} "
@@ -120,14 +121,21 @@ class IsSprStage(XsprStage):
             raise RuntimeError(f"[isspr] step {version}: {len(bad)} rows' log-probs not theta_{version}'s "
                                f"(versions {sorted({c.version for c in bad})[:5]})")
         # Row (g, j) is the data-plane sample "{g}_g{j}" (payload.pack_payload: generation index j = completion j).
+        # Per-row column: the row's clipped weight (its own, or its group's), times l_r / L_c under the constant length
+        # normalizer (isspr.train_coefficients), l_r the row's trained token count.
         if row:
             w = isspr.clipped_weights(s_rows, self.cfg.clip_c)
-            keys = [f"{g}_g{j}" for g, cs in zip(gids, certs) for j in range(len(cs))]
         else:
-            w = isspr.clipped_weights(s, self.cfg.clip_c)
-            keys = gids
-        w_of = dict(zip(keys, w))
-        unit = list(meta.sample_ids) if row else [t[GROUP_ID_TAG] for t in meta.tags]
+            w = [wg for wg, cs in zip(isspr.clipped_weights(s, self.cfg.clip_c), certs) for _ in cs]
+        lengths = [nolanes._assistant(comp.message_log)["token_ids"].numel() for _, rec in groups
+                   for comp in rec.completions]
+        off = [(c.key, n, c.tokens) for c, n in zip(flat, lengths) if n != c.tokens]
+        if off:
+            raise RuntimeError(f"[isspr] step {version}: trained token counts differ from the certified rows' "
+                               f"(key, trained, certified) {off[:3]}")
+        keys = [f"{g}_g{j}" for g, cs in zip(gids, certs) for j in range(len(cs))]
+        w_of = dict(zip(keys, isspr.train_coefficients(w, lengths, self.cfg)))
+        unit = list(meta.sample_ids)
         unknown = [k for k in unit if k not in w_of]
         if unknown or len(unit) != len(flat):
             raise RuntimeError(f"[isspr] step {version}: {len(unit)} batch rows for {len(flat)} certified rows, "
