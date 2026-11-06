@@ -17,8 +17,8 @@ Rank 0 drives the engines through the coordinator: its resume / unpause reaches 
 local wake (inference weights onloaded and resharded, engine scratch mapped back) runs on that rank's main thread.
 If rank 0 resumes the engines before every rank finished its local wake, a slower rank's engine steps on unmapped
 engine scratch (TMS) or on weights still being written: Nano 8k SPR-BI on cdfeb3ad / 514231f7 died with a Warp MMU
-Fault in fp16_moe_dk's _dk_count_kernel storing to the first bytes of the engine-scratch region (coredump of job
-), 0.2-0.6 s after a wake, on the slower node's ranks. The fix (5a96a507) puts the default-group barrier
+Fault in fp16_moe_dk's _dk_count_kernel storing to the first bytes of the engine-scratch region
+(core dump), 0.2-0.6 s after a wake, on the slower node's ranks. The fix (5a96a507) puts the default-group barrier
 between the local wake and the coordinator resume.
 
 Two ranks run the real ``MegatronGenerationMixin._wake`` / ``_sleep`` on their own main and engine-loop threads, with
