@@ -77,6 +77,8 @@ NEGATIVES = (
     "tree_skip_kv_rollback",  # tail_tree: the accepted path's K / V are not copied into the request's block
     "tree_non_bi_verify",  # tail_tree: node rows drawn / scored from bf16-rounded logits (not one-token decode's)
     "tree_stale_cache",  # tail_tree + prefix caching: tree requests hash their prompt blocks with the previous epoch
+    "tree_stale_version",  # tail_tree: tail state (P / H, plen, key id) kept across an engine weight epoch (resume)
+    "tree_straddle_commit",  # tail_tree: a forward laid out before a resume commits its node tokens after it (old weights)
     "carry_unverified",  # colocated partial rollout: carried (stale-version) draft tokens trained without verification
     "spare_by_content",  # XPR-S: the trained prompts are the P pools with the fewest continued rows (selection on content)
     "spare_tail_drop",  # XPR-S: an output that needs a tail does not fill a slot (the next draft does), no IS weight
@@ -352,6 +354,9 @@ def config_problems(config: Any) -> list[str]:
             p.append("thundersync.tail_tree_depth must be in 1..7")
         if not int(cfg.tail_tree) <= int(cfg.tail_tree_rows) <= 256:
             p.append("thundersync.tail_tree_rows must be in tail_tree..256")
+        if int(_get(config, "async_rl.sampler.max_lookahead_versions", 1) or 0) > 1:
+            p.append("thundersync.tail_tree needs async_rl.sampler.max_lookahead_versions <= 1 in loop (lag K > 1 is "
+                     "not gated with a lag-K verify stage yet; reviewer batch 48)")
         if not _get(mcfg, "batch_invariant_mode", False):
             p.append("thundersync.tail_tree needs the batch-invariant engine (policy.megatron_cfg.batch_invariant_mode)")
         if int(_get(mcore, "pipeline_model_parallel_size") or 1) != 1:

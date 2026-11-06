@@ -54,42 +54,12 @@ except ImportError:  # pragma: no cover - CPU-only environments
     HAVE_TRITON = False
 
 _ORIG: dict[str, Any] = {}
-_STATE: dict[str, Any] = {"capacity": 0, "nbuf": [], "nbuf_ptrs": None, "tree": False, "replay": [],
-                          "replay_ptrs": None}
+_STATE: dict[str, Any] = {"capacity": 0, "nbuf": [], "nbuf_ptrs": None}
 
 
 def capacity() -> int:
     """Lookahead entries (scratch conv rows) per engine step; 0 when not installed."""
     return int(_STATE["capacity"])
-
-
-def tree_capacity() -> int:
-    """Scratch replay rows per Mamba layer for tree node rows (tree_spec); 0 unless installed with ``tree=True``."""
-    return int(_STATE["capacity"]) if _STATE["tree"] else 0
-
-
-def register_replay(buf) -> None:
-    """A Mamba layer's z-free replay buffers with tree scratch rows (``buf.scratch``), for the commit copy."""
-    _STATE["replay"].append(buf)
-    _STATE["replay_ptrs"] = None
-
-
-def replay_ptrs(device) -> tuple[torch.Tensor, tuple[int, int, int]]:
-    """(int64 [8, L] device table: slot x / dt / B / C then scratch x / dt / B / C data pointers per registered
-    layer, (n_x, nheads, n_bc) row sizes), built once after allocation."""
-    bufs = _STATE["replay"]
-    p = _STATE["replay_ptrs"]
-    if p is None or p[0].shape[1] != len(bufs):
-        rows = [[b.x.data_ptr() for b in bufs], [b.dt.data_ptr() for b in bufs], [b.B.data_ptr() for b in bufs],
-                [b.C.data_ptr() for b in bufs]]
-        rows += [[b.scratch[i].data_ptr() for b in bufs] for i in range(4)]
-        b0 = bufs[0]
-        sizes = (b0.x[0, 0].numel(), b0.dt[0, 0].numel(), b0.B[0, 0].numel())
-        for b in bufs:
-            assert (b.x[0, 0].numel(), b.dt[0, 0].numel(), b.B[0, 0].numel()) == sizes
-            assert all(t.is_contiguous() for t in (b.x, b.dt, b.B, b.C) + tuple(b.scratch))
-        p = _STATE["replay_ptrs"] = (torch.tensor(rows, dtype=torch.int64, device=device), sizes)
-    return p
 
 
 def register_num_buffered(t: torch.Tensor) -> None:
@@ -191,82 +161,6 @@ if HAVE_TRITON:
         m = offs < conv_row_elems
         v = tl.load(conv_ptr + lyr * stride_cl + sid * stride_cb + offs, mask=m)
         tl.store(conv_ptr + lyr * stride_cl + slot.to(tl.int64) * stride_cb + offs, v, mask=m)
-
-
-if HAVE_TRITON:
-
-    @triton.jit
-    def _tree_commit_kernel(
-        conv_ptr, nbuf_ptrs, rp_ptrs, slot_ptr, path_ptr, acc_ptr, cursor_ptr,
-        n_layers, stride_path, stride_cl, stride_cb, conv_row_elems, scratch_base, n_x, n_dt, n_bc,
-        CHUNK: tl.constexpr, LOOK_MAX: tl.constexpr, BLOCK: tl.constexpr, SKIP_REPLAY: tl.constexpr,
-    ):
-        """Program (tail t, layer l): commit of a tree tail's accepted path (a tokens, path nodes at depths 1..a-1 with
-        scratch indices path[t, 0 .. a-2]): cursor <- (w0 + a) mod CHUNK; replay rows w0 + 1 + j <- the path node's
-        scratch rows (x, dt, B, C); conv state <- the depth a-1 node's scratch conv row (a >= 2)."""
-        t = tl.program_id(axis=0)
-        lyr = tl.program_id(axis=1).to(tl.int64)
-        slot = tl.load(slot_ptr + t)
-        a = tl.load(acc_ptr + t)
-        if (slot < 0) | (a <= 0):
-            return
-        w0 = tl.load(cursor_ptr + t)
-        nb = tl.load(nbuf_ptrs + lyr).to(tl.pointer_type(tl.int32))
-        tl.store(nb + slot, (w0 + a) % CHUNK)
-        if a < 2:
-            return
-        slot64 = slot.to(tl.int64)
-        offs = tl.arange(0, BLOCK)
-        if not SKIP_REPLAY:
-            px = tl.load(rp_ptrs + 0 * n_layers + lyr).to(tl.pointer_type(tl.float32))
-            pdt = tl.load(rp_ptrs + 1 * n_layers + lyr).to(tl.pointer_type(tl.float32))
-            pb = tl.load(rp_ptrs + 2 * n_layers + lyr).to(tl.pointer_type(tl.float32))
-            pc = tl.load(rp_ptrs + 3 * n_layers + lyr).to(tl.pointer_type(tl.float32))
-            sx = tl.load(rp_ptrs + 4 * n_layers + lyr).to(tl.pointer_type(tl.float32))
-            sdt = tl.load(rp_ptrs + 5 * n_layers + lyr).to(tl.pointer_type(tl.float32))
-            sb = tl.load(rp_ptrs + 6 * n_layers + lyr).to(tl.pointer_type(tl.float32))
-            sc = tl.load(rp_ptrs + 7 * n_layers + lyr).to(tl.pointer_type(tl.float32))
-            for j in range(0, a - 1):
-                src = tl.load(path_ptr + t * stride_path + j).to(tl.int64)
-                dst = slot64 * CHUNK + w0 + 1 + j
-                for o in range(0, n_x, BLOCK):
-                    m = o + offs < n_x
-                    tl.store(px + dst * n_x + o + offs, tl.load(sx + src * n_x + o + offs, mask=m), mask=m)
-                for o in range(0, n_bc, BLOCK):
-                    m = o + offs < n_bc
-                    tl.store(pb + dst * n_bc + o + offs, tl.load(sb + src * n_bc + o + offs, mask=m), mask=m)
-                    tl.store(pc + dst * n_bc + o + offs, tl.load(sc + src * n_bc + o + offs, mask=m), mask=m)
-                for o in range(0, n_dt, BLOCK):
-                    m = o + offs < n_dt
-                    tl.store(pdt + dst * n_dt + o + offs, tl.load(sdt + src * n_dt + o + offs, mask=m), mask=m)
-        last = tl.load(path_ptr + t * stride_path + a - 2).to(tl.int64) + scratch_base  # conv scratch row
-        for o in range(0, conv_row_elems, BLOCK):
-            m = o + offs < conv_row_elems
-            v = tl.load(conv_ptr + lyr * stride_cl + last * stride_cb + o + offs, mask=m)
-            tl.store(conv_ptr + lyr * stride_cl + slot64 * stride_cb + o + offs, v, mask=m)
-
-
-def commit_tree(conv_states_all: torch.Tensor, slots: torch.Tensor, path: torch.Tensor, accepted: torch.Tensor,
-                cursors: torch.Tensor, chunk: int, scratch_base: int, skip_replay: bool = False) -> None:
-    """After a tree tail's acceptance (tree_spec): per tail t with a = accepted[t] >= 1 tokens and accepted path
-    nodes at depths 1..a-1 with scratch indices path[t, :a-1]: every Mamba layer's cursor <- (cursors[t] + a) mod
-    chunk, its replay rows cursors[t] + 1 .. + a - 1 <- the path's scratch replay rows, its conv state <- the scratch
-    conv row (scratch_base + path[t, a-2]) of the depth a-1 node. ``skip_replay``: negative control
-    tree_stale_mamba (the slot keeps stale replay rows)."""
-    T = slots.numel()
-    if T == 0 or not _STATE["nbuf"]:
-        return
-    L = conv_states_all.shape[0]
-    assert len(_STATE["nbuf"]) == L == len(_STATE["replay"]), (len(_STATE["nbuf"]), L, len(_STATE["replay"]))
-    from nemo_rl.models.megatron import mamba_bi_fused_decode as fd
-
-    rp, (n_x, n_dt, n_bc) = replay_ptrs(conv_states_all.device)
-    row = conv_states_all[0, 0].numel()
-    _tree_commit_kernel[(T, L)](
-        conv_states_all, num_buffered_ptrs(conv_states_all.device), rp, slots, path, accepted, cursors, L,
-        path.stride(0), conv_states_all.stride(0), conv_states_all.stride(1), row, scratch_base, n_x, n_dt, n_bc,
-        CHUNK=chunk, LOOK_MAX=fd.LOOK_MAX, BLOCK=1024, SKIP_REPLAY=bool(skip_replay),
-    )
 
 
 def full_conv_state(conv_state: torch.Tensor) -> torch.Tensor:
@@ -397,17 +291,21 @@ def _ssm_decode(self, zxBCdt, conv_state, ssm_state, batch_indices=None, interme
     return y
 
 
-def install(lookahead_capacity: int, tree: bool = False) -> None:
+def install(lookahead_capacity: int) -> None:
     """Enable lookahead rows (idempotent; ``lookahead_capacity`` > 0 entries per step). Call before the engine's
-    context is built (the scratch conv rows are allocated with the Mamba states). ``tree``: also per-node scratch
-    replay rows in every Mamba layer (tree_spec: sibling nodes at one depth)."""
+    context is built (the scratch conv rows are allocated with the Mamba states). Tree speculation owns its node-row
+    state (tree_kv) and is exclusive with this."""
+    import sys
+
     cap = int(lookahead_capacity)
     assert cap > 0
     if _ORIG:
         assert cap == _STATE["capacity"], ("lookahead capacity is fixed once installed", cap, _STATE["capacity"])
-        assert bool(tree) == _STATE["tree"], "tree scratch rows are fixed once installed"
         return
-    _STATE["tree"] = bool(tree)
+    tk = sys.modules.get("nemo_rl.models.generation.megatron.tree_kv")
+    if tk is not None and tk.capacity() > 0:
+        raise RuntimeError("mamba_bi_lookahead: tree node rows (tree_kv) are installed; tail_mtd and tail_tree are "
+                           "exclusive")
     from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
     from megatron.core.ssm.mamba_mixer import MambaMixer
 

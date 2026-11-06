@@ -251,21 +251,22 @@ class NolanesEngineMixin:
         if not spec:
             return
         w, d, rows, ref_cap = (int(x) for x in spec.split(":"))
-        if os.environ.get("THUNDERSYNC_TAIL_MTD_DEBUG_FORCE_K") and os.environ.get("THUNDERSYNC_NL_CHECKS") != "1":
-            raise RuntimeError("THUNDERSYNC_TAIL_MTD_DEBUG_FORCE_K is a gate tool: refused without CHECKS")
         from nemo_rl.models.generation.megatron import tree_kv, tree_spec
-        from nemo_rl.models.megatron import mamba_bi_lookahead
 
-        if mamba_bi_lookahead.tree_capacity() == 0 or tree_kv.capacity() == 0:
+        tree_spec.force_width()  # the gate tool's checks (CHECKS only; the retired MTD name refused) before install
+        if tree_kv.capacity() == 0:
             raise RuntimeError("[nolanes engine] tail_tree: the node rows (Mamba scratch rows, KV gather) were not "
                                "installed before the engine was built (megatron_worker._prepare_engine_numerics)")
         engine = self.dynamic_inference_engine
         nl = self._nl
         self._nl_tree = tree_spec.install(
+            # t_max tail slots (continuation rows with references), not one per request slot: per rank the tables are
+            # t_max x (max sequence + ref_cap) int32 and the tree's fixed grids run over t_max; a request past it
+            # decodes one token per step (the [tree] line's tails_full)
             engine, W=w, D=d, t_max=64, ref_cap=ref_cap, node_cap=rows, sample_rows=self._nl_tree_sample,
             key_check=getattr(self, "_wide_key_check", None), keyreg=nl["keyreg"],
             key_ids=lambda rids: self._nl_key_ids(engine, rids),
-            scores_rows=self._nl_tree_scores, uniform_rows=self._nl_tree_uniform,
+            scores_rows=self._nl_tree_scores, uniform_rows=self._nl_tree_uniform, top2_rows=self._nl_tree_top2,
         )
         print(f"[nolanes engine] rank={getattr(self, 'rank', '?')} tail_tree W={w} D={d} rows/step={rows} "
               f"ref tokens={ref_cap}", flush=True)
@@ -322,10 +323,10 @@ class NolanesEngineMixin:
         pos_d = pos.to(device=dev, dtype=torch.int64)
         rows = logits if logits.stride(-1) == 1 else logits.contiguous()
         n, v = rows.shape
-        ws = getattr(self, "_nl_mtd_ws", None)
+        ws = getattr(self, "_nl_tree_ws", None)
         need = s_mod.workspace_bytes(n, v)
         if ws is None or ws.numel() < need:
-            ws = self._nl_mtd_ws = torch.empty(max(need, 1), dtype=torch.uint8, device=dev)
+            ws = self._nl_tree_ws = torch.empty(max(need, 1), dtype=torch.uint8, device=dev)
         out = torch.empty(n, dtype=torch.int64, device=dev)
         assert getattr(self, "_wide_key64", True), "tail_tree: the key64 sampler (thundersync.wide_sampler_key64)"
         s_mod.wide_sample(rows, kid_d, pos_d, temp.clamp(min=_min_sampling_temperature()), self._wide_salt,
@@ -344,6 +345,26 @@ class NolanesEngineMixin:
         rows = logits if logits.stride(-1) == 1 else logits.contiguous()
         return keyed_scores(rows, kid_d, pos.to(device=logits.device, dtype=torch.int64),
                             temp.clamp(min=_min_sampling_temperature()), self._wide_salt)
+
+    def _nl_tree_top2(self, logits, kid_dev, pos_dev, temp):
+        """Proposals only (tree_spec's MTP depth-1 sibling): the runner-up of each row's keyed race (S's keys and
+        noise, fp32 scores), -1 where none. Device key ids and positions; fixed shapes (graph-capturable)."""
+        import torch
+
+        from thundersync_rl import keyed_sampling_s as s_mod
+        from thundersync_rl.worker import _min_sampling_temperature
+
+        rows = logits if logits.stride(-1) == 1 else logits.contiguous()
+        n, v = rows.shape
+        need = s_mod.top2_workspace_bytes(n, v)
+        ws = self.__dict__.get("_nl_top2_ws")
+        if ws is None or ws.numel() < need:
+            ws = self._nl_top2_ws = torch.empty(max(need, 1), dtype=torch.uint8, device=rows.device)
+        o1 = torch.empty(n, dtype=torch.int64, device=rows.device)
+        o2 = torch.empty(n, dtype=torch.int64, device=rows.device)
+        s_mod.keyed_top2(rows, kid_dev.to(torch.int64), pos_dev.to(torch.int64),
+                         temp.clamp(min=_min_sampling_temperature()), self._wide_salt, out1=o1, out2=o2, workspace=ws)
+        return o2
 
     def _nl_tree_uniform(self, kid_dev, pos_dev):
         from thundersync_rl.keyed_scores import keyed_uniform
@@ -482,19 +503,28 @@ class NolanesEngineMixin:
         nl["tags"].record(keys, ts, self._nl_tag_version())
 
     def _nl_key_ids(self, engine: Any, rids: np.ndarray) -> np.ndarray:
-        """Noise-key request ids of the sampled rows (the engine id; a key_reuse negative's override)."""
+        """Noise-key request ids of the sampled rows: the engine request id, or the request's KEY_RID_ATTR override
+        when it carries one (a consumer continuing a row under the original row's keys, e.g. a keyed check's
+        in-place continuation; INTERFACE.md). nolanes' own requests carry it only under the key_reuse negative, so its
+        fresh-key rule (E4) is unchanged; the negative's tokens are counted."""
         nl = self.__dict__.get("_nl")
-        if nl is None or nl["neg"] != "key_reuse":
-            return rids
+        cache = self.__dict__.setdefault("_nl_kid_cache", {})  # rid -> override or None (attributes are immutable)
+        if len(cache) > 1 << 16:
+            cache.clear()
         out = rids.copy()
         for i, rid in enumerate(rids.tolist()):
-            entry = engine.requests.get(int(rid))
-            if entry is None:
-                continue
-            k = getattr(entry.record[-1].sampling_params, KEY_RID_ATTR, None)
+            if rid in cache:
+                k = cache[rid]
+            else:
+                entry = engine.requests.get(int(rid))
+                if entry is None:
+                    continue
+                k = getattr(entry.record[-1].sampling_params, KEY_RID_ATTR, None)
+                cache[rid] = k
             if k is not None:
                 out[i] = int(k)
-                nl["neg_tokens"] += 1
+                if nl is not None and nl["neg"] == "key_reuse":
+                    nl["neg_tokens"] += 1
         return out
 
     def _nl_observe_keys(self, key_ids: np.ndarray, pos: Optional[np.ndarray]) -> None:
@@ -530,7 +560,7 @@ class NolanesEngineMixin:
             if key_rid is not None and int(key_rid[i]) >= 0:
                 attrs[KEY_RID_ATTR] = int(key_rid[i])
             if mtd_refs is not None and mtd_refs[i] is not None:
-                from nemo_rl.models.generation.megatron.tail_mtd import MTD_REFS_ATTR
+                from nemo_rl.models.generation.megatron.tree_spec import MTD_REFS_ATTR
 
                 attrs[MTD_REFS_ATTR] = np.ascontiguousarray(mtd_refs[i], dtype=np.int32).tobytes()
             if attrs:

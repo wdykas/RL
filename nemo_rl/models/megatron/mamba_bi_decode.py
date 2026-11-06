@@ -172,17 +172,6 @@ def _allocate(
     from nemo_rl.models.megatron import mamba_bi_lookahead
 
     mamba_bi_lookahead.register_num_buffered(buf.num_buffered)  # cursor update after lookahead rows (tail_mtd)
-    cap = mamba_bi_lookahead.tree_capacity()
-    if cap > 0:
-        # Tree node rows (tree_spec): per-node scratch replay rows (x, dt, B, C), so sibling nodes at one depth never
-        # share the slot's chunk row; the accepted path's rows are copied into the slot at commit.
-        buf.scratch = (
-            torch.zeros(cap, nheads, headdim, device=device, dtype=dtype),
-            torch.zeros(cap, nheads, device=device, dtype=dtype),
-            torch.zeros(cap, ngroups, dstate, device=device, dtype=dtype),
-            torch.zeros(cap, ngroups, dstate, device=device, dtype=dtype),
-        )
-        mamba_bi_lookahead.register_replay(buf)
     return buf
 
 

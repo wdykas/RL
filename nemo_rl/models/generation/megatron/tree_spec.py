@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Exact tree speculation on opted-in engine requests (shared engine module; interface:
-the research notes, summarized in docs/colo/). It generalizes tail_mtd's single proposal chain to a token tree.
+the research notes, summarized in docs/colo/). A single proposal chain is its 1-branch case. Self-contained:
+the node-row state (KV and Mamba) is tree_kv's; no other speculation module is needed.
 
 Per engine iteration an opted-in request ("tail") gets up to W extra decode rows, one per tree node. The nodes are
 the trie of the candidate continuations that follow the suffix matches (n = 4..1) of its context in its references:
@@ -21,7 +22,7 @@ the dead suffix, then the siblings. Candidates go best first: longer match, then
 **Every node is a one-token decode row** at position P - 1 + depth of the same forward. It sees exactly the prefix
 one-token decode sees once its ancestors are committed:
 - Mamba: its ancestors' entries in ``look_chain``, their scratch replay rows in ``look_srow``, and its scratch conv
-  window (mamba_bi_fused_decode / mamba_bi_lookahead);
+  window (mamba_bi_fused_decode, tree_kv);
 - attention: a private KV block with the committed part of the last block, the root's and the ancestors' K / V
   gathered in every layer (tree_kv).
 So a depth-d path is verified in ONE iteration, and its logits are bitwise one-token decode's.
@@ -31,9 +32,9 @@ uses for its position: (key id of the request, P + depth). Starting at the root,
 token equals the parent's draw: a = 1 + the depth reached, cut at EOS / budget. The emitted tokens are the draws
 along the path, i.e. exactly one-token decode's (same keys, bitwise logits). Rejected nodes are never committed:
 no SSM state is touched (depth <= chunk room). The accepted path's replay rows, conv state, cursor and K / V are
-copied into the request's slot and block (``mamba_bi_lookahead.commit_tree``, ``tree_kv.commit_copy``).
+copied into the request's slot and block (``tree_kv.commit_mamba``, ``tree_kv.commit_copy``).
 
-**Device-resolved** (as tail_mtd): the attach, candidate, trie, layout, accept and commit kernels run on the forward's
+**Device-resolved**: the attach, candidate, trie, layout, accept and commit kernels run on the forward's
 stream with fixed grids and no host sync. The host lays out widths one iteration late and reconciles the accepted
 tokens at the resolve.
 
@@ -69,14 +70,16 @@ try:
 except ImportError:  # pragma: no cover
     HAVE_TRITON = False
 
-from nemo_rl.models.generation.megatron.tail_mtd import MTD_REFS_ATTR, SEP, _ListSample, pack_refs  # noqa: F401
-
+# Per-request opt-in: packed int32 references [ref0, SEP, ref1, SEP, ...] in preference order (driver data field
+# nl_mtd_refs; the attribute name is the wire format the drivers already use).
+MTD_REFS_ATTR = "ts_mtd_refs"
+SEP = -1  # reference separator
 # Optional per-request attr: int32 bytes [W, D, src_flags] (W = 0: plain decode). Without it the engine's W / D apply.
 TREE_ATTR = "ts_tree"
 NMAX = 4  # longest suffix matched
 WMAX = 64  # nodes per tail per iteration (kernel width)
 CMAX = 32  # candidate continuations per tail per iteration
-LOOK_MAX = 8  # = mamba_bi_fused_decode.LOOK_MAX: depth <= 7
+LOOK_MAX = 8  # = mamba_bi_fused_decode.LOOK_MAX = tree_kv.LOOK_MAX: depth <= 7
 BLOCK = 1024  # reference positions per candidate program
 KMTP = 4  # MTP draft depth (candidate 0 of the trie)
 # Cost of one decode row relative to an iteration: Nano TP1 EP8 BI engine 0.03-0.045 ms per row at 26-78 rows/rank
@@ -86,7 +89,40 @@ BETA = 0.004
 PRIOR0, FORGET = 0.5, 0.9995  # first node's prior acceptance; pooled counts forgotten over ~2000 tail iterations
 NEGATIVES = ("tree_accept_all", "tree_accept_topk", "tree_accept_by_draft_prob", "tree_stale_mamba", "tree_key_off_by_one", "tree_key_reuse",
              "tree_fresh_keys",
-             "tree_skip_kv_rollback", "tree_non_bi_verify", "tree_stale_cache")
+             "tree_skip_kv_rollback", "tree_non_bi_verify", "tree_stale_cache",
+             "tree_stale_version", "tree_straddle_commit")
+# Gate tool (CHECKS only): every tail gets this width. The retired name (from tail_mtd) is refused, not ignored.
+FORCE_W_ENV = "THUNDERSYNC_TAIL_TREE_DEBUG_FORCE_W"
+RETIRED_FORCE_ENV = "THUNDERSYNC_TAIL_MTD_DEBUG_FORCE_K"
+
+
+def pack_refs(refs) -> np.ndarray:
+    """[ref0, SEP, ref1, SEP, ...] int32 (driver side)."""
+    parts = []
+    for r in refs:
+        parts.append(np.asarray(r, dtype=np.int32))
+        parts.append(np.full(1, SEP, dtype=np.int32))
+    return np.concatenate(parts) if parts else np.zeros(0, dtype=np.int32)
+
+
+class _ListSample:
+    """``sample`` for post_process_requests with several tokens for some requests (tolist() -> ints / lists)."""
+
+    def __init__(self, rows):
+        self.rows = rows
+
+    def tolist(self):
+        return self.rows
+
+
+def force_width() -> Optional[int]:
+    """The CHECKS gate tool's forced width (``FORCE_W_ENV``), or None."""
+    if os.environ.get(RETIRED_FORCE_ENV, "").strip():
+        raise RuntimeError(f"{RETIRED_FORCE_ENV} is retired for tail_tree: use {FORCE_W_ENV}")
+    fw = os.environ.get(FORCE_W_ENV, "").strip()
+    if fw and os.environ.get("THUNDERSYNC_NL_CHECKS", "") != "1":
+        raise RuntimeError(f"{FORCE_W_ENV} is a gate tool: refused without CHECKS")
+    return int(fw) if fw else None
 
 
 if HAVE_TRITON:
@@ -181,7 +217,7 @@ if HAVE_TRITON:
             tl.store(ncand + j, tl.minimum(total, CMAXC))
 
     @triton.jit
-    def _build_kernel(H, R, RLEN, P, OWN, BUD, lay, cand, ncand, ntok, npar, ndep, nn, p_out, mtok, mlen, nm_out,
+    def _build_kernel(H, R, RLEN, P, OWN, BUD, lay, cand, ncand, ntok, npar, ndep, nn, p_out, mtok, mlen, msib, nm_out,
                       stride_h, stride_r, stride_lay, stride_m, D, CHUNK: tl.constexpr, BS: tl.constexpr,
                       WPOW: tl.constexpr, CMAXC: tl.constexpr, LOOK: tl.constexpr, ALWAYS: tl.constexpr,
                       KM: tl.constexpr):
@@ -228,6 +264,15 @@ if HAVE_TRITON:
                 dep_v = tl.where(ok & (idx == n), d, dep_v)
                 cur = tl.where(ok, n, cur)
                 n = tl.where(ok, n + 1, n)
+        # the MTP depth-1 sibling (the depth-1 race's runner-up), right after the chain: a second child of the root
+        sb = tl.load(msib + tid64)
+        if (w > 0) & (pf != 1) & (dmax > 0) & (ml > 0) & (sb >= 0) & (n < w):
+            first = tl.sum(tl.where((idx == 0) & (n > 0), tok_v, 0), axis=0)
+            if (n == 0) | (first != sb):
+                tok_v = tl.where(idx == n, sb, tok_v)
+                par_v = tl.where(idx == n, -1, par_v)
+                dep_v = tl.where(idx == n, 1, dep_v)
+                n = n + 1
         tl.store(nm_out + j, n)  # MTP nodes = insertion indices 0 .. n - 1 (per-source acceptance counters)
         for c in range(0, nc):
             e = tl.load(cand + j * CMAXC + c)
@@ -373,15 +418,19 @@ if HAVE_TRITON:
     @triton.jit
     def _accept_kernel(
         H, P, BUD, EOS, DONE, lay, row_now, s0, s_ext, alt_root, alt_ext, alt2_root, alt2_ext, pacc_root, pacc_ext,
-        res_root, res_ext, ntok, npar, nn, p_in, priv,
+        res_root, res_ext, ntok, npar, nn, p_in, priv, root_only,
         acc_out, tok_out, slots_out, cur_out, path_idx, path_blk, rblk, done_out,
         stride_h, stride_lay, stride_tok, stride_path,
         CHUNK: tl.constexpr, BS: tl.constexpr, WPOW: tl.constexpr, LOOK: tl.constexpr, KPOW: tl.constexpr,
         TOPK: tl.constexpr, ACCEPT_ALL: tl.constexpr = False, DRAFTPROB: tl.constexpr = False,
     ):
         """Program j: walk tail j's tree along the keyed draws (the child whose token == its parent's draw), emit the
-        draws of the path, cut at EOS / budget; H / P / done; commit inputs (path scratch indices, private blocks)."""
+        draws of the path, cut at EOS / budget; H / P / done; commit inputs (path scratch indices, private blocks).
+        ``root_only[0] != 0`` (a forward laid out before an engine resume, sampled after it): the walk takes no child,
+        a = 1, as one-token decode commits one old-weights token across a resume; the slot stays set so the Mamba
+        commit restores the cursor (node rows of the forward moved it)."""
         j = tl.program_id(0)
+        ro = tl.load(root_only)
         tid = tl.load(lay + 0 * stride_lay + j)
         rn = tl.load(row_now + j)
         lc = tl.arange(0, LOOK)
@@ -432,8 +481,9 @@ if HAVE_TRITON:
                 first = tl.min(tl.where((par_v == cur) & (idx < n), idx, WPOW + 1), axis=0)
                 hidx = tl.where((first <= WPOW) & (q_cur > 0.0), first, -1)
                 stop = tl.where((alive != 0) & (first <= WPOW) & (q_cur <= 0.0), 1, stop)
-                emitted = tl.where((alive != 0) & (first <= WPOW) & (q_cur <= 0.0) & (offs == d - 1), r_cur, emitted)
-            go = (alive != 0) & (hidx >= 0)
+                emitted = tl.where((alive != 0) & (first <= WPOW) & (q_cur <= 0.0) & (offs == d - 1) & (ro == 0), r_cur,
+                                   emitted)
+            go = (alive != 0) & (hidx >= 0) & (ro == 0)
             node = tl.maximum(hidx, 0)
             e_rel = x0 - n_rows + node
             ntk = tl.sum(tl.where(idx == node, tok_v, 0), axis=0).to(tl.int64)
@@ -511,7 +561,7 @@ class _Tail:
     w_cap: int  # per-request W (ts_tree) or the engine's
     d_cap: int
     own: bool = False  # src bit1: candidates from the request's own history (XS-SD)
-    kid: int = -1  # the sampler's key id of the request (cached at registration)
+    kid: int = -1  # the sampler's key id of the request (resolved at its first layout in this epoch)
     mslot: int = -1  # its tree_mtp KV slot (-1: no MTP drafts)
     mstart: int = 0  # first position with head K / V (prefix-cache skipped tokens have no decoder output)
     prev_acc: int = 0  # tokens of its last resolved iteration (diagnostics)
@@ -530,6 +580,8 @@ class _Forward:
     tails: list  # [(_Tail, row0 entry, W, flag)]
     n_rows: int
     E: int
+    epoch: int = 0  # the engine weight epoch it was laid out in (a forward sampled after a resume straddles it)
+    straddle: bool = False  # sampled in a later epoch: root-only commit
     staging: Any = None
     result: Any = None
 
@@ -604,20 +656,20 @@ class TreeSpec:
     RING = 4
 
     def __init__(self, engine, W: int, D: int, t_max: int, ref_cap: int, node_cap: int, sample_rows, scores_rows=None,
-                 uniform_rows=None, own_history: bool = False):
+                 uniform_rows=None, own_history: bool = False, top2_rows=None):
         from nemo_rl.models.generation.megatron import tree_kv
-        from nemo_rl.models.megatron import mamba_bi_lookahead as la
 
         ctx = engine.context
         self.engine, self.ctx, self.ctrl = engine, ctx, engine.controller
         self.W, self.D = int(W), int(D)
         assert 1 <= self.W <= WMAX and 1 <= self.D <= LOOK_MAX - 1, (W, D)
         self.t_max, self.ref_cap = int(t_max), int(ref_cap)
-        self.node_cap = min(int(node_cap), la.tree_capacity(), tree_kv.capacity())
-        assert self.node_cap > 0, "tree_spec: install mamba_bi_lookahead(tree=True) and tree_kv before the engine"
+        self.node_cap = min(int(node_cap), tree_kv.capacity())
+        assert self.node_cap > 0, "tree_spec: tree_kv.install(node_cap) must run before the engine is built"
         self.sample_rows = sample_rows
         # checks / negatives only: the full keyed race scores and a keyed uniform (thundersync_rl.keyed_scores)
         self.scores_rows, self.uniform_rows = scores_rows, uniform_rows
+        self.top2_rows = top2_rows  # keyed runner-up of rows (the MTP depth-1 sibling; None: no sibling)
         dev = torch.device("cuda", torch.cuda.current_device())
         self.dev = dev
         S = int(ctx.max_sequence_length) + 8 * LOOK_MAX + 8
@@ -635,6 +687,7 @@ class TreeSpec:
         # MTP draft per tail id (tree_mtp): the chain drafted after the last accept, read by the next trie build
         self.mtp_tok = torch.full((self.t_max + 1, KMTP), -1, **i32)  # row t_max: the sink of rows without a tail
         self.mtp_len = torch.zeros(self.t_max + 1, **i32)
+        self.mtp_sib = torch.full((self.t_max + 1,), -1, **i32)  # depth-1 sibling: the keyed race's runner-up
         self.mtp = None  # tree_mtp.MTPHead (attach_mtp)
         self._mtp_new_q: list = []  # per forward: tails registered in it (tail, token start, length), FIFO
         # candidate blocks cover the references, and the whole history when own-history tails are enabled
@@ -688,6 +741,9 @@ class TreeSpec:
         self.alt_none = torch.full((max(int(ctx.max_requests), 1) + E + 8,), -1, dtype=torch.int64, device=dev)
         self.f_none = torch.zeros(max(int(ctx.max_requests), 1) + E + 8, dtype=torch.float32, device=dev)
         self.arange_e = torch.arange(max(E, 1), dtype=torch.int64, device=dev)
+        # 1 while the forward being sampled was laid out before an engine resume (fixed storage: read in the graph)
+        self.root_only = torch.zeros(1, dtype=torch.int32, device=dev)
+        self._root_only_host = 0
         # CHECKS tool (THUNDERSYNC_TREE_DEBUG_RUNNERUP=1): per request, the runner-up of the keyed race at every
         # sampled position of every row (plain rows too): the harness's true runner-up draft source
         self.debug_ru = (os.environ.get("THUNDERSYNC_TREE_DEBUG_RUNNERUP", "") == "1"
@@ -711,11 +767,25 @@ class TreeSpec:
         self.stats = {"iters": 0, "tail_iters": 0, "tokens": 0, "nodes": 0, "accepted_nodes": 0, "registered": 0,
                       "forwards_with_nodes": 0, "attaches": 0, "detaches": 0, "widths": [0] * (WMAX + 1),
                       "neg_tokens": 0, "crit_tokens": 0, "crit_iters": 0, "pc_tail_shared_blocks": 0,
+                      "pc_tail_stale_blocks": 0, "plan_no_room": 0, "layout_dropped_no_graph": 0,
                       "mtp_nodes": 0, "mtp_accepted": 0, "other_nodes": 0, "other_accepted": 0,
                       "mtp_d1_n_a1": 0, "mtp_d1_ok_a1": 0, "mtp_d1_n_a2": 0, "mtp_d1_ok_a2": 0}
         self._seen: set = set()
-        fk = os.environ.get("THUNDERSYNC_TAIL_MTD_DEBUG_FORCE_K", "").strip()
-        self.force_w = int(fk) if fk else None  # gate tool (CHECKS only): every tail gets this width
+        self._blk_epoch: dict = {}  # prefix cache: block id -> weight epoch it was registered under (install_epoch_map)
+        rank0 = (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0
+        self._log_s = float(os.environ.get("THUNDERSYNC_TREE_LOG_S", "0") or 0) if rank0 else 0.0
+        self._log_t, self._log_it, self._log_prev = None, 0, None
+        # lag K (rows paused in the engine across up to K wakes): every tail state is valid for ONE engine weight epoch
+        # (MCore bumps _weight_epoch at each resume). At the first layout of a new epoch every tail is released (a
+        # tracked one detached first) and re-registered from the request's committed record: P / H, plen, budget,
+        # key id, references; an MTP slot (KV of the old weights' hidden states) is not carried.
+        if not hasattr(engine, "_weight_epoch"):
+            raise RuntimeError("tree_spec: the engine has no _weight_epoch (Megatron-Core bumps it at every resume): "
+                               "tail state could cross a weight install unnoticed")
+        self._epoch = self._weight_epoch()
+        self.stats.update(epochs=0, epoch_released=0, epoch_kept=0, epoch_straddle_forwards=0, cut_dropped=0,
+                          tails_full=0)
+        self.force_w = force_width()  # gate tool (CHECKS only): every tail gets this width
         neg = os.environ.get("THUNDERSYNC_NL_NEG", "").strip()
         self.neg = neg if neg in NEGATIVES else ""
         self.per_request = os.environ.get("THUNDERSYNC_NL_CHECKS", "") == "1"  # nl_tree_stats under CHECKS
@@ -729,6 +799,80 @@ class TreeSpec:
         self.stats["graph_captures"] = 0
         self.stats["graph_fallbacks"] = 0
         self.kv_tab = tree_kv.tables(dev)
+
+    # ------------------------------------------------------------------ weight epochs (lag K)
+    def _weight_epoch(self) -> int:
+        """The engine's weight epoch (Megatron-Core bumps it at every resume, i.e. at every wake / refit)."""
+        return int(getattr(self.engine, "_weight_epoch", 0) or 0)
+
+    def _new_epoch(self, ctx, rids: np.ndarray, n_dec: int, lo: int, epoch: int) -> None:
+        """First layout of a new weight epoch (MCore bumps it at every resume: a wake / refit).
+
+        A resident request's tail state is version-free: H / P are its committed tokens and positions, the node rows of
+        each forward are drawn and accepted under that forward's own weights. It is kept (no detach / re-attach: on the
+        first step after a resume MCore runs no overlap, so the record already holds the in-flight token and a host
+        re-sync would be one position ahead; measured (l3): persist K = 1 / 2 / 4 inexact with the re-sync, exact
+        without). Only what was built from the old weights is dropped: the MTP slot (its K / V are the old weights'
+        hidden states) and the key id is resolved again. A request MCore rebuilt is released: re-added for a prefill
+        (a RECOMPUTE resume: prompt + generated as its prompt, fresh MCore state) or not resident (waiting to be
+        re-added); its prefill registers it again with fresh tables. NEGATIVE CONTROL tree_stale_version keeps the
+        rebuilt requests' old tails (stale P / plen against the re-added record: the CHECKS P check / mismatch)."""
+        self._epoch = epoch
+        self.stats["epochs"] += 1
+        if self.neg == "tree_stale_version":
+            return
+        resident = set(int(r) for r in ctx.request_ids[: int(ctx.total_request_count)].tolist())
+        prefill = set(int(r) for r in rids[n_dec:].tolist())
+        for rid, t in list(self.tails.items()):
+            if rid in prefill or rid not in resident:
+                self.release(rid)
+                self._seen.discard(rid)
+                self.stats["epoch_released"] += 1
+                continue
+            t.kid = -1
+            if t.mslot >= 0:
+                self._drop_mtp_slot(t)
+            self.stats["epoch_kept"] += 1
+
+    def _drop_mtp_slot(self, t: "_Tail") -> None:
+        """The tail stops drafting with the MTP head: its slot (K / V of hidden states) is freed, its draft row cleared."""
+        if self.mtp is not None:
+            self.mtp.set_start(t.mslot, 0)  # the slot's next request sets its own start at registration
+        self.mtp_free.append(t.mslot)
+        self._mslot_host[t.tid] = -1
+        self.mtp_len[t.tid].fill_(0)
+        self.mtp_sib[t.tid].fill_(-1)
+        t.mslot = -1
+
+    def _set_straddle(self, lay: "_Forward") -> None:
+        """Before the sample stage of ``lay``: a forward laid out before an engine resume and sampled after it commits
+        its root only (one-token decode commits one old-weights token across a resume; node tokens past it would be
+        old-weights draws). The device flag ``root_only`` (read inside the sample graph) is written only when it
+        changes. NEGATIVE CONTROL tree_straddle_commit commits the node tokens."""
+        straddling = lay.epoch != self._weight_epoch()
+        lay.straddle = straddling and self.neg != "tree_straddle_commit"
+        if straddling:
+            self.stats["epoch_straddle_forwards"] += 1
+        if int(lay.straddle) != self._root_only_host:
+            self._root_only_host = int(lay.straddle)
+            self.root_only.fill_(self._root_only_host)
+
+    def _live(self, lay: "_Forward", t: "_Tail") -> bool:
+        """Whether layout ``lay``'s tail ``t`` may commit its tree results: still the registered tail of its request (not
+        released since, e.g. re-added by a RECOMPUTE resume, nor re-registered). A forward laid out before a resume and
+        sampled after it ran on the old weights entirely, as its root row; its accepted tokens are that forward's
+        (counted: epoch_straddle_forwards)."""
+        return self.tails.get(t.rid) is t
+
+    def _drop_cut_rows(self, cut) -> None:
+        """Rows MCore finishes this step WITHOUT the step's tokens (stop-word path: a wake cut) get none of the tree's
+        tokens either: dropped from the resolve before keys are registered or the list sample is built."""
+        res = getattr(self, "_res", None)
+        if not res or not cut:
+            return
+        for rid in [r for r in res if r in cut]:
+            del res[rid]
+            self.stats["cut_dropped"] += 1
 
     # ------------------------------------------------------------------ registration
     def maybe_register(self, rid: int, req) -> Optional[_Tail]:
@@ -748,8 +892,36 @@ class TreeSpec:
             # src bit1 without refs: the request's own history is its reference (XS-SD). With refs the refs are
             # the source (one source per tail for now).
             own = v.size > 2 and (int(v[2]) & 2) != 0 and refs is None
-        if (refs is None and not own) or w_cap <= 0 or not self.free_tids:
+        if (refs is None and not own) or w_cap <= 0:
             return None
+        if not self.free_tids:
+            self.stats["tails_full"] += 1  # every tail id in use (t_max): this request decodes one token per step
+            return None
+        return self._new_tail(rid, req, refs, own, w_cap, d_cap)
+
+    def register_tail(self, rid: int, refs: list, w: int, d: int = 0) -> bool:
+        """Make an already-decoding request a tail from its next decode step (e.g. a verified row continued in place
+        after its first rejection: refs = the rejected draft's suffix and its siblings' drafts). Its history is
+        uploaded from the request record on attach, as for any tail; refs are proposals only. False if the request
+        is unknown, already a tail, or no tail id is free."""
+        rid = int(rid)
+        if rid in self.tails:
+            return False
+        try:
+            req = self.engine.get_request(rid)
+        except KeyError:  # not (or no longer) in the engine
+            return False
+        if req is None or w <= 0:
+            return False
+        packed = pack_refs(refs).tobytes() if not isinstance(refs, (bytes, bytearray)) else refs
+        t = self._new_tail(rid, req, packed, False, min(int(w), self.W), min(int(d), self.D) if d else self.D)
+        self._seen.add(rid)
+        return t is not None
+
+    def _new_tail(self, rid: int, req, refs, own: bool, w_cap: int, d_cap: int) -> Optional[_Tail]:
+        if not self.free_tids:
+            return None
+        sp = req.sampling_params
         plen = len(req.prompt_tokens)
         ntg = sp.num_tokens_to_generate if sp.num_tokens_to_generate is not None else (
             (sp.num_tokens_total or self.ctx.max_sequence_length) - plen)
@@ -802,7 +974,7 @@ class TreeSpec:
         self.stats["attaches"] += 1
 
     def _detach(self, ctx, t: _Tail, idx: int, row: int, req) -> None:
-        """As tail_mtd: MCore's bookkeeping back to the truth (its last forward had no nodes)."""
+        """MCore's bookkeeping back to the truth (its last forward had no nodes)."""
         bs = int(ctx.block_size_tokens)
         p = t.plen + len(req.generated_tokens)
         col = p // bs
@@ -837,6 +1009,10 @@ class TreeSpec:
         ids = ctx.request_to_kv_block_ids[idx, :nb].long().cpu()
         ids = ids[ids >= 0]
         self.stats["pc_tail_shared_blocks"] += int((refs[ids] > 1).sum())
+        # strict cross-epoch evidence: blocks this tail uses that were registered under an older weight epoch
+        # (production: never, the cache is salted per epoch; NEGATIVE tree_stale_cache: its stale hits)
+        ep = int(getattr(self.engine, "_weight_epoch", 0))
+        self.stats["pc_tail_stale_blocks"] += sum(1 for b in ids.tolist() if self._blk_epoch.get(b, ep) < ep)
 
     def set_width_cap(self, rid: int, w: int) -> bool:
         """Per-request node cap between iterations (host; e.g. a fork-lane rule turning a row's drafting on / off).
@@ -858,9 +1034,9 @@ class TreeSpec:
             self._sorted = None
             self.free_tids.append(t.tid)
             if t.mslot >= 0:
-                self.mtp_free.append(t.mslot)
-                self._mslot_host[t.tid] = -1
-                t.mslot = -1
+                self._drop_mtp_slot(t)
+            self.mtp_len[t.tid].fill_(0)  # a reused tail id must not propose the last request's drafts
+            self.mtp_sib[t.tid].fill_(-1)
 
     def on_post_process(self, finished, evicted) -> None:
         """Finished and evicted requests leave: their tail state is released. An evicted request is re-admitted from
@@ -896,6 +1072,9 @@ class TreeSpec:
         lo = ctx.paused_request_count
         rids = ctx.request_ids[lo: lo + n].numpy()
         n_dec = ctx.num_decode_requests
+        epoch = self._weight_epoch()
+        if epoch != self._epoch:
+            self._new_epoch(ctx, rids, n_dec, lo, epoch)
         tok0 = n_dec  # token row of the first prefill request (decode rows: one token each)
         new = []
         for row in range(n_dec, n):
@@ -944,8 +1123,17 @@ class TreeSpec:
         rows = rows[live]
         if rows.size == 0:
             return 0
+        # node rows are attention rows of the forward: they fit in the context's request capacity and the largest
+        # decode graph next to the n request rows (an engine sized for exactly its admitted rows has no room)
         room = min(int(ctx.max_requests), self._max_graph_rows(ctx)) - n
         budget = max(0, min(self.node_cap, room))
+        if decode_only and budget == 0:
+            self.stats["plan_no_room"] += 1
+            if self.stats["plan_no_room"] == 1:
+                print(f"[tree_spec] WARNING: no room for node rows ({n} request rows, max_requests "
+                      f"{int(ctx.max_requests)}, largest decode graph {self._max_graph_rows(ctx)}): node rows are "
+                      "attention rows next to the requests; size max_requests >= live rows + node budget "
+                      "([tree] plan_no_room counts these forwards)", flush=True)
         cands = []
         for row in rows.tolist():
             t = self.tails[int(rids[row])]
@@ -982,7 +1170,7 @@ class TreeSpec:
         if not tails:
             return 0
         self._ensure_kv(ctx, tails, lo, dprev)
-        self.layout = _Forward(slot=-1, tails=tails, n_rows=n, E=E)
+        self.layout = _Forward(slot=-1, tails=tails, n_rows=n, E=E, epoch=self._epoch)
         return E
 
     def _max_graph_rows(self, ctx) -> int:
@@ -1015,6 +1203,7 @@ class TreeSpec:
             return
         padded = int(ctx.padded_active_token_count)
         if lay.E > 0 and (lay.n_rows + lay.E > padded or not ctx.using_cuda_graph_this_step()):
+            self.stats["layout_dropped_no_graph"] += 1
             lay.tails = [(t, row, 0, pf) for t, row, _, pf in lay.tails]
             lay.E = 0
             for t, _row, _k, _pf in lay.tails:
@@ -1029,8 +1218,6 @@ class TreeSpec:
 
     def expand(self, ctx) -> None:
         from nemo_rl.models.generation.megatron import tree_kv
-        from nemo_rl.models.megatron import mamba_bi_fused_decode as fd
-        from nemo_rl.models.megatron import mamba_bi_lookahead as la
 
         lay = self.layout
         self.layout = None
@@ -1121,7 +1308,7 @@ class TreeSpec:
                 one()
             torch.cuda.current_stream().wait_stream(st)
             g = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(g):
+            with torch.cuda.graph(g, capture_error_mode="thread_local"):
                 one()
             run = g.replay
             run()
@@ -1155,7 +1342,8 @@ class TreeSpec:
         from nemo_rl.models.generation.megatron import tree_mtp
 
         return self._sig_common(ctx) + (ctx.gpu_view.temperature.data_ptr(), tree_mtp.hidden_buffer().data_ptr(),
-                                        self.mtp.kc.data_ptr(), self.mtp_tok.data_ptr())
+                                        self.mtp.kc.data_ptr(), self.mtp_tok.data_ptr(), self.mtp_sib.data_ptr(),
+                                        self.top2_rows is not None)
 
     def _mtp_prefill(self, ctx, ctrl) -> None:
         """Tails with a prefill chunk in this forward: the head's KV of the chunk's positions off .. off + q - 1
@@ -1236,9 +1424,12 @@ class TreeSpec:
         temp = ctx.gpu_view.temperature.index_select(0, r["row_now"].long().clamp(min=0))
         drafts = []
         u, x = lh, ltok
+        sib = None
         for depth in range(depth_k):
             u, logits = self.mtp.forward_rows(lsl, lpos + depth, u, x)
             d = self.sample_rows(logits, r["tk"], p + acc + depth, temp).to(torch.int64)
+            if depth == 0 and self.top2_rows is not None:
+                sib = self.top2_rows(logits, r["tk"], p + acc, temp)  # same key and position as the depth-1 draw
             drafts.append(d)
             x = d
         live = ok & (r["done"] == 0)
@@ -1249,6 +1440,8 @@ class TreeSpec:
         self.mtp_tok.index_copy_(0, dst, torch.where(live[:, None], dt, torch.full_like(dt, -1)))
         self.mtp_len.index_copy_(0, dst, torch.where(live, torch.full_like(acc, depth_k),
                                                      torch.zeros_like(acc)).to(torch.int32))
+        sv = sib.to(torch.int32) if sib is not None else torch.full_like(tid, -1, dtype=torch.int32)
+        self.mtp_sib.index_copy_(0, dst, torch.where(live, sv, torch.full_like(sv, -1)))
 
     # ------------------------------------------------------------------ device stages (graph-replayable)
     def _graphs_on(self) -> bool:
@@ -1269,7 +1462,10 @@ class TreeSpec:
             return
         g = torch.cuda.CUDAGraph()
         try:
-            with torch.cuda.graph(g, pool=self.graph_pool):
+            # thread_local: other engine-process threads (e.g. a hidden-log seal thread's event.synchronize) may make
+            # unsafe CUDA calls while a tree stage is captured lazily mid-run (a new ring slot / MTP depth); global
+            # mode would invalidate the capture and fail their call (BX-SD)
+            with torch.cuda.graph(g, pool=self.graph_pool, capture_error_mode="thread_local"):
                 body()
         except Exception as ex:  # a stage that cannot be captured: eager from now on (correct, slower), loudly
             print(f"[tree_spec] CUDA graph capture of {name} failed ({type(ex).__name__}: {ex}); eager stages",
@@ -1288,25 +1484,25 @@ class TreeSpec:
         reallocation) forces a recapture."""
         from nemo_rl.models.generation.megatron import tree_kv
         from nemo_rl.models.megatron import mamba_bi_fused_decode as fd
-        from nemo_rl.models.megatron import mamba_bi_lookahead as la
 
         mr = int(ctx.max_requests)
         off, chain = fd.lookahead_buffers(mr, self.dev)
-        ws = getattr(getattr(self.sample_rows, "__self__", None), "__dict__", {}).get("_nl_mtd_ws")
+        ws = getattr(getattr(self.sample_rows, "__self__", None), "__dict__", {}).get("_nl_tree_ws")
         ptrs = [off.data_ptr(), chain.data_ptr(), fd.lookahead_rows(mr, self.dev).data_ptr(),
-                la.scratch_ids(mr, self.dev).data_ptr(), self.kv_tab["gath"].data_ptr(), self.kv_tab["part"].data_ptr(),
+                tree_kv.scratch_ids(mr, self.dev).data_ptr(), self.kv_tab["gath"].data_ptr(),
+                self.kv_tab["part"].data_ptr(),
                 self.priv.ids.data_ptr(), -1 if ws is None else ws.data_ptr(), ws.numel() if ws is not None else 0]
-        if la._STATE["nbuf"]:
-            ptrs.append(la.num_buffered_ptrs(self.dev).data_ptr())
-        if la._STATE["replay"]:
-            ptrs.append(la.replay_ptrs(self.dev)[0].data_ptr())
+        if tree_kv.mamba_layers():
+            ptrs.append(tree_kv.num_buffered_ptrs(self.dev).data_ptr())
+            ptrs.append(tree_kv.replay_ptrs(self.dev)[0].data_ptr())
         return tuple(ptrs)
 
     def _sig_expand(self, ctx):
         gv = ctx.gpu_view
         return self._sig_common(ctx) + (gv.token_to_input_ids.data_ptr(), gv.mha_block_table.data_ptr(), gv.mha_query_lengths.data_ptr(),
                 gv.mha_kv_seq_lengths.data_ptr(), gv.mha_cu_query_seq_lengths.data_ptr(), ctx.active_logit_idxs.data_ptr(),
-                gv.mamba_batch_indices_decode.data_ptr(), gv.real_token_count.data_ptr(), ctx.memory_buffer.data_ptr())
+                gv.mamba_batch_indices_decode.data_ptr(), gv.real_token_count.data_ptr(), ctx.memory_buffer.data_ptr(),
+                self._conv_base(ctx), int(ctx.kv_block_allocator.dummy_block_idx))
 
     def _expand_device(self, ctx, r, TG: int, padded) -> None:
         """attach, candidates, trie, node-row layout, cumulative lengths, token count, KV partial copy. ``TG`` = grid
@@ -1314,7 +1510,6 @@ class TreeSpec:
         request arrays (graph mode: a fixed shape; entries past the padded batch are never read)."""
         from nemo_rl.models.generation.megatron import tree_kv
         from nemo_rl.models.megatron import mamba_bi_fused_decode as fd
-        from nemo_rl.models.megatron import mamba_bi_lookahead as la
 
         gv = ctx.gpu_view
         _attach_kernel[(TG,)](self.H, self.P, r["lay"], gv.token_to_input_ids, self.H.stride(0), r["lay"].stride(0))
@@ -1324,14 +1519,15 @@ class TreeSpec:
                                     r["ncand"], self.H.stride(0), self.R.stride(0), r["lay"].stride(0), self.NB,
                                     BLOCKC=BLOCK, NMAXC=NMAX, NBPOW=triton.next_power_of_2(self.NB), CMAXC=CMAX)
         _build_kernel[(TG,)](self.H, self.R, self.RLEN, self.P, self.OWN, self.BUD, r["lay"], r["cand"], r["ncand"],
-                             r["ntok"], r["npar"], r["ndep"], r["nn"], r["p"], self.mtp_tok, self.mtp_len, r["nmtp"],
+                             r["ntok"], r["npar"], r["ndep"], r["nn"], r["p"], self.mtp_tok, self.mtp_len, self.mtp_sib,
+                             r["nmtp"],
                              self.H.stride(0), self.R.stride(0), r["lay"].stride(0), self.mtp_tok.stride(0),
                              self.D if self.force_w is None else LOOK_MAX - 1,
                              CHUNK=self._chunk(), BS=int(ctx.block_size_tokens), WPOW=WMAX, CMAXC=CMAX,
                              LOOK=LOOK_MAX, ALWAYS=self.neg == "tree_accept_all", KM=KMTP)
         off, chain = fd.lookahead_buffers(int(ctx.max_requests), self.dev)
         srow = fd.lookahead_rows(int(ctx.max_requests), self.dev)
-        sid = la.scratch_ids(int(ctx.max_requests), self.dev)
+        sid = tree_kv.scratch_ids(int(ctx.max_requests), self.dev)
         bt = gv.mha_block_table
         _expand_kernel[(TG, WMAX + 1)](
             self.H, r["lay"], r["ntok"], r["npar"], r["ndep"], r["nn"], r["p"], self.priv.ids, r["rblk"],
@@ -1340,7 +1536,7 @@ class TreeSpec:
             gv.mha_query_lengths, gv.mha_kv_seq_lengths, bt, gv.mamba_batch_indices_decode, ctx.active_logit_idxs,
             off, chain, srow, sid, r["kpos"], self.kv_tab["gath"], self.kv_tab["part"],
             self.H.stride(0), r["lay"].stride(0), bt.stride(0), chain.stride(0), srow.stride(0),
-            bt.shape[1], int(ctx.kv_block_allocator.dummy_block_idx), int(ctx.max_requests),
+            bt.shape[1], int(ctx.kv_block_allocator.dummy_block_idx), self._conv_base(ctx),
             {"tree_key_off_by_one": 1, "tree_key_reuse": -1}.get(self.neg, 0),
             BS=int(ctx.block_size_tokens), WPOW=WMAX, BTCOLS=triton.next_power_of_2(bt.shape[1]), LOOK=LOOK_MAX,
         )
@@ -1366,15 +1562,23 @@ class TreeSpec:
         self.kv_tab["dirty"] = False
         del tree_kv
 
+    def _conv_base(self, ctx) -> int:
+        """First node scratch conv row (the context's conv-state slot count); 0 without Mamba layers (unused)."""
+        from nemo_rl.models.generation.megatron import tree_kv
+
+        return tree_kv.conv_scratch_base(ctx) if tree_kv.conv_states_full(ctx) is not None else 0
+
     def _sig_sample(self, ctx, ctrl):
-        return self._sig_common(ctx) + (ctx.gpu_view.temperature.data_ptr(), ctx.mamba_conv_states_full.data_ptr(), ctx.memory_buffer.data_ptr(),
-                id(ctrl._sampling))
+        from nemo_rl.models.generation.megatron import tree_kv
+
+        full = tree_kv.conv_states_full(ctx)
+        return self._sig_common(ctx) + (ctx.gpu_view.temperature.data_ptr(), 0 if full is None else full.data_ptr(),
+                                        ctx.memory_buffer.data_ptr(), id(ctrl._sampling), self.root_only.data_ptr())
 
     def _sample_device(self, ctx, ctrl, r) -> None:
         """Every node row of the capacity drawn with its key (rows past this forward's nodes are never read), their
         log-probs, the accept walk, the commits and the results' D2H: fixed shapes, no host sync."""
         from nemo_rl.models.generation.megatron import tree_kv
-        from nemo_rl.models.megatron import mamba_bi_lookahead as la
 
         TM, E = self.t_max, self.node_cap
         nk = r["nk"]
@@ -1388,14 +1592,13 @@ class TreeSpec:
         _accept_kernel[(TM,)](
             self.H, self.P, self.BUD, self.EOS, self.DONE, r["lay"], r["row_now"], r["s0_buf"],
             r["s_ext"], self.alt_none, r["alt_ext"], self.alt_none, r["alt2_ext"], self.f_none, r["pacc_ext"],
-            self.alt_none, r["res_ext"], r["ntok"], r["npar"], r["nn"], r["p"], self.priv.ids,
+            self.alt_none, r["res_ext"], r["ntok"], r["npar"], r["nn"], r["p"], self.priv.ids, self.root_only,
             r["acc"], r["tok"], r["slots"], r["cur"], r["path_idx"], r["path_blk"], r["rblk"], r["done"],
             self.H.stride(0), r["lay"].stride(0), r["tok"].stride(0), r["path_idx"].stride(0),
             CHUNK=self._chunk(), BS=int(ctx.block_size_tokens), WPOW=WMAX, LOOK=LOOK_MAX, KPOW=8,
             TOPK=False, ACCEPT_ALL=False, DRAFTPROB=False,
         )
-        la.commit_tree(ctx.mamba_conv_states_full, r["slots"], r["path_idx"], r["acc"], r["cur"], self._chunk(),
-                       int(ctx.max_requests))
+        tree_kv.commit_mamba(ctx, r["slots"], r["path_idx"], r["acc"], r["cur"], self._chunk())
         tree_kv.commit_copy(ctx, r["rblk"], r["acc"], r["p"], r["path_blk"])
         r["h_out"].copy_(r["ibuf"], non_blocking=True)
         r["h_lp"][:E].copy_(r["lp_ext"][:E], non_blocking=True)
@@ -1512,7 +1715,6 @@ class TreeSpec:
         if not self.pending:
             return
         from nemo_rl.models.generation.megatron import tree_kv
-        from nemo_rl.models.megatron import mamba_bi_lookahead as la
 
         lay = self.pending.pop(0)
         ctx = self.ctx
@@ -1526,11 +1728,21 @@ class TreeSpec:
         rn = r["h_rn"]
         rn.fill_(-1)
         live = []
+        # a forward laid out before an engine resume (weight install) and sampled after it: one-token decode commits
+        # exactly one token of the old weights across a resume (the root); node tokens past it would be old-weights
+        # draws where one-token decode draws from the new weights -> root-only (device flag, read in the graph), and no
+        # MTP stage (its slots may be dropped / reused at the new epoch)
+        self._set_straddle(lay)
         for j, (t, row, k, _pf) in enumerate(lay.tails):
             now = rid_row.get(t.rid, -1)
-            if t.rid in self.tails and now >= 0:
+            if now >= 0 and self._live(lay, t):
                 rn[j] = now
                 live.append((j, t, now, k))
+            elif now >= 0 and k > 0 and self.per_request:
+                # CHECKS: a resident request whose forward ran node rows must reach the Mamba commit (its write cursor
+                # was moved by the node rows; only commit_mamba puts it back)
+                raise RuntimeError(f"[tree_spec] request {t.rid}: forward with {k} node rows, tail not live: its "
+                                   f"Mamba cursor commit would be skipped")
         r["row_now"].copy_(rn, non_blocking=True)
         logits = ctrl._all_logits_cuda.squeeze(0)
         E = lay.E
@@ -1548,7 +1760,7 @@ class TreeSpec:
             r["s0_buf"][:ns].copy_(ctrl._sampled_tokens_cuda[:ns])
             self._run_graph(r, "gB", lambda: self._sample_device(ctx, ctrl, r), self._sig_sample(ctx, ctrl))
             r["ev"].record()
-            if self.mtp is not None:  # after the results' event: the host never waits on the drafts
+            if self.mtp is not None and not lay.straddle:  # after the results' event: the host never waits on drafts
                 k = self._mtp_depth()
                 self._run_graph(r, f"gM{k}", lambda: self._mtp_device(ctx, r, r["lay"][5, 0].long(), k),
                                 self._sig_mtp(ctx))
@@ -1597,7 +1809,7 @@ class TreeSpec:
         _accept_kernel[(T,)](
             self.H, self.P, self.BUD, self.EOS, self.DONE, r["lay"], r["row_now"], ctrl._sampled_tokens_cuda,
             r["s_ext"], alt_root, r["alt_ext"], alt2_root, r["alt2_ext"], pacc_root, r["pacc_ext"], res_root,
-            r["res_ext"], r["ntok"], r["npar"], r["nn"], r["p"], self.priv.ids,
+            r["res_ext"], r["ntok"], r["npar"], r["nn"], r["p"], self.priv.ids, self.root_only,
             r["acc"], r["tok"], r["slots"], r["cur"], r["path_idx"], r["path_blk"], r["rblk"], r["done"],
             self.H.stride(0), r["lay"].stride(0), r["tok"].stride(0), r["path_idx"].stride(0),
             CHUNK=self._chunk(), BS=int(ctx.block_size_tokens), WPOW=WMAX, LOOK=LOOK_MAX, KPOW=8,
@@ -1605,9 +1817,8 @@ class TreeSpec:
             DRAFTPROB=self.neg == "tree_accept_by_draft_prob",
         )
         if E > 0:
-            la.commit_tree(ctx.mamba_conv_states_full, r["slots"][:T], r["path_idx"][:T], r["acc"][:T],
-                           r["cur"][:T], self._chunk(), int(ctx.max_requests),
-                           skip_replay=self.neg == "tree_stale_mamba")
+            tree_kv.commit_mamba(ctx, r["slots"][:T], r["path_idx"][:T], r["acc"][:T], r["cur"][:T], self._chunk(),
+                                 skip_replay=self.neg == "tree_stale_mamba")
             if self.neg != "tree_skip_kv_rollback":  # NEGATIVE CONTROL skips the accepted path's K / V copy
                 tree_kv.commit_copy(ctx, r["rblk"][:T], r["acc"][:T], r["p"][:T], r["path_blk"][:T])
         r["h_out"].copy_(r["ibuf"], non_blocking=True)  # one D2H of every accept result
@@ -1615,7 +1826,7 @@ class TreeSpec:
             r["h_lp"][:E].copy_(r["lp_ext"][:E], non_blocking=True)
         T8 = T * 8
         r["ev"].record()
-        if self.mtp is not None:
+        if self.mtp is not None and not lay.straddle:
             self._mtp_device(ctx, r, r["lay"][5, 0].long(), self._mtp_depth())
         lay.result = (r, T, T8, live)
         self._last_sampled = lay
@@ -1670,7 +1881,7 @@ class TreeSpec:
                 raise RuntimeError(f"[tree_spec] request {t.rid}: tree expanded at P={int(p_dev[j])}, host resolves "
                                    f"P={p_row0}")
             res[t.rid] = (tok[j, :a].tolist(), ext, bool(done[j]), p_row0)
-            if k > 0:
+            if k > 0 and not lay.straddle:  # a root-only (straddling) forward is no acceptance evidence
                 x0 = x_of[j] - lay.n_rows
                 built = int(nn[j])
                 self.accN[:k] += 1.0  # every allocated row is a trial (an unbuilt one is a row computed for nothing)
@@ -1696,17 +1907,18 @@ class TreeSpec:
             if t.rid == crit_rid:
                 self.stats["crit_tokens"] += a
                 self.stats["crit_iters"] += 1
-            if self.neg:
-                self.stats["neg_tokens"] += a - 1
+            if self.neg and (self.neg != "tree_straddle_commit" or lay.epoch != self._weight_epoch()):
+                self.stats["neg_tokens"] += a - 1  # tree_straddle_commit: the straddling forwards' node tokens only
             if self.per_request:
                 st = self.req_stats.setdefault(t.rid, [0, 0, 0])
                 st[0] += 1
                 st[1] += a - 1
                 st[2] += int(nn[j])
+        self.maybe_log()
         return res
 
     def _commit_keys(self) -> None:
-        """Noise keys are checked at commit (as tail_mtd): positions p0 + 1 .. p0 + a - 1 to the registry."""
+        """Noise keys are checked at commit: positions p0 + 1 .. p0 + a - 1 to the registry."""
         res = getattr(self, "_res", None) or {}
         kc, kr = self._key_check, self._keyreg
         for rid, (toks, _lp, _done, p0) in res.items():
@@ -1725,6 +1937,26 @@ class TreeSpec:
 
                     raise SamplerKeyError(f"[tree_spec] committed noise key reused: {bad[:3]}")
 
+    def maybe_log(self) -> None:
+        """Worker-side [tree] line every THUNDERSYNC_TREE_LOG_S seconds on rank 0 (paths without a stage line, e.g. the
+        stock SPR-SD loop): this rank's per-interval deltas plus the engine's ms per iteration."""
+        import time
+
+        iv = self._log_s
+        if iv <= 0:
+            return
+        now = time.perf_counter()
+        if self._log_t is None:
+            self._log_t, self._log_it = now, self.stats["iters"]
+            return
+        if now - self._log_t < iv:
+            return
+        line, self._log_prev = stats_line(self.stats["iters"], [self.summary()], self._log_prev)
+        it = self.stats["iters"] - self._log_it
+        print(f"{line} ms/iter={1e3 * (now - self._log_t) / max(it, 1):.3f} (rank 0, last {now - self._log_t:.0f} s)",
+              flush=True)
+        self._log_t, self._log_it = now, self.stats["iters"]
+
     def pop_request_stats(self, rid: int) -> Optional[list]:
         return self.req_stats.pop(int(rid), None)
 
@@ -1738,10 +1970,27 @@ class TreeSpec:
 
 # ---------------------------------------------------------------------------- installation
 
+# Node rows of the forward whose attention state is being initialized (read by the graph-config match).
+_EXTRA_ROWS: dict[str, int] = {"n": 0}
+
+
+def async_sched_state(ctrl):
+    """The controller's async-schedule state of the forward in flight: ``_async_sched_forward`` on Megatron-LM main
+    (a11c84aec), ``_async_sched_logits`` on earlier pins."""
+    st = getattr(ctrl, "_async_sched_forward", None)
+    if st is None:
+        st = getattr(ctrl, "_async_sched_logits", None)
+    if st is None:
+        raise RuntimeError("tree_spec: the controller has no async-schedule state (_async_sched_forward / "
+                           "_async_sched_logits): async_sched_mode async is required")
+    return st
+
 
 STAT_KEYS = ("tail_iters", "tokens", "nodes", "accepted_nodes", "forwards_with_nodes", "registered", "attaches",
              "neg_tokens", "crit_tokens", "crit_iters", "graph_captures", "graph_fallbacks", "mtp_nodes", "mtp_accepted",
-             "other_nodes", "other_accepted", "mtp_tails", "pc_tail_shared_blocks")
+             "other_nodes", "other_accepted", "mtp_tails", "pc_tail_shared_blocks", "pc_tail_stale_blocks",
+             "plan_no_room", "layout_dropped_no_graph",
+             "epochs", "epoch_kept", "epoch_released", "epoch_straddle_forwards", "cut_dropped", "tails_full")
 
 
 def stats_line(step: int, ms: list, prev: Optional[dict]) -> tuple:
@@ -1761,13 +2010,43 @@ def stats_line(step: int, ms: list, prev: Optional[dict]) -> tuple:
             f"other_accepted={d['other_accepted']} mtp_tails={d['mtp_tails']} mtp_depths={depths} "
             f"fwd_with_nodes={d['forwards_with_nodes']} registered={d['registered']} attaches={d['attaches']} "
             f"neg_tokens={d['neg_tokens']} pc_tail_shared_blocks={d['pc_tail_shared_blocks']} "
-            f"graph_captures={tot['graph_captures']} graph_fallbacks={tot['graph_fallbacks']} rates_rank0={rates}")
+            f"pc_tail_stale_blocks={d['pc_tail_stale_blocks']} plan_no_room={d['plan_no_room']} "
+            f"layout_dropped_no_graph={d['layout_dropped_no_graph']} "
+            f"graph_captures={tot['graph_captures']} graph_fallbacks={tot['graph_fallbacks']} "
+            f"epochs={tot['epochs']} epoch_kept={d['epoch_kept']} epoch_released={d['epoch_released']} "
+            f"epoch_straddle_fwd={d['epoch_straddle_forwards']} cut_dropped={d['cut_dropped']} tails_full={d['tails_full']} "
+            f"rates_rank0={rates}")
     return line, tot
 
 
 def is_tree_request(sp) -> bool:
     """A request that would become a tree tail (references or a ts_tree spec on its sampling params)."""
     return getattr(sp, MTD_REFS_ATTR, None) is not None or getattr(sp, TREE_ATTR, None) is not None
+
+
+def install_epoch_map(engine, ts: "TreeSpec") -> None:
+    """Record the weight epoch each prefix-cache block is registered under (cleared when the block is re-allocated),
+    so a tail can count blocks it uses from an older epoch ([tree] pc_tail_stale_blocks). Host-side, per
+    registration call; no device work."""
+    alloc = engine.context.kv_block_allocator
+    orig_reg, orig_alloc = alloc.register_kv_block_hashes, alloc.allocate_memory_blocks
+
+    def register_kv_block_hashes(block_ids, block_hashes, *a, **kw):
+        out = orig_reg(block_ids, block_hashes, *a, **kw)
+        ep = int(getattr(engine, "_weight_epoch", 0))
+        for b in (out if out is not None else block_ids):
+            ts._blk_epoch[int(b)] = ep
+        return out
+
+    def allocate_memory_blocks(num_blocks):
+        ids = orig_alloc(num_blocks)
+        if ids is not None:
+            for b in ids.tolist():
+                ts._blk_epoch.pop(int(b), None)
+        return ids
+
+    alloc.register_kv_block_hashes = register_kv_block_hashes
+    alloc.allocate_memory_blocks = allocate_memory_blocks
 
 
 def install_stale_cache_negative(engine) -> None:
@@ -1792,8 +2071,9 @@ def install_stale_cache_negative(engine) -> None:
 
 
 def install(engine, *, W: int, D: int, t_max: int, ref_cap: int, node_cap: int, sample_rows, key_check=None,
-            keyreg=None, key_ids=None, scores_rows=None, uniform_rows=None, own_history: bool = False) -> TreeSpec:
-    """Hook a built DynamicInferenceEngine (idempotent per engine), as tail_mtd.install. ``sample_rows(logits,
+            keyreg=None, key_ids=None, scores_rows=None, uniform_rows=None, own_history: bool = False,
+            top2_rows=None) -> TreeSpec:
+    """Hook a built DynamicInferenceEngine (idempotent per engine). ``sample_rows(logits,
     key_rids np, positions (device int64), temperature)`` draws rows with the engine's keyed sampler."""
     from megatron.core.inference.batch_dimensions_utils import (
         CUDAGraphBatchDimensionBuilder,
@@ -1804,9 +2084,11 @@ def install(engine, *, W: int, D: int, t_max: int, ref_cap: int, node_cap: int, 
     if existing is not None:
         return existing
     ts = TreeSpec(engine, W, D, t_max, ref_cap, node_cap, sample_rows, scores_rows, uniform_rows,
-                  own_history=own_history)
+                  own_history=own_history, top2_rows=top2_rows)
     ts._key_check, ts._keyreg, ts._key_ids = key_check, keyreg, key_ids
     engine._tree_spec = ts
+    if getattr(engine.context, "enable_prefix_caching", False):
+        install_epoch_map(engine, ts)
     if ts.neg == "tree_stale_cache":
         install_stale_cache_negative(engine)
     buf = engine.context.memory_buffer
@@ -1816,13 +2098,13 @@ def install(engine, *, W: int, D: int, t_max: int, ref_cap: int, node_cap: int, 
               f"({'past' if top >= 2**31 else 'under'} 2^31)", flush=True)
     ctx, ctrl = engine.context, engine.controller
 
-    if not getattr(CUDAGraphBatchDimensionBuilder, "_tail_mtd_wrapped", False):
-        from nemo_rl.models.generation.megatron import tail_mtd
-
+    if not getattr(CUDAGraphBatchDimensionBuilder, "_tree_spec_wrapped", False):
+        # the decode graph of a forward with E node rows: the batch's decode rows + E (set only while that forward's
+        # attention state is initialized)
         orig_match = CUDAGraphBatchDimensionBuilder.match_graph_config
 
         def match_graph_config(real_batch_dim, *a, **kw):
-            e = tail_mtd._ACTIVE.get("extra", 0)
+            e = _EXTRA_ROWS["n"]
             if e > 0 and real_batch_dim.prefill_req_count == 0:
                 real_batch_dim = InferenceBatchDimensions(
                     token_count=real_batch_dim.token_count + e, prefill_req_count=0,
@@ -1830,20 +2112,18 @@ def install(engine, *, W: int, D: int, t_max: int, ref_cap: int, node_cap: int, 
             return orig_match(real_batch_dim, *a, **kw)
 
         CUDAGraphBatchDimensionBuilder.match_graph_config = staticmethod(match_graph_config)
-        CUDAGraphBatchDimensionBuilder._tail_mtd_wrapped = True
-
-    from nemo_rl.models.generation.megatron import tail_mtd as _mtd
+        CUDAGraphBatchDimensionBuilder._tree_spec_wrapped = True
 
     orig_init = ctx.initialize_attention_state
 
     def initialize_attention_state(*a, **kw):
         dummy = bool(kw.get("is_expert_parallel_dummy_cuda_graph_step")) or kw.get("construct_graph_dimensions") is not None
         E = ts.plan(ctx, dummy)
-        _mtd._ACTIVE["extra"] = E
+        _EXTRA_ROWS["n"] = E
         try:
             out = orig_init(*a, **kw)
         finally:
-            _mtd._ACTIVE["extra"] = 0
+            _EXTRA_ROWS["n"] = 0
         ts.finish_layout(ctx)
         return out
 
@@ -1882,7 +2162,8 @@ def install(engine, *, W: int, D: int, t_max: int, ref_cap: int, node_cap: int, 
 
     ctrl._dynamic_step_sample_logits = _dynamic_step_sample_logits
 
-    logits_state = ctrl._async_sched_logits
+    # its clear() drops the forward in flight, and with it the tree's pending layout
+    logits_state = async_sched_state(ctrl)
     orig_clear = logits_state.clear
 
     def clear():
@@ -1897,6 +2178,7 @@ def install(engine, *, W: int, D: int, t_max: int, ref_cap: int, node_cap: int, 
         ts._res = ts.resolve()
         ts._res_idx = {}
         ids, fin, mask = orig_state(sampled_tokens_cpu, resolved_sequence_lengths)
+        ts._drop_cut_rows(getattr(engine, "stop_word_being_finished_ids", None))
         if ts._res:
             lo = ctx.paused_request_count
             n = ctx.total_request_count - lo
@@ -1930,23 +2212,56 @@ def install(engine, *, W: int, D: int, t_max: int, ref_cap: int, node_cap: int, 
 
     ctrl._materialize_async_sched_log_probs = _materialize_async_sched_log_probs
 
+    install_sample_substitution(engine, ts)
+    return ts
+
+
+def tree_rows_sample(ts: TreeSpec, request_ids, sample):
+    """The step's sample with every tail that accepted a > 1 tokens replaced by its token list (the row-0 draw first:
+    MCore's own sample, checked), as MCore's request-output processing reads it (``sample.tolist()``: an int or a list
+    per request). Unchanged when no tail accepted more than its root."""
+    res = getattr(ts, "_res", None)
+    if not res:
+        return sample
+    new, changed = [], False
+    for rid, s in zip(request_ids.tolist(), sample.tolist()):
+        rr = res.get(int(rid))
+        if rr is not None and len(rr[0]) > 1:
+            if ts.neg not in ("tree_accept_topk", "tree_accept_all", "tree_accept_by_draft_prob"):
+                assert int(rr[0][0]) == int(s), ("[tree_spec] row 0 sample mismatch", rid, rr[0][0], s)
+            new.append(list(rr[0]))
+            changed = True
+        else:
+            new.append(s)
+    return _ListSample(new) if changed else sample
+
+
+def install_sample_substitution(engine, ts: TreeSpec) -> None:
+    """Hand the tails' accepted tokens to MCore wherever it applies a step's sample to requests. Megatron-LM main
+    (a11c84aec) applies finished rows inside the controller step (``_finalize_finished_requests``, before their
+    storage is released) and the survivors in ``post_process_requests``, both through ``_process_request_outputs``:
+    the substitution goes there, so a tail that finishes on a multi-token accept gets its tokens with their
+    log-probs (else its log-probs, extended by the tree, outnumber its tokens). Earlier pins apply every row in
+    ``post_process_requests``. Either way the tails leave at post-processing (``on_post_process``)."""
+    per_output = hasattr(engine, "_process_request_outputs")
+    if per_output:
+        orig_pro = engine._process_request_outputs
+
+        def _process_request_outputs(*a, **kw):
+            if "sample" in kw:
+                kw["sample"] = tree_rows_sample(ts, kw["request_ids"] if "request_ids" in kw else a[0], kw["sample"])
+            else:
+                a = (a[0], a[1], tree_rows_sample(ts, a[0], a[2])) + tuple(a[3:])
+            return orig_pro(*a, **kw)
+
+        engine._process_request_outputs = _process_request_outputs
+
     orig_post = engine.post_process_requests
 
     def post_process_requests(request_ids, finished_request_ids, evict_request_ids, step_time, sample,
                               accepted_tokens, log_probs, *a, **kw):
-        res = getattr(ts, "_res", None)
-        if res:
-            toks = sample.tolist()
-            new = []
-            for rid, s in zip(request_ids.tolist(), toks):
-                rr = res.get(int(rid))
-                if rr is not None and len(rr[0]) > 1:
-                    if ts.neg not in ("tree_accept_topk", "tree_accept_all", "tree_accept_by_draft_prob"):
-                        assert int(rr[0][0]) == int(s), ("[tree_spec] row 0 sample mismatch", rid, rr[0][0], s)
-                    new.append(list(rr[0]))
-                else:
-                    new.append(s)
-            sample = _ListSample(new)
+        if not per_output:
+            sample = tree_rows_sample(ts, request_ids, sample)
         out = orig_post(request_ids, finished_request_ids, evict_request_ids, step_time, sample, accepted_tokens,
                         log_probs, *a, **kw)
         ts.on_post_process(finished_request_ids, evict_request_ids)
@@ -1954,4 +2269,3 @@ def install(engine, *, W: int, D: int, t_max: int, ref_cap: int, node_cap: int, 
         return out
 
     engine.post_process_requests = post_process_requests
-    return ts

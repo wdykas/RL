@@ -87,7 +87,10 @@ def test_eviction_releases_tail_state_and_readmission_registers_fresh():
     t._trk = np.zeros(4, dtype=bool)
     t._wlast = np.zeros(4, dtype=np.int64)
     t.stats = {"registered": 0}
+    t.mtp = None  # no MTP draft source
     t.ctx = type("C", (), {"max_sequence_length": 900})()
+    t._epoch, t.mtp, t.mtp_len = 0, None, torch.zeros(5, dtype=torch.int32)
+    t.mtp_sib = torch.full((5,), -1, dtype=torch.int32)
 
     class _SP:
         num_tokens_to_generate, num_tokens_total, termination_id = 100, None, 2
@@ -109,6 +112,171 @@ def test_eviction_releases_tail_state_and_readmission_registers_fresh():
     assert 12 not in t.tails
 
 
+def _spec(neg=""):
+    """A TreeSpec with only the host state registration / epochs / liveness read."""
+    t = ts.TreeSpec.__new__(ts.TreeSpec)
+    t.t_max, t.W, t.D, t.S, t.neg = 4, 8, 4, 1000, neg
+    t.tails, t._seen, t._sorted = {}, set(), None
+    t.free_tids = [3, 2, 1, 0]
+    t._rid_of = np.full(4, -1, dtype=np.int64)
+    t._trk = np.zeros(4, dtype=bool)
+    t._wlast = np.zeros(4, dtype=np.int64)
+    t._mslot_host = np.full(4, -1, dtype=np.int64)
+    t.stats = {"registered": 0, "epochs": 0, "epoch_released": 0, "epoch_kept": 0, "cut_dropped": 0, "tails_full": 0}
+    t.ctx = type("C", (), {"max_sequence_length": 900})()
+    t._epoch, t.mtp, t.mtp_len, t.mtp_free = 0, None, torch.zeros(5, dtype=torch.int32), []
+    t.mtp_sib = torch.full((5,), -1, dtype=torch.int32)
+    t.engine = type("E", (), {"get_request": staticmethod(lambda rid: None), "_weight_epoch": 0})()
+    return t
+
+
+class _SP:
+    num_tokens_to_generate, num_tokens_total, termination_id = 100, None, 2
+    ts_mtd_refs = ts.pack_refs([[5, 6, 7]]).tobytes()
+
+
+_REQ = type("R", (), {"sampling_params": _SP(), "prompt_tokens": [1, 2, 3]})()
+
+
+def _ctx(ids):
+    return type("Ctx", (), {"request_ids": torch.tensor(ids, dtype=torch.int32), "total_request_count": len(ids)})()
+
+
+def test_new_weight_epoch_keeps_resident_tails_and_releases_rebuilt_requests():
+    """Lag K: at the first layout of a new engine weight epoch a resident request's tail (decode row or paused) keeps
+    its version-free state (tracked, same tail object: no host re-sync) with its key id unresolved and its MTP slot
+    (old-weights K / V) dropped; a request MCore rebuilt (re-added for a prefill by a RECOMPUTE resume, or not resident
+    yet) is released and unseen, so its prefill registers it again. NEGATIVE CONTROL tree_stale_version keeps every
+    old tail."""
+    t = _spec()
+    for rid in (11, 12, 13, 14):
+        t._seen.add(rid)
+        t.maybe_register(rid, _REQ).kid = 77
+    for rid in (11, 12, 14):
+        t.tails[rid].tracked = True
+    t.tails[11].mslot, t._mslot_host[t.tails[11].tid] = 5, 5
+    t.mtp_len[t.tails[11].tid] = 3
+    keep11, keep12 = t.tails[11], t.tails[12]
+    # context: 12 paused (index 0), 11 decode, 14 re-added for a prefill; 13 not resident (waiting to be re-added)
+    rids = np.asarray([11, 14], dtype=np.int64)
+    t._new_epoch(_ctx([12, 11, 14]), rids, 1, 1, epoch=1)
+    assert t._epoch == 1 and t.stats["epochs"] == 1
+    assert t.stats["epoch_kept"] == 2 and t.stats["epoch_released"] == 2
+    assert t.tails[11] is keep11 and t.tails[12] is keep12 and keep11.tracked and keep12.tracked
+    assert keep11.kid == -1 and keep12.kid == -1
+    assert keep11.mslot == -1 and t.mtp_free == [5] and int(t.mtp_len.sum()) == 0
+    assert set(t.tails) == {11, 12} and t._seen == {11, 12}
+    again = t.maybe_register(14, _REQ)  # the re-added request's prefill: a fresh tail
+    assert again is not None and not again.tracked and again.kid == -1
+    n = _spec("tree_stale_version")
+    for rid in (11, 14):
+        n.maybe_register(rid, _REQ)
+    n._new_epoch(_ctx([11, 14]), rids, 1, 0, epoch=1)
+    assert n._epoch == 1 and set(n.tails) == {11, 14}
+
+
+def test_layout_commits_only_for_its_registered_tail():
+    """A layout's tail commits only while it is the request's registered tail object: a forward laid out before a
+    resume and sampled after it commits for a kept tail (it ran on the old weights entirely, as its root row did), not
+    for a released / re-registered one."""
+    t = _spec()
+    tail = t.maybe_register(11, _REQ)
+    lay = ts._Forward(slot=0, tails=[(tail, 0, 4, 0)], n_rows=1, E=4, epoch=0)
+    t.engine._weight_epoch = 1
+    assert t._live(lay, tail)  # straddling forward, kept tail
+    t._new_epoch(_ctx([11]), np.asarray([11]), 0, 0, epoch=1)  # 11 is a prefill row now: rebuilt, released
+    assert not t._live(lay, tail)
+    again = t.maybe_register(11, _REQ)
+    assert not t._live(lay, tail) and t._live(ts._Forward(slot=1, tails=[(again, 0, 4, 0)], n_rows=1, E=4, epoch=1),
+                                              again)
+
+
+def test_straddle_flag_set_and_reset_across_resumes():
+    """The sample stage of a forward laid out before a resume sets root_only; the next forward of the current epoch
+    resets it; the device flag is written only on a change; several resumes (lag K); the negative never sets it."""
+    for neg in ("", "tree_straddle_commit"):
+        t = _spec(neg)
+        t.stats["epoch_straddle_forwards"] = 0
+        t.root_only, t._root_only_host = torch.zeros(1, dtype=torch.int32), 0
+        writes = []
+        orig_fill = t.root_only.fill_
+        t.root_only = type("Flag", (), {"fill_": lambda self, v: (writes.append(v), orig_fill(v))[1]})()
+        seq = []
+        for epoch_now, lay_epoch in ((0, 0), (1, 0), (1, 1), (1, 1), (2, 1), (3, 2), (3, 3)):
+            t.engine._weight_epoch = epoch_now
+            lay = ts._Forward(slot=0, tails=[], n_rows=1, E=0, epoch=lay_epoch)
+            t._set_straddle(lay)
+            seq.append(int(lay.straddle))
+        if neg:
+            assert seq == [0] * 7 and writes == []
+        else:
+            assert seq == [0, 1, 0, 0, 1, 1, 0] and writes == [1, 0, 1, 0]
+        assert t.stats["epoch_straddle_forwards"] == 3
+
+
+class _MainEngine:
+    """Megatron-LM main's shape: finished rows applied by the controller's finalize callback through
+    _process_request_outputs (keywords), survivors by post_process_requests (positional, through the same method)."""
+
+    def __init__(self):
+        self.seen = []
+
+    def _process_request_outputs(self, request_ids, finished_request_ids, sample, *a, **kw):
+        self.seen.append(sample.tolist())
+
+    def post_process_requests(self, request_ids, finished_request_ids, evict_request_ids, step_time, sample,
+                              accepted_tokens, log_probs, *a, **kw):
+        self._process_request_outputs(request_ids, finished_request_ids, sample)
+
+
+class _OldEngine:
+    def __init__(self):
+        self.seen = []
+
+    def post_process_requests(self, request_ids, finished_request_ids, evict_request_ids, step_time, sample,
+                              accepted_tokens, log_probs, *a, **kw):
+        self.seen.append(sample.tolist())
+
+
+@pytest.mark.parametrize("main", [True, False])
+def test_tails_tokens_reach_finished_and_surviving_rows(main):
+    """Regression (main-pin in-loop: a finished tail's log-probs outnumbered its tokens by a - 1): the tails'
+    accepted tokens replace the sample wherever MCore applies it, the finalize path of finished rows included."""
+    t = _spec()
+    t.on_post_process = lambda fin, ev: None
+    eng = _MainEngine() if main else _OldEngine()
+    ts.install_sample_substitution(eng, t)
+    ids, sample = torch.tensor([11, 12]), torch.tensor([5, 9])
+    t._res = {11: ([5, 6, 7], [0.1, 0.2], True, 10)}
+    if main:  # the finalize callback (keywords) for finished row 11, then post-processing of the survivors
+        eng._process_request_outputs(request_ids=ids[:1], finished_request_ids=ids[:1], sample=sample[:1])
+        assert eng.seen[-1] == [[5, 6, 7]]
+    eng.post_process_requests(ids, ids[:1], None, 0.0, sample, None, None)
+    assert eng.seen[-1] == [[5, 6, 7], 9] and t._res is None
+    t._res = {}
+    eng.post_process_requests(ids, ids[:0], None, 0.0, sample, None, None)
+    assert eng.seen[-1] == [5, 9]  # no multi-token tail: MCore's own sample object
+
+
+def test_wake_cut_rows_commit_no_tree_tokens():
+    """Rows MCore finishes without the step's token (stop-word path: a wake cut) are dropped from the resolve: no list
+    sample, no log-probs, no key registered."""
+    t = _spec()
+    t._res = {11: ([5, 6, 7], [0.1, 0.2], False, 10), 12: ([8], [], False, 20)}
+    t._drop_cut_rows({11, 99})
+    assert set(t._res) == {12} and t.stats["cut_dropped"] == 1
+    t._drop_cut_rows(None)
+    t._drop_cut_rows(set())
+    assert set(t._res) == {12}
+
+
+def test_tail_ids_exhausted_is_counted():
+    t = _spec()
+    for rid in range(10, 15):
+        t.maybe_register(rid, _REQ)
+    assert len(t.tails) == 4 and t.stats["tails_full"] == 1
+
+
 def test_set_width_cap():
     """set_width_cap clamps to [0, W] on a live tail and reports unknown requests."""
     t = ts._Tail(rid=5, tid=0, plen=3, budget_end=100, eos=-1, refs=None, w_cap=8, d_cap=4)
@@ -117,6 +285,67 @@ def test_set_width_cap():
     assert spec.set_width_cap(5, 0) and t.w_cap == 0
     assert spec.set_width_cap(5, 99) and t.w_cap == 16
     assert not spec.set_width_cap(6, 3)
+
+
+def _stub_spec(n_tids=4):
+    spec = object.__new__(ts.TreeSpec)
+    spec.tails, spec.W, spec.D, spec.S = {}, 16, 4, 4096 + 8 * ts.LOOK_MAX + 8
+    spec.free_tids = list(range(n_tids - 1, -1, -1))
+    spec._rid_of = np.full(n_tids, -1, dtype=np.int64)
+    spec._trk = np.zeros(n_tids, dtype=bool)
+    spec._wlast = np.zeros(n_tids, dtype=np.int64)
+    spec._sorted, spec._seen, spec.stats = None, set(), {"registered": 0}
+    spec.ctx = type("C", (), {"max_sequence_length": 4096})()
+    return spec
+
+
+def test_register_tail_for_a_decoding_request():
+    """register_tail makes an already-decoding request a tail (packed refs, caps clamped); unknown / repeated
+    requests and a full tail table are refused."""
+    sp = type("SP", (), {"num_tokens_to_generate": 100, "num_tokens_total": None, "termination_id": 2})()
+    req = type("R", (), {"sampling_params": sp, "prompt_tokens": [5] * 30})()
+
+    class Eng:
+        def get_request(self, rid):
+            if rid != 7:
+                raise KeyError(rid)
+            return req
+
+    spec = _stub_spec(n_tids=1)
+    spec.engine = Eng()
+    assert spec.register_tail(7, [[1, 2, 3], [4, 5]], w=99, d=2)
+    t = spec.tails[7]
+    assert t.w_cap == 16 and t.d_cap == 2 and t.budget_end == 130 and t.eos == 2 and not t.own
+    assert np.array_equal(np.frombuffer(t.refs, dtype=np.int32), ts.pack_refs([[1, 2, 3], [4, 5]]))
+    assert 7 in spec._seen and spec._rid_of[t.tid] == 7 and not spec._trk[t.tid]
+    assert not spec.register_tail(7, [[1]], w=4)  # already a tail
+    assert not spec.register_tail(8, [[1]], w=4)  # unknown request
+    spec.engine = type("E2", (), {"get_request": lambda self, rid: req})()
+    assert not spec.register_tail(9, [[1]], w=4)  # no free tail id
+
+
+def test_epoch_map_counts_blocks_registered_under_an_older_epoch():
+    """install_epoch_map: blocks keep the epoch they were registered under until re-allocated."""
+
+    class Alloc:
+        def register_kv_block_hashes(self, block_ids, block_hashes, parent_hashes=None):
+            return list(block_ids)
+
+        def allocate_memory_blocks(self, n):
+            return torch.arange(10, 10 + n)
+
+    eng = type("E", (), {})()
+    eng._weight_epoch = 0
+    eng.context = type("C", (), {"kv_block_allocator": Alloc()})()
+    spec = object.__new__(ts.TreeSpec)
+    spec._blk_epoch = {}
+    ts.install_epoch_map(eng, spec)
+    eng.context.kv_block_allocator.register_kv_block_hashes([3, 4, 10], [1, 2, 3])
+    eng._weight_epoch = 1
+    eng.context.kv_block_allocator.register_kv_block_hashes([5], [9])
+    assert spec._blk_epoch == {3: 0, 4: 0, 10: 0, 5: 1}
+    eng.context.kv_block_allocator.allocate_memory_blocks(1)  # block 10 re-allocated: its old epoch is gone
+    assert 10 not in spec._blk_epoch and spec._blk_epoch[3] == 0
 
 
 def test_mtp_depth_rule():
@@ -133,7 +362,7 @@ def test_mtp_depth_rule():
 # ---------------------------------------------------------------------------- Python reference of the device rule
 
 
-def py_tree(h, refs, p, w, dmax, nmax=4, cmax=32, mtp=()):
+def py_tree(h, refs, p, w, dmax, nmax=4, cmax=32, mtp=(), sib=-1):
     """Candidates (n desc, reference position asc) of the suffix match (n <= nmax) of h[:p] in refs, first cmax,
     inserted best first into a trie of <= w nodes and depth <= dmax. Returns [(token, parent, depth)]."""
     rl = len(refs)
@@ -157,6 +386,8 @@ def py_tree(h, refs, p, w, dmax, nmax=4, cmax=32, mtp=()):
             break
         nodes.append((x, cur, d))
         cur = len(nodes) - 1
+    if mtp and dmax >= 1 and sib >= 0 and len(nodes) < w and (not nodes or nodes[0][0] != sib):
+        nodes.append((sib, -1, 1))  # the MTP depth-1 sibling (the depth-1 race's runner-up)
     for _negn, e in cands[:cmax]:
         cur = -1
         for d in range(1, ts.LOOK_MAX):
@@ -175,7 +406,7 @@ def py_tree(h, refs, p, w, dmax, nmax=4, cmax=32, mtp=()):
     return nodes
 
 
-def _device_trees(H, R, RLEN, P, BUD, lay, D, chunk=128, bs=256, mtp=None, own=()):
+def _device_trees(H, R, RLEN, P, BUD, lay, D, chunk=128, bs=256, mtp=None, own=(), sib=None):
     T = lay.shape[1]
     nb = -(-max(R.shape[1], H.shape[1] if own else 0) // ts.BLOCK)  # own-history tails: blocks cover H too
     dev = H.device
@@ -200,7 +431,10 @@ def _device_trees(H, R, RLEN, P, BUD, lay, D, chunk=128, bs=256, mtp=None, own=(
         mtok[j, : len(chain)] = torch.tensor(chain, dtype=torch.int32)
         mlen[j] = len(chain)
     nm = torch.zeros(T, dtype=torch.int64, device=dev)
-    ts._build_kernel[(T,)](H, R, RLEN, P, OWN, BUD, lay, cand, ncand, ntok, npar, ndep, nn, pout, mtok, mlen, nm,
+    msib = torch.full((T,), -1, **i32)
+    for j, x in (sib or {}).items():
+        msib[j] = int(x)
+    ts._build_kernel[(T,)](H, R, RLEN, P, OWN, BUD, lay, cand, ncand, ntok, npar, ndep, nn, pout, mtok, mlen, msib, nm,
                            H.stride(0), R.stride(0), lay.stride(0), mtok.stride(0), D, CHUNK=chunk, BS=bs,
                            WPOW=ts.WMAX, CMAXC=ts.CMAX, LOOK=ts.LOOK_MAX, ALWAYS=False, KM=ts.KMTP)
     _device_trees.nm = nm.cpu()
@@ -238,14 +472,16 @@ def test_device_tree_equals_python_rule(seed, vocab):
     dev = torch.device("cuda")
     mtp = {j: [int(x) for x in rng.integers(0, vocab, int(rng.integers(1, ts.KMTP + 1)))] for j in range(0, T, 2)}
     own = (1, 4)  # src bit1 (XS-SD): candidates from the tail's own history h[:p] (tail 4 also has an MTP chain)
+    # depth-1 siblings: a fresh token on tail 0, the chain's own first token on tail 2 (deduplicated), none on 4
+    sib = {0: vocab + 1, 2: mtp[2][0]}
     for D in (4, 7):
         out = _device_trees(H.to(dev), R.to(dev), RLEN.to(dev), P.to(dev), BUD.to(dev), lay.to(dev), D, mtp=mtp,
-                            own=own)
+                            own=own, sib=sib)
         ntok, npar, ndep, nn, pout = out
         for j, (h, refs, p, w) in enumerate(cases):
             dmax = min(D, 128 - 2 - (p - 1) % 128, 256 - 1 - (p - 1) % 256, int(BUD[j]) - 1 - p, ts.LOOK_MAX - 1)
             src = list(h[:p]) if j in own else list(refs)
-            ref = py_tree(list(h), src, p, w, dmax, mtp=mtp.get(j, ()))
+            ref = py_tree(list(h), src, p, w, dmax, mtp=mtp.get(j, ()), sib=sib.get(j, -1))
             got = [(int(ntok[j, i]), int(npar[j, i]), int(ndep[j, i])) for i in range(int(nn[j]))]
             assert got == ref, (j, D, got[:6], ref[:6])
             assert int(pout[j]) == p
@@ -255,6 +491,8 @@ def test_device_tree_equals_python_rule(seed, vocab):
                 if tk != x or dd != n_mtp + 1:
                     break
                 n_mtp += 1
+            if n_mtp < len(ref) and n_mtp and ref[n_mtp] == (sib.get(j, -1), -1, 1):
+                n_mtp += 1  # the sibling counts as an MTP node
             assert int(_device_trees.nm[j]) == n_mtp, (j, D, int(_device_trees.nm[j]), n_mtp)
 
 
@@ -286,7 +524,10 @@ def py_accept(nodes, s_root, s_node, eos, bud, p, alt_root=None, alt_node=None):
 @cuda
 @pytest.mark.parametrize("seed", list(range(6)))
 @pytest.mark.parametrize("topk", [False, True])
-def test_accept_walk_equals_reference(seed, topk):
+@pytest.mark.parametrize("root_only", [False, True])
+def test_accept_walk_equals_reference(seed, topk, root_only):
+    """The device walk == the Python rule; root_only (a forward sampled after an engine resume): a = 1, the root's draw
+    only, no path, the slot kept for the Mamba cursor commit."""
     rng = np.random.default_rng(seed)
     T, W = 5, ts.WMAX
     n_rows = 7
@@ -357,10 +598,16 @@ def test_accept_walk_equals_reference(seed, topk):
         out["H"], out["P"], out["BUD"], out["EOS"], out["DONE"], out["lay"], out["row_now"], out["s0"], out["s_ext"],
         out["alt0"], out["alt_ext"], none_i, none_i, none_f, none_f, none_i, none_i,
         out["ntok"], out["npar"], out["nn"], out["pin"], out["priv"],
+        torch.full((1,), int(root_only), dtype=torch.int32, device=dev),
         acc, tok, slots, cur, pidx, pblk, rblk, torch.zeros(T, dtype=torch.int64, device=dev), out["H"].stride(0),
         out["lay"].stride(0), tok.stride(0),
         pidx.stride(0), CHUNK=128, BS=256, WPOW=W, LOOK=ts.LOOK_MAX, KPOW=8, TOPK=topk)
     for j, (nodes, sr, sn, p, ar, an, x0) in enumerate(expect):
+        if root_only:
+            assert int(acc[j]) == 1 and tok[j, 0].item() == sr and pidx[j].tolist() == [-1] * 8
+            assert int(out["P"][j]) == p + 1 and int(out["H"][j, p]) == sr
+            assert int(slots[j]) == 10 + j  # nodes ran: the cursor commit must run (a = 1: cursor w0 + 1)
+            continue
         em, path = py_accept(nodes, sr, sn, 3, int(BUD[j]), p, ar, an)
         a = int(acc[j])
         assert a == len(em), (j, a, em)
@@ -519,7 +766,44 @@ def test_accept_walk_draft_prob_negative(seed):
     ts._accept_kernel[(T,)](
         t["H"], t["P"], t["BUD"], t["EOS"], t["DONE"], t["lay"], t["row_now"], t["s0"], t["s_ext"], none_i, none_i,
         none_i, none_i, t["q0"], t["q_ext"], t["r0"], t["r_ext"], t["ntok"], t["npar"], t["nn"], t["pin"], priv,
-        acc, tok, z[0], z[1], pidx, pblk, z[2], torch.zeros(T, dtype=torch.int64, device=dev), t["H"].stride(0), t["lay"].stride(0), tok.stride(0), pidx.stride(0),
+        torch.zeros(1, dtype=torch.int32, device=dev), acc, tok, z[0], z[1], pidx, pblk, z[2], torch.zeros(T, dtype=torch.int64, device=dev), t["H"].stride(0), t["lay"].stride(0), tok.stride(0), pidx.stride(0),
         CHUNK=128, BS=256, WPOW=W, LOOK=ts.LOOK_MAX, KPOW=8, TOPK=False, ACCEPT_ALL=False, DRAFTPROB=True)
     for j, (p, em) in enumerate(exp):
         assert tok[j, : int(acc[j])].tolist() == em, (j, tok[j].tolist(), em)
+
+
+@cuda
+def test_lazy_capture_tolerates_another_threads_sync():
+    """A tree stage captured lazily mid-run (thread_local capture mode) neither fails nor breaks another thread's
+    event.synchronize issued during the capture (BX-SD: a hidden-log seal thread's sync invalidated a global
+    capture and died)."""
+    import threading
+
+    spec = object.__new__(ts.TreeSpec)
+    spec.graph_pool = torch.cuda.graph_pool_handle()
+    spec.stats = {"graph_captures": 0, "graph_fallbacks": 0}
+    spec.use_graphs = True
+    x = torch.zeros(1024, device="cuda")
+    ev = torch.cuda.Event()
+    ev.record()
+    errs = []
+
+    def other():
+        try:
+            ev.synchronize()
+        except Exception as e:  # noqa: BLE001 -- the test records whatever the other thread hits
+            errs.append(e)
+
+    def body():
+        x.add_(1.0)
+        th = threading.Thread(target=other)
+        th.start()
+        th.join()
+
+    r = {}
+    for _ in range(3):  # eager warm-up, capture (+ replay), replay
+        spec._run_graph(r, "gT", body, ("sig",))
+    torch.cuda.synchronize()
+    assert spec.stats["graph_fallbacks"] == 0 and spec.stats["graph_captures"] == 1
+    assert not errs, errs
+    assert float(x[0]) == 3.0

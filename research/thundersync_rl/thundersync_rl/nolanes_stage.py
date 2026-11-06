@@ -677,7 +677,7 @@ class VerifyStage:
                 if (self.cfg.tail_mtd or getattr(self.cfg, "tail_tree", 0)) and not complete:
                     # Multi-token tail decode: lookup references (proposals only; any content is exact, DESIGN E6
                     # concerns targets): the rejected draft from tau on, then the group's other drafts.
-                    from nemo_rl.models.generation.megatron.tail_mtd import pack_refs
+                    from nemo_rl.models.generation.megatron.tree_spec import pack_refs
 
                     refs = []
                     if o.kind == "continued" and o.draft is not None and o.prefix:

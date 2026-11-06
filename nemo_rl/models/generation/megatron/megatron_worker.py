@@ -992,16 +992,14 @@ class MegatronGenerationMixin:
                 from nemo_rl.models.megatron import mamba_bi_lookahead
 
                 mamba_bi_lookahead.install(int(mtd.split(":")[1]))
-            # Tree speculation (thundersync.tail_tree, tree_spec): node rows in the Mamba layers (scratch conv and
-            # replay rows) and the private-block KV gather, both before the context is sized and the graphs captured.
+            # Tree speculation (thundersync.tail_tree, tree_spec): the node-row state (tree_kv: scratch conv and
+            # replay rows in the Mamba layers, the private-block KV gather), before the context is sized and the
+            # graphs captured.
             tree = os.environ.get("THUNDERSYNC_TAIL_TREE", "").strip()
             if tree:
                 from nemo_rl.models.generation.megatron import tree_kv
-                from nemo_rl.models.megatron import mamba_bi_lookahead
 
-                rows = int(tree.split(":")[2])
-                mamba_bi_lookahead.install(rows, tree=True)
-                tree_kv.install(rows)
+                tree_kv.install(int(tree.split(":")[2]))
                 # MTP draft source (thundersync.tail_tree_mtp): the decoder output of every engine forward, captured
                 # into a fixed buffer by a hook on the final norm (inside the graphs once they are captured).
                 if os.environ.get("THUNDERSYNC_TAIL_TREE_MTP", "").strip():

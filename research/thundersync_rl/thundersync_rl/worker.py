@@ -4658,9 +4658,8 @@ class ThunderSyncMegatronPolicyWorker(
             raise RuntimeError("install_tree_xssd: install the wide sampler first")
         w, d, rows, _ref = (int(x) for x in spec.split(":"))
         from nemo_rl.models.generation.megatron import tree_kv, tree_spec
-        from nemo_rl.models.megatron import mamba_bi_lookahead
 
-        if mamba_bi_lookahead.tree_capacity() == 0 or tree_kv.capacity() == 0:
+        if tree_kv.capacity() == 0:
             raise RuntimeError("install_tree_xssd: node rows were not installed before the engine was built")
         key_ids = None
         if fresh_salt is not None:
@@ -4679,6 +4678,7 @@ class ThunderSyncMegatronPolicyWorker(
             engine, W=w, D=d, t_max=int(engine.context.max_requests), ref_cap=1, node_cap=rows,
             sample_rows=self._nl_tree_sample, key_check=self._wide_key_check, keyreg=None, key_ids=key_ids,
             scores_rows=self._nl_tree_scores, uniform_rows=self._nl_tree_uniform, own_history=True,
+            top2_rows=self._nl_tree_top2,
         )
         self._xssd_tree_attr = np.asarray([w, d, 2], dtype=np.int32).tobytes()  # src bit1: own history
         mtp = os.environ.get("THUNDERSYNC_TAIL_TREE_MTP", "").strip()
