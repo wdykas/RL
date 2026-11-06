@@ -885,8 +885,50 @@ class ThunderSyncMegatronPolicyWorker(
             self._step_max_mb_tokens = max(
                 getattr(self, "_step_max_mb_tokens", 0), max(int(s[0]) * int(s[-1]) for s in shapes)
             )
-        with mem_debug.capture(self.rank, f"train_microbatches {shapes}"):
-            return super().train_microbatches(datas, *args, **kwargs)
+        prof = self._learner_torchprof_begin()
+        try:
+            with mem_debug.capture(self.rank, f"train_microbatches {shapes}"):
+                return super().train_microbatches(datas, *args, **kwargs)
+        finally:
+            if prof is not None:
+                self._learner_torchprof_end(prof, shapes)
+
+    def _learner_torchprof_begin(self):
+        """Debug-only (``THUNDERSYNC_LEARNER_TORCHPROF=<first>:<count>``): torch-profile learner train calls
+        first..first+count-1 of this process (rank 0 only) and print a per-kernel CUDA-time table. Off (no cost)
+        unless set. Learner-only by construction (engine workers never call train_microbatches)."""
+        spec = os.environ.get("THUNDERSYNC_LEARNER_TORCHPROF", "")
+        self._tprof_calls = getattr(self, "_tprof_calls", 0) + 1
+        if not spec or self.rank != 0:
+            return None
+        first, _, count = spec.partition(":")
+        first, count = int(first), int(count or 1)
+        if not (first <= self._tprof_calls < first + count):
+            return None
+        from torch.profiler import ProfilerActivity, profile
+
+        torch.cuda.synchronize()
+        tp = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA])
+        tp._get_distributed_info = lambda: None  # Megatron sub-groups without backend options (see _stream_train_call)
+        tp.__enter__()
+        tp._ts_t0 = time.perf_counter()
+        return tp
+
+    def _learner_torchprof_end(self, tp, shapes) -> None:
+        torch.cuda.synchronize()
+        wall = time.perf_counter() - tp._ts_t0
+        tp.__exit__(None, None, None)
+        rows = []
+        for e in tp.key_averages():
+            cuda_us = float(getattr(e, "self_device_time_total", 0.0) or getattr(e, "self_cuda_time_total", 0.0) or 0.0)
+            if cuda_us > 0:
+                rows.append((cuda_us, int(e.count), e.key))
+        rows.sort(reverse=True)
+        tot = sum(r[0] for r in rows)
+        lines = [f"[learner torchprof] call={self._tprof_calls} shapes={shapes} wall_ms={wall * 1e3:.1f} "
+                 f"kernel_sum_ms={tot / 1e3:.1f} kernels={len(rows)}"]
+        lines += [f"[learner torchprof] k {us / 1e3:10.3f} ms {n:6d} x {name[:110]}" for us, n, name in rows[:60]]
+        print("\n".join(lines), flush=True)
 
     # -- EDV (edv.py, DESIGN §22.9): the capture of a group whose deferred row was not accepted whole is dropped -----
 
@@ -925,6 +967,20 @@ class ThunderSyncMegatronPolicyWorker(
         agreed = sum(int(b) << s for s, b in enumerate(bits.tolist()))
         self._edv_log.append({"mask": agreed, "decisions": dec})
         return agreed != 0
+
+    def _inplace_retrain_call_done(self) -> None:
+        """In-place retrain (EDV surprise under NEMO_RL_EXACT_GRAD_ACCUM=inplace): a re-run call re-decides its
+        deferred rows in its forward. The forward is bitwise the first run's, so the agreed mask must again be 0
+        (the call was captured); the decisions are consumed, not logged twice."""
+        from thundersync_rl import edv
+
+        mask = edv.surprise_mask(edv.take())
+        bits = torch.tensor([(mask >> s) & 1 for s in range(64)], dtype=torch.int32, device="cuda")
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(bits, op=torch.distributed.ReduceOp.MAX)
+        if int(bits.sum()) != 0:
+            raise RuntimeError("[edv] inplace retrain: a re-run call's deferred rows decided differently from its "
+                               "first run (forward not reproducible)")
 
     def nl_edv_take(self) -> list:
         """The calls' surprise masks (agreed) and this rank's decisions (slot, b_g, η_g, accepted) since the last take."""

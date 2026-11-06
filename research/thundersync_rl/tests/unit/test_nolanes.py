@@ -542,13 +542,21 @@ def test_train_overlap_valid_and_r31_refusals(monkeypatch):
     assert nolanes.config_problems(c) == []
 
 
+def _overlap_int64():
+    c = _overlap()
+    c["thundersync"]["train_overlap_accum"] = "int64"
+    return c
+
+
 def test_grad_order_negative_needs_overlap_and_checks(monkeypatch):
     monkeypatch.setenv("THUNDERSYNC_NL_CHECKS", "1")
     monkeypatch.setenv("THUNDERSYNC_NL_NEG", "grad_order")
     assert any("train_overlap" in p for p in nolanes.config_problems(_valid()))
-    assert nolanes.config_problems(_overlap()) == []
+    assert nolanes.config_problems(_overlap_int64()) == []
+    # the order check it must fail exists only on the int64 accumulator
+    assert any("train_overlap_accum=int64" in p for p in nolanes.config_problems(_overlap()))
     monkeypatch.delenv("THUNDERSYNC_NL_CHECKS")
-    assert any("THUNDERSYNC_NL_CHECKS" in p for p in nolanes.config_problems(_overlap()))
+    assert any("THUNDERSYNC_NL_CHECKS" in p for p in nolanes.config_problems(_overlap_int64()))
 
 
 def test_configure_driver_sets_learner_accumulator_env(monkeypatch):
@@ -567,9 +575,14 @@ def test_configure_driver_sets_learner_accumulator_env(monkeypatch):
     nolanes.configure_driver(c)
     assert c["loss_fn"]["train_lp_check"] is True  # the always-on sentinel is a loss config field
     ev = c["policy"]["megatron_cfg"]["env_vars"]
+    # default: in-place fp32 accumulation, no order re-sum (nothing to re-sum), also under CHECKS
+    assert ev["NEMO_RL_EXACT_GRAD_ACCUM"] == "inplace" and "NEMO_RL_EXACT_GRAD_ACCUM_CHECK" not in ev
+    c = _overlap_int64()
+    nolanes.configure_driver(c)
+    ev = c["policy"]["megatron_cfg"]["env_vars"]
     assert ev["NEMO_RL_EXACT_GRAD_ACCUM"] == "1" and int(ev["NEMO_RL_EXACT_GRAD_ACCUM_CHECK"]) > 0
     monkeypatch.setenv("THUNDERSYNC_NL_NEG", "grad_order")
-    c = _overlap()
+    c = _overlap_int64()
     nolanes.configure_driver(c)
     assert c["policy"]["megatron_cfg"]["env_vars"]["NEMO_RL_EXACT_GRAD_ACCUM"] == "naive"
 

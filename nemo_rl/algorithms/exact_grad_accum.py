@@ -421,3 +421,80 @@ class NaiveArrivalOrderAccumulator(OrderInvariantGradAccumulator):
         self.sums = []
         self.samples = []
         self.acc_slices = None
+
+
+class InPlaceGradAccumulator:
+    """train_overlap default (``NEMO_RL_EXACT_GRAD_ACCUM=inplace``): the groups' gradients accumulate in place in the
+    fp32 grad buffers, in arrival order, exactly as stock gradient accumulation across micro-batches. 0 extra bytes.
+
+    Why not the int64 sum by default: it costs 8 B per LOCAL grad element while the Adam moments it displaces are 8 B
+    per optimizer SHARD element (distributed optimizer), so at expert-DP > 1 it does not fit (Nano EP4 +45 GB/rank over
+    stock; Ultra TP8 EP32 PP2 ~+64 GB). Rule 10-19: gradients need accuracy, not determinism; the learner backward is
+    itself not bitwise reproducible (replay rel_l2 1e-4..6e-4), far above fp32 arrival-order rounding (~1e-7).
+
+    ``capture`` only counts (the gradient stays in the buffers). A call cannot be subtracted, so ``discard`` (EDV
+    surprise) is done by the worker: zero the buffers and re-run the step's earlier captured calls
+    (``MegatronPolicyWorker._inplace_retrain``); ``retrained`` records it. The int64 classes stay for the CHECKS order
+    test and the grad_order negative.
+    """
+
+    naive = True
+    inplace = True
+
+    def __init__(self, grads: Sequence[torch.Tensor], **_: object):
+        self.grads = list(grads)
+        self.captures = 0
+        self.capture_s = 0.0
+        self.discards = 0
+        self.retrain_calls = 0
+        self.retrain_s = 0.0
+        self.order_check: dict[str, float] = {}
+        self.replay: dict[str, float] = {}
+        self.acc_slices = None
+
+    @property
+    def nbytes(self) -> int:
+        return 0
+
+    @torch.no_grad()
+    def reset(self) -> None:
+        for g in self.grads:  # the step starts on empty buffers, as the int64 path's scratch
+            g.zero_()
+        self.captures = 0
+        self.capture_s = 0.0
+        self.discards = 0
+        self.retrain_calls = 0
+        self.retrain_s = 0.0
+
+    def capture(self) -> None:
+        self.captures += 1
+
+    @torch.no_grad()
+    def zero_grads(self) -> None:
+        for g in self.grads:
+            g.zero_()
+
+    def retrained(self, calls: int, seconds: float) -> None:
+        self.discards += 1
+        self.retrain_calls += int(calls)
+        self.retrain_s += float(seconds)
+
+    def discard(self) -> None:
+        raise RuntimeError("[exact_grad_accum] inplace: a call cannot be dropped by the accumulator; the worker "
+                           "retrains the step without it (_inplace_retrain)")
+
+    def replay_compare(self) -> None:
+        raise RuntimeError("[exact_grad_accum] inplace: the CHECKS group replay needs NEMO_RL_EXACT_GRAD_ACCUM=1")
+
+    def finalize(self) -> None:
+        return None
+
+    def adam_sim(self, *_: object, **__: object) -> dict:
+        return {}
+
+    def release(self) -> None:
+        return None
+
+    def report(self) -> dict[str, float]:
+        return {"inplace": 1.0, "discards": float(self.discards), "retrain_calls": float(self.retrain_calls),
+                "retrain_s": float(self.retrain_s)}

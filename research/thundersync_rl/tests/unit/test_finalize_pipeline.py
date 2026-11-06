@@ -298,3 +298,68 @@ def test_trained_once_check_is_independent_of_the_train_calls():
     # a step group that was never finalized is refused outright
     with pytest.raises(RuntimeError, match="finalized groups != step groups"):
         step_output_ids(gids + ["g9"], metas, has_valid)
+
+
+def test_submit_extra_during_drain_trains_the_new_unit_once():
+    """GRPO-Z + EDV: a unit's capture is dropped in its train call and its slots come back as a NEW unit
+    (submit_extra); drain trains it too, exactly once, and refuses a duplicate name."""
+    async def main():
+        trained = []
+        pipe = FinalizePipeline(lambda g, res: _rows(0.0, ("meta", g)))
+
+        async def train(g, out):
+            trained.append(g)
+            if g == "u#c":
+                pipe.submit_extra("u#c1", asyncio.ensure_future(_rows(0.01, "rows")))
+                with pytest.raises(RuntimeError):
+                    pipe.submit_extra("u#c1", asyncio.ensure_future(_rows(0.0, "rows")))
+
+        pipe.submit("u#c", asyncio.ensure_future(_rows(0.0, "rows")))
+        pipe.submit("u#3", asyncio.ensure_future(_rows(0.02, "rows")))
+        await pipe.drain(2, _each(train))
+        return trained
+
+    trained = _run(main())
+    assert sorted(trained) == ["u#3", "u#c", "u#c1"]
+
+
+def test_open_drain_trains_while_units_arrive_and_ends_at_close():
+    """Engine verify (DX): units are submitted while the learner already trains; drain(None) ends once close() was
+    called and every submitted unit (incl. one submit_extra made by a train call) trained exactly once."""
+    async def main():
+        trained = []
+        pipe = FinalizePipeline(lambda g, res: _rows(0.0, ("meta", g)))
+
+        async def train(g, out):
+            trained.append(g)
+            if g == "a":
+                pipe.submit_extra("a2", asyncio.ensure_future(_rows(0.005, "rows")))
+
+        async def producer():
+            for i, g in enumerate(["a", "b", "c"]):
+                await asyncio.sleep(0.01)
+                pipe.submit(g, asyncio.ensure_future(_rows(0.002 * i, "rows")))
+            pipe.close()
+
+        prod = asyncio.ensure_future(producer())
+        await pipe.drain(None, _each(train))
+        await prod
+        return trained
+
+    trained = _run(main())
+    assert sorted(trained) == ["a", "a2", "b", "c"]
+
+
+def test_open_drain_raises_the_producer_failure():
+    async def main():
+        pipe = FinalizePipeline(lambda g, res: _rows(0.0, ("meta", g)))
+
+        async def train(g, out):
+            pass
+
+        pipe.submit("a", asyncio.ensure_future(_rows(0.0, "rows")))
+        pipe.fail(RuntimeError("verify phase failed"))
+        await pipe.drain(None, _each(train))
+
+    with pytest.raises(RuntimeError, match="verify phase failed"):
+        _run(main())

@@ -54,11 +54,24 @@ class FinalizePipeline:
         self.order: list[str] = []  # finalize-completion order (= the learner's training order)
         self.prepare_s = 0.0  # driver time spent in prepare (all of it overlaps verify / training / tails)
         self._extra = 0  # resubmitted groups not yet counted by ``drain`` (each trains once more)
+        self._submitted = 0  # every submit / resubmit / submit_extra (the open drain's total)
+        self._closed = False
+
+    def close(self) -> None:
+        """Open drain (``drain(None, ...)``): no more units will be submitted except the ones ``train`` itself creates
+        (resubmit / submit_extra). The drain ends once every submitted unit trained."""
+        self._closed = True
+        self._ready.put_nowait((None, None, None))  # wakes a drain waiting on an empty queue
+
+    def fail(self, err: BaseException) -> None:
+        """The producer of units failed (e.g. the engine verify phase): the drain raises ``err``."""
+        self._ready.put_nowait((None, None, err))
 
     def submit(self, g: str, rows_task: Awaitable[Any]) -> None:
         """Group g's rows are being produced by ``rows_task`` (its continuations / scoring); finalize it when done."""
         if g in self._futs:
             raise RuntimeError(f"[finalize overlap] group {g} submitted twice")
+        self._submitted += 1
         self._futs[g] = asyncio.ensure_future(self._run(g, rows_task))
 
     def resubmit(self, g: str, rows_task: Awaitable[Any]) -> None:
@@ -67,6 +80,16 @@ class FinalizePipeline:
         if g not in self._futs:
             raise RuntimeError(f"[finalize overlap] group {g} resubmitted before its first submission")
         self._extra += 1
+        self._submitted += 1
+        self._futs[g] = asyncio.ensure_future(self._run(g, rows_task))
+
+    def submit_extra(self, g: str, rows_task: Awaitable[Any]) -> None:
+        """A NEW unit created while draining (ThunderSync GRPO-Z + EDV: a dropped unit's slots relaunched as new
+        units): submitted like ``submit`` and counted by ``drain`` as one more unit to train."""
+        if g in self._futs:
+            raise RuntimeError(f"[finalize overlap] unit {g} submitted twice")
+        self._extra += 1
+        self._submitted += 1
         self._futs[g] = asyncio.ensure_future(self._run(g, rows_task))
 
     async def _run(self, g: str, rows_task: Awaitable[Any]) -> None:
@@ -94,6 +117,8 @@ class FinalizePipeline:
         groups finalized while a batch trains form the next batch. Returns the learner wait probes:
         ``learner_wait`` = total time the learner had no finalized group to train, ``tail_exposed`` = the last such
         wait (the learner was free and only the last-finishing rows were outstanding)."""
+        if n_groups is None:
+            return await self._drain_open(train)
         if n_groups != len(self._futs):
             raise RuntimeError(f"[finalize overlap] draining {n_groups} groups, {len(self._futs)} submitted")
         wait = 0.0
@@ -116,6 +141,39 @@ class FinalizePipeline:
                 self.batch_sizes.append(len(items))
                 await train([(g, out) for g, out, _ in items])
                 left, self._extra = left + self._extra, 0  # groups resubmitted during ``train``
+        except BaseException:
+            for f in self._futs.values():
+                f.cancel()
+            raise
+        return {"learner_wait": wait, "tail_exposed": last_wait}
+
+
+    async def _drain_open(self, train) -> dict[str, float]:
+        """``drain`` while units are still being submitted (ThunderSync engine verify: the learner trains while the
+        engine verifies). Ends once ``close`` was called and every submitted unit trained."""
+        wait = 0.0
+        last_wait = 0.0
+        self.batch_sizes = []
+        done = 0
+        try:
+            while not (self._closed and done >= self._submitted):
+                t = time.perf_counter()
+                first = await self._ready.get()
+                dt = time.perf_counter() - t
+                items = [first]
+                while not self._ready.empty():
+                    items.append(self._ready.get_nowait())
+                for _, _, err in items:
+                    if err is not None:
+                        raise err
+                items = [x for x in items if x[0] is not None]  # close() wake-ups
+                if not items:
+                    continue
+                wait += dt
+                last_wait = dt
+                done += len(items)
+                self.batch_sizes.append(len(items))
+                await train([(g, out) for g, out, _ in items])
         except BaseException:
             for f in self._futs.values():
                 f.cancel()

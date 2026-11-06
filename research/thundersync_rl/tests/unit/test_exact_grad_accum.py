@@ -248,3 +248,29 @@ def test_both_accumulators_share_the_constructor_signature():
         acc.reset()
         acc.capture()
         acc.finalize()
+
+
+def test_inplace_accumulator_holds_no_memory_and_counts():
+    """train_overlap default: the groups accumulate in the grad buffers themselves; 0 bytes; capture only counts;
+    a discard must go through the worker's retrain (the accumulator refuses it); int64-only checks refuse."""
+    from nemo_rl.algorithms.exact_grad_accum import InPlaceGradAccumulator
+
+    grads = [torch.ones(5), torch.ones(3)]
+    acc = InPlaceGradAccumulator(grads, check_elems=7)
+    acc.reset()
+    assert all(float(g.abs().sum()) == 0 for g in grads) and acc.nbytes == 0
+    grads[0] += 2.0  # a call's backward lands in the buffers
+    acc.capture()
+    grads[0] += 3.0
+    acc.capture()
+    acc.finalize()
+    assert acc.captures == 2 and torch.equal(grads[0], torch.full((5,), 5.0))  # nothing moved
+    with pytest.raises(RuntimeError, match="retrains"):
+        acc.discard()
+    with pytest.raises(RuntimeError, match="NEMO_RL_EXACT_GRAD_ACCUM=1"):
+        acc.replay_compare()
+    acc.zero_grads()
+    acc.retrained(4, 0.5)
+    r = acc.report()
+    assert r["inplace"] == 1.0 and r["discards"] == 1.0 and r["retrain_calls"] == 4.0
+    assert all(float(g.abs().sum()) == 0 for g in grads)

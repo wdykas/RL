@@ -158,6 +158,10 @@ class VerifyStage:
         self.history: list[dict[str, Any]] = []
         self.neg = nolanes.negative()
         self.prev_from_verify = bool(cfg.prev_logprobs_from_verify)
+        # GRPO-Z (grpo_z.py): row advantages from the siblings' draft rewards, rows train on arrival. loo_c scale s_k:
+        # a constant at the first step, then the previous step's mean within-group std of final rewards.
+        self.grpo_z = str(getattr(cfg, "grpo_z", "off") or "off")
+        self.gz_scale = 1.0
         # Colocated engine (research/colo/MODEL.md v2, XPR-1): set in setup() from the generation backend.
         self.colocated = False
         nolanes.apply_driver_env(cfg)
@@ -205,7 +209,11 @@ class VerifyStage:
             # resolved by nolanes.configure_driver (effective_verify_batch_tokens)
             verify_batch_tokens=int(self.cfg.verify_batch_tokens),
             longest_first=False,
-            verify_on="learner",
+            verify_on=str(self.cfg.verify_on),
+            # Engine verify: a verification request is prompt + draft + one sampled token; drafts longer than the
+            # engine's max_model_len - 1 are verified as their prefix that fits (a cut at a fixed position: exact).
+            engine_max_len=(int((self.sc._gen.cfg.get("mcore_generation_config") or {}).get("max_model_len")
+                                or self.max_seq) if str(self.cfg.verify_on) == "engine" else None),
             pool_weights=None,
             fused_verify_train=False,
             fused_max_retained_tokens=0,
@@ -304,6 +312,14 @@ class VerifyStage:
             self._colo_stash_pending = int(version)
         else:
             self.stash_head(version)
+        self.engine_verify = str(self.cfg.verify_on) == "engine"
+        if self.engine_verify:
+            # DX: the inference pool verifies (one-token prefill requests, head-input capture, ⊥-BV decided on the
+            # engine rank that holds the rows); q rows need the LM head of every drafting version on the engine ranks.
+            from thundersync_rl.speculative import EngineVerifier
+
+            self.spec.engine_verifier = EngineVerifier(self._gen_wg())
+            self.stash_engine_head(version)
         print(f"[nolanes] verify stage ready: G={self.g} N={self.n} lag={self.lag} version={version} "
               f"negative={self.neg or 'none'}", flush=True)
 
@@ -380,6 +396,14 @@ class VerifyStage:
         vs = ray.get(self._gen_wg().run_all_workers_single_data("nl_version"))
         if not vs or any(v != version for v in vs):
             raise RuntimeError(f"[nolanes] engine version tags {vs} != trainer version {version}")
+        if getattr(self, "engine_verify", False):
+            self.stash_engine_head(version)
+
+    def stash_engine_head(self, version: int) -> None:
+        """Engine verify: every engine rank stashes its live LM head as ``version`` (it holds theta_version right after
+        the refit); keeps the versions a batch's drafts can carry (lag + 1 back)."""
+        keep = list(range(max(0, version - self.lag - 1), version + 1))
+        ray.get(self._gen_wg().run_all_workers_single_data("stash_head", version=int(version), keep=keep))
 
     def _edv_configure(self) -> str:
         """EDV shadow counter (DESIGN §22.8): ``<run dir>/edv_shadow.jsonl``, log only. Configured at the first step:
@@ -626,6 +650,73 @@ class VerifyStage:
             return m, new_rec
 
         pipe = None
+        # GRPO-Z train-on-arrival: a group's rows are finalized and trained in UNITS as they become final: one unit
+        # "<g>#c" of the rows complete at verification (whole drafts, scored only) and one unit "<g>#<slot>" per row
+        # that decodes on the engine. Each unit is one capture of the exact accumulator; its composition is a function
+        # of the verification outcome only, so theta_{k+1} does not depend on the tails' timing.
+        gz_on = self.grpo_z != "off"
+        gz_units: dict[str, tuple[str, list[int]]] = {}
+        gz_metas: dict[str, Any] = {}
+        gz_valid: dict[str, bool] = {}
+        gz_comps: dict[str, list] = {}
+        gz_draft_r: dict[str, list[float]] = {}
+        gz_slot_sid: dict[tuple[str, int], Any] = {}  # (group, slot) -> the sample id its row was written under
+        gz_relaunches = [0]
+        if gz_on:
+            if not self.cfg.train_overlap or (edv_on and self.n != self.g):
+                raise RuntimeError("[grpo_z] needs train_overlap; with EDV, k_drafts 1 (validator)")
+            for g in gids:
+                gz_draft_r[g] = [float(c.reward) for c in recs[g][1].completions]
+                if len(gz_draft_r[g]) != self.n:
+                    raise RuntimeError(f"[grpo_z] group {g}: {len(gz_draft_r[g])} draft rewards for N={self.n} drafts")
+            # The drafts' rows leave the data plane up front; each unit then writes only its own slots.
+            await self.sc._call_dp("clear_samples", sample_ids=[sid for g in gids for sid in old_ids[g]],
+                                   partition_id=meta.partition_id)
+            for g in gids:
+                written_ids[g] = []
+
+        async def gz_finalize(u: str, res) -> tuple[Any, bool]:
+            """Unit u's rows: rewrite into the data plane at their slots, GRPO-Z row advantages, advantage stage."""
+            from nemo_rl.experience.rollout_manager import PromptGroupRecord as _PGR
+            from thundersync_rl import grpo_z as _gz
+
+            g, sl = gz_units[u]
+            sample, rec = recs[g]
+            comps = [c for c, _ in res]
+            for c, k in zip(comps, sl):
+                o = specs[g][k]
+                a = nolanes._assistant(c.message_log)
+                a.pop(nolanes.DRAFT_REF, None)
+                st.continuation_tokens += len(a["token_ids"]) - len(o.prefix)
+                cont_max[g] = max(cont_max.get(g, 0), len(a["token_ids"]) - len(o.prefix))
+            part = _PGR(prompt_idx=rec.prompt_idx, prompt=rec.prompt, extra_env_info=rec.extra_env_info,
+                        metadata=rec.metadata, completions=comps, rollout_metrics=rec.rollout_metrics,
+                        loss_multiplier=rec.loss_multiplier)
+            # A slot written before (its unit's capture was dropped by an EDV surprise) is rewritten in place.
+            stale = [gz_slot_sid.pop((g, k)) for k in sl if (g, k) in gz_slot_sid]
+            extra = None
+            if edv_on:
+                full = edv_fields_of(g)
+                idx = torch.tensor(list(sl), dtype=torch.long)
+                extra = {name: col.index_select(0, idx) for name, col in full.items()}
+            m = await self.sc._buffer.rewrite_group_rows(
+                group_id=g, record=part, weight_version=disp_version[g], clear_sample_ids=stale,
+                extra_tags={VERIFIED_TAG: int(version)}, prev_logprobs_from_generation=self.prev_from_verify,
+                generation_indices=list(sl), extra_fields=extra,
+            )
+            written_ids[g] = [x for x in written_ids[g] if x not in set(stale)] + list(m.sample_ids)
+            for k, sid in zip(sl, m.sample_ids):
+                gz_slot_sid[(g, k)] = sid
+            # Row k's source draft (its index in g's drafts), None when it came from another group's draft of the same
+            # prompt (a shared pool) or is fresh: its baseline is then every draft of g (all independent of Y_k).
+            srcs = [specs[g][k].draft.index if specs[g][k].draft is not None and specs[g][k].draft.group_id == g
+                    else None for k in sl]
+            adv = _gz.group_row_advantages([float(c.reward) for c in comps], srcs, gz_draft_r[g], self.grpo_z,
+                                           step_scale=self.gz_scale if self.grpo_z == "loo_c" else None)
+            m, has_valid = await self.sc._advantage_stage(m, row_advantages=torch.tensor(adv, dtype=torch.float32))
+            gz_metas[u], gz_valid[u], gz_comps[u] = m, bool(has_valid), comps
+            return m, bool(has_valid)
+
         if self.cfg.train_overlap:
             # Finalize overlap (DESIGN §13; part of train_overlap): each group is rewritten and gets its group-local advantages the moment its
             # rows are final (here: while the learner verifies later chunks / trains other groups); the learner trains
@@ -639,7 +730,7 @@ class VerifyStage:
                 has_valid_of[g] = bool(has_valid)
                 return m, bool(has_valid)
 
-            pipe = FinalizePipeline(_finalize)
+            pipe = FinalizePipeline(gz_finalize if gz_on else _finalize)
 
         def count_specs(outs: list, sign: int) -> None:
             """The step's output-row statistics of one group's outputs (sign -1: an EDV re-walk replaces them)."""
@@ -657,17 +748,17 @@ class VerifyStage:
 
         n_gen_calls = [0]  # rows launched that call the engine (not complete): continuation / fresh calls
 
-        def launch(g: str, relaunch: bool = False) -> None:
+        def launch(g: str, relaunch: bool = False, gz_slots: Optional[list[int]] = None) -> None:
             """Group g's continuations / fresh slots / scoring: new engine requests at theta_k, started now.
             ``relaunch`` (EDV surprise): the group's outputs were re-walked; its rows replace the submitted ones."""
             sample, rec = recs[g]
             plen = len(drafts[g][0].prompt)
             rows = []
-            count_specs(specs[g], +1)
-            for o in specs[g]:
+            count_specs(specs[g] if gz_slots is None else [specs[g][k] for k in gz_slots], +1)
+            for k_, o in enumerate(specs[g]):
                 budget = continuation_budget(plen, len(o.prefix), self.max_new, self.max_seq)
                 complete = o.complete or budget == 0
-                n_gen_calls[0] += 0 if complete else 1
+                n_gen_calls[0] += 0 if (complete or (gz_slots is not None and k_ not in gz_slots)) else 1
                 gd = {"nl_no_log": 1, "max_new_tokens": int(budget)}
                 if self.neg == "key_reuse" and o.kind == "continued" and o.draft is not None and o.draft.rid is not None:
                     gd["nl_key_rid"] = int(o.draft.rid)  # NEGATIVE CONTROL (E4): the rejected draft's noise key
@@ -695,10 +786,34 @@ class VerifyStage:
                         "generation_data": gd,
                     }
                 )
-            tasks[g] = asyncio.ensure_future(impl.run_rows(sample, rows))
+            if gz_on:
+                # GRPO-Z units (see gz_finalize): the rows complete now, then each engine row on its own. An EDV
+                # re-walk (gz_slots: the dropped unit's slots) relaunches only those slots, as new units.
+                ks = list(range(len(rows))) if gz_slots is None else sorted(gz_slots)
+                cname = f"{g}#c" if gz_slots is None else f"{g}#c{gz_relaunches[0]}"
+                done_now = [k for k in ks if rows[k]["complete"]]
+                parts = ([(cname, done_now)] if done_now else []) + [
+                    (f"{g}#{k}", [k]) for k in ks if not rows[k]["complete"]]
+                unit_tasks = []
+                for u, sl in parts:
+                    if u in gz_units:
+                        raise RuntimeError(f"[grpo_z] unit {u} launched twice")
+                    gz_units[u] = (g, sl)
+                    tu = asyncio.ensure_future(impl.run_rows(sample, [rows[k] for k in sl]))
+                    unit_tasks.append(tu)
+                    if gz_slots is None:
+                        pipe.submit(u, tu)
+                    else:
+                        pipe.submit_extra(u, tu)
+                if gz_slots is None:
+                    tasks[g] = asyncio.ensure_future(asyncio.gather(*unit_tasks))
+                else:
+                    tasks[g] = asyncio.ensure_future(asyncio.gather(tasks[g], *unit_tasks))
+            else:
+                tasks[g] = asyncio.ensure_future(impl.run_rows(sample, rows))
             t_launch[g] = time.perf_counter()
             tasks[g].add_done_callback(lambda _f, g=g: t_done.__setitem__(g, time.perf_counter()))
-            if pipe is not None:
+            if pipe is not None and not gz_on:
                 if relaunch:
                     pipe.resubmit(g, tasks[g])
                 else:
@@ -767,130 +882,137 @@ class VerifyStage:
                     launch(g, relaunch=relaunch)
             t_launch_total += time.perf_counter() - tl
 
-        # Every chunk's call is posted up front; the learner runs them in posting order back to back (no driver
-        # round trip between chunks), and the driver collects and publishes them in the same order as they finish.
-        posted = []
-        tv = time.perf_counter()
-        if not edv_on:
-            for run_pks in chunks:
-                run_pools = [pools[pk] for pk in run_pks if pk in pools]
-                h = None
-                if run_pools:
-                    spec._null_slots[int(version)] = {pk: slots[pk] for pk in run_pks}
-                    h = await asyncio.to_thread(spec.verify_post, run_pools)
-                posted.append((run_pks, run_pools, h))
-        else:
-            # EDV: prepare every chunk, draw every row's η_g in one learner call, defer the finished rows with
-            # η_g <= e of single-group pools (predicted whole: decided by their group's training forward), and post
-            # each chunk's other rows (drafting order, as without EDV). CHECKS: the deferred rows are also posted, last.
-            for run_pks in chunks:
-                run_pools = [pools[pk] for pk in run_pks if pk in pools]
-                h = None
-                if run_pools:
-                    spec._null_slots[int(version)] = {pk: slots[pk] for pk in run_pks}
-                    h = await asyncio.to_thread(spec.verify_prepare, run_pools)
-                posted.append((run_pks, run_pools, h))
-            idx_all = [(h, i) for _, _, h in posted if h is not None for i in h["batch"]]
-            if idx_all:
-                seeds, lens = [], []
+        async def verify_phase() -> None:
+            """theta_k's verification of every pool (learner chunks, or the engine: DX) and the continuations' start."""
+            nonlocal gids, spare_sel
+            # Every chunk's call is posted up front; the learner runs them in posting order back to back (no driver
+            # round trip between chunks), and the driver collects and publishes them in the same order as they finish.
+            posted = []
+            tv = time.perf_counter()
+            if not edv_on:
+                for run_pks in chunks:
+                    run_pools = [pools[pk] for pk in run_pks if pk in pools]
+                    h = None
+                    if run_pools:
+                        spec._null_slots[int(version)] = {pk: slots[pk] for pk in run_pks}
+                        h = await asyncio.to_thread(spec.verify_post, run_pools)
+                    posted.append((run_pks, run_pools, h))
+            else:
+                # EDV: prepare every chunk, draw every row's η_g in one learner call, defer the finished rows with
+                # η_g <= e of single-group pools (predicted whole: decided by their group's training forward), and post
+                # each chunk's other rows (drafting order, as without EDV). CHECKS: the deferred rows are also posted, last.
+                for run_pks in chunks:
+                    run_pools = [pools[pk] for pk in run_pks if pk in pools]
+                    h = None
+                    if run_pools:
+                        spec._null_slots[int(version)] = {pk: slots[pk] for pk in run_pks}
+                        h = await asyncio.to_thread(spec.verify_prepare, run_pools)
+                    posted.append((run_pks, run_pools, h))
+                idx_all = [(h, i) for _, _, h in posted if h is not None for i in h["batch"]]
+                if idx_all:
+                    seeds, lens = [], []
+                    for _, _, h in posted:
+                        if h is not None:
+                            sd, ln = spec.edv_seeds(h, h["batch"])
+                            seeds += sd
+                            lens += ln
+                    etas_r = await asyncio.to_thread(
+                        ray.get, self.sc._trainer.worker_group.run_all_workers_single_data(
+                            "nl_row_etas", seeds=seeds, lengths=lens)
+                    )
+                    etas = next(e for e in etas_r if e is not None)
+                    for (h, i), eta in zip(idx_all, etas):
+                        d = h["flat"][i][1]
+                        pk_row = tuple(int(t) for t in d[0].tolist())
+                        if len(pool_groups.get(pk_row, ())) == 1 and edv.eligible(d[3], eta, edv_e):
+                            h["edv_done"][i] = edv.deferred_result(d, tuple(h["pools"][h["groups"][i]].env[i]))
+                            edv_rows[d[4]] = (h, i)
+                            edv_eta[d[4]] = float(eta)
+                    edv_stats["deferred"] = len(edv_rows)
                 for _, _, h in posted:
                     if h is not None:
-                        sd, ln = spec.edv_seeds(h, h["batch"])
-                        seeds += sd
-                        lens += ln
-                etas_r = await asyncio.to_thread(
-                    ray.get, self.sc._trainer.worker_group.run_all_workers_single_data(
-                        "nl_row_etas", seeds=seeds, lengths=lens)
-                )
-                etas = next(e for e in etas_r if e is not None)
-                for (h, i), eta in zip(idx_all, etas):
-                    d = h["flat"][i][1]
-                    pk_row = tuple(int(t) for t in d[0].tolist())
-                    if len(pool_groups.get(pk_row, ())) == 1 and edv.eligible(d[3], eta, edv_e):
-                        h["edv_done"][i] = edv.deferred_result(d, tuple(h["pools"][h["groups"][i]].env[i]))
-                        edv_rows[d[4]] = (h, i)
-                        edv_eta[d[4]] = float(eta)
-                edv_stats["deferred"] = len(edv_rows)
-            for _, _, h in posted:
+                        h["sub"] = [i for i in h["batch"] if i not in h["edv_done"]]
+                        h["futs"] = await asyncio.to_thread(spec.verify_submit, h, h["sub"])
+                replay_posted = []
+                if nolanes.checks_on():
+                    for _, _, h in posted:
+                        if h is not None and h["edv_done"]:
+                            rk = sorted(h["edv_done"])
+                            replay_posted.append((h, rk, await asyncio.to_thread(spec.verify_submit, h, rk)))
+            st.times["verify"] += time.perf_counter() - tv
+            for run_pks, run_pools, h in posted:
                 if h is not None:
-                    h["sub"] = [i for i in h["batch"] if i not in h["edv_done"]]
-                    h["futs"] = await asyncio.to_thread(spec.verify_submit, h, h["sub"])
-            replay_posted = []
-            if nolanes.checks_on():
-                for _, _, h in posted:
-                    if h is not None and h["edv_done"]:
-                        rk = sorted(h["edv_done"])
-                        replay_posted.append((h, rk, await asyncio.to_thread(spec.verify_submit, h, rk)))
-        st.times["verify"] += time.perf_counter() - tv
-        for run_pks, run_pools, h in posted:
-            if h is not None:
-                tv = time.perf_counter()
-                await asyncio.to_thread(spec.verify_collect, h)
-                st.times["verify"] += time.perf_counter() - tv
-                if int(self.cfg.spare_prompts):
-                    # XPR-S: the verifier's prompt selection (first P undropped pools, fixed order; one verify call per
-                    # step, the validator requires it). Unselected pools are discarded at publish.
-                    if spec.null_selected_keys is None:
-                        raise RuntimeError("[nolanes] spare prompts: the verifier selected no prompts (prompt drop off?)")
-                    spare_sel = {tuple(k) for k in spec.null_selected_keys}
-                chunk_s.append(round(time.perf_counter() - tv, 2))
-                call_stats.append({k: v for k, v in spec.stats.items() if k.startswith("spec/null_")})
-            if not self.colocated:
-                publish(run_pks, bool(run_pools))
-        if self.colocated:
-            # Wake on the same theta_k (no version announced: the tag stays k; checked on every rank), then start the
-            # continuations; they co-batch with the resumed lookahead drafting.
-            tc = time.perf_counter()
-            try:
-                if self.slots is not None:
-                    # the step's continuations take their slots before the next batch's drafts (released in finally:
-                    # also when the wake raises and the loop retries)
-                    self.slots.hold_drafts()
-                if self.defers_post_step_wake():
-                    # This wake is the step's refit (the loop deferred its post-step wake): the rollouts it permits
-                    # are stamped with theta_k's version, set before the dispatch gate opens.
-                    self.sc._rollout_manager.set_weight_version(int(self.sc._trainer_version))
-                await self.sc._sync_weights()
-                await asyncio.to_thread(self.check_engine_version, int(version))
-                st.times["colo_wake"] = time.perf_counter() - tc
-                arrivals0 = self.slots.cont_arrivals if self.slots is not None else 0
-                calls0 = n_gen_calls[0]
-                for run_pks, run_pools, _h in posted:
+                    tv = time.perf_counter()
+                    await asyncio.to_thread(spec.verify_collect, h)
+                    st.times["verify"] += time.perf_counter() - tv
+                    if int(self.cfg.spare_prompts):
+                        # XPR-S: the verifier's prompt selection (first P undropped pools, fixed order; one verify call per
+                        # step, the validator requires it). Unselected pools are discarded at publish.
+                        if spec.null_selected_keys is None:
+                            raise RuntimeError("[nolanes] spare prompts: the verifier selected no prompts (prompt drop off?)")
+                        spare_sel = {tuple(k) for k in spec.null_selected_keys}
+                    chunk_s.append(round(time.perf_counter() - tv, 2))
+                    call_stats.append({k: v for k, v in spec.stats.items() if k.startswith("spec/null_")})
+                if not self.colocated:
                     publish(run_pks, bool(run_pools))
-                if self.slots is not None:
-                    # every launched engine call is queued at the gate before the drafts are released
-                    await self.slots.wait_cont_arrivals(arrivals0 + n_gen_calls[0] - calls0)
-            finally:
-                if self.slots is not None:
-                    self.slots.open_drafts()
-        if edv_on:
-            for h, rk, futs in replay_posted:
-                got = await asyncio.to_thread(spec.verify_results, h, rk, futs)
-                edv_replay.update({h["flat"][i][1][4]: r for i, r in got.items()})
-        st.times["verify_wall"] = time.perf_counter() - t1
-        vprof = {k[6:]: round(v, 3) for k, v in spec.stats.items() if k.startswith("vprof/")}
-        vprof.update(nolanes.call_idle(spec.__dict__.get("_vp_calls", []), time.time() - (time.perf_counter() - t1)))
-        vprof.update({"chunks_s": chunk_s, "launch_s": round(t_launch_total, 3), "pools_s": round(t_pools, 3)})
-        st.vprof = vprof
-        st.neg_tokens += int(spec.stats.get("nl/neg_content_m_rows", 0.0) - neg_m0)  # rows the E3 negative moved
-        n_admitted = len(gids)
-        dropped_gids = [g for pk in dropped_pks for g in pool_groups[pk]]
-        if dropped_pks:
-            st.crit["spare_dropped_groups"] = len(dropped_gids)
-            gids = [g for g in gids if g not in set(dropped_gids)]
-            # Release the discarded groups' rows from the data plane (the loop only clears the groups it trains).
-            ids = [sid for g in dropped_gids for sid in old_ids[g]]
-            await self.sc._call_dp("clear_samples", sample_ids=ids, partition_id=meta.partition_id)
-            for g in dropped_gids:
-                self.sc._finalizer_metrics_by_group.pop(g, None)
-                self.sc._finalizer_rewards_by_group.pop(g, None)
-        if int(self.cfg.spare_prompts) and len(gids) != n_admitted - int(self.cfg.spare_prompts):
-            raise RuntimeError(f"[nolanes] spare prompts: {len(gids)} of {n_admitted} groups kept, expected "
-                               f"{n_admitted - int(self.cfg.spare_prompts)}")
-        missing = [g for g in gids if g not in tasks]
-        if missing:
-            raise RuntimeError(f"[nolanes] groups {missing[:5]} got no outputs (pool / chunk bookkeeping)")
-        st.draft_tokens = sum(len(d.tokens) for d in flat_d)
+            if self.colocated:
+                # Wake on the same theta_k (no version announced: the tag stays k; checked on every rank), then start the
+                # continuations; they co-batch with the resumed lookahead drafting.
+                tc = time.perf_counter()
+                try:
+                    if self.slots is not None:
+                        # the step's continuations take their slots before the next batch's drafts (released in finally:
+                        # also when the wake raises and the loop retries)
+                        self.slots.hold_drafts()
+                    if self.defers_post_step_wake():
+                        # This wake is the step's refit (the loop deferred its post-step wake): the rollouts it permits
+                        # are stamped with theta_k's version, set before the dispatch gate opens.
+                        self.sc._rollout_manager.set_weight_version(int(self.sc._trainer_version))
+                    await self.sc._sync_weights()
+                    await asyncio.to_thread(self.check_engine_version, int(version))
+                    st.times["colo_wake"] = time.perf_counter() - tc
+                    arrivals0 = self.slots.cont_arrivals if self.slots is not None else 0
+                    calls0 = n_gen_calls[0]
+                    for run_pks, run_pools, _h in posted:
+                        publish(run_pks, bool(run_pools))
+                    if self.slots is not None:
+                        # every launched engine call is queued at the gate before the drafts are released
+                        await self.slots.wait_cont_arrivals(arrivals0 + n_gen_calls[0] - calls0)
+                finally:
+                    if self.slots is not None:
+                        self.slots.open_drafts()
+            if edv_on:
+                for h, rk, futs in replay_posted:
+                    got = await asyncio.to_thread(spec.verify_results, h, rk, futs)
+                    edv_replay.update({h["flat"][i][1][4]: r for i, r in got.items()})
+            st.times["verify_wall"] = time.perf_counter() - t1
+            vprof = {k[6:]: round(v, 3) for k, v in spec.stats.items() if k.startswith("vprof/")}
+            vprof.update(nolanes.call_idle(spec.__dict__.get("_vp_calls", []), time.time() - (time.perf_counter() - t1)))
+            vprof.update({"chunks_s": chunk_s, "launch_s": round(t_launch_total, 3), "pools_s": round(t_pools, 3)})
+            st.vprof = vprof
+            st.neg_tokens += int(spec.stats.get("nl/neg_content_m_rows", 0.0) - neg_m0)  # rows the E3 negative moved
+            n_admitted = len(gids)
+            dropped_gids = [g for pk in dropped_pks for g in pool_groups[pk]]
+            if dropped_pks:
+                st.crit["spare_dropped_groups"] = len(dropped_gids)
+                gids = [g for g in gids if g not in set(dropped_gids)]
+                # Release the discarded groups' rows from the data plane (the loop only clears the groups it trains).
+                ids = [sid for g in dropped_gids for sid in old_ids[g]]
+                await self.sc._call_dp("clear_samples", sample_ids=ids, partition_id=meta.partition_id)
+                for g in dropped_gids:
+                    self.sc._finalizer_metrics_by_group.pop(g, None)
+                    self.sc._finalizer_rewards_by_group.pop(g, None)
+            if int(self.cfg.spare_prompts) and len(gids) != n_admitted - int(self.cfg.spare_prompts):
+                raise RuntimeError(f"[nolanes] spare prompts: {len(gids)} of {n_admitted} groups kept, expected "
+                                   f"{n_admitted - int(self.cfg.spare_prompts)}")
+            missing = [g for g in gids if g not in tasks]
+            if missing:
+                raise RuntimeError(f"[nolanes] groups {missing[:5]} got no outputs (pool / chunk bookkeeping)")
+            st.draft_tokens = sum(len(d.tokens) for d in flat_d)
+
+        engine_mode = bool(getattr(self, "engine_verify", False))
+        if not engine_mode:
+            await verify_phase()
         tw = time.perf_counter()
         if self.cfg.train_overlap:
             # R31 Option A (exact variant): each group trains the moment its G rows are final, in ARRIVAL order,
@@ -926,6 +1048,50 @@ class VerifyStage:
                     out.update({h["flat"][i][1][4]: r for i, r in got.items()})
                 edv_replay.update(out)
                 return out
+
+            def unit_group(u: str) -> str:
+                return gz_units[u][0] if gz_on else u
+
+            def edv_slots_of(u: str) -> dict[int, str]:
+                """Slot -> draft key of the deferred whole rows of group / unit u (a unit: only its slots)."""
+                sl = edv_slots(unit_group(u))
+                if gz_on:
+                    mine = set(gz_units[u][1])
+                    sl = {k: key for k, key in sl.items() if k in mine}
+                return sl
+
+            async def gz_edv_rewalk(u: str, keys: list[str]) -> None:
+                """GRPO-Z + EDV surprise (k_drafts 1: N = G drafts, envelope 1, no ⊥): verify the deferred rows, walk
+                the group's pool again, and relaunch the dropped unit's slots as new units. Only the surprised slots
+                can change (validated): every other unit of the group stands."""
+                g, sl = gz_units[u]
+                got = await edv_verify(keys)
+                h, _ = edv_rows[keys[0]]
+                name = h["groups"][edv_rows[keys[0]][1]]
+                once = ("null_grid_pit", "edv_shadow")
+                for i in [i for i, gg in enumerate(h["groups"]) if gg == name]:
+                    k = h["flat"][i][1][4]
+                    h["res"][i] = got[k] if k in keys else {a: v for a, v in h["res"][i].items() if a not in once}
+                plans = await asyncio.to_thread(spec.edv_rewalk, h, name)
+                for k in keys:
+                    edv_rows.pop(k)
+                pk = next(pk for pk in pool_groups if g in pool_groups[pk])
+                if pool_groups[pk] != [g] or len(plans) != self.g:
+                    raise RuntimeError(f"[grpo_z] EDV re-walk of {g}: {len(plans)} plans for a pool of {pool_groups[pk]}")
+                new = outputs_of_group([draft_by_key[p.engine_key] for p in plans], plans, self.g)
+                changed = [k for k, (a, b) in enumerate(zip(specs[g], new))
+                           if (a.kind, list(a.prefix), id(a.draft)) != (b.kind, list(b.prefix), id(b.draft))]
+                if not set(changed) <= set(sl):
+                    raise RuntimeError(f"[grpo_z] EDV re-walk of {g} changed slots {changed} outside the dropped unit "
+                                       f"{u} {sl} (needs k_drafts 1: no ⊥)")
+                count_specs([specs[g][k] for k in sl], -1)
+                specs[g] = new
+                gz_metas.pop(u, None)
+                gz_units.pop(u)
+                gz_valid.pop(u, None)
+                gz_comps.pop(u, None)
+                gz_relaunches[0] += 1
+                launch(g, relaunch=True, gz_slots=list(sl))
 
             async def edv_rewalk(g: str, keys: list[str]) -> None:
                 """Deferred rows of g were not accepted whole: verify them, walk the pool again with the true outcomes,
@@ -963,7 +1129,7 @@ class VerifyStage:
                     if len(masks) != 1:
                         raise RuntimeError(f"[edv] group {g}: learner ranks disagree on the surprise mask {masks}")
                     mask = masks.pop()
-                    sl = edv_slots(g)
+                    sl = edv_slots_of(g)
                     decided = {}
                     for lg in logs:
                         for slot, bg, eta, ok in lg[j]["decisions"]:
@@ -990,7 +1156,10 @@ class VerifyStage:
                             raise RuntimeError(f"[edv] group {g}: surprise mask {mask:#x} names slots without a deferred row")
                         edv_stats["surprises"] += len(keys)
                         dropped.add(g)
-                        await edv_rewalk(g, keys)
+                        if gz_on:
+                            await gz_edv_rewalk(g, keys)
+                        else:
+                            await edv_rewalk(g, keys)
                 return dropped
             st.times["train_in_stage"] = 0.0
             arrival: list[str] = []
@@ -1000,12 +1169,35 @@ class VerifyStage:
 
             def edv_risk(g: str) -> float:
                 """The largest η_g among g's deferred rows (its surprise risk is increasing in η_g); 0 without one."""
-                return max((edv_eta[k] for k in edv_slots(g).values()), default=0.0)
+                return max((edv_eta[k] for k in edv_slots_of(g).values()), default=0.0)
+
+            # GRPO-Z: finalize units are re-chunked into TRAIN units of exactly D = learner DP x MBS rows (any groups,
+            # arrival order) so every DP rank (and every EP peer) trains one row per capture; the step's P x G rows
+            # are a multiple of D, so nothing is left over. Train-unit composition follows arrival (theta_{k+1}'s
+            # bits may follow tail timing; gradients need accuracy only, user rule 10-19); the rows' law is unchanged.
+            gz_dp = int(self.sc._trainer.sharding_annotations.get_axis_size("data_parallel")) if gz_on else 1
+            gz_carry: list[tuple[str, Any]] = []
+            gz_chunk_metas: dict[str, Any] = {}
 
             async def train_ready(batch: list[tuple[str, tuple[Any, bool]]]) -> None:
                 """EDV: the riskiest groups (deferred rows with η_g near e) train first, in a call of their own, so a
                 surprise is found at the start of training and its continuation launches early. Order only: the
                 accumulator is order-invariant (R31)."""
+                if gz_on:
+                    for u, (m, has_valid) in batch:
+                        arrival.append(u)
+                        self.stage_has_valid_tokens |= bool(has_valid)
+                        gz_carry.extend((u, m.subset([i])) for i in range(len(m.sample_ids)))
+                    chunks: list[tuple[str, tuple[Any, bool]]] = []
+                    while len(gz_carry) >= gz_dp:
+                        part, gz_carry[:] = gz_carry[:gz_dp], gz_carry[gz_dp:]
+                        tm = part[0][1] if gz_dp == 1 else part[0][1].concat(*[x[1] for x in part[1:]])
+                        name = f"t{len(gz_chunk_metas)}"
+                        gz_chunk_metas[name] = tm
+                        chunks.append((name, (tm, True)))
+                    if chunks:
+                        await train_call(chunks, record_arrival=False)
+                    return
                 if not edv_on or len(batch) < 2:
                     return await train_call(batch)
                 ranked = sorted(batch, key=lambda x: -edv_risk(x[0]))
@@ -1016,22 +1208,24 @@ class VerifyStage:
                 if rest:
                     await train_call(rest)
 
-            async def train_call(batch: list[tuple[str, tuple[Any, bool]]]) -> None:
+            async def train_call(batch: list[tuple[str, tuple[Any, bool]]], record_arrival: bool = True) -> None:
                 # Every group finalized when the learner became free trains in ONE learner call, one group after the
                 # other with one accumulator capture per group (PERF_RECONCILE_1102 lever 1: no driver round trip
                 # between groups). What each group trains is unchanged.
                 call: list[Any] = []
                 called: list[str] = []
                 for g, (m, has_valid) in batch:
-                    arrival.append(g)
-                    self.stage_has_valid_tokens |= bool(has_valid)
+                    if record_arrival:
+                        arrival.append(g)
+                        self.stage_has_valid_tokens |= bool(has_valid)
                     if not has_valid:
                         continue
-                    if neg_late and len(trained_order) == len(gids) - 1 and trained_order and trained_order[0] != g:
+                    n_units = (sum(len(sl) for _, sl in gz_units.values()) // gz_dp) if gz_on else len(gids)
+                    if neg_late and len(trained_order) == n_units - 1 and trained_order and trained_order[0] != g:
                         # NEGATIVE CONTROL (P5): the step does not wait for its last-finishing group; the first group
                         # trains a second time in its place (same group and capture counts).
                         st.neg_tokens += len(m.sample_ids)
-                        g, m = trained_order[0], metas[trained_order[0]]
+                        g, m = trained_order[0], (gz_chunk_metas if gz_on else metas)[trained_order[0]]
                     self._groups_trained += 1
                     trained_order.append(g)
                     trained_ids.extend(m.sample_ids)
@@ -1043,7 +1237,7 @@ class VerifyStage:
                 await asyncio.to_thread(trainer.train_groups_from_metas, call, train_fields=train_fields)
                 st.times["train_in_stage"] += time.perf_counter() - tt
                 st.train_calls += 1
-                if edv_on and any(edv_slots(g) for g in called):
+                if edv_on and any(edv_slots_of(g) for g in called):
                     # Dropped captures: those groups did not train (their re-walked rows train when final).
                     for g in await edv_after_call(called):
                         m = call[called.index(g)]
@@ -1056,7 +1250,52 @@ class VerifyStage:
                         ray.get, trainer.worker_group.run_all_workers_single_data("nl_edv_take")
                     )
 
-            probes = await pipe.drain(len(gids), train_ready)
+            if engine_mode:
+                # DX: the learner trains whatever is final while the engine verifies the step's pools (open drain:
+                # the verify phase closes the pipeline once every pool is published).
+                vtask = asyncio.ensure_future(verify_phase())
+
+                def _verify_done(f) -> None:
+                    if f.cancelled():
+                        return
+                    err = f.exception()
+                    if err is not None:
+                        pipe.fail(err)
+                    else:
+                        pipe.close()
+
+                vtask.add_done_callback(_verify_done)
+                try:
+                    probes = await pipe.drain(None, train_ready)
+                finally:
+                    if not vtask.done():
+                        vtask.cancel()
+                await vtask
+            else:
+                probes = await pipe.drain(len(gz_units) if gz_on else len(gids), train_ready)
+            if gz_on and gz_carry:
+                raise RuntimeError(f"[grpo_z] {len(gz_carry)} finalized rows left untrained (not a multiple of DP "
+                                   f"{gz_dp}): the step's rows must be a multiple of learner DP x MBS")
+            if gz_on:
+                # Per-group views for the checks and the step meta: units in slot order.
+                from nemo_rl.experience.rollout_manager import PromptGroupRecord as _PGR
+
+                for g in gids:
+                    us = sorted((u for u, (gg, _) in gz_units.items() if gg == g), key=lambda u: gz_units[u][1][0])
+                    mg = None
+                    comps_g: dict[int, Any] = {}
+                    for u in us:
+                        mg = gz_metas[u] if mg is None else mg.concat(gz_metas[u])
+                        for k, c in zip(gz_units[u][1], gz_comps[u]):
+                            comps_g[k] = c
+                    metas[g] = mg
+                    has_valid_of[g] = True  # every finalized row trains (in DP-sized train units), valid tokens or not
+                    rec = recs[g][1]
+                    recs_out[g] = _PGR(prompt_idx=rec.prompt_idx, prompt=rec.prompt, extra_env_info=rec.extra_env_info,
+                                       metadata=rec.metadata, completions=[comps_g[k] for k in sorted(comps_g)],
+                                       rollout_metrics=rec.rollout_metrics, loss_multiplier=rec.loss_multiplier)
+                    if sorted(comps_g) != list(range(self.g)):
+                        raise RuntimeError(f"[grpo_z] group {g}: slots {sorted(comps_g)} finalized, expected 0..{self.g - 1}")
             st.times["learner_wait"] = probes["learner_wait"]
             st.times["finalize_hidden"] = pipe.prepare_s
             st.crit["tail_exposed"] = round(probes["tail_exposed"], 2)
@@ -1073,21 +1312,23 @@ class VerifyStage:
             if bad and not neg_late:
                 raise RuntimeError(f"[nolanes] step {int(version)}: the trained rows are not the step's output rows "
                                    f"exactly once (missing {missing[:3]}, extra / duplicated {extra[:3]})")
-            if nolanes.checks_on() and trained_order:
+            if nolanes.checks_on() and trained_order and self.cfg.train_overlap_accum == "int64":
                 # R32 item 1: re-run the window's FIRST trained group at its end; the learner compares the gradient
                 # with that group's first contribution (bitwise / digest) and drops it.
                 await asyncio.to_thread(
                     ray.get, trainer.worker_group.run_all_workers_single_data("exact_accum_arm_replay")
                 )
                 await asyncio.to_thread(
-                    trainer.train_groups_from_metas, [metas[trained_order[0]]], train_fields=train_fields
+                    trainer.train_groups_from_metas, [(gz_chunk_metas if gz_on else metas)[trained_order[0]]],
+                    train_fields=train_fields
                 )
             st.times["continue_after_verify"] = time.perf_counter() - tw
             t_post = time.perf_counter()
             st.times["continue"] = time.perf_counter() - (t2 if t2 is not None else tw)
             st.arrival_inversions = sum(
                 1 for i in range(len(arrival)) for j in range(i + 1, len(arrival))
-                if gids.index(arrival[i]) > gids.index(arrival[j])
+                if gids.index(arrival[i].rsplit("#", 1)[0] if gz_on else arrival[i])
+                > gids.index(arrival[j].rsplit("#", 1)[0] if gz_on else arrival[j])
             )
         else:
             results = [await tasks[g] for g in gids]  # fixed group order (R2), whatever order they finish in
@@ -1218,6 +1459,17 @@ class VerifyStage:
         nolanes.check_provenance(new_meta.tags, int(version), "verify stage output")
         if edv_on:
             edv_finish_step(int(version))
+        if gz_on:
+            # loo_c: the next step's scale from this step's FINAL rewards (F_{k+1}-measurable for step k+1).
+            from thundersync_rl import grpo_z as _gz
+
+            fr = [float(c.reward) for g in gids for c in recs_out[g].completions]
+            gi = [i for i, g in enumerate(gids) for _ in recs_out[g].completions]
+            self.gz_scale = _gz.next_step_scale(torch.tensor(gi), torch.tensor(fr))
+            n_units = len(gz_units)
+            print(f"[grpo_z] step={int(version)} mode={self.grpo_z} units={n_units} "
+                  f"row_units={sum(1 for u in gz_units if not u.endswith('#c'))} next_scale={self.gz_scale:.4f}",
+                  flush=True)
         if st.dropped_unlogged:
             msg = (f"[nolanes] WARN step={int(version)}: {st.dropped_unlogged} of {st.drafts} drafts dropped (hidden log or "
                    "version tags shorter than the draft); their slots decode fresh")
@@ -1315,6 +1567,12 @@ class VerifyStage:
         if caps != [self._groups_trained]:
             raise RuntimeError(f"[nolanes] train overlap step {version}: learner captures {caps} != groups trained "
                                f"{self._groups_trained} (a train call did not fold into the accumulator)")
+        if any(float(r.get("inplace", 0.0)) for r in reps):
+            # In-place fp32 accumulation (train_overlap_accum=inplace): no order invariance is claimed, nothing to
+            # re-sum; EDV retrains (an exact drop) are reported. Trained-exactly-once is checked on the driver side.
+            print(f"[nolanes grad accum] step={version} inplace: discards={int(mx('discards'))} "
+                  f"retrain_calls={int(mx('retrain_calls'))} retrain_s={mx('retrain_s'):.2f}", flush=True)
+            return
         if not nolanes.checks_on():
             return
         checked = sum(float(r.get("checked", 0.0)) for r in reps)

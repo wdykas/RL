@@ -2299,7 +2299,13 @@ class MegatronPolicyWorkerImpl(
             if state.get("exact_accum") is not None and self._capture_may_discard()
             else None
         )
-        if state.get("exact_accum") is not None:
+        inplace = bool(getattr(state.get("exact_accum"), "inplace", False))
+        if inplace and discard_snapshot is not None and "inplace_calls" not in state:
+            # In-place accumulation cannot drop one call: keep the step-start counters and every call's inputs so a
+            # discard can retrain the step without it (_inplace_retrain). Inputs only (host refs), no gradients.
+            state["inplace_step_snapshot"] = discard_snapshot
+            state["inplace_calls"] = []
+        if state.get("exact_accum") is not None and not inplace:
             # R33 hardening: each group's backward starts on an idle device (nothing from the previous group, the
             # data-plane fetch or the moment park still in flight), so arrival timing cannot shift what overlaps it.
             torch.cuda.synchronize()
@@ -2334,11 +2340,19 @@ class MegatronPolicyWorkerImpl(
                     state["exact_replay"] = False
                 elif discard_snapshot is not None and self._pre_capture_discard(state):
                     # The call's gradient is dropped, not added, and the step's counters are those before the call.
-                    state["exact_accum"].discard()
-                    self._restore_step_counters(state, discard_snapshot)
+                    if inplace:
+                        self._inplace_retrain(state, discard_snapshot)
+                    else:
+                        state["exact_accum"].discard()
+                        self._restore_step_counters(state, discard_snapshot)
                 else:
-                    # One call = one prompt group (nolanes train overlap): fold its gradient out of the buffers.
+                    # One call = one prompt group (nolanes train overlap): fold its gradient out of the buffers
+                    # (int64), or leave it in them (inplace) and remember the call for a possible retrain.
                     state["exact_accum"].capture()
+                    if inplace and discard_snapshot is not None:
+                        state["inplace_calls"].append(
+                            (list(datas), None if micro_batch_sizes is None else list(micro_batch_sizes))
+                        )
             if stream_bucket is not None:
                 counts = state["grad_stream_group_counts"]
                 prev_seqs, prev_toks = counts.get(stream_bucket.group, (0.0, 0.0))
@@ -2371,6 +2385,45 @@ class MegatronPolicyWorkerImpl(
                     "failed to restore mcore hooks after train_microbatch error"
                 )
             raise
+
+    def _inplace_retrain(self, state: dict[str, Any], discard_snapshot: dict[str, Any]) -> None:
+        """In-place accumulation (``NEMO_RL_EXACT_GRAD_ACCUM=inplace``): drop the call that just ran by zeroing the grad
+        buffers and re-running the step's earlier captured calls, in their order, from the step-start counters. Exact:
+        the buffers then hold exactly those calls' gradients (the dropped call contributes nothing). Rare (EDV
+        surprises, ~0.003 / step expected); costs one re-run of the calls trained so far."""
+        ea = state["exact_accum"]
+        calls = list(state.get("inplace_calls") or [])
+        if state.get("draft_step_state") is not None:
+            raise RuntimeError("[exact_grad_accum] inplace retrain with a draft-head step open is not built")
+        t0 = time.perf_counter()
+        ea.zero_grads()
+        self._restore_step_counters(state, state["inplace_step_snapshot"])
+        yield_ok = getattr(self, "_yield_ok", False)
+        self._yield_ok = False  # posted verifications ran with the first pass; a retrain only re-trains
+        try:
+            for datas_i, mbs_i in calls:
+                call_has_live = state["skip_zero_advantage_rows"] and any(
+                    bool(self._live_rows(d).any()) for d in datas_i
+                )
+                pieces = [
+                    self._prepare_train_piece(
+                        state, d, state["mbs"] if mbs_i is None else mbs_i[k], call_has_live=call_has_live
+                    )
+                    for k, d in enumerate(datas_i)
+                ]
+                pieces = [p for p in pieces if p is not None]
+                for call, variable_shapes in (self._pipeline_call_groups(pieces) if pieces else []):
+                    self._run_train_pieces(state, call, variable_shapes)
+                self._inplace_retrain_call_done()
+        finally:
+            self._yield_ok = yield_ok
+        # The counters / metric lists are those before the dropped call (the re-run reproduced them).
+        self._restore_step_counters(state, discard_snapshot)
+        ea.retrained(len(calls), time.perf_counter() - t0)
+
+    def _inplace_retrain_call_done(self) -> None:
+        """After each re-run call of ``_inplace_retrain`` (a subclass hook: consume / check what the forward recorded)."""
+        return None
 
     def _capture_may_discard(self) -> bool:
         """Whether ``_pre_capture_discard`` can refuse a call's capture (a subclass hook; never in stock)."""
@@ -2828,9 +2881,18 @@ class MegatronPolicyWorkerImpl(
                 "captures": float(ea.captures), "bytes": float(ea.nbytes), "capture_s": float(ea.capture_s),
                 "park_s": float(getattr(self, "_park_s", 0.0)),
                 **ea.order_check, **ea.replay,
+                **(ea.report() if getattr(ea, "inplace", False) else {}),
             }
             state["exact_accum"] = None
-            state["exact_accum_done"] = ea  # released (and the moments unparked) right before the optimizer step
+            state.pop("inplace_calls", None)
+            state.pop("inplace_step_snapshot", None)
+            if getattr(ea, "inplace", False):
+                # Nothing parked, nothing to release: the grad buffers already hold the step's sum.
+                exact_accum_report["unpark_s"] = 0.0
+                exact_accum_report["reserved_gib"] = torch.cuda.memory_reserved() / 2**30
+                exact_accum_report["peak_gib"] = torch.cuda.max_memory_allocated() / 2**30
+            else:
+                state["exact_accum_done"] = ea  # released (and the moments unparked) right before the optimizer step
 
         # Recover policy and draft counts with one existing DP collective.
         # The draft slice is length-1 while the step is active and empty
@@ -2975,7 +3037,7 @@ class MegatronPolicyWorkerImpl(
         # opt.step clips internally (clip_grad config); operates on the
         # already-rescaled grad. Returns (success, grad_norm, num_zeros).
         update_successful, grad_norm, num_zeros_in_grad = self.optimizer.step()
-        if exact_accum_report is not None:
+        if exact_accum_report is not None and not exact_accum_report.get("inplace"):
             # The first optimizer step creates the Adam moments in fresh allocations; move them into the persistent
             # overlap buffer once, so the buffer + moments never coexist across the next verify (X1).
             self._adopt_moments_into_overlap_buffer()
@@ -3272,8 +3334,8 @@ class MegatronPolicyWorkerImpl(
         """CHECKS (R32 item 1): the next train call re-runs an earlier group; its gradient is compared with that
         group's first contribution and dropped (no add, no counts, no metrics)."""
         state = self._assert_step_open()
-        if state.get("exact_accum") is None:
-            raise RuntimeError("exact_accum_arm_replay without NEMO_RL_EXACT_GRAD_ACCUM")
+        if state.get("exact_accum") is None or getattr(state["exact_accum"], "inplace", False):
+            raise RuntimeError("exact_accum_arm_replay needs NEMO_RL_EXACT_GRAD_ACCUM=1 (int64; not inplace)")
         state["exact_replay"] = True
 
     @torch.no_grad()
@@ -3340,16 +3402,34 @@ class MegatronPolicyWorkerImpl(
         """``NEMO_RL_EXACT_GRAD_ACCUM`` (nolanes train overlap, R31): ``1`` folds every ``train_microbatches`` call's
         gradient into the order-invariant int64-limb accumulator (exact_grad_accum.py), ``naive`` is the negative
         control (plain fp32 sum in call order). ``NEMO_RL_EXACT_GRAD_ACCUM_CHECK=<n>`` keeps n elements per buffer per
-        call and re-sums them in other orders at finish (CHECKS runs). Allocated at begin, dropped at finalize."""
+        call and re-sums them in other orders at finish (CHECKS runs). Allocated at begin, dropped at finalize.
+        ``inplace`` (the train_overlap default): the calls accumulate in the fp32 grad buffers in arrival order, as stock
+        (exact_grad_accum.InPlaceGradAccumulator: 0 extra bytes, no moment park, no capture pass); an EDV discard
+        retrains the step's earlier calls (``_inplace_retrain``)."""
         mode = os.environ.get("NEMO_RL_EXACT_GRAD_ACCUM", "").strip()
         if mode in ("", "0"):
             return None
-        if mode not in ("1", "naive"):
-            raise ValueError(f"NEMO_RL_EXACT_GRAD_ACCUM={mode!r}: expected 1 or naive")
+        if mode not in ("1", "naive", "inplace"):
+            raise ValueError(f"NEMO_RL_EXACT_GRAD_ACCUM={mode!r}: expected 1, naive or inplace")
         if grad_streaming is not None:
             raise ValueError("NEMO_RL_EXACT_GRAD_ACCUM and gradient streaming both own the grad buffers")
         if not self.cfg["megatron_cfg"]["distributed_data_parallel_config"]["grad_reduce_in_fp32"]:
             raise ValueError("NEMO_RL_EXACT_GRAD_ACCUM needs grad_reduce_in_fp32 (fp32 grad buffers)")
+        if mode == "inplace":
+            from nemo_rl.algorithms.exact_grad_accum import InPlaceGradAccumulator
+
+            if int(os.environ.get("NEMO_RL_EXACT_GRAD_ACCUM_CHECK", "0") or 0) > 0:
+                raise ValueError("NEMO_RL_EXACT_GRAD_ACCUM_CHECK (order re-sum) needs NEMO_RL_EXACT_GRAD_ACCUM=1")
+            torch.cuda.reset_peak_memory_stats()
+            self._park_s = 0.0
+            acc = InPlaceGradAccumulator([buf.grad_data for buf in self.model.buffers + self.model.expert_parallel_buffers])
+            acc.reset()
+            if self.rank == 0 and not getattr(self, "_exact_accum_logged", False):
+                self._exact_accum_logged = True
+                print(f"[exact_grad_accum] mode=inplace buffers={len(acc.grads)} "
+                      f"elements={sum(g.numel() for g in acc.grads)} accumulator 0.00 GiB/rank "
+                      "(fp32 grad buffers, arrival order)", flush=True)
+            return acc
         from nemo_rl.algorithms.exact_grad_accum import (
             NaiveArrivalOrderAccumulator,
             OrderInvariantGradAccumulator,
