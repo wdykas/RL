@@ -191,6 +191,17 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
 
+
+def _grad_scale(factor: float) -> torch.Tensor:
+    """``DistributedDataParallel.scale_gradients`` factor: an fp32 scalar tensor on the current device.
+
+    Megatron-LM main's ``ParamAndGradBuffer.scale_gradients`` takes a tensor (it reads ``.is_cuda``); older
+    Megatron-Core multiplied by a Python float. Both multiply in fp32 (the float is cast to the fp32 opmath type),
+    so the scaled gradients are the same bits.
+    """
+    return torch.tensor(float(factor), dtype=torch.float32, device=torch.cuda.current_device())
+
+
 def _defer_metrics_ctx():
     """Learner loss metrics as device scalars inside a forward/backward call (opt-in,
     ``NEMO_RL_LEARNER_DEFER_METRICS=1``: no ``.item()`` between a micro-batch's forward
@@ -1449,7 +1460,7 @@ class MegatronPolicyWorkerImpl(
             # Finish any overlap on the comm stream before touching the reduced
             # gradient buffers (including distributed-optimizer gradient shards).
             torch.cuda.synchronize()
-            self.model.scale_gradients(token_factor)
+            self.model.scale_gradients(_grad_scale(token_factor))
         metrics = [
             rescale_loss_metrics(
                 m,
@@ -2882,7 +2893,7 @@ class MegatronPolicyWorkerImpl(
         # below sees the rescaled grads; for all_reduce the result is the
         # global mean grad; for reduce_scatter (dist-opt) it's the shard.
         # Either way, opt.step sees the right-normalized gradient.
-        self.model.scale_gradients(inv_n)
+        self.model.scale_gradients(_grad_scale(inv_n))
         if draft_step_state.active:
             draft_step_state.correct_main_grads(
                 self.model.parameters(),
@@ -6400,5 +6411,7 @@ class MegatronPolicyWorkerImpl(
 @ray.remote(
     runtime_env=get_runtime_env_for_policy_worker("megatron_policy_worker")
 )  # pragma: no cover
+
+
 class MegatronPolicyWorker(MegatronPolicyWorkerImpl):
     pass

@@ -391,7 +391,10 @@ def _wrap(orig):
         router_replay: Any = None,
         dense_output: bool = False,
         precomputed_indices: Optional[torch.Tensor] = None,
+        **kwargs: Any,
     ):
+        # kwargs: Megatron-LM main's qb_histogram / qb_bin_bounds (quantile balancing), topk_indices (fused dense
+        # output buffer) and allow_batch_invariant_sigmoid_topk; forwarded to MCore's routing when cross-fade is off.
         m, k, extra = _STATE["m"], _STATE["k"], _STATE["extra"]
         if m is None:
             return orig(
@@ -407,6 +410,11 @@ def _wrap(orig):
                 router_replay=router_replay,
                 dense_output=dense_output,
                 precomputed_indices=precomputed_indices,
+                **kwargs,
+            )
+        if kwargs.get("qb_histogram") is not None or kwargs.get("topk_indices") is not None:
+            raise NotImplementedError(
+                "cross-fade routing: quantile-balancing histograms / a fused top-k index buffer are not built"
             )
         if score_function != "sigmoid" or expert_bias is None or use_pre_softmax:
             raise NotImplementedError(

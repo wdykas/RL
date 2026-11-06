@@ -114,6 +114,11 @@ def main() -> None:
         from thundersync_rl.colo import configure_driver as configure_colo_driver
 
         configure_colo_driver(config)
+    elif (config.get("thundersync") or {}).get("mode") == "sprsd":
+        # SPR-SD: the stock loop (no ThunderSync stage) with XS-SD's keyed sampler + tree drafter on every row.
+        from thundersync_rl.sprsd import configure_driver as configure_sprsd_driver
+
+        configure_sprsd_driver(config)
     config = MasterConfig(**config)
     print("Applied CLI overrides")
 

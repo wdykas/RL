@@ -529,9 +529,29 @@ def decode_step(buffers, x, z, dt, B, C, A, D, dt_bias, batch_indices, ssm_state
     return out.unsqueeze(1)
 
 
+_SERVES: dict[int, bool] = {}
+
+
+def _serves(buffers) -> bool:
+    """This step serves a layer iff its buffers are z-free and ``supported_config`` accepts their shapes (cached per
+    buffer object). Before Megatron-LM #8221 only the layers it serves got z-free buffers (``mamba_bi_decode``); on
+    main every layer's buffers are z-free and the rest keep main's decode."""
+    key = id(buffers)
+    hit = _SERVES.get(key)
+    if hit is None:
+        if getattr(buffers, "z", None) is not None:
+            hit = False
+        else:
+            _, chunk, nheads, headdim = buffers.x.shape
+            ngroups, dstate = buffers.B.shape[-2:]
+            hit = supported_config(nheads, headdim, ngroups, dstate, chunk, buffers.x.dtype, buffers.x.device)
+        _SERVES[key] = hit
+    return hit
+
+
 def _scan(buffers, x, z, dt, B, C, A, D, dt_bias, batch_indices, ssm_state):
-    """``batch_invariant_decode_buffered_scan``: this step on z-free buffers, MCore's path on buffers with z."""
-    if buffers.z is None:
+    """``batch_invariant_decode_buffered_scan``: this step on the layers it serves, MCore's path on the others."""
+    if _serves(buffers):
         return decode_step(buffers, x, z, dt, B, C, A, D, dt_bias, batch_indices, ssm_state)
     return _ORIG["scan"](buffers, x, z, dt, B, C, A, D, dt_bias, batch_indices, ssm_state)
 

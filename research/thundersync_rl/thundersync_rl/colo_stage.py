@@ -208,12 +208,15 @@ class ColoStage(VerifyStage):
                 failures.append(f"{name} law")
         negative = bool(os.environ.get("THUNDERSYNC_NL_NEG", "").strip()) or os.environ.get(SKIP_RESHARD_ENV) == "1"
         print(f"[colo checks] step={step} {'FAIL ' + str(failures) if failures else 'EXACT'}", flush=True)
-        if failures and not negative:
+        # thundersync.report_only (diagnostic runs, e.g. a multi-step T1 of a path with a known defect): failed
+        # checks are printed (FAIL above) but do not stop the run, so later steps can still be compared.
+        report_only = bool(getattr(self.cfg, "report_only", False))
+        if failures and not negative and not report_only:
             raise RuntimeError(f"[colo] CHECKS step {step} failed: {failures}")
         del torch
 
     def check_train_lp(self, step_metrics: dict, version: int) -> None:
-        if os.environ.get(SKIP_RESHARD_ENV) == "1":
+        if os.environ.get(SKIP_RESHARD_ENV) == "1" or bool(getattr(self.cfg, "report_only", False)):
             # Negative control: report the sentinel, never stop on it (the run must reach its later steps).
             bad = float(step_metrics.get("train_gen_lp_inexact_tokens", -1))
             print(f"[nolanes sentinel] step={version} train-lp tokens={float(step_metrics.get('train_gen_lp_tokens', 0)):.0f} "

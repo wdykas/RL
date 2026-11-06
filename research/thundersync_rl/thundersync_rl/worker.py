@@ -535,6 +535,42 @@ class KeyedBatchError(RuntimeError):
     """A request whose sampling parameters the keyed sampler cannot serve reached a keyed engine."""
 
 
+def _key_check_positions(context: Any, ids: np.ndarray, pos: np.ndarray) -> np.ndarray:
+    """``pos`` with the partial prefill chunk's row set to -1 (unknown: the key checks skip it).
+
+    With chunked prefill, MCore samples the row of a request whose prompt is not done yet
+    (``context.chunked_prefill_request_id``: more prompt tokens follow this step) and discards the draw: the next
+    chunk's first prompt token replaces it. Its key position len(prompt) is drawn again, and kept, by the request's
+    final chunk, so the discarded draw is not a key reuse. The draw itself is unchanged (same noise as unchunked).
+    """
+    cid = int(getattr(context, "chunked_prefill_request_id", -1))
+    if cid < 0:
+        return pos
+    hit = ids == cid
+    if not hit.any():
+        return pos
+    out = pos.copy()
+    out[hit] = -1
+    return out
+
+
+def _hidden_log_rows(context: Any, tag: np.ndarray, rids: np.ndarray, a: int, e: int) -> list[int]:
+    """Active rows (relative to ``a``) whose hidden state and version tag the draft hidden log records: this rank's
+    tagged rows (``tag == 1``) except a partial prefill chunk's row. MCore samples that row and discards the draw (more
+    prompt tokens follow, ``context.chunked_prefill_request_id``); recording it would put a row at the draft's index 0
+    that only the final chunk's record overwrites (_key_check_positions skips the same row).
+
+    Reading the live ``chunked_prefill_request_id`` at sampling time gives the sampled forward's value: the engine
+    schedules (the only writer) before a forward, and under async scheduling the controller samples the pending
+    forward before it admits the next one (no-overlap path: sample -> update -> schedule -> forward); an overlap step
+    admits nothing (``_should_run_async_sched_overlap`` is False while the queue head can be scheduled)."""
+    rows = np.flatnonzero(tag[a:e] == 1)
+    cid = int(getattr(context, "chunked_prefill_request_id", -1))
+    if cid >= 0 and rows.size:
+        rows = rows[rids[a + rows] != cid]
+    return rows.tolist()
+
+
 def _request_positions(engine: Any, ids: np.ndarray, lens: Optional["_RequestLengths"] = None) -> np.ndarray:
     """Index of the token each engine request samples now: len(prompt_tokens) + len(generated_tokens) of its latest
     record (an eviction checkpoint moves generated tokens into the prompt: the sum is unchanged); -1 if unknown.
@@ -2515,7 +2551,8 @@ class ThunderSyncMegatronPolicyWorker(
             # an async H2D (the context rewrites its array next step).
             host_rids = context.request_ids[lo : lo + n].to(torch.int64)
             hpos = _request_positions(engine, host_rids.numpy(), lens)
-            key_check.observe(host_rids.numpy(), hpos)
+            cpos = _key_check_positions(context, host_rids.numpy(), hpos)
+            key_check.observe(host_rids.numpy(), cpos)
             stats.update(key_check.stats())
             # The per-row host arrays (key ids, key positions, per-row salts) reach the device in ONE pinned
             # [k, n] int64 block and one async H2D (was one fresh pinned buffer + H2D each): same values.
@@ -2523,7 +2560,7 @@ class ThunderSyncMegatronPolicyWorker(
             if self.__dict__.get("_nl") is not None:
                 # nolanes (nolanes_engine.py): the noise-key registry (E4: each (key, position) drawn once).
                 h_rids = self._nl_key_ids(engine, h_rids)
-                self._nl_observe_keys(h_rids, hpos)
+                self._nl_observe_keys(h_rids, cpos)
             known = hpos >= 0
             if fresh_salt is not None:
                 keys = fresh_keys.lookup(h_rids)
@@ -2667,7 +2704,7 @@ class ThunderSyncMegatronPolicyWorker(
             # Request-derived positions (_request_positions; the gpu_view lengths are not compacted with the rows
             # under async scheduling).
             hpos = _request_positions(engine, host_rids.numpy(), lens)
-            key_check.observe(host_rids.numpy(), hpos)
+            key_check.observe(host_rids.numpy(), _key_check_positions(context, host_rids.numpy(), hpos))
             stats.update(key_check.stats())
             pos = gv.request_kv_length_offsets[:n].long() + gv.request_query_lengths[:n].long()
             if (hpos >= 0).any():
@@ -4060,6 +4097,15 @@ class ThunderSyncMegatronPolicyWorker(
             super()._initialize_inference_engine(mcore_generation_config)
         finally:
             de.DynamicInferenceEngine = orig
+        from thundersync_rl.sprsd import SALT_ENV
+
+        salt = os.environ.get(SALT_ENV, "").strip()
+        if salt and getattr(self, "dynamic_inference_engine", None) is not None:
+            # thundersync.mode=sprsd (SPR-SD: the stock loop has no ThunderSync stage to install them): the keyed
+            # sampler and XS-SD's tree (+ MTP head) on this engine, as colo's stage setup does for XS-SD
+            self.install_wide_sampler(salt=int(salt), key64=True)
+            info = self.install_tree_xssd()
+            print(f"[sprsd] rank={getattr(self, 'rank', '?')} keyed sampler + tree {info}", flush=True)
 
     def _engine_class(self, orig: type) -> type:
         """``orig`` (MCore's DynamicInferenceEngine) with the draft logs armed.
@@ -4876,7 +4922,7 @@ class ThunderSyncMegatronPolicyWorker(
                 pf = getattr(context, "request_in_prefill_status_tensor", None)
                 # Slots in prefill may hold a new request under a reused id: looked up again.
                 tag = owned_slots.refresh(rids, np.ones(e, dtype=bool) if pf is None else pf[:e].numpy() != 0)
-                for row in (np.flatnonzero(tag[a:e] == 1)).tolist():
+                for row in _hidden_log_rows(context, tag, rids, a, e):
                     rid = int(rids[a + row])
                     # (latest record, its prompt, len, first prompt, len, key): cached prompt lengths
                     # (_RequestLengths), the same values as len() of the request's tensors.
@@ -4977,11 +5023,17 @@ class ThunderSyncMegatronPolicyWorker(
         # Under async scheduling the controller launches the next forward
         # before finished requests are resolved, then compacts the surviving
         # rows and reorders the pending logits to match
-        # (``_compact_async_sched_logits``). Apply the same permutation to the
-        # hidden-copy buffer, on the same stream, so row i of the buffer stays
-        # the hidden state of logits row i.
+        # (``_compact_async_sched_forward``; ``_compact_async_sched_logits`` before
+        # Megatron-LM main). Apply the same permutation to the hidden-copy buffer,
+        # on the same stream, so row i of the buffer stays the hidden state of
+        # logits row i.
         controller = engine.controller
-        orig_compact = controller._compact_async_sched_logits
+        compact_name = (
+            "_compact_async_sched_forward"
+            if hasattr(controller, "_compact_async_sched_forward")
+            else "_compact_async_sched_logits"
+        )
+        orig_compact = getattr(controller, compact_name)
 
         def compact(survivor_idxs, *args, **kwargs):
             n = survivor_idxs.numel()
@@ -4991,7 +5043,7 @@ class ThunderSyncMegatronPolicyWorker(
                 static[:n].copy_(static[survivor_idxs.to(static.device)])
             return orig_compact(survivor_idxs, *args, **kwargs)
 
-        controller._compact_async_sched_logits = compact
+        setattr(controller, compact_name, compact)
         self._hidden_log = log
         return True
 

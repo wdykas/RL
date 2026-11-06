@@ -129,6 +129,22 @@ def replay_adjusted_budget(
 # ---------------------------------------------------------------------------
 
 
+def mcore_buffers_z_free() -> bool:
+    """Whether the installed Megatron-Core's batch-invariant decode buffers have no z field (NVIDIA/Megatron-LM#8221):
+    it allocates and seeds z-free buffers itself, so this module only counts them and installs the decode step."""
+    import dataclasses as dc
+
+    from megatron.core.ssm.ops.mamba2 import batch_invariant_decode as bid
+
+    cls = bid.BatchInvariantDecodeBuffers
+    return dc.is_dataclass(cls) and "z" not in {f.name for f in dc.fields(cls)}
+
+
+def _allocate_mcore(cls, *args, **kwargs):
+    """Megatron-Core's own (z-free) allocation (slim: no tail_mtd write cursors to register)."""
+    return _ORIG["allocate"].__func__(cls, *args, **kwargs)
+
+
 def _z_free(nheads, headdim, ngroups, dstate, chunk, dtype, device) -> bool:
     """Buffers without z iff the batch-invariant decode step serves the layer (it gates the target row itself)."""
     from nemo_rl.models.megatron import mamba_bi_fused_decode
@@ -246,7 +262,9 @@ def _context_init(self, model_config, inference_config, *args, **kwargs):
     nheads, headdim, dstate = tuple(state_cfg.ssm_states_shape)
     ngroups = (max(state_cfg.conv_states_shape) - nheads * headdim) // (2 * dstate)
     device = torch.device("cuda", torch.cuda.current_device())
-    z_free = _z_free(nheads, headdim, ngroups, dstate, state_cfg.mamba_chunk_size, dtype, device)
+    z_free = _ORIG.get("mcore_z_free", False) or _z_free(
+        nheads, headdim, ngroups, dstate, state_cfg.mamba_chunk_size, dtype, device
+    )
     replay = replay_bytes_per_request(
         tuple(state_cfg.conv_states_shape),
         tuple(state_cfg.ssm_states_shape),
@@ -293,12 +311,17 @@ def install() -> None:
 
     buffers_cls = bid.BatchInvariantDecodeBuffers
     _ORIG["allocate"] = buffers_cls.__dict__["allocate"]
-    _ORIG["seed"] = buffers_cls.seed
-    _ORIG["scan"] = bid.batch_invariant_decode_buffered_scan  # MCore's (buffers with z)
-    _ORIG["masked_update_rows"] = bid._masked_update_rows
     _ORIG["context_init"] = DynamicInferenceContext.__init__
-
-    buffers_cls.allocate = classmethod(_allocate)
-    buffers_cls.seed = _seed
+    _ORIG["mcore_z_free"] = mcore_buffers_z_free()
+    if _ORIG["mcore_z_free"]:
+        # Megatron-LM main (#8221): MCore allocates and seeds z-free buffers for every layer; keep its allocation
+        # and seeding, and count the replay buffers.
+        buffers_cls.allocate = classmethod(_allocate_mcore)
+    else:
+        _ORIG["seed"] = buffers_cls.seed
+        _ORIG["scan"] = bid.batch_invariant_decode_buffered_scan  # MCore's (buffers with z)
+        _ORIG["masked_update_rows"] = bid._masked_update_rows
+        buffers_cls.allocate = classmethod(_allocate)
+        buffers_cls.seed = _seed
     DynamicInferenceContext.__init__ = _context_init
     mamba_bi_fused_decode.install()

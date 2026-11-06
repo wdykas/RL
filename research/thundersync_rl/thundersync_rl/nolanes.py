@@ -249,14 +249,15 @@ V8B_LEAVES = {
 
 
 def mcore_prefix_cache_weight_scoped() -> bool:
-    """Whether the installed Megatron-Core salts prefix-cache block hashes with a weight epoch bumped at every engine
-    resume (``dynamic_engine._weight_scoped_salt``): blocks computed under different weights never match. False if
-    Megatron-Core is not importable here (refuse rather than assume)."""
+    """Whether the installed Megatron-Core scopes the prefix cache by weight version: ``resume()`` bumps a weight epoch
+    salted into every block hash and re-salts every request that holds no KV yet
+    (``DynamicInferenceEngine._resalt_unprefilled_requests``; an older engine with only ``_weight_scoped_salt`` kept a
+    waiting request's old salt). False if Megatron-Core is not importable here (refuse rather than assume)."""
     try:
-        from megatron.core.inference.engines import dynamic_engine
+        from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
     except ImportError:
         return False
-    return callable(getattr(dynamic_engine, "_weight_scoped_salt", None))
+    return callable(getattr(DynamicInferenceEngine, "_resalt_unprefilled_requests", None))
 
 
 def config_problems(config: Any) -> list[str]:
@@ -393,8 +394,13 @@ def config_problems(config: Any) -> list[str]:
         p.append(f"policy.generation.mcore_generation_config.max_tokens={mt} < max_total_sequence_length={mseq} "
                  "(a continuation's re-prefill must fit one engine step without chunked prefill)")
     # E8: no prefix-cache hits across versions. Every weight install (refit, colocated wake) is an engine suspend /
-    # resume; an engine that salts its prefix-cache block hashes with a weight epoch bumped at every resume makes
-    # blocks of different versions unmatchable, so a continuation only reuses blocks computed at theta_k.
+    # resume; an engine that salts its prefix-cache block hashes with a weight epoch bumped at every resume (and
+    # re-salts every request without KV at the resume) makes blocks of different versions unmatchable. Invariant
+    # relied on: no target row (continuation / fresh row) spans a weight install -- target rows are new requests
+    # launched after the wake / refit that installs theta_k, and VerifyStage.run returns batch k only after every one
+    # of them finished, i.e. before training step k and the next install. So a target row's prefill can only match
+    # blocks computed at theta_k. A draft spanning an install keeps its old salt (MCore) and its q is logged per
+    # forward (E1).
     if _get(mcore, "enable_prefix_caching", False) and not mcore_prefix_cache_weight_scoped():
         p.append(
             "policy.generation.mcore_generation_config.enable_prefix_caching must be false (E8: a continuation "

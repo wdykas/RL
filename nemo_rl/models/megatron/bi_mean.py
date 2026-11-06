@@ -45,10 +45,15 @@ mean_batch_invariant._nemo_rl_full_reduction_fix = True  # type: ignore[attr-def
 
 
 def mcore_full_mean_is_correct(fn: Callable[..., Any]) -> bool:
-    """True if ``fn(x, [])`` is the mean of ``x`` (checked on CPU, no kernel launch)."""
+    """True if ``fn(x, [])`` is the mean of ``x`` (checked on CPU, no kernel launch).
+
+    The probe is 2-D: a fixed Megatron-Core (NVIDIA/Megatron-LM#8242) expands the empty ``dim`` to every dimension,
+    and a multi-dimension reduction takes its torch path (CPU-safe); a 1-D probe would expand to one dimension and
+    reach the Triton kernel, which asserts a CUDA input.
+    """
     import torch
 
-    return float(fn(torch.ones(4), [])) == 1.0
+    return float(fn(torch.ones(2, 2), [])) == 1.0
 
 
 def install() -> None:

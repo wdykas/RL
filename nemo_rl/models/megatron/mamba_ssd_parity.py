@@ -369,12 +369,16 @@ def _check_bi_mixer(self, packed_seq_params) -> None:
     assert self.rmsnorm, "batch-invariant Mamba requires the gated RMSNorm"
 
 
-def _ssm_training(self, zxBCdt, packed_seq_params=None):
-    """``MambaMixer._ssm_training`` on the engine's kernels in batch-invariant mode."""
+def _ssm_training(self, zxBCdt, packed_seq_params=None, **kwargs):
+    """``MambaMixer._ssm_training`` on the engine's kernels in batch-invariant mode.
+
+    ``kwargs``: Megatron-LM main passes ``runtime_cp`` (the call's context-parallel view of the mixer). Batch-invariant
+    mode requires context_parallel_size 1 (TransformerConfig), where it is the mixer's own ``self.cp``.
+    """
     from einops import rearrange
 
     if not self.config.batch_invariant_mode:
-        return _ORIGINAL_SSM_TRAINING[0](self, zxBCdt, packed_seq_params)
+        return _ORIGINAL_SSM_TRAINING[0](self, zxBCdt, packed_seq_params, **kwargs)
     _check_bi_mixer(self, packed_seq_params)
     z, xBC, dt = _split_proj(self, zxBCdt)
     xBC = _conv(self, rearrange(xBC, "b l d -> b d l").contiguous())

@@ -449,6 +449,23 @@ def _resolve_optimizer_dtype_kwargs(optimizer_cfg: dict[str, Any]) -> dict[str, 
     return resolved
 
 
+def normalize_trivial_router_groups(model_cfg: Any) -> None:
+    """``moe_router_num_groups == 1`` with ``moe_router_group_topk`` 1 (or unset) is no group limit (one group holding
+    every expert, keep it): set both to None on every model, learner and engine alike.
+
+    The inference router (InferenceTopKRouter) requires None; the training router accepted the trivial grouping the
+    Bridge writes for Nemotron-H (n_group 1, topk_group 1). Under batch invariance on Megatron-LM main that split the
+    two sides across implementations: grouped arguments send the learner to the reference top-k while the engine
+    took #8602's Triton sigmoid top-k, and their log-probs differed on every token (route trace of an XS gate:
+    learner 'reference' with num_groups 1 / group_topk 1, engine 'triton' with None / None). With the same (None) arguments both sides take the same routing implementation.
+    """
+    if getattr(model_cfg, "moe_router_num_groups", None) == 1 and getattr(
+        model_cfg, "moe_router_group_topk", None
+    ) in (None, 1):
+        model_cfg.moe_router_num_groups = None
+        model_cfg.moe_router_group_topk = None
+
+
 def enable_batch_invariant_mode(config: PolicyConfig) -> None:
     """Validate, then enable Megatron-Core batch-invariant kernels before CUDA init."""
     validate_zero_train_gen_kl(config, check_environment=True)
@@ -1454,12 +1471,7 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
         model_cfg.moe_router_group_topk = config["megatron_cfg"][
             "moe_router_group_topk"
         ]
-    if (
-        config["megatron_cfg"].get("transformer_impl") == "inference_optimized"
-        and getattr(model_cfg, "moe_router_num_groups", None) == 1
-    ):
-        model_cfg.moe_router_num_groups = None
-        model_cfg.moe_router_group_topk = None
+    normalize_trivial_router_groups(model_cfg)
     if "moe_pad_experts_for_cuda_graph_inference" in config["megatron_cfg"]:
         model_cfg.moe_pad_experts_for_cuda_graph_inference = config["megatron_cfg"][
             "moe_pad_experts_for_cuda_graph_inference"

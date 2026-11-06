@@ -66,9 +66,10 @@ _ZERO_KL_MEGATRON_REQUIRED: dict[str, Any] = {
     "batch_invariant_collective": "ordered",
 }
 
-_ZERO_KL_GENERATION_REQUIRED: dict[str, Any] = {
-    "enable_chunked_prefill": False,
-}
+# No generation-side requirement on chunked prefill or prefix caching: Megatron-Core's batch-invariant dynamic engine
+# keeps a hybrid model's prefill chunks on SSM chunk boundaries (dynamic_engine._mamba_batch_invariant_prefill_chunk_
+# length) and restores cached Mamba states only at block boundaries that are SSM chunk boundaries (NVIDIA/Megatron-LM
+# #8214), so the engine's log-probs do not depend on how a prompt is split or which prefix blocks were cached.
 
 # Workspace-free cuBLAS (fixed reduction order) for the te_native backend.
 _TE_NATIVE_ENV_VARS = {
@@ -111,6 +112,8 @@ def validate_zero_train_gen_mismatch(
     _validate_platform(out, check_device=check_platform)
     if check_packages:
         _validate_packages(out)
+    # Config-time too (the driver's preflight): an unsupported engine otherwise fails after the model load.
+    _validate_megatron_core_engine(config, out)
     _validate_precision(config, out)
     return out
 
@@ -899,7 +902,9 @@ def _install_vocab_lse_engine() -> None:
     if getattr(orig, "_vocab_lse", False):
         return
 
-    def _processed_log_probs(self, logits, n_active, active_query_lengths, sampling, row_to_request=None):
+    def _processed_log_probs(self, logits, *args, **kwargs):
+        # args: (n_active, active_query_lengths, sampling, row_to_request) before Megatron-LM main, (sampling,
+        # row_to_request) on main; the raw canonical-block path reads only the logits.
         if self.config.logprobs_mode == "raw_logprobs" and vocab_lse.enabled():
             if not _processed_log_probs._called:
                 # Self-evidencing runs: the first call in each engine process names its rank.
@@ -908,12 +913,72 @@ def _install_vocab_lse_engine() -> None:
                 print(f"[vocab_lse] engine raw log-probs first call: canonical-block LSE (role=engine, global rank "
                       f"{rank}, pid {os.getpid()})", flush=True)
             return vocab_lse.logprob_rows(logits).to(logits.dtype)
-        return orig(self, logits, n_active, active_query_lengths, sampling, row_to_request)
+        return orig(self, logits, *args, **kwargs)
 
     _processed_log_probs._vocab_lse = True
     _processed_log_probs._called = False
     DynamicInferenceContext._processed_log_probs = _processed_log_probs
+    _route_context_raw_log_softmax()
     print("[vocab_lse] engine raw log-probs: canonical-block LSE", flush=True)
+
+
+class _CanonicalRawLogSoftmax:
+    """``torch.nn.functional`` for the dynamic inference context module, with its raw row log-softmax
+    (``F.log_softmax(rows, dim=-1)`` on 2-D float rows) replaced by the canonical-block LSE; every other attribute
+    is ``torch.nn.functional``'s."""
+
+    _canonical_vocab_lse = True
+
+    def __getattr__(self, name):
+        import torch.nn.functional as F
+
+        return getattr(F, name)
+
+    @staticmethod
+    def log_softmax(input, dim=None, _stacklevel=3, dtype=None):
+        import torch.nn.functional as F
+
+        from nemo_rl.models.megatron import vocab_lse
+
+        if (
+            vocab_lse.enabled()
+            and dtype is None
+            and input.dim() == 2
+            and dim in (-1, 1)
+            and input.dtype == torch.float32
+        ):
+            return vocab_lse.logprob_rows(input)
+        return F.log_softmax(input, dim=dim, _stacklevel=_stacklevel, dtype=dtype)
+
+
+def _route_context_raw_log_softmax() -> None:
+    """Megatron-LM main computes the raw log-probs of prefill / mixed steps with ``F.log_softmax`` inline in
+    ``calculate_log_probs_tensors`` (older Megatron-Core went through ``_processed_log_probs`` for every step), so the
+    ``_processed_log_probs`` hook alone left those rows on torch's LSE: engine != trainer (MLM-main XS gates,
+    max|d| 0.13 at step 0). Route the context module's ``F`` (its only log-softmax callers are these raw
+    paths; processed log-probs go through the sampling backend) to the canonical-block LSE. Idempotent."""
+    from megatron.core.inference.contexts import dynamic_context
+
+    if getattr(getattr(dynamic_context, "F", None), "_canonical_vocab_lse", False):
+        return
+    dynamic_context.F = _CanonicalRawLogSoftmax()
+
+
+def _pin_mcore_kernel_selection() -> bool:
+    """Megatron-Core's deterministic kernel selection, as ``initialize_megatron`` does after batch-invariant mode.
+
+    Megatron-LM main (``megatron.core.tuning``) pins every Triton autotuner's choice to a pure function of its
+    candidate list (no wall-clock benchmarking, so every process and every call shape picks the same tiles) when
+    deterministic mode is on, and asserts it for a batch-invariant hybrid model (TransformerConfig). Runs before the
+    model is built, i.e. before any Triton kernel. Returns False on a Megatron-Core without ``tuning`` (nothing to pin).
+    """
+    try:
+        from megatron.core import tuning
+    except ImportError:
+        return False
+    tuning.set_deterministic_mode(True)
+    tuning.install(deterministic=True)
+    return True
 
 
 def enable_batch_invariant_kernels(config: PolicyConfig) -> None:
@@ -940,6 +1005,7 @@ def enable_batch_invariant_kernels(config: PolicyConfig) -> None:
     enable_mcore_batch_invariant_mode(
         backend=megatron_cfg["batch_invariant_backend"], collective=collective
     )
+    _pin_mcore_kernel_selection()
     # Opt-in: bitwise-reproducible training (policy.megatron_cfg.deterministic_training).
     # Batch invariance (train == generation logprobs) does not need it.
     deterministic = bool(megatron_cfg.get("deterministic_training", False))
@@ -1038,17 +1104,6 @@ def _validate_required_values(
                 f"(got {megatron_cfg.get(key)!r})."
             )
 
-    generation = config.get("generation")
-    if generation is None or generation.get("backend") != "megatron":
-        return  # reported by _validate_backend
-    mcore_generation_config = generation["mcore_generation_config"]
-    for key, value in _ZERO_KL_GENERATION_REQUIRED.items():
-        if mcore_generation_config.get(key) != value:
-            out.violations.append(
-                f"policy.generation.mcore_generation_config.{key} must be "
-                f"{value!r} (got {mcore_generation_config.get(key)!r})."
-            )
-
 
 def _validate_backend(config: PolicyConfig, out: ZeroTrainGenValidation) -> None:
     generation = config.get("generation")
@@ -1115,6 +1170,70 @@ def _validate_megatron_core_features(out: ZeroTrainGenValidation) -> None:
         out.violations.append(
             "Installed Megatron-Core lacks TransformerConfig fields required for "
             f"zero_train_gen_mismatch: {', '.join(missing)}."
+        )
+
+
+def _mcore_supports_bi_mamba_prefix_caching() -> bool:
+    """Whether the installed Megatron-Core runs prefix caching on a hybrid (Mamba) model under batch_invariant_mode.
+
+    NVIDIA/Megatron-LM#8214 made the batch-invariant prefill chunk a function of the prompt tokens left to compute
+    AFTER the cached prefix: ``DynamicInferenceEngine._mamba_batch_invariant_prefill_chunk_length(remaining,
+    capacity)`` (before: ``(req, capacity)``, and the dynamic context asserted against BI prefix caching at engine
+    construction, after the model load).
+    """
+    import inspect
+
+    from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
+
+    fn = getattr(DynamicInferenceEngine, "_mamba_batch_invariant_prefill_chunk_length", None)
+    return fn is not None and "remaining" in inspect.signature(fn).parameters
+
+
+def _mcore_bi_chunked_prefill_graph_admission() -> bool:
+    """Whether the installed Megatron-Core's CUDA-graph-gated chunked prefill admits every prompt of a batch-invariant
+    hybrid model.
+
+    Under batch_invariant_mode a hybrid model's non-final prefill chunk is floored to the SSM chunk alignment
+    (``_mamba_batch_invariant_prefill_chunk_length``). With ``cuda_graph_all_prefills`` the older scheduler snapped a
+    first chunk DOWN to the largest captured graph below the prompt length; a snap below the alignment floors to 0, the
+    queue head is deferred, and with nothing else in flight the engine steps forever with every request waiting (a gate:
+    active 0, waiting 60). NVIDIA/Megatron-LM#6675 pads the chunk UP to a covering graph
+    (``_select_cg_chunk_size``).
+    """
+    from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
+
+    return hasattr(DynamicInferenceEngine, "_select_cg_chunk_size")
+
+
+def _validate_megatron_core_engine(config: PolicyConfig, out: ZeroTrainGenValidation) -> None:
+    """Prefix caching / chunked prefill under batch_invariant_mode need an engine that supports them (preflight: the
+    unsupported cases otherwise fail at engine construction or livelock at the first prefill)."""
+    generation = config.get("generation") or {}
+    mcore = generation.get("mcore_generation_config") or {}
+    want_pc = bool(mcore.get("enable_prefix_caching"))
+    want_cp = bool(mcore.get("enable_chunked_prefill")) and bool(mcore.get("cuda_graph_all_prefills"))
+    if not (want_pc or want_cp):
+        return
+    try:
+        pc_ok = _mcore_supports_bi_mamba_prefix_caching()
+        cp_ok = _mcore_bi_chunked_prefill_graph_admission()
+    except ImportError:
+        out.warnings.append(
+            "Megatron-Core inference engine not importable here: prefix caching / chunked prefill support under "
+            "batch_invariant_mode is checked in the generation workers."
+        )
+        return
+    if want_pc and not pc_ok:
+        out.violations.append(
+            "policy.generation.mcore_generation_config.enable_prefix_caching under batch_invariant_mode needs a "
+            "Megatron-Core with batch-invariant Mamba prefix caching (NVIDIA/Megatron-LM#8214); the installed one "
+            "asserts against it for hybrid models."
+        )
+    if want_cp and not cp_ok:
+        out.violations.append(
+            "policy.generation.mcore_generation_config.enable_chunked_prefill with cuda_graph_all_prefills under "
+            "batch_invariant_mode needs a Megatron-Core whose graph-gated chunked prefill pads a chunk up to a "
+            "covering graph (NVIDIA/Megatron-LM#6675); the installed one can livelock a hybrid model's prefill queue."
         )
 
 

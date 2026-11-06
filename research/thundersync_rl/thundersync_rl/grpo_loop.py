@@ -1138,7 +1138,6 @@ def validate_config(master_config: ThunderSyncMasterConfig) -> None:
     validate_crossfade_routing(master_config)
     validate_draft_at_step_top(master_config)
     validate_exact_int(master_config)
-    validate_sampler_chunked_prefill(master_config)
     validate_exact_top_p(master_config)
     validate_sticky_rounding(master_config)
     validate_null_bv(master_config)
@@ -2094,25 +2093,6 @@ def validate_exact_int(master_config: ThunderSyncMasterConfig) -> None:
             problems.append("sticky_anchor_horizon (engine-side anchor verification) not built")
     if problems:
         raise ValueError("thundersync.engine_sampler=exact_int: " + "; ".join(problems) + ".")
-
-
-def validate_sampler_chunked_prefill(master_config: Any) -> None:
-    """The wide / exact_int engine samplers with chunked prefill: not built yet.
-
-    MCore samples a partial prefill chunk too (then replaces the draw with the next prompt token), so the sampler sees
-    request r at position len(prompt) once per chunk; the samplers' always-on key check (key_check.KeyContinuity)
-    raises on the repeat at the first chunked prompt (async2_stock, Super-L22: step 1). Fail at
-    config time instead of after engine start. Every A/B arm keeps chunked prefill off (ab_base).
-    """
-    sampler = effective_engine_sampler(master_config.thundersync)
-    if sampler not in ("wide", "exact_int"):
-        return
-    gen = (getattr(master_config, "policy", None) or {}).get("generation") or {}
-    if (gen.get("mcore_generation_config") or {}).get("enable_chunked_prefill"):
-        raise ValueError(
-            f"engine sampler {sampler} with mcore_generation_config.enable_chunked_prefill=true is not built yet "
-            "(partial-chunk draws repeat the (request, position) noise key; set enable_chunked_prefill=false)"
-        )
 
 
 def validate_exact_top_p(master_config: ThunderSyncMasterConfig) -> None:

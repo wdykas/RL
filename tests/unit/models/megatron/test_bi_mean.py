@@ -81,3 +81,28 @@ def test_registered_kernel_full_mean_and_grad(installed):
     torch.testing.assert_close(m_fn.detach(), ref)
     torch.testing.assert_close(m_rows.detach(), x.detach().mean(dim=-1))
     torch.testing.assert_close(x.grad, torch.full_like(x, 1.0 / x.numel()))
+
+
+def test_probe_is_cpu_safe_on_a_fixed_and_an_unfixed_mean():
+    """The probe never reaches a CUDA-only kernel: a fixed mean expands [] to (0, 1) (torch path), an unfixed one
+    divides the sum by 1."""
+    import torch
+
+    def fixed(x, dim, keepdim=False, dtype=None):
+        if dim is None or len(dim) == 0:
+            dim = list(range(x.ndim))
+        if len(dim) == 1:
+            raise AssertionError("Input must be a CUDA tensor")
+        n = 1
+        for d in dim:
+            n *= x.shape[d]
+        return torch.sum(x, dim=dim, keepdim=keepdim, dtype=torch.float32) / n
+
+    def unfixed(x, dim, keepdim=False, dtype=None):
+        n = 1
+        for d in dim:
+            n *= x.shape[d]
+        return torch.sum(x, dim=dim, keepdim=keepdim, dtype=torch.float32) / n
+
+    assert bi_mean.mcore_full_mean_is_correct(fixed)
+    assert not bi_mean.mcore_full_mean_is_correct(unfixed)

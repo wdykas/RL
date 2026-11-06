@@ -1,0 +1,9 @@
+# SPR-SD: SPR-BI (colo_sprbi.yaml: the stock colocated partial-rollout loop, lag 1, BI numerics) + XS-SD's drafter on
+# every row: keyed sampler + tree_spec own-history tails (+ the MTP head as candidate 0 with tree_xssd_mtp), installed
+# by the generation workers at engine build (thundersync_rl/sprsd.py). No ThunderSync stage: the loop is SPR-BI's.
+defaults:
+  - colo_sprbi.yaml
+
+thundersync:
+  mode: sprsd
+  tree_xssd: "8:4:256"

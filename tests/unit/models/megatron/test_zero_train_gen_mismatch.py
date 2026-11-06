@@ -180,11 +180,15 @@ def test_validate_rejects_a_missing_required_megatron_value():
     assert any("moe_permute_fusion must be False" in v for v in result.violations)
 
 
-def test_validate_rejects_chunked_prefill():
+@pytest.mark.parametrize("key", ["enable_chunked_prefill", "enable_prefix_caching"])
+def test_validate_accepts_chunked_prefill_and_prefix_caching(key):
+    # Megatron-Core's batch-invariant engine keeps prefill chunks and restored prefix
+    # states on SSM chunk boundaries, so neither knob changes the engine's log-probs.
     config = _policy_config()
-    config["generation"]["mcore_generation_config"]["enable_chunked_prefill"] = True
+    config["generation"]["mcore_generation_config"][key] = True
     result = _validate(config)
-    assert any("enable_chunked_prefill must be False" in v for v in result.violations)
+    assert not any(key in v for v in result.violations)
+    assert not result.violations
 
 
 # --------------------------------------------------------------------------- #
@@ -1321,3 +1325,104 @@ def test_device_dispatch_budget_must_cover_a_learner_micro_batch():
     assert any("train_micro_batch_size" in x and "36864" in x for x in v), v
     config["megatron_cfg"]["env_vars"]["NEMO_RL_MOE_DEVICE_DISPATCH_TOKENS"] = "36864"
     assert zgm.validate_batch_invariant_mode(config).violations == []
+
+
+# --------------------------------------------------------------------------- #
+# Engine support for prefix caching / chunked prefill under batch invariance   #
+# --------------------------------------------------------------------------- #
+
+
+def _engine_problems(monkeypatch, *, pc_ok: bool, cp_ok: bool, **mcore: Any) -> zgm.ZeroTrainGenValidation:
+    monkeypatch.setattr(zgm, "_mcore_supports_bi_mamba_prefix_caching", lambda: pc_ok)
+    monkeypatch.setattr(zgm, "_mcore_bi_chunked_prefill_graph_admission", lambda: cp_ok)
+    config = _policy_config()
+    config["generation"]["mcore_generation_config"].update(mcore)
+    out = zgm.ZeroTrainGenValidation()
+    zgm._validate_megatron_core_engine(config, out)
+    return out
+
+
+def test_engine_check_refuses_prefix_caching_without_bi_mamba_support(monkeypatch):
+    out = _engine_problems(monkeypatch, pc_ok=False, cp_ok=True, enable_prefix_caching=True)
+    assert any("Megatron-LM#8214" in v for v in out.violations)
+
+
+def test_engine_check_refuses_graph_gated_chunked_prefill_without_padding(monkeypatch):
+    out = _engine_problems(
+        monkeypatch, pc_ok=True, cp_ok=False, enable_chunked_prefill=True, cuda_graph_all_prefills=True
+    )
+    assert any("Megatron-LM#6675" in v for v in out.violations)
+    # Eager prefills never snap a chunk to a graph: no livelock, no refusal.
+    out = _engine_problems(
+        monkeypatch, pc_ok=True, cp_ok=False, enable_chunked_prefill=True, cuda_graph_all_prefills=False
+    )
+    assert not out.violations
+
+
+def test_engine_check_accepts_both_on_a_supporting_engine(monkeypatch):
+    out = _engine_problems(
+        monkeypatch,
+        pc_ok=True,
+        cp_ok=True,
+        enable_prefix_caching=True,
+        enable_chunked_prefill=True,
+        cuda_graph_all_prefills=True,
+    )
+    assert not out.violations
+
+
+def test_engine_probes_match_the_installed_megatron_core():
+    pytest.importorskip("megatron.core.inference.engines.dynamic_engine")
+    # The pinned Megatron-Core (Megatron-LM main, colo-mlm-main) has both.
+    assert zgm._mcore_supports_bi_mamba_prefix_caching()
+    assert zgm._mcore_bi_chunked_prefill_graph_admission()
+
+
+def test_kernel_selection_pinned_on_megatron_core_with_tuning():
+    tuning = pytest.importorskip("megatron.core.tuning")
+    old = tuning.policy._deterministic_override
+    try:
+        assert zgm._pin_mcore_kernel_selection()
+        # TransformerConfig's batch-invariant hybrid check reads this (Megatron-LM main).
+        assert tuning.use_deterministic_mode()
+    finally:
+        tuning.set_deterministic_mode(old)
+        tuning.install()
+
+
+@pytest.mark.parametrize(
+    "groups, group_topk, expect",
+    [
+        (1, 1, (None, None)),  # the Bridge's Nemotron-H default: one group, keep it == no group limit
+        (1, None, (None, None)),
+        (None, None, (None, None)),
+        (8, 4, (8, 4)),  # a real group limit is kept
+        (1, 2, (1, 2)),  # not the trivial form: left to Megatron-Core's validation
+    ],
+)
+def test_trivial_router_groups_normalized_for_learner_and_engine(groups, group_topk, expect):
+    import types
+
+    from nemo_rl.models.megatron.setup import normalize_trivial_router_groups
+
+    cfg = types.SimpleNamespace(moe_router_num_groups=groups, moe_router_group_topk=group_topk)
+    normalize_trivial_router_groups(cfg)
+    assert (cfg.moe_router_num_groups, cfg.moe_router_group_topk) == expect
+
+
+def test_engine_model_config_takes_the_same_router_group_normalization():
+    """The engine's model config must end with the same (None, None) router grouping as the learner's, or the two sides
+    route through different top-k implementations on Megatron-LM main (XS). Both providers
+    pass through _apply_moe_config, which normalizes; a separate engine-config path would have to normalize too."""
+    import inspect
+
+    from nemo_rl.models.megatron import setup
+
+    assert "normalize_trivial_router_groups(model_cfg)" in inspect.getsource(setup._apply_moe_config)
+    assert "_apply_moe_config(inference_provider, policy_cfg)" in inspect.getsource(setup.build_inference_model)
+    learner_calls = [
+        n for n, f in vars(setup).items()
+        if inspect.isfunction(f) and f is not setup.build_inference_model and "_apply_moe_config(" in inspect.getsource(f)
+        and n != "_apply_moe_config"
+    ]
+    assert learner_calls, "the learner's model config no longer passes through _apply_moe_config"

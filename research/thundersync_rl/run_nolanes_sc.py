@@ -138,11 +138,22 @@ def _dry(argv: list[str]) -> None:
     except ImportError as e:
         print(f"{TAG} DRY note: thundersync_rl.nolanes not importable ({e}); nolanes validator skipped", flush=True)
     else:
-        if (c.get("thundersync") or {}).get("mode") == "colo":
+        mode = (c.get("thundersync") or {}).get("mode")
+        if mode == "colo":
             from thundersync_rl import colo
 
             ccfg = colo.validate_config(c)
             print(f"{TAG} DRY colo.validate_config OK: {ccfg}", flush=True)
+        elif mode == "sprsd":
+            from thundersync_rl import sprsd
+
+            probs = sprsd.config_problems(c)
+            assert not probs, "thundersync.mode=sprsd: " + "; ".join(probs)
+            print(f"{TAG} DRY sprsd.config_problems OK: {c['thundersync']}", flush=True)
+        elif mode is None:
+            # No ThunderSync stage: NeMo-RL's stock loop on this config (e.g. the SPR-BI baseline arm, stock colocated
+            # partial rollout on the batch-invariant recipe); the BI validators above still ran.
+            print(f"{TAG} DRY no thundersync mode: stock loop, no ThunderSync validator", flush=True)
         elif not hasattr(nolanes, "validate_config"):
             print(f"{TAG} DRY note: thundersync_rl.nolanes has no validate_config yet; skipped", flush=True)
         else:

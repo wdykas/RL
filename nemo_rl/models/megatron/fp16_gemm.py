@@ -1122,6 +1122,9 @@ def _patch_mamba_layer_input() -> None:
     cls = ml.MambaLayer
     orig = cls._prepare_mixer_input
     _STATE["orig"][(cls, "prepare")] = orig
+    # Megatron-LM main split the residual out (``_prepare_residual``): ``_prepare_mixer_input`` returns the
+    # normalized branch input only. Older Megatron-Core returns ``(normalized input, residual)``.
+    returns_residual = not hasattr(cls, "_prepare_residual")
 
     def _prepare_mixer_input(self, hidden_states):
         in_proj = getattr(getattr(self, "mixer", None), "in_proj", None)
@@ -1131,7 +1134,8 @@ def _patch_mamba_layer_input() -> None:
             or hidden_states.dtype != torch.float32
         ):
             return orig(self, hidden_states)
-        return ml.apply_module(self.norm)(hidden_states), hidden_states
+        normed = ml.apply_module(self.norm)(hidden_states)
+        return (normed, hidden_states) if returns_residual else normed
 
     cls._prepare_mixer_input = _prepare_mixer_input
 
@@ -1266,7 +1270,8 @@ def _patch_moe() -> None:
             return _STATE["moe_preprocess"](layer, hidden_states, probs, routing_map)
         return hidden_states
 
-    def preprocess(self, hidden_states, probs, routing_map):
+    def preprocess(self, hidden_states, probs, routing_map, *args, **kwargs):
+        # *args / **kwargs: Megatron-LM main passes padding_mask and packed_seq_params through to the dispatcher.
         if getattr(self.config, "moe_latent_size", None):
             # Latent MoE (Nemotron Super / Ultra): MCore's preprocess projects the
             # hidden states to the latent (fc1_latent_proj: a "duplicated" TE /
@@ -1277,11 +1282,11 @@ def _patch_moe() -> None:
             _latent_hook(self)
             self._fp16_latent_ctx = (probs, routing_map)
             try:
-                return orig_preprocess(self, hidden_states, probs, routing_map)
+                return orig_preprocess(self, hidden_states, probs, routing_map, *args, **kwargs)
             finally:
                 self._fp16_latent_ctx = None
         return orig_preprocess(
-            self, dispatched_rows(self, hidden_states, probs, routing_map), probs, routing_map
+            self, dispatched_rows(self, hidden_states, probs, routing_map), probs, routing_map, *args, **kwargs
         )
 
     def _latent_hook(layer):
