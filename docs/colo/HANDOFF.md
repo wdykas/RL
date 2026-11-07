@@ -156,10 +156,10 @@ method lands only with its gate green and its negative red.
 
 ## 6. Where things stand
 
-- `colo-handoff` passes the XS and wvs gates (positive exact, negatives fail).
-- Nano real text, 8k, 4 nodes, K=1, same-job sets: IS-SPR 1.19× SPR-BI (kernel-normalized 1.18); XS 1.39× SPR-BI
-  (measured before the wake-barrier fix, speed only). These are provisional until the stale main-pin unit tests are
-  confirmed stale (`handoff/slim-mainpin-tests`).
+- `colo-handoff` passes the unit, XS, IS-SPR and wvs gates (positive exact, negatives fail), with the F3 band.
+- Nano real text, 8k, 4 nodes, K=1, same-job set run in both orders on this code, pooled: IS-SPR **1.11× SPR-BI**
+  (kernel-normalized 1.10); XS 1.37× SPR-BI (kn 1.34); SPR-BI / SPR 1.13 (kn 1.02, the BI-numerics tax is almost all
+  kernel speed); IS-SPR / SPR 1.24 (kn 1.12).
 - IS-SPR lag sweep K = 1 / 2 / 4: 1.23 / 1.44 / 1.40× SPR-BI, row ESS ≈ 0.97.
 - Full tables, regimes and negative results: [`RESULTS.md`](RESULTS.md).
 

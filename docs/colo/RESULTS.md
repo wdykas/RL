@@ -76,7 +76,52 @@ five same-job SPR vs SPR-BI pairs at Nano 8k, 4 nodes, lag 1:
 - `policy.offload_optimizer_for_refit=false` in every arm.
 - `pair_check` (config diff: METHOD keys only between b and c) and `levers_audit` pass in preflight.
 
-## 2. Headline: Nano real text, 8k, 4 nodes (TP1 EP8), lag 1 [provisional]
+## 2. Headline: Nano real text, 8k, 4 nodes (TP1 EP8), lag 1
+
+### 2.0 Current release (this branch's code: F3 band, wake-order fix, main-pin test fixes)
+
+One 4-arm set, run twice in the same allocation with the arm order reversed (SPR-BI, XS, IS-SPR, SPR and then
+SPR, IS-SPR, XS, SPR-BI). Setup:
+- Nano 8k, DAPO-Math real text, 4 nodes, TP1 EP8, K=1, 16 steps.
+- Scored on steps 3-14 (whole cycles).
+- KV persist, prefix caching and chunked prefill on, 64 rows per rank, routers frozen.
+- Our tree (XS, SPR-BI, IS-SPR) runs the F3 cross-fade band cfS30.
+- Stock SPR runs on `handoff/stock-baseline` with plain top-k, torch_memory_saver off and deferred metrics on.
+
+All arms pass their checks: sentinel 0 inexact, no illegal memory access, levers audit and pair check clean.
+
+s/step:
+
+| run | a SPR | b SPR-BI | XS | IS-SPR |
+|---|---|---|---|---|
+| order 1 | 56.45 | 63.87 | 87.27 | 69.64 |
+| order 2 (reversed) | 56.21 | 62.84 | 86.68 | 70.55 |
+| pooled | 56.33 | 63.36 | 86.97 | 70.09 |
+
+Pooled ratios, raw / kernel-normalized. Kernel-normalized means the BI arms minus (generation + engine verify)
+x (1 - 1/1.209); stock is unchanged.
+
+| ratio | raw | kn |
+|---|---|---|
+| XS / SPR-BI | 1.373 | 1.340 |
+| IS-SPR / SPR-BI | **1.106** | **1.098** |
+| SPR-BI / SPR | 1.125 | 1.019 |
+| XS / SPR | 1.544 | 1.365 |
+| IS-SPR / SPR | 1.244 | 1.118 |
+
+Per-run raw ratios:
+
+| run | XS / b | IS-SPR / b |
+|---|---|---|
+| order 1 | 1.366 | 1.090 |
+| order 2 | 1.379 | 1.123 |
+
+This set supersedes the earlier table below. Compared with it:
+- The F3 band and the deferred-metrics stock lever are in.
+- IS-SPR / SPR-BI fell from 1.19 to 1.11.
+- XS / SPR-BI is unchanged at ~1.37.
+
+### 2.1 Earlier sets (before F3) [historical]
 
 Regime: full Nemotron 3 Nano 30B-A3B, DAPO-Math with the real reward, 8k generation, P 64 × G 8, MBS 1, KV persist on
 every arm, each arm at its best config. Stock runs without torch_memory_saver (TMS); our arms and SPR-BI run with TMS.

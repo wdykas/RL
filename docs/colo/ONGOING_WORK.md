@@ -58,17 +58,12 @@ before measuring.
 ## 2. Streams
 
 ### A. Production (`colo-handoff`)
-- **State:** gated: XS and wvs positives exact, negatives fail; the live-row device-dispatch units pass. Same-job
-  IS-SPR set at Nano 8k 4 nodes K=1: **1.19× SPR-BI** (kernel-normalized 1.18). The XS set (1.39× SPR-BI) predates
-  the wake-barrier fix, speed only.
-- **Next production tip:** `handoff/wakeorder` (engine wake ordering fix plus its unit test). Promote it once the
-  wake-order unit gate passes.
-- **Queued:** stock vs stock + deferred metrics A/B (adopt the faster stock config, re-score b/a); land the F3 band;
-  re-measure XS / SPR-BI / SPR on the fixed tip; then the K = 2 / 4 sets.
-- **Unit tests:** about 130 fused-decode / decode / parity / wide-key tests fail on the main pin and are believed
-  stale (written against the old pin). `handoff/slim-mainpin-tests` fixes most: wake-order and parity suites pass,
-  the decode suite has 4 failures and the fused suite 16 left. Until those are confirmed stale rather than a code path
-  the arms run, the Nano numbers are provisional.
+- **State:** includes the wake-order fix, the main-pin unit test fixes and the F3 band. Gates pass: units, XS,
+  IS-SPR and wvs positives are exact, and their negatives fail.
+- **Fair set:** same-job Nano 8k, 4 nodes, K=1, run in both orders and pooled. IS-SPR is **1.11× SPR-BI**
+  (kernel-normalized 1.10); XS is 1.37× (kernel-normalized 1.34). Stock runs with deferred metrics (its best
+  config). Full table: `RESULTS.md` section 2.0.
+- **Next:** the K = 2 / 4 sets on this code; the 16k Nano and Ultra fair ladders.
 
 ### B. IS-SPR / IS-RLOO, the near-on-policy arm (`handoff/isspr-dd`, `handoff/isspr-pc`)
 - **What:** stock pause / resume plus a keyed rescore at the wake and importance weights; unbiased, not exact in law.
