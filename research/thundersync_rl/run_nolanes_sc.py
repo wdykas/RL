@@ -55,6 +55,53 @@ def _patch_effective_config_dump(out: str) -> None:
     cfg_mod.parse_hydra_overrides = parse_and_dump
 
 
+BAND_KEYS = ("crossfade_routing_m", "crossfade_routing_m_profile", "crossfade_routing_extra", "crossfade_routing_sparse",
+             "crossfade_routing_sparse_engine", "crossfade_routing_ramp_stopgrad")
+
+
+def append_applied_band(out: str, config: dict) -> None:
+    """Rewrite the effective-config dump's policy.megatron_cfg cross-fade keys with the band the driver applied
+    (a ThunderSync mode's configure_driver / nolanes.apply_crossfade copies its thundersync block there after the dump
+    was written), so the dump shows the band that ran (REVIEW batch 49 condition 2)."""
+    import yaml
+
+    if not out or not os.path.exists(out):
+        return
+    mcfg = (config.get("policy") or {}).get("megatron_cfg") or {}
+    with open(out) as f:
+        dumped = yaml.safe_load(f)
+    dm = dumped.setdefault("policy", {}).setdefault("megatron_cfg", {})
+    for k in BAND_KEYS:
+        if k in mcfg:
+            dm[k] = mcfg[k]
+    with open(out, "w") as f:
+        yaml.safe_dump(dumped, f, sort_keys=False)
+    print(f"{TAG} effective config: applied cross-fade band "
+          f"{ {k: dm.get(k) for k in BAND_KEYS} } -> {out}", flush=True)
+
+
+def _patch_configure_drivers(out: str) -> None:
+    """Every ThunderSync mode's configure_driver re-dumps the band it applied (append_applied_band)."""
+    import importlib
+
+    for name in ("nolanes", "colo", "xspr", "isspr"):
+        try:
+            mod = importlib.import_module(f"thundersync_rl.{name}")
+        except ImportError:
+            continue
+        orig = getattr(mod, "configure_driver", None)
+        if orig is None or getattr(orig, "_nl_band_dump", False):
+            continue
+
+        def wrapped(config, *a, _orig=orig, **kw):
+            res = _orig(config, *a, **kw)
+            append_applied_band(out, config)
+            return res
+
+        wrapped._nl_band_dump = True
+        mod.configure_driver = wrapped
+
+
 def _dry(argv: list[str]) -> None:
     import argparse
 
@@ -139,20 +186,21 @@ def _dry(argv: list[str]) -> None:
         print(f"{TAG} DRY note: thundersync_rl.nolanes not importable ({e}); nolanes validator skipped", flush=True)
     else:
         mode = (c.get("thundersync") or {}).get("mode")
+        mode_cfg = None
         if mode == "colo":
             from thundersync_rl import colo
 
-            ccfg = colo.validate_config(c)
+            mode_cfg = ccfg = colo.validate_config(c)
             print(f"{TAG} DRY colo.validate_config OK: {ccfg}", flush=True)
         elif (c.get("thundersync") or {}).get("mode") == "xspr":
             from thundersync_rl import xspr
 
-            xcfg = xspr.validate_config(c)
+            mode_cfg = xcfg = xspr.validate_config(c)
             print(f"{TAG} DRY xspr.validate_config OK: {xcfg}", flush=True)
         elif (c.get("thundersync") or {}).get("mode") == "isspr":
             from thundersync_rl import isspr
 
-            icfg = isspr.validate_config(c)
+            mode_cfg = icfg = isspr.validate_config(c)
             print(f"{TAG} DRY isspr.validate_config OK: {icfg}", flush=True)
         elif mode is None:
             # No ThunderSync stage: NeMo-RL's stock loop on this config (e.g. the SPR-BI baseline arm, stock colocated
@@ -161,8 +209,12 @@ def _dry(argv: list[str]) -> None:
         elif not hasattr(nolanes, "validate_config"):
             print(f"{TAG} DRY note: thundersync_rl.nolanes has no validate_config yet; skipped", flush=True)
         else:
-            ncfg = nolanes.validate_config(c)
+            mode_cfg = ncfg = nolanes.validate_config(c)
             print(f"{TAG} DRY nolanes.validate_config OK: {ncfg}", flush=True)
+        if mode_cfg is not None and hasattr(mode_cfg, "crossfade_routing_extra"):
+            # The band the driver will apply (configure_driver -> nolanes.apply_crossfade), into the dump.
+            nolanes.apply_crossfade(mode_cfg, c["policy"]["megatron_cfg"])
+            append_applied_band(os.environ.get("NL_EFFECTIVE_CONFIG", ""), c)
 
     print(f"{TAG} DRY OK sampler={s.name} lookahead={getattr(s, 'max_lookahead_versions', None)} "
           f"buffer={mc.async_rl.max_buffered_rollouts} need={need} inflight={mc.async_rl.max_inflight_prompts} "
@@ -179,6 +231,7 @@ def main() -> None:
     out = os.environ.get("NL_EFFECTIVE_CONFIG")
     if out:
         _patch_effective_config_dump(out)
+        _patch_configure_drivers(out)
     if os.environ.get("NL_DRY", "0") == "1":
         _dry(sys.argv[1:])
         return

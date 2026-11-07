@@ -85,6 +85,13 @@ preset() {
                  export MAX_REQ=${MAX_REQ:-$(( (k + 1) * _P * 8 * _TP / _GPUS ))}
                fi ;;
       esac
+      # F3: the Nano cross-fade band cfS30 (m .03 x [.3, 1, .5] by MoE depth, extra 4) in every arm on our tree. SPR-BI's
+      # stock loop reads it from policy.megatron_cfg, ThunderSync arms from the thundersync block. Other models keep the
+      # configs' band (m .01, extra 8). No spaces inside the profile: XA is split on whitespace.
+      if [ $m = nano ]; then
+        local _BP=$( [ $arm = sprbi ] && echo policy.megatron_cfg || echo thundersync )
+        _XE="$_XE ++$_BP.crossfade_routing_m=0.03 ++$_BP.crossfade_routing_m_profile=[[0.0,0.2608,0.3],[0.2608,0.7826,1.0],[0.7826,1.0,0.5]] ++$_BP.crossfade_routing_extra=4"
+      fi
       [ -n "$_MBS" ] && export MBS=${MBS:-$_MBS}
       # MAX_REQ / ENGINE_BUF: by rule in colo_arm.sh (lib/engine_buf.py), except the 1-node values the gates used.
       [ $m = l8 ] && { export ENGINE_BUF=${ENGINE_BUF:-16}; [ $arm = xpr ] && export MAX_REQ=${MAX_REQ:-$(( (_P * 9 * (k + 1) + 1) / 2 / 16 * 16 + 16 ))}; }

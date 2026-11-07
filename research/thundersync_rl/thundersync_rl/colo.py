@@ -26,6 +26,10 @@ What this mode adds to the stock colocated loop:
   PIT law test of every output token and of every row's first token (thundersync_rl/law_check.py);
 - the negative control ``NEMO_RL_DEBUG_COLOC_SKIP_RESHARD=1`` (engine keeps theta_0): sentinel and law must fail.
 
+Routing: the cross-fade band (``thundersync.crossfade_routing_*``, nemo_rl/models/megatron/crossfade_routing.py) is
+part of the policy definition, so XS routes with the same band as every other arm (F3, 11-06: the band applies to
+every arm for fairness); with one weight version per step it is not needed for verification, only for a common model.
+
 Exactness conditions of the mode (validator): colocated Megatron generation, batch-invariant numerics on learner and
 engine (zero_train_gen_mismatch), router weights + bias frozen, persist KV (or offload with the TMS=1
 torch_memory_saver overlay), lag 0 (every row of batch k is admitted after the wake that installs theta_k).
@@ -40,7 +44,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, fields
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 MODE = "colo"
 SKIP_RESHARD_ENV = "NEMO_RL_DEBUG_COLOC_SKIP_RESHARD"
@@ -62,6 +66,15 @@ class ColoConfig:
     mode: Literal["colo"] = MODE
     seed_stream: str = "colo"
     wide_sampler_key64: bool = True
+    # Cross-fade routing (nolanes.crossfade_problems: required, off only with crossfade_off_reason): the same keys,
+    # rule and values as every other colo arm, so XS trains and samples the same policy definition.
+    crossfade_routing_m: Optional[float] = None
+    crossfade_routing_m_profile: Any = None
+    crossfade_routing_extra: int = 8
+    crossfade_routing_ramp_stopgrad: bool = True
+    crossfade_routing_sparse: bool = True
+    crossfade_routing_sparse_engine: bool = True
+    crossfade_off_reason: Optional[str] = None
 
     @classmethod
     def from_config(cls, config: Any) -> "ColoConfig":
@@ -107,6 +120,10 @@ def config_problems(config: Any) -> list[str]:
     if str(env.get(SKIP_RESHARD_ENV, os.environ.get(SKIP_RESHARD_ENV, "0"))) == "1" and not nolanes.checks_on():
         p.append(f"{SKIP_RESHARD_ENV} is a negative control: refused without CHECKS")
     p += nolanes.router_frozen_problems(config)
+    try:
+        p += nolanes.crossfade_problems(ColoConfig.from_config(config), mcfg)
+    except (TypeError, ValueError) as e:
+        p.append(str(e))
     return p
 
 
@@ -130,15 +147,19 @@ def configure_driver(config: dict) -> ColoConfig:
     ACTOR_ENVIRONMENT_REGISTRY[nolanes.WORKER_FQN] = PY_EXECUTABLES.MCORE
     config["policy"]["worker_extension_cls_fqn"] = nolanes.WORKER_FQN
     mcfg = config["policy"]["megatron_cfg"]
-    # Plain top-k routing: with one weight version per step there is nothing to verify, so theta-only routing needs
-    # no cross-fade band (MODEL.md §1, XS).
-    mcfg["crossfade_routing_m"] = None
+    # Cross-fade routing from the thundersync block, as every other colo arm (one policy definition for all arms).
+    nolanes.apply_crossfade(cfg, mcfg)
     # Always-on sentinel: the loss reports every trained token's training log-prob against its generation log-prob.
     config.setdefault("loss_fn", {})["train_lp_check"] = True
     if os.environ.get(SKIP_RESHARD_ENV) == "1":
         mcfg["env_vars"] = dict(mcfg.get("env_vars") or {}, **{SKIP_RESHARD_ENV: "1"})
     neg = nolanes.negative()
+    if neg == "cf_engine_m":
+        # Negative control: the engine (inference mode only) routes with 2 x the band; the CHECKS mismatch test and
+        # the train-lp sentinel must fail (crossfade_routing.py THUNDERSYNC_DEBUG_CF_ENGINE_M_SCALE).
+        mcfg["env_vars"] = dict(mcfg.get("env_vars") or {}, THUNDERSYNC_DEBUG_CF_ENGINE_M_SCALE="2")
     print(f"[colo] mode=colo sync (lag 0) engine sampler=wide key64={int(cfg.wide_sampler_key64)} "
-          f"checks={int(nolanes.checks_on())}" + (f" NEGATIVE CONTROL {neg}" if neg else "")
+          f"checks={int(nolanes.checks_on())} cf m={cfg.crossfade_routing_m} profile={cfg.crossfade_routing_m_profile} "
+          f"extra={cfg.crossfade_routing_extra}" + (f" NEGATIVE CONTROL {neg}" if neg else "")
           + (" NEGATIVE CONTROL skip_reshard" if os.environ.get(SKIP_RESHARD_ENV) == "1" else ""), flush=True)
     return cfg
