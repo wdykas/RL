@@ -21,4 +21,13 @@ makes lazy tree-stage CUDA-graph captures use `capture_error_mode="thread_local"
 another engine-process thread cannot invalidate a capture mid-flight. It is in `handoff/tree-spec` and
 `handoff/bxsd2`; DX does not have it yet.
 
-Open item: the nolanes lag-2 hang at step 3 still needs a root cause.
+Open items:
+- **Host-side hang at step 3 (culprit not identified).** The DX tip hung host-side at step 3 twice in BI-learner runs:
+  the driver logs the train step but never issues the train call. The same arm ran 14 steps on the earlier DX state,
+  which had GRPO-Z train-on-arrival but not the later commits. Those later commits are the suspects:
+  - the GRPO-Z + early-deferred-verification relaunch;
+  - the engine-verify FinalizePipeline drain;
+  - two follow-ups.
+- **Stall-abort coverage.** The async_rl stall-abort does not cover actor setup, so a hang during worker setup is not
+  caught. One smoke of the DX tip hung there.
+- The nolanes lag-2 hang at step 3 still needs a root cause. It may be the same issue as the host-side hang above.
