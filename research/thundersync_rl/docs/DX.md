@@ -21,6 +21,13 @@ makes lazy tree-stage CUDA-graph captures use `capture_error_mode="thread_local"
 another engine-process thread cannot invalidate a capture mid-flight. It is in `handoff/tree-spec` and
 `handoff/bxsd2`; DX does not have it yet.
 
+EDV CHECKS coverage:
+- What changed: EDV CHECKS at learner TP=1 now records the EDV shadow (eta, b_g per envelope) on the gathered non-DS2
+  verify path too.
+- New gate: the X1 arm `edv_dp2` covers it.
+- Before the fix: the cross-check was not exercised at TP=1. EDV decisions were unaffected: the gate shows
+  replay_mismatch 0.
+
 Open items:
 - **Host-side hang at step 3 (culprit not identified).** The DX tip hung host-side at step 3 twice in BI-learner runs:
   the driver logs the train step but never issues the train call. The same arm ran 14 steps on the earlier DX state,

@@ -233,6 +233,8 @@ def parse(path):
     r["coverage"] = []
     if arm.startswith("x1-neg_content_m_edv-") and r["edv_neg_rows"] < 20:
         r["coverage"].append(f"coverage: content_m_edv moved {r['edv_neg_rows']} EDV rows (need >= 20)")
+    if arm.startswith("x1-edv_dp2-") and r["edv_replay"] == 0:
+        r["coverage"].append("coverage: edv_dp2 replay_rows=0 (no deferred row was replayed at DP 2)")
     if arm.startswith("x1-edv_stress-") and r["edv_surprises"] == 0:
         r["coverage"].append("coverage: edv_stress surprises=0 (the surprise path did not run)")
     if arm.startswith("x1-prod_stress-") and r["continued"] == 0:

@@ -6823,6 +6823,18 @@ class ThunderSyncMegatronPolicyWorker(
                             grid, lpx, n_eval = verify_engine_q_grid(
                                 p_lp, draft, lq, q_rows, row_gen, tuple(null_envelopes[i])
                             )
+                            if row_seeds is not None and os.environ.get("THUNDERSYNC_NL_CHECKS", "0") == "1":
+                                # EDV shadow on the gathered (non-DS2, e.g. learner TP 1) path, CHECKS only: the same
+                                # record DS2 keeps (eta_g, b_g per envelope), from this verification's own log p and
+                                # the row's seed, so the driver's EDV replay check can compare the loss's committed
+                                # (b_g, eta_g) bitwise at every TP (BUGS: EDV replay mismatch at TP 1, 11-06).
+                                lq_d = (lq if torch.is_tensor(lq) else torch.tensor(lq, dtype=torch.float32)).to(lpx.device)
+                                edv_row = {
+                                    "g": int(g),
+                                    "eta_g": float(vit.eta_last(int(row_seeds[i]), int(g), dev)),
+                                    "b_g": {float(M): float(vit.whole_weight(lpx[:g], lq_d[:g], float(M)))
+                                            for M in tuple(null_envelopes[i])},
+                                }
                     tau = max(t for t, _, _ in grid.values())
                     if os.environ.get("THUNDERSYNC_NL_DEBUG_ROWS") == "1":
                         self._nl_debug_rows(grid, p_lp, q_rows, draft, lq, ds2_used)
@@ -6881,7 +6893,7 @@ class ThunderSyncMegatronPolicyWorker(
                         "lr_seg_moments": seg_m,
                         "lr_pos_moments": pos_m,
                     }
-                    if ds2_used and edv_row is not None:
+                    if edv_row is not None:
                         # EDV shadow (DESIGN §22.5): eta_g and b_g per envelope for the driver's jsonl. Read only.
                         res["edv_shadow"] = {**edv_row, "key": keys[i]}
                     from thundersync_rl import acc_dump

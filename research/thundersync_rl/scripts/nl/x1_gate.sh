@@ -245,6 +245,10 @@ case $ARMX in
           summary ;;
   # EDV (DESIGN §22.9): deferred rows decided by the training forward, replayed by the verifier (CHECKS).
   edv) run1 edv 1 $STEPS "" "++thundersync.edv_threshold=0.5"; summary ;;
+  # EDV at learner DP 2 / TP 1 (BUGS 11-06: the CHECKS replay compared against a shadow only DS2 (TP > 1) recorded,
+  # so every replayed deferred row counted as a mismatch at TP 1): nl_super (train_overlap, EDV e 0.5), learner and
+  # engine TP 1 EP 2; must be EXACT with replay_rows > 0 and replay_mismatch 0.
+  edv_dp2) run1 edv_dp2 1 $STEPS "" "" "CFG_REL=research/thundersync_rl/configs/nl/nl_super.yaml TP=1 GEN_TP=1"; summary ;;
   # EDV surprise path: e forced to 0.95 and stress lr, so deferred rows are not whole: dropped captures, re-walks,
   # retrained groups; must be EXACT with surprises > 0.
   edv_stress) run1 edv_stress 1 $STEPS "" "++thundersync.edv_threshold=0.5 $STRESS_XA"; summary ;;
@@ -255,6 +259,7 @@ case $ARMX in
        run1 prod_stress 1 $STEPS "" "$STRESS_XA"
        run1 stress 1 $STEPS "" "$STRESS_XA"
        run1 sanity 1 $STEPS "" "policy.megatron_cfg.optimizer.lr=0.0 policy.megatron_cfg.optimizer.min_lr=0.0 policy.megatron_cfg.scheduler.lr_warmup_init=0.0"
+       run1 edv_dp2 1 $STEPS "" "" "CFG_REL=research/thundersync_rl/configs/nl/nl_super.yaml TP=1 GEN_TP=1"
        negs
        summary ;;
   *) echo "arm all|pf|pos|pos_base|prod|prod_stress|stress|sanity|mtd|neg"; exit 1 ;;
