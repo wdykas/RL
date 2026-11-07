@@ -261,10 +261,20 @@ Findings:
 - The sweep before learner row weights measured K = 1 / 2 / 4 at 1.23 / 1.44 / 1.40x SPR-BI. Removing the
   finished-row re-prefill, and skipping the resume prefill without recompute, brings K = 2 to parity with SPR-BI.
 - The training-side delta is now about 0.8-1.1 s per step, since SPR-BI also carries the F3 band.
-- K=4 below 1x is **not explained yet**. The IS arms generate in bursts (about 140 s every 5th step, then four steps
-  with no engine phase), while SPR-BI spends about 33 s of untimed engine work on every step. This is a schedule
-  difference between the ThunderSync stage loop and the stock loop, not an IS-RLOO effect. Do not claim < 1x until
-  it is root-caused.
+- **K=4: the baseline is capped at 1000 engine rows.** Treat the K=4 row as "baseline capped at 1000 rows", not as
+  a speedup.
+  - Cause: every generation request is one Ray call on engine rank 0. The stock `MegatronPolicyWorker` sets no Ray
+    `max_concurrency`, so Ray's async-actor default of 1000 applies. The ThunderSync worker sets 4096
+    (`engine_slots.ACTOR_MAX_CONCURRENCY`). Engine settings and the loop are otherwise identical.
+  - At K=4 the (K+1)·P·G = 2560 rows exceed the cap, which has two effects on SPR-BI:
+    - the engine runs at most 1000 rows (101k vs 149k generated tok/s);
+    - the stand-down call queues behind pending generate calls on rank 0, delaying it about 31 s per step, while the
+      other ranks wait paused.
+  - s/step stays comparable: both arms time the same pump, and the windows are whole cycles. Only the per-phase split
+    was misattributed: the engine work sits in the untimed stand-down.
+  - Prediction, not yet measured: with the cap lifted on every arm, IS-RLOO without recompute is about 1.02x SPR-BI
+    at K=4, and about 1.13x with recompute. The re-measure is pending. A fair baseline must carry the same actor
+    concurrency.
 - **Why no-recompute is still unbiased:** with s_r from the learner, w_r = min(C, prod_t p_target(x_t) / q_t), where
   q_t is the probability the engine actually drew token t with. That is standard importance sampling for any
   proposal, including a stale-state one. The usual caveats remain: the clip, and for row weights the sibling
@@ -331,7 +341,29 @@ Settings: same job, both orders, steps 2-9 (whole cycles), KV offload + TMS, buf
   - the tree_stale_mamba negative fails;
   - 2.06-2.13 tokens/iteration;
   - generation 19.5-20.7 s vs 25.5-25.9 s for plain XS (1.26×) on 2k rows.
-- The fair 4-arm set with the c3 head (SPR / SPR-BI / SPR-SD / XS-SD) is pending. Prediction: 1.17-1.38× SPR-BI.
+- **Fair 4-arm set, final (v3).** Nano 8k with the head_v2 MTP drafter and the F3 band. The set ran in one job, then
+  again in the reverse order. All arms used MR 128, the rule engine buffer, P 64 x G 8, 12 steps, and tree 8:4:256.
+  SPR-SD is SPR-BI's stock loop with the same drafter; its MTP head slot is now kept across a weight epoch (gated
+  exact).
+
+| arm | lag | s/step (A / B) | gen (A / B) | kernel-normalized (A / B) | tokens / iteration |
+|---|---|---|---|---|---|
+| SPR (stock) | 1 | 58.4 / 58.7 | 29.8 / 29.7 | 58.4 / 58.7 (stock) | — |
+| SPR-BI | 1 | 66.4 / 65.9 | 37.7 / 37.6 | 59.9 / 59.4 | — |
+| SPR-SD | 1 | 64.2 / 63.8 | 34.5 / 34.6 | 58.2 / 57.8 | 1.67 |
+| XS-SD | 0 | 79.1 / 79.3 | 50.3 / 50.3 | 70.4 / 70.6 | 2.18-2.21 |
+
+| ratio | raw | kernel-normalized |
+|---|---|---|
+| XS-SD / SPR-BI | 1.19-1.20 | 1.18-1.19 |
+| XS-SD / SPR-SD (fair drafter-equipped baseline) | **1.23-1.24** | 1.21-1.22 |
+| XS-SD / SPR (stock) | 1.35 | **1.20-1.21** |
+
+  - Prediction check: XS-SD / SPR-BI was predicted at 1.12 (1.05-1.20). The measured 1.19-1.20 is at the upper edge.
+  - The drafter reaches a critical-path rate of only about 2.1 tokens per iteration in this loop.
+  - SPR-SD missed its prediction (0.97x SPR-BI instead of 0.80-0.92x). At 64 live rows per rank, a tree iteration
+    costs about 26 ms vs about 10 ms for plain BI decode, so most of the token gain goes to verify width and draft
+    cost.
 
 ### BX-SD (block verification at the wake + balanced fork lane)
 

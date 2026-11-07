@@ -27,7 +27,8 @@ Two code lineages exist:
 | `handoff/isspr-dd` | `colo-handoff` | B. IS-SPR / IS-RLOO, current work |
 | `handoff/isspr-pc` | `colo-handoff` | B. IS-SPR with prefix caching / chunked prefill (measured lag sweep) |
 | `handoff/f3-band` | `colo-handoff` | H. wider cross-fade band |
-| `handoff/xssd-slim2` | `colo-handoff` | D. XS-SD on the slim line |
+| `handoff/xssd-spec` | `colo-handoff` | D. XS-SD and SPR-SD on the slim line, final (head_v2, F3 band) |
+| `handoff/xssd-slim2` | `colo-handoff` | D. XS-SD on the slim line | (older)
 | `handoff/tree-prod-slim` | `colo-handoff` | C. tree speculation, slim gate integration |
 | `handoff/oldpin-base` | upstream main `ce0cb739` | common base of the old-pin line |
 | `handoff/tree-spec` | `handoff/oldpin-base` | C. shared tree-speculation module, MTP head input contract v2 |
@@ -74,12 +75,12 @@ before measuring.
 - **Measured (RESULTS §3a):**
   - K=1: 1.09x SPR-BI.
   - K=2 without wake recompute: 1.01x.
-  - K=4 without wake recompute: 0.85x (open: a schedule difference between the stage loop and the stock loop; not
-    yet root-caused).
+  - K=4 without wake recompute: 0.85x, with the baseline capped at 1000 engine rows by Ray's default actor
+    concurrency (the stock worker sets none; ours sets 4096). About 1.02x is predicted with the cap lifted.
   - The earlier sweep, before learner weights, was 1.23 / 1.44 / 1.40x.
 - **Next:**
   - Make no-recompute the row unit's default (pending review).
-  - Root-cause the K=4 < 1x schedule difference.
+  - Lift the actor-concurrency cap on every arm and re-measure K = 2 / 4 (prediction: ~1.02x at K=4).
   - Re-run the same-job sets on the final tip.
 - **Open:** a non-finite log-prob seen once at step 6 of one run; root cause unknown. Reproduce with the dump on.
 
@@ -93,10 +94,16 @@ before measuring.
 - **Next:** port to the slim line; explain the OOM at engine buffer 30 GiB on Megatron-LM main (140 GB resident at
   the torch_memory_saver resume).
 
-### D. XS-SD, exact sync + speculative decode (`handoff/xssd-slim2`, `handoff/xssd-mainpin`, `handoff/ext-tree-xssd`)
-- **State:** exact at engine buffer 48 on the main pin (1024/1024 tokens), and the negative fails.
-- **Running:** fair 4-arm SPR / SPR-BI / SPR-SD / XS-SD with the c3 draft head on the slim line.
-- **Prediction:** 1.17-1.38× SPR-BI. `handoff/ext-tree-xssd` is the old-pin line.
+### D. XS-SD, exact sync + speculative decode (`handoff/xssd-spec`; older lines `handoff/xssd-slim2`, `handoff/xssd-mainpin`, `handoff/ext-tree-xssd`)
+- **State:**
+  - Slim gate PASS: T1 1024/1024 exact over 4 steps, CHECKS exact every step, and the tree_stale_mamba negative
+    fails.
+  - The MTP head slot is kept across a weight epoch, gated exact for persist K = 1 / 2 / 4.
+- **Final fair set (v3, RESULTS §4):** XS-SD is 1.19-1.20x SPR-BI, 1.23-1.24x SPR-SD (the fair drafter-equipped
+  baseline) and 1.20-1.21x stock SPR kernel-normalized.
+- **Limit:** in this loop the head_v2 drafter reaches a critical-path rate of only about 2.1 tokens per iteration,
+  and a tree iteration at 64 live rows per rank costs about 26 ms vs about 10 ms for plain decode.
+- **Next:** a better drafter (round-2 head) or fewer verify rows per iteration.
 
 ### E. EX-T and BX-SD fork lane (`handoff/bxsd2`; EX-T lives in `handoff/tree-spec`)
 - **EX-T + MTP:** 1.37× SPR-BI with draft head r1_e3, 1.28× with c3 (control arm); c3 pairs queued.

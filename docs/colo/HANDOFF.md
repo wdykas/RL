@@ -161,7 +161,10 @@ method lands only with its gate green and its negative red.
   (kernel-normalized 1.10); XS 1.37× SPR-BI (kn 1.34); SPR-BI / SPR 1.13 (kn 1.02, the BI-numerics tax is almost all
   kernel speed); IS-SPR / SPR 1.24 (kn 1.12).
 - IS-RLOO with learner row weights (`colo_isrloo.yaml`), same-job vs SPR-BI: K=1 1.09×, K=2 1.01× and K=4 0.85×
-  without the wake recompute (K=4 < 1× not yet root-caused); row ESS ≥ 0.96. Earlier sweep: 1.23 / 1.44 / 1.40×.
+  without the wake recompute (baseline capped at 1000 engine rows by Ray's default actor concurrency; ~1.02× predicted
+  with the cap lifted); row ESS ≥ 0.96. Earlier sweep: 1.23 / 1.44 / 1.40×.
+- XS-SD (exact sync + keyed tree speculative decode, head_v2), fair same-job set: 1.19-1.20× SPR-BI, 1.23-1.24×
+  SPR-SD (the drafter-equipped SPR baseline), 1.20-1.21× stock SPR kernel-normalized.
 - Full tables, regimes and negative results: [`RESULTS.md`](RESULTS.md).
 
 Top next steps:
