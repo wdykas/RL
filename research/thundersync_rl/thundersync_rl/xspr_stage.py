@@ -63,6 +63,7 @@ class XsprStage(ColoStage):
         self.dump_dir = os.path.join(master_config.logger.log_dir, "nonfinite_lp")
         self.rows = self.rows_cls(seed, cfg.seed_stream, self.max_new, sc._rollout_manager.weight_version,
                                   neg=self.negative(), keep_forks=bool(cfg.row_dump_dir))
+        self.rows.dump_dir = self.dump_dir
         impl = sc._rollout_manager._impl
         if not hasattr(impl, "_generate_response"):
             raise RuntimeError("[xspr] needs the native rollout path (AsyncRolloutImpl)")

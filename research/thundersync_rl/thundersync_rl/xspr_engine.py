@@ -48,6 +48,7 @@ CHECK_ATTR = "ts_xspr_check"  # L: the last L prompt tokens are the row's candid
 CONTINUE_ATTR = "ts_xspr_continue"  # the check request decodes on after its prefill: 1 unless a token mismatched, 2 always
 RESULT_ATTR = "ts_xspr_result"  # {"tau", "lps", "y"} of a check request (engine rank)
 NOCACHE_ATTR = "ts_xspr_nocache"  # the request matches no prefix-cache block (an independent reference prefill)
+WAKE_AT_ATTR = "ts_xspr_wake_at"  # generated-token counts of the request at each wake it was in flight across
 
 
 def check_rows(
@@ -239,7 +240,7 @@ def check_capture(overflow_before: int, overflow_after: int) -> None:
 def record_failure(xs: dict, err: Exception) -> None:
     """A guard failed on the engine loop thread: keep the first failure for raise_failure (printing it once)."""
     if "error" not in xs:
-        xs["error"] = str(err)
+        xs["error"] = f"{type(err).__name__}: {err}"
         print(f"[xspr engine] FAILURE (raised on the worker's next result / stats / wake call): {err}", flush=True)
 
 
@@ -258,6 +259,44 @@ def prefill_one_epoch(seen: dict, rids, epoch: int, is_cut: Callable[[int], bool
         if first != epoch and not is_cut(int(rid)):
             raise RuntimeError(f"[xspr engine] request {int(rid)}: its prefill ran under weight epochs {first} and "
                                f"{epoch} (a chunked prefill across a wake that the cut missed)")
+
+
+def replay_draw(rows, rids, pos, temp, salt: int, key64: bool, row_salts=None):
+    """The keyed draw of ``rows`` again, by the kernel the engine's sampler used for it (worker.install_wide_sampler:
+    the keyed sampler S for unsalted 64-bit keys, else wide_sample_logits): bitwise the engine's token at the same
+    law."""
+    import torch
+
+    from thundersync_rl.keyed_sampling import wide_sample_logits
+
+    if row_salts is None and key64:
+        from thundersync_rl import keyed_sampling_s as s_mod
+
+        rows = rows if rows.stride(-1) == 1 else rows.contiguous()
+        ws = torch.empty(max(s_mod.workspace_bytes(rows.shape[0], rows.shape[1]), 1), dtype=torch.uint8,
+                         device=rows.device)
+        out = torch.empty(rows.shape[0], dtype=torch.int64, device=rows.device)
+        s_mod.wide_sample(rows, rids, pos, temp, salt, out=out, workspace=ws)
+        return out
+    return wide_sample_logits(rows, rids, pos, temp, salt, key64=key64, row_salts=row_salts)
+
+
+def mark_wake(engine: Any) -> int:
+    """At a wake (engine suspended, before the resume): append every in-flight xspr request's generated-token count
+    to its ``WAKE_AT_ATTR`` list (returned with its result): the tokens it samples after that count are the new
+    weights'. With the wake cut no request runs on (a cut request appends no token); without it (the stale-KV
+    negative) the driver still knows which of a row's tokens the new weights sampled. Returns the number marked."""
+    n = 0
+    for entry in list(engine.requests.values()):
+        sp = entry.record[-1].sampling_params
+        if sp is None or getattr(sp, KEY_RID_ATTR, None) is None:
+            continue
+        at = list(getattr(sp, WAKE_AT_ATTR, None) or ()) + [sum(len(r.generated_tokens) for r in entry.record.requests)]
+        for r in entry.record.requests:
+            if getattr(r, "sampling_params", None) is not None:
+                r.sampling_params.add_attributes({WAKE_AT_ATTR: at})
+        n += 1
+    return n
 
 
 def cut_touched(engine: Any, stats: Optional[dict] = None, prefill_cut: bool = True) -> int:
@@ -396,6 +435,7 @@ class XsprEngineMixin:
         if nolanes.checks_on():
             # A host sync per engine step: CHECKS runs only, never timed pairs (REVIEW batch 27, N1). Timed runs keep
             # the free driver-side check (ExactRows._segment: require_finite).
+            self._xspr_qcheck = {"rows": 0, "bad_token": 0, "bad_lp": 0, "last": None}
             self._xspr_guard_logprobs(engine, dump_dir)
         print(f"[xspr engine] rank={getattr(self, 'rank', '?')} check + row keys + wake cut installed "
               f"(chunk_rows={chunk_rows})", flush=True)
@@ -411,13 +451,52 @@ class XsprEngineMixin:
         ctx = engine.context
         orig = ctx.calculate_log_probs_tensors
 
+        qc = getattr(self, "_xspr_qcheck", None)
+
+        def check_q(new_tokens, selected) -> None:
+            """q is the law each token was drawn with: the keyed draw replayed on the sampler's own rows at the
+            LOGGED temperature gives the recorded token, and the recorded log-prob is the engine's raw log-prob of
+            those rows at that token, bitwise (a sampler running another law, THUNDERSYNC_DEBUG_LAW_BUG=temp:f, fails
+            both)."""
+            if qc is None:
+                return
+            last, qc["last"] = qc["last"], None
+            if last is None:
+                return
+            rows, rids, pos, temp, row_salts, _, emitted = last
+            n = int(rows.shape[0])
+            if int(new_tokens.shape[0]) < n or int(selected.shape[0]) < n:
+                return
+            ref = replay_draw(rows, rids, pos, temp, int(self._wide_salt), bool(self._wide_key64), row_salts)
+            tok = new_tokens[:n].to(ref.dtype)
+            if "logprobs" not in qhead:
+                qhead["logprobs"] = self._xspr_head()[1]
+            lp = qhead["logprobs"](rows.float())
+            lp_ref = lp.gather(-1, tok.unsqueeze(-1)).squeeze(-1)
+            bad_tok = (ref != tok) & emitted
+            bad_lp = (lp_ref.float() != selected[:n].float()) & emitted
+            qc["rows"] += int(emitted.sum())
+            qc["bad_token"] += int(bad_tok.sum())
+            qc["bad_lp"] += int(bad_lp.sum())
+            if bool((bad_tok | bad_lp).any()) and len(qc.setdefault("examples", [])) < 8:
+                for i in torch.nonzero(bad_tok | bad_lp).flatten()[:4].tolist():
+                    qc["examples"].append({"rid": int(rids[i]), "pos": int(pos[i]), "token": int(tok[i]),
+                                           "replayed": int(ref[i]), "lp_recorded": float(selected[i]),
+                                           "lp_rows": float(lp_ref[i]), "temp": float(temp[i])})
+
+        qhead: dict = {}  # the q check's own head fn (the check rows' ``head`` cache is the score path's)
+
         def calculate_log_probs_tensors(logits, new_tokens, *args, **kwargs):
             selected, log_probs = orig(logits, new_tokens, *args, **kwargs)
+            try:
+                check_q(new_tokens, selected)
+            except Exception as err:  # the engine loop thread: recorded, raised on the worker path
+                record_failure(self._xspr, err)
             n = int(new_tokens.shape[0])
             if selected.shape[0] == n and not bool(torch.isfinite(selected).all()):
                 try:
                     nonfinite_dump(self, engine, logits, new_tokens, selected, dump_dir)
-                except RuntimeError as err:  # the engine loop thread: recorded, raised on the worker path
+                except Exception as err:  # the engine loop thread: recorded, raised on the worker path
                     record_failure(self._xspr, err)
             return selected, log_probs
 
@@ -456,14 +535,15 @@ class XsprEngineMixin:
         xs = self.__dict__.get("_xspr")
         raise_failure(xs)
         engine = getattr(self, "dynamic_inference_engine", None)
-        if (xs is not None and xs["wake_cut"] and engine is not None and getattr(self, "is_generation_colocated", False)
+        if (xs is not None and engine is not None and getattr(self, "is_generation_colocated", False)
                 and getattr(self, "_inference_engine_asleep", False)):
             import asyncio
 
             import torch
 
             async def mark() -> int:
-                return cut_touched(engine, xs["cut_stats"], xs["prefill_cut"])
+                mark_wake(engine)
+                return cut_touched(engine, xs["cut_stats"], xs["prefill_cut"]) if xs["wake_cut"] else 0
 
             xs["cut"] += asyncio.run_coroutine_threadsafe(mark(), self._inference_loop).result()
             torch.distributed.barrier()
@@ -514,7 +594,8 @@ class XsprEngineMixin:
         out = super()._parse_result_to_batched_data_dict(data, result)
         out["xspr"] = [
             {"cut": int(getattr(r.sampling_params, CUT_ATTR, 0) or 0),
-             "check": getattr(r.sampling_params, RESULT_ATTR, None)}
+             "check": getattr(r.sampling_params, RESULT_ATTR, None),
+             "wake_at": [int(x) for x in (getattr(r.sampling_params, WAKE_AT_ATTR, None) or ())]}
             for r in result
         ]
         return out
@@ -528,6 +609,11 @@ class XsprEngineMixin:
             return {}
         raise_failure(xs)
         out = {k: xs[k] for k in ("checks", "check_rows", "check_s", "check_chunked", "check_void", "cut")}
+        qc = self.__dict__.get("_xspr_qcheck")
+        if qc is not None:
+            out.update(q_rows=qc["rows"], q_bad_token=qc["bad_token"], q_bad_lp=qc["bad_lp"],
+                       q_examples=list(qc.get("examples", [])))
+            qc.update(rows=0, bad_token=0, bad_lp=0, examples=[])
         out["cut_midprefill"] = int(xs["cut_stats"].pop("midprefill", 0))
         out["evicted"] = int(getattr(engine, "evicted_request_count", 0)) - xs["evicted0"]
         out.update(occupancy(xs["occ"]))
@@ -707,14 +793,14 @@ class XsprEngineMixin:
             if "error" not in xs:
                 try:
                     picked = select()
-                except RuntimeError as err:
+                except Exception as err:  # any error on the engine loop thread would kill it: record, raise later
                     record_failure(xs, err)
             ovf0 = cap["overflow"][0]
             out = orig(*args, **kwargs)
             if picked is not None:
                 try:
                     score(*picked, ovf0)
-                except RuntimeError as err:
+                except Exception as err:
                     record_failure(xs, err)
             if len(tags.by_rid) > 1024:
                 tags.prune()

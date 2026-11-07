@@ -67,6 +67,8 @@ _TEXT_TOKEN_ALIGNED_FIELDS = frozenset(
         "routed_experts",
         INVALID_TOOL_CALL_MASK,
         MALFORMED_THINKING_MASK,
+        # ThunderSync IS-RLOO CHECKS audit: the engine's rescore of every token (loss_functions.is_row_weights).
+        "is_audit_logprobs",
     }
 )
 

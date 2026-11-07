@@ -136,7 +136,8 @@ def config_problems(config: Any) -> list[str]:
     if _get(gen, "stop_strings"):
         p.append("xspr: no stop strings (a continuation's stop match would not see the kept prefix)")
     if _get(pol, "offload_optimizer_for_refit", True):
-        p.append("policy.offload_optimizer_for_refit must be false (resident colocated learner)")
+        p.append("policy.offload_optimizer_for_refit must be false (as SPR-BI: the optimizer stays, stock "
+                 "offload_before_refit moves the grad buffers off for the engine phase)")
     if _get(config, "async_rl.sampler.name") != "in_order":
         p.append("xspr needs the in_order sampler (batch k complete before the stand-down of step k)")
     lag = int(_get(config, "async_rl.sampler.max_lookahead_versions", 0) or 0)
@@ -286,6 +287,25 @@ class ExactRows:
         self.keep_forks = keep_forks
         self.ledger = KeyLedger()
         self.certs: dict[tuple, RowCert] = {}
+        # Where a row with a non-finite log-prob is dumped for a bitwise offline replay (set by the stage).
+        self.dump_dir: Optional[str] = None
+
+    def dump_row(self, key: int, what: str, prompt: list, tokens: list, lps: dict, **meta: Any) -> str:
+        """Write the row a finite check refused (its prompt and token ids, every log-prob list the caller has, the
+        keys of every row open on this driver: the batch in flight) as JSON; returns the path ("" without a dump
+        directory)."""
+        import json
+
+        if not self.dump_dir:
+            return ""
+        os.makedirs(self.dump_dir, exist_ok=True)
+        path = os.path.join(self.dump_dir, f"row_{key}_{what}.json")
+        with open(path, "w") as f:
+            json.dump({"key": int(key), "what": what, "prompt_token_ids": [int(t) for t in prompt],
+                       "token_ids": [int(t) for t in tokens],
+                       "logprobs": {k: [float(x) for x in v] for k, v in lps.items()},
+                       "open_keys": sorted(int(k) for k in self.ledger.hi), **meta}, f)
+        return path
 
     def key_of(self, target_step: int, prompt_idx: Any, j: int) -> int:
         return row_key(self.seed, self.stream, target_step, _plain(prompt_idx), j)
@@ -333,9 +353,17 @@ class ExactRows:
             raise RuntimeError(f"[xspr] check of key {key}: missing or wrong result {info['check']}")
         # Every log-prob the row will carry is finite (host values already here: free). The sampler cannot draw a
         # token its logged law gives probability 0; a NaN / -inf means the engine's log-prob path and sampler disagree.
-        require_finite(msg["generation_logprobs"][len(prefix):].tolist(), "decoded", key, len(prefix))
-        if check and info["check"] is not None:
-            require_finite(info["check"]["lps"], "rescored", key, 0)
+        try:
+            require_finite(msg["generation_logprobs"][len(prefix):].tolist(), "decoded", key, len(prefix))
+            if check and info["check"] is not None:
+                require_finite(info["check"]["lps"], "rescored", key, 0)
+        except RuntimeError as e:
+            lps = {"generation": msg["generation_logprobs"].tolist()}
+            if check and info["check"] is not None:
+                lps["rescored"] = list(info["check"]["lps"])
+            path = self.dump_row(key, "nonfinite", [int(t) for m in message_log for t in m["token_ids"]],
+                                 [int(t) for t in msg["token_ids"]], lps, version=int(v), first=len(prefix))
+            raise RuntimeError(f"{e}; row dumped to {path or '(no dump dir)'}") from e
         return msg, in_len, metrics, info, v
 
     def _finished(self, info: dict, tokens: list) -> bool:

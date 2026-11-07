@@ -149,6 +149,8 @@ def configure_driver(config: dict) -> ColoConfig:
     mcfg = config["policy"]["megatron_cfg"]
     # Cross-fade routing from the thundersync block, as every other colo arm (one policy definition for all arms).
     nolanes.apply_crossfade(cfg, mcfg)
+    # Resident learner across the engine phase, as before (worker.py offload_before_refit).
+    mcfg["resident_learner"] = True
     # Always-on sentinel: the loss reports every trained token's training log-prob against its generation log-prob.
     config.setdefault("loss_fn", {})["train_lp_check"] = True
     if os.environ.get(SKIP_RESHARD_ENV) == "1":

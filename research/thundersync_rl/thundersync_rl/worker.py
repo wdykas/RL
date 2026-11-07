@@ -666,7 +666,8 @@ class ThunderSyncMegatronPolicyWorker(XsprEngineMixin, NolanesEngineMixin, Megat
         # master shard are allocated before the hook, in stock segments, as before.
         # Colocated generation (research/colo/MODEL.md v2 §11): the learner process is also the engine, so it keeps
         # the stock allocator, as stock colocated does. Its state is RESIDENT (the colo validators require
-        # policy.offload_optimizer_for_refit=false; offload_before_refit below moves nothing). Expandable segments are
+        # policy.offload_optimizer_for_refit=false; offload_before_refit below keeps the grad buffers where
+        # megatron_cfg.resident_learner is set). Expandable segments are
         # off here because the colocated cycle still swaps the training parameters around the dedicated inference
         # model every step, and through expandable segments that churn remaps pages under training: Super-L8
         # policy_training 7.0 s (stock allocator) vs 30 s, and the speculative arm still OOMed with them,
@@ -910,9 +911,11 @@ class ThunderSyncMegatronPolicyWorker(XsprEngineMixin, NolanesEngineMixin, Megat
             )
 
     def offload_before_refit(self, *args, **kwargs):
-        if getattr(self, "is_generation_colocated", False) and not getattr(self, "offload_optimizer_for_refit", True):
-            # Resident colocated learner: optimizer state and grad buffers stay on the device across the engine phase
-            # (the engine's KV / state buffer is sized by rule beside them, research/colo/jobs/engine_buf.py).
+        mcfg = (getattr(self, "cfg", None) or {}).get("megatron_cfg") or {}
+        if getattr(self, "is_generation_colocated", False) and mcfg.get("resident_learner", False):
+            # Resident colocated learner (policy.megatron_cfg.resident_learner, set by the modes whose stages read the
+            # learner after the stand-down: nolanes verify, colo): grad buffers stay on the device across the engine
+            # phase. Every other mode (xspr, isspr) offloads as stock / SPR-BI does.
             self.finalize_async_save()
             return None
         return super().offload_before_refit(*args, **kwargs)
@@ -1138,6 +1141,7 @@ class ThunderSyncMegatronPolicyWorker(XsprEngineMixin, NolanesEngineMixin, Megat
                 if any_known:
                     pos = torch.where(dev[1] >= 0, dev[1], pos)
             temp = gv.temperature[:n].clamp(min=_min_sampling_temperature())
+            logged_temp = temp
             if temp_bug != 1.0:
                 temp = temp * temp_bug
             rows = logits[gather_indices[:n]] if gather_indices is not None else logits[:n]
@@ -1153,6 +1157,18 @@ class ThunderSyncMegatronPolicyWorker(XsprEngineMixin, NolanesEngineMixin, Megat
                                   out=out, workspace=s_ws[0])
             else:
                 out = wide_sample_logits(rows, rids, pos, temp, salt, key64=key64, row_salts=row_salts)
+            qcheck = self.__dict__.get("_xspr_qcheck")
+            if qcheck is not None:
+                # Exact SPR / IS-SPR q check (CHECKS; xspr_engine._xspr_guard_logprobs): this step's draw, to be
+                # replayed at the logged law and compared with the log-prob the engine records.
+                # A copy: the engine may reuse the logits buffer before it records the log-probs. Rows of requests
+                # part-way through a chunked prefill (MCore keeps them in waiting_request_ids) draw a token that is
+                # discarded (their recorded "token" is the next prompt token): not checked.
+                waiting = {int(r) for r in engine.waiting_request_ids}
+                emitted = torch.from_numpy(np.array([int(r) not in waiting for r in host_rids.numpy()], dtype=bool))
+                qcheck["last"] = (rows.clone(), rids.clone(), pos.clone(), logged_temp.clone(),
+                                  None if row_salts is None else row_salts.clone(), out,
+                                  emitted.to(rows.device))
             if output is None:
                 return out
             output.copy_(out)
