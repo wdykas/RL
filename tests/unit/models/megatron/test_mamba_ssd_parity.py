@@ -107,6 +107,8 @@ def _train_and_generate(mixer, zxBCdt):
             intermediate_chunk_indices=None,
             intermediate_abs_positions=None,
             intermediate_real_count=None,
+            intermediate_ssm_out=None,  # Megatron-LM main: prefix-caching intermediate-state outputs (none here)
+            intermediate_conv_out=None,
             cu_chunk_seqlens=None,
             last_chunk_indices=None,
             seq_idx_for_varlen=None,

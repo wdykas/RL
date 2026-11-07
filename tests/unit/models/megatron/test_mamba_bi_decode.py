@@ -89,11 +89,17 @@ def _decode(z_free: bool, steps: int, slots, prefill, graph: bool, seed=0, mixed
             cls.seed,
             bid.batch_invariant_decode_buffered_scan,
         )
+    elif mbd._ORIG.get("mcore_z_free", False):
+        # Megatron-LM main (#8221): no z-buffer path; the reference is MCore main's own z-free buffered decode (the
+        # function the fused step replaced), on MCore's buffers
+        from nemo_rl.models.megatron import mamba_bi_fused_decode as fd
+
+        alloc, seed_fn, scan = mbd._ORIG["allocate"].__get__(None, cls), cls.seed, fd._ORIG["scan"]
     else:
         alloc = mbd._ORIG["allocate"].__get__(None, cls)
         seed_fn, scan = mbd._ORIG["seed"], mbd._ORIG["scan"]
     buf = alloc(R, chunk, nh, hd, ng, ds, torch.device("cuda"), torch.float32)
-    assert (buf.z is None) == z_free
+    assert (getattr(buf, "z", None) is None) == (z_free or mbd._ORIG.get("mcore_z_free", False))
     A = -torch.rand(nh, device="cuda", generator=g) - 0.5
     if mixed_decay:  # per-head |A| from 1e-4 to 2: the chunk-boundary state carry is non-trivial
         A = -torch.exp(torch.empty(nh, device="cuda").uniform_(-9.2, 0.7, generator=g))
@@ -105,14 +111,15 @@ def _decode(z_free: bool, steps: int, slots, prefill, graph: bool, seed=0, mixed
         return torch.randn(*shape, device="cuda", generator=g)
 
     # Seed each slot from a prefill tail (lengths straddle a chunk boundary).
+    import inspect
+
+    takes_z = "z" in inspect.signature(seed_fn).parameters  # Megatron-LM main's seed has no z (#8221)
     for slot, plen in zip(slots, prefill):
+        x_, z_, dt_, B_, C_ = (rnd(plen, nh, hd), rnd(plen, nh, hd), rnd(plen, nh), rnd(plen, ng, ds),
+                               rnd(plen, ng, ds))  # z drawn either way: both arms see the same random stream
         seed_fn(
             buf,
-            rnd(plen, nh, hd),
-            rnd(plen, nh, hd),
-            rnd(plen, nh),
-            rnd(plen, ng, ds),
-            rnd(plen, ng, ds),
+            *((x_, z_, dt_, B_, C_) if takes_z else (x_, dt_, B_, C_)),
             torch.tensor([0, plen], device="cuda", dtype=torch.int32),
             torch.tensor([slot], device="cuda", dtype=torch.int32),
         )
