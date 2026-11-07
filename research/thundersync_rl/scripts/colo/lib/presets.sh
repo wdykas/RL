@@ -105,7 +105,9 @@ preset() {
       export K=$k VARIANT=ltuned LMBS=${LMBS:-${_MBS:-$_LMBS}} LDIV=${LDIV:-$_LDIV} KV=$COLO_KV
       [ $m = l8 ] && export ENGINE_BUF=${ENGINE_BUF:-$_SBUF} MAX_REQ=${MAX_REQ:-$_SREQ}
       export MAX_REQ=${MAX_REQ:-$(( (k + 1) * _P * 8 * _TP / _GPUS ))}
-      export ARGS="policy.offload_optimizer_for_refit=false async_rl.max_inflight_prompts=$(( _P * (k + 1) )) ${XA_EXTRA:-}" ;;
+      # Stock's best config also carries the generic learner lever NEMO_RL_LEARNER_DEFER_METRICS (stock code, no BI;
+      # same-job A/B: 57.06 vs 57.61 s/step, training phase equal).
+      export ARGS="policy.offload_optimizer_for_refit=false async_rl.max_inflight_prompts=$(( _P * (k + 1) )) ++policy.megatron_cfg.env_vars={NEMO_RL_LEARNER_DEFER_METRICS:'1'} ${XA_EXTRA:-}" ;;
     *) echo "[preset] arm must be wvs | xprs | xpr | vg | xs | isspr | spr | sprbi | cs" >&2; return 2 ;;
   esac
   export ARM_LAUNCHER
