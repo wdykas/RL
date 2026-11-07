@@ -169,7 +169,9 @@ class NolanesEngineMixin:
             # every admitted row keeps its KV at full length (engine_slots.py), never paused / evicted.
             from thundersync_rl.engine_slots import check_engine_reservation
 
-            kv = check_engine_reservation(self.dynamic_inference_engine)
+            tree = os.environ.get("THUNDERSYNC_TAIL_TREE", "").strip()
+            kv = check_engine_reservation(self.dynamic_inference_engine,
+                                          reserved_blocks=int(tree.split(":")[2]) if tree else 0)
             print(f"[nolanes engine] rank={getattr(self, 'rank', '?')} kv reservation {kv}", flush=True)
         self.install_wide_sampler(salt=int(salt), key64=bool(key64), fresh_salt=None)
         logging_rank = self.install_draft_hidden_log(seal_blocks=bool(seal_blocks))
@@ -208,12 +210,129 @@ class NolanesEngineMixin:
             return orig(*args, **kwargs)
 
         controller._dynamic_step_forward_logits = forward_logits
+        self._nl_install_tail_tree()
         print(
             f"[nolanes engine] rank={getattr(self, 'rank', '?')} version tags + hidden keys + key registry installed "
             f"(logging={logging_rank}, version={version})",
             flush=True,
         )
         return logging_rank
+
+    def _nl_install_tail_tree(self) -> None:
+        """thundersync.tail_tree (env THUNDERSYNC_TAIL_TREE = W:D:rows:ref_tokens, set by nolanes.configure_driver):
+        the exact tree speculation runtime on this engine (nemo_rl/models/generation/megatron/tree_spec.py)."""
+        spec = os.environ.get("THUNDERSYNC_TAIL_TREE", "").strip()
+        if not spec:
+            return
+        w, d, rows, ref_cap = (int(x) for x in spec.split(":"))
+        from nemo_rl.models.generation.megatron import tree_kv, tree_spec
+
+        tree_spec.force_width()  # the gate tool's checks (CHECKS only; the retired MTD name refused) before install
+        if tree_kv.capacity() == 0:
+            raise RuntimeError("[nolanes engine] tail_tree: the node rows (Mamba scratch rows, KV gather) were not "
+                               "installed before the engine was built (megatron_worker._prepare_engine_numerics)")
+        engine = self.dynamic_inference_engine
+        nl = self._nl
+        self._nl_tree = tree_spec.install(
+            # t_max tail slots (continuation rows with references), not one per request slot: per rank the tables are
+            # t_max x (max sequence + ref_cap) int32 and the tree's fixed grids run over t_max; a request past it
+            # decodes one token per step (the [tree] line's tails_full)
+            engine, W=w, D=d, t_max=64, ref_cap=ref_cap, node_cap=rows, sample_rows=self._nl_tree_sample,
+            key_check=getattr(self, "_wide_key_check", None), keyreg=nl["keyreg"],
+            key_ids=lambda rids: self._nl_key_ids(engine, rids),
+            scores_rows=self._nl_tree_scores, uniform_rows=self._nl_tree_uniform,
+        )
+        print(f"[nolanes engine] rank={getattr(self, 'rank', '?')} tail_tree W={w} D={d} rows/step={rows} "
+              f"ref tokens={ref_cap}", flush=True)
+        mtp = os.environ.get("THUNDERSYNC_TAIL_TREE_MTP", "").strip()
+        if mtp:
+            self._nl_install_tree_mtp(mtp)
+
+    def _nl_install_tree_mtp(self, spec: str) -> None:
+        """thundersync.tail_tree_mtp (env THUNDERSYNC_TAIL_TREE_MTP = head path:slots): the MTP draft source of the
+        tree (tree_mtp.MTPHead on the engine model's embedding / output layer; the decoder-output capture was
+        installed by megatron_worker before the engine was built)."""
+        from megatron.core.utils import unwrap_model
+
+        from nemo_rl.models.generation.megatron import tree_mtp
+
+        path, slots = spec.rsplit(":", 1)
+        if tree_mtp.hidden_buffer() is None:
+            raise RuntimeError("[nolanes engine] tail_tree_mtp: the decoder-output capture was not installed before "
+                               "the engine was built (megatron_worker._prepare_engine_numerics)")
+        m = unwrap_model(self._gen_model())
+        cfg = m.config
+        if int(getattr(cfg, "tensor_model_parallel_size", 1) or 1) != 1:
+            raise RuntimeError("[nolanes engine] tail_tree_mtp needs an engine with tensor_model_parallel_size 1")
+        ctx = self.dynamic_inference_engine.context
+        head = tree_mtp.MTPHead(
+            path, m.embedding.word_embeddings.weight, m.output_layer.weight, slots=int(slots),
+            max_seq=int(ctx.max_sequence_length), num_heads=int(cfg.num_attention_heads),
+            num_kv_heads=int(cfg.num_query_groups or cfg.num_attention_heads), head_dim=int(cfg.kv_channels),
+            eps=float(cfg.layernorm_epsilon),
+        )
+        if tree_mtp.hidden_buffer().shape[1] != head.in_width:
+            raise RuntimeError(f"[nolanes engine] tail_tree_mtp: the capture holds {tree_mtp.hidden_buffer().shape[1]} "
+                               f"columns, the head reads {head.in_width} (feature layers {head.feat_layers})")
+        self._nl_tree.attach_mtp(head)
+        print(f"[nolanes engine] rank={getattr(self, 'rank', '?')} tail_tree MTP head {path} slots={slots} "
+              f"KV {2 * head.kc.numel() * 2 / 2**20:.0f} MiB", flush=True)
+
+    def _nl_tree_sample(self, logits, rids: np.ndarray, pos, temp, kid_xor: int = 0):
+        """The keyed sampler S on node rows: noise keyed by (salt, key id of the request, position), positions as a
+        device tensor (the device knows each node's depth). ``kid_xor``: negative control tree_fresh_keys only."""
+        import torch
+
+        from thundersync_rl import keyed_sampling_s as s_mod
+        from thundersync_rl.worker import _min_sampling_temperature
+
+        engine = self.dynamic_inference_engine
+        dev = logits.device
+        if torch.is_tensor(rids):  # device key ids, already mapped (tree_spec stages them with the layout)
+            kid_d = rids.to(device=dev, dtype=torch.int64)
+            if kid_xor:
+                kid_d = kid_d ^ int(kid_xor)
+        else:
+            kid = self._nl_key_ids(engine, rids).astype(np.int64)
+            if kid_xor:
+                kid = kid ^ np.int64(kid_xor)
+            kid_d = torch.from_numpy(kid).pin_memory().to(dev, non_blocking=True)
+        pos_d = pos.to(device=dev, dtype=torch.int64)
+        rows = logits if logits.stride(-1) == 1 else logits.contiguous()
+        n, v = rows.shape
+        ws = getattr(self, "_nl_tree_ws", None)
+        need = s_mod.workspace_bytes(n, v)
+        if ws is None or ws.numel() < need:
+            ws = self._nl_tree_ws = torch.empty(max(need, 1), dtype=torch.uint8, device=dev)
+        out = torch.empty(n, dtype=torch.int64, device=dev)
+        assert getattr(self, "_wide_key64", True), "tail_tree: the key64 sampler (thundersync.wide_sampler_key64)"
+        s_mod.wide_sample(rows, kid_d, pos_d, temp.clamp(min=_min_sampling_temperature()), self._wide_salt,
+                          out=out, workspace=ws)
+        return out
+
+    def _nl_tree_scores(self, logits, rids: np.ndarray, pos, temp):
+        """Checks / negative controls only: the keyed race's full scores of the given rows (keyed_scores)."""
+        import torch
+
+        from thundersync_rl.keyed_scores import keyed_scores
+        from thundersync_rl.worker import _min_sampling_temperature
+
+        kid = self._nl_key_ids(self.dynamic_inference_engine, np.asarray(rids, dtype=np.int64)).astype(np.int64)
+        kid_d = torch.from_numpy(kid).pin_memory().to(logits.device, non_blocking=True)
+        rows = logits if logits.stride(-1) == 1 else logits.contiguous()
+        return keyed_scores(rows, kid_d, pos.to(device=logits.device, dtype=torch.int64),
+                            temp.clamp(min=_min_sampling_temperature()), self._wide_salt)
+
+    def _nl_tree_uniform(self, kid_dev, pos_dev):
+        from thundersync_rl.keyed_scores import keyed_uniform
+
+        return keyed_uniform(kid_dev, pos_dev, self._wide_salt)
+
+    def nl_tree_stats(self) -> dict:
+        m = self.__dict__.get("_nl_tree")
+        if m is None:
+            m = getattr(self.__dict__.get("dynamic_inference_engine"), "_tree_spec", None)
+        return {} if m is None else m.summary()
 
     def nl_announce_version(self, version: int) -> int:
         """Driver, right before a refit: the absolute weight version the next suspend_for_refit installs."""
@@ -344,12 +463,17 @@ class NolanesEngineMixin:
         if no_log is not None:
             nl["cont_inflight"] = nl.get("cont_inflight", 0) + sum(1 for x in no_log if bool(x))
         key_rid = data.get("nl_key_rid") if data is not None and "nl_key_rid" in data else None
+        mtd_refs = data.get("nl_mtd_refs") if data is not None and "nl_mtd_refs" in data else None
         for i, sp in enumerate(sps):
             attrs = {}
             if no_log is None or not bool(no_log[i]):
                 attrs[HIDDEN_KEY_ATTR] = f"{NL_KEY_PREFIX}{next(nl['counter'])}"
             if key_rid is not None and int(key_rid[i]) >= 0:
                 attrs[KEY_RID_ATTR] = int(key_rid[i])
+            if mtd_refs is not None and mtd_refs[i] is not None:
+                from nemo_rl.models.generation.megatron.tree_spec import MTD_REFS_ATTR
+
+                attrs[MTD_REFS_ATTR] = np.ascontiguousarray(mtd_refs[i], dtype=np.int32).tobytes()
             if attrs:
                 sp.add_attributes(attrs)
 
@@ -367,6 +491,12 @@ class NolanesEngineMixin:
                  "cut": int(getattr(r.sampling_params, CUT_ATTR, 0) or 0)}
                 for r in result
             ]
+            ts = self.__dict__.get("_nl_tree")
+            if ts is not None and ts.per_request:
+                # CHECKS: per request (tree rounds, accepted nodes, nodes laid out) -- the gate's non-vacuity check
+                out["nl_tree_stats"] = [ts.pop_request_stats(int(r.request_id)) for r in result]
+                if ts.debug_ru:  # THUNDERSYNC_TREE_DEBUG_RUNNERUP: {position: keyed-race runner-up} per request
+                    out["nl_tree_runner_up"] = [ts.pop_runner_ups(int(r.request_id)) for r in result]
         return out
 
     # -- wake_verify: cut the drafts at a stand-down ------------------------------------------------------------
@@ -474,7 +604,7 @@ class NolanesEngineMixin:
             "refits": nl["refits"],
             "tag_mismatch": nl["tag_mismatch"],
             "straddle_samples": nl.get("straddle_samples", 0),
-            "neg_tokens": nl["neg_tokens"],
+            "neg_tokens": nl["neg_tokens"] + int((self.nl_tree_stats() or {}).get("neg_tokens", 0)),
             "key_draws": nl["keyreg"].draws,
             "key_violations": nl["keyreg"].violations,
             "open_tag_keys": len(nl["tags"]),

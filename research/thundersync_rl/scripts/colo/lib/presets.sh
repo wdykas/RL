@@ -7,6 +7,8 @@
 #        vg   = ours, ALTERNATIVE: exact partial rollout with variable group size (colo_vg.yaml, M 1.4, wake_verify),
 #               lag K; rows in flight capped at SPR's
 #        xs   = ours, exact colocated sync (colo.yaml), lag 0              (reference)
+#        xssd = ours, XS + exact keyed tree speculative decode (colo.yaml + tail tree 8:4:256, MTP draft head
+#               COLO_XSSD_HEAD), lag 0; engine rows MAX_REQ on every arm of its set
 #        spr  = stock colocated partial rollout (stock tree, in_order lag K)  (baseline a)
 #        sprbi = stock colocated partial rollout on OUR tree, engine and BI numerics (colo_sprbi.yaml)  (baseline b:
 #               ours / sprbi = method overhead; give it the same MAX_REQ / ENGINE_BUF as the arm it is compared to)
@@ -41,7 +43,7 @@ preset() {
   local _ENG="$_ENG_SYNC $_MG.prefix_caching_coordinator_policy=load_balanced"
   local _CP_ON="$_MG.enable_chunked_prefill=true" _CP_OFF="$_MG.enable_chunked_prefill=false"
   case $arm in
-    wvs|xpr|xprs|xs|vg|sprbi|isspr)
+    wvs|xpr|xprs|xs|xssd|vg|sprbi|isspr)
       ARM_LAUNCHER=colo_arm.sh
       case $arm in
         xpr)  export CFG_REL=research/thundersync_rl/configs/colo/colo_xpr.yaml K=$k; _XE="$_XE $_ENG $_CP_OFF" ;;
@@ -56,6 +58,12 @@ preset() {
         # xs: engine rows = SPR's rows in flight (2 P G / engine DP), as the fair XS / SPR-BI pair (SPRBI_MATCH=xs).
         xs)   export CFG_REL=research/thundersync_rl/configs/colo/colo.yaml; _XE="$_XE $_ENG_SYNC $_CP_ON"
               [ $m = l8 ] || export MAX_REQ=${MAX_REQ:-$(( 2 * _P * 8 * _TP / _GPUS ))} ;;
+        # xssd: XS + the exact tree speculative decode. Tree node rows count against max_requests (tree_spec.plan:
+        # room = max_requests - live rows), so MAX_REQ = max((K+1) P G, 4 P G) / engine DP; set the same MAX_REQ on every
+        # arm of its set. The MTP head's K / V slots = MAX_REQ.
+        xssd) export CFG_REL=research/thundersync_rl/configs/colo/colo.yaml; _XE="$_XE $_ENG_SYNC $_CP_ON"
+              [ $m = l8 ] || export MAX_REQ=${MAX_REQ:-$(( 4 * _P * 8 * _TP / _GPUS ))}
+              _XE="$_XE ++thundersync.tree_xssd=${XSSD_TREE:-8:4:256} ++thundersync.tree_xssd_mtp=${XSSD_HEAD:-${COLO_XSSD_HEAD:?set COLO_XSSD_HEAD to the MTP draft head file (head_v2)}}:${MAX_REQ:-64}" ;;
         # vg: admits ceil(1.4 P) prompts (Super-L22: 90 -> ~512 trained rows); engine requests per rank capped at
         # SPR's rows in flight ((K+1) P G / engine DP: 128 at Super-L22), the measured VG-cap arm.
         vg)   export CFG_REL=research/thundersync_rl/configs/colo/colo_vg.yaml K=$k; _XE="$_XE $_ENG $_CP_OFF"
@@ -108,7 +116,7 @@ preset() {
       # Stock's best config also carries the generic learner lever NEMO_RL_LEARNER_DEFER_METRICS (stock code, no BI;
       # same-job A/B: 57.06 vs 57.61 s/step, training phase equal).
       export ARGS="policy.offload_optimizer_for_refit=false async_rl.max_inflight_prompts=$(( _P * (k + 1) )) ++policy.megatron_cfg.env_vars={NEMO_RL_LEARNER_DEFER_METRICS:'1'} ${XA_EXTRA:-}" ;;
-    *) echo "[preset] arm must be wvs | xprs | xpr | vg | xs | isspr | spr | sprbi | cs" >&2; return 2 ;;
+    *) echo "[preset] arm must be wvs | xprs | xpr | vg | xs | xssd | isspr | spr | sprbi | cs" >&2; return 2 ;;
   esac
   export ARM_LAUNCHER
 }

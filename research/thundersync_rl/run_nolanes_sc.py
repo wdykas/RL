@@ -202,6 +202,12 @@ def _dry(argv: list[str]) -> None:
 
             mode_cfg = icfg = isspr.validate_config(c)
             print(f"{TAG} DRY isspr.validate_config OK: {icfg}", flush=True)
+        elif mode == "sprsd":
+            from thundersync_rl import sprsd
+
+            probs = sprsd.config_problems(c)
+            assert not probs, "thundersync.mode=sprsd: " + "; ".join(probs)
+            print(f"{TAG} DRY sprsd.config_problems OK: {c['thundersync']}", flush=True)
         elif mode is None:
             # No ThunderSync stage: NeMo-RL's stock loop on this config (e.g. the SPR-BI baseline arm, stock colocated
             # partial rollout on the batch-invariant recipe); the BI validators above still ran.

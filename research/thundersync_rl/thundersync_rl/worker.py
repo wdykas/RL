@@ -1632,6 +1632,15 @@ class ThunderSyncMegatronPolicyWorker(XsprEngineMixin, NolanesEngineMixin, Megat
             super()._initialize_inference_engine(mcore_generation_config)
         finally:
             de.DynamicInferenceEngine = orig
+        from thundersync_rl.sprsd import SALT_ENV
+
+        salt = os.environ.get(SALT_ENV, "").strip()
+        if salt and getattr(self, "dynamic_inference_engine", None) is not None:
+            # thundersync.mode=sprsd (SPR-SD: the stock loop has no ThunderSync stage to install them): the keyed
+            # sampler and XS-SD's tree (+ MTP head) on this engine, as colo's stage setup does for XS-SD
+            self.install_wide_sampler(salt=int(salt), key64=True)
+            info = self.install_tree_xssd()
+            print(f"[sprsd] rank={getattr(self, 'rank', '?')} keyed sampler + tree {info}", flush=True)
 
     def _engine_class(self, orig: type) -> type:
         """``orig`` (MCore's DynamicInferenceEngine) with the draft logs armed.
@@ -1878,6 +1887,50 @@ class ThunderSyncMegatronPolicyWorker(XsprEngineMixin, NolanesEngineMixin, Megat
 
 
 
+    def install_tree_xssd(self, fresh_salt: int | None = None) -> dict | None:
+        """Generation workers, colo mode with thundersync.tree_xssd (env THUNDERSYNC_TAIL_TREE = W:D:rows:1): install
+        tree_spec on the engine with own-history tails (src bit1) for every row, keyed by the wide sampler (key id =
+        engine request id, as one-token decode). Needs the wide sampler first. None without an engine."""
+        import numpy as np
+
+        engine = getattr(self, "dynamic_inference_engine", None)
+        if engine is None:
+            return None
+        spec = os.environ.get("THUNDERSYNC_TAIL_TREE", "").strip()
+        if not spec:
+            raise RuntimeError("install_tree_xssd: THUNDERSYNC_TAIL_TREE not set (colo tree_xssd)")
+        if getattr(self, "_wide_key_check", None) is None:
+            raise RuntimeError("install_tree_xssd: install the wide sampler first")
+        w, d, rows, _ref = (int(x) for x in spec.split(":"))
+        from nemo_rl.models.generation.megatron import tree_kv, tree_spec
+
+        if tree_kv.capacity() == 0:  # tree_kv owns the node rows (KV gather and Mamba scratch rows)
+            raise RuntimeError("install_tree_xssd: node rows were not installed before the engine was built")
+        key_ids = None
+        if fresh_salt is not None:
+            # stable keys (colo stable_keys): every fresh row is keyed by (fresh_salt, noise_seed | 2**62, position) in
+            # the wide sampler; node rows draw with the same key id and salt, so the tree emits one-token decode's rows
+            fk = _RequestKeys(engine)
+
+            def key_ids(rids):
+                keys = fk.lookup(np.asarray(rids, dtype=np.int64))
+                if (keys < 0).any():
+                    raise RuntimeError("install_tree_xssd: stable keys on, but a tree row has no noise_seed")
+                return keys | _FRESH_KEY_BIT
+
+            self._wide_salt = int(fresh_salt)  # node rows' salt (the tree sampler reads it); plain rows: per-row salt
+        ts = tree_spec.install(
+            engine, W=w, D=d, t_max=int(engine.context.max_requests), ref_cap=1, node_cap=rows,
+            sample_rows=self._nl_tree_sample, key_check=self._wide_key_check, keyreg=None, key_ids=key_ids,
+            scores_rows=self._nl_tree_scores, uniform_rows=self._nl_tree_uniform, own_history=True,
+        )
+        self._xssd_tree_attr = np.asarray([w, d, 2], dtype=np.int32).tobytes()  # src bit1: own history
+        mtp = os.environ.get("THUNDERSYNC_TAIL_TREE_MTP", "").strip()
+        if mtp:  # colo tree_xssd_mtp: the MTP chain as every tree row's first candidate
+            self._nl_tree = ts
+            self._nl_install_tree_mtp(mtp)
+        return {"W": w, "D": d, "rows": ts.node_cap, "t_max": ts.t_max, "mtp": bool(mtp)}
+
     def _prepare_data_for_generation(self, data, greedy: bool = False):
         """Tag requests that continue an anchored rollout (anchor horizon).
 
@@ -1898,6 +1951,13 @@ class ThunderSyncMegatronPolicyWorker(XsprEngineMixin, NolanesEngineMixin, Megat
         self._nl_request_attrs(data, sps)
         # exact SPR: the row key / check of every xspr request (xspr_engine.py).
         self._xspr_request_attrs(data, sps)
+        # XS-SD on tree_spec (colo tree_xssd / sprsd): every request is a tree tail with own-history candidates.
+        tree_attr = self.__dict__.get("_xssd_tree_attr")
+        if tree_attr is not None:
+            from nemo_rl.models.generation.megatron.tree_spec import TREE_ATTR
+
+            for sp in sps:
+                sp.add_attributes({TREE_ATTR: tree_attr})
         keys = data.get("ts_anchor_key") if data is not None else None
         if keys:
             from thundersync_rl.engine_q import ANCHOR_KEY_ATTR

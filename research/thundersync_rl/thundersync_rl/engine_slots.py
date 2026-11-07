@@ -368,15 +368,17 @@ def _wrap(gen: Any, slots: PrioritySlots) -> None:
     gen.generate_async = generate_async
 
 
-def check_engine_reservation(engine: Any) -> dict[str, int]:
+def check_engine_reservation(engine: Any, reserved_blocks: int = 0) -> dict[str, int]:
     """Engine rank: the KV pool holds every admitted row at full length (max_requests x max_kv_block_count blocks), so
     no row is ever paused or evicted for blocks. Raises otherwise (the buffer is sized by rule:
-    research/colo/jobs/engine_buf.py)."""
+    research/colo/jobs/engine_buf.py). ``reserved_blocks``: blocks taken out of the pool for good (tree_spec's private
+    node blocks, ``thundersync.tail_tree_rows``)."""
     ctx = engine.context
     alloc = ctx.kv_block_allocator
-    usable = int(alloc.pool_size) - 1 - int(alloc.paused_limit)
+    usable = int(alloc.pool_size) - 1 - int(alloc.paused_limit) - int(reserved_blocks)
     need = int(ctx.max_requests) * int(ctx.max_kv_block_count)
-    out = {"kv_blocks_usable": usable, "kv_blocks_needed": need, "max_requests": int(ctx.max_requests)}
+    out = {"kv_blocks_usable": usable, "kv_blocks_needed": need, "max_requests": int(ctx.max_requests),
+           "kv_blocks_reserved": int(reserved_blocks)}
     if usable < need:
         raise RuntimeError(f"[engine slots] KV pool {usable} blocks < max_requests {ctx.max_requests} x "
                            f"{ctx.max_kv_block_count} blocks/row = {need}: admitted rows could be paused; size the "

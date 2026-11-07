@@ -17,6 +17,7 @@
 #   COLO_RL_STOCK  stock NeMo-RL tree for the SPR / CS baselines (branch handoff/stock-baseline on the fork)
 #   COLO_MLM / COLO_MBRIDGE_TREE    Megatron-LM / Megatron-Bridge trees for our arms (default: $COLO_WORKSPACE/...)
 #   COLO_MLM_STOCK / COLO_MBRIDGE_STOCK_TREE   the stock baseline's Megatron-LM / Bridge trees
+#   COLO_XSSD_HEAD  MTP draft head file for the xssd arm (head_v2; not in git, see docs/colo/HANDOFF.md)
 #   COLO_WORKSPACE  directory holding the sibling checkouts named below (default: the parent of this RL checkout)
 : "${COLO_OUT:?set COLO_OUT (output root on a shared filesystem; see docs/colo/HANDOFF.md)}"
 : "${COLO_IMAGE:?set COLO_IMAGE (NeMo-RL container image; see docs/colo/HANDOFF.md)}"

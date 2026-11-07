@@ -12,7 +12,7 @@ echo "[pair] $M K=$KK order=$ORDER id=$ID start $(date -Is)"
 i=0; rc_all=0
 for a in ${ORDER//,/ }; do
   i=$((i + 1))
-  case $a in xs|cs) KT="" ;; *) KT=$KK ;; esac
+  case $a in xs|xssd|cs) KT="" ;; *) KT=$KK ;; esac
   TAG=colo-$a$KT-$M-$ID-$i
   ( preset $a $M $KK || exit 2; export TAG
     bash $COLO_SCRIPTS/lib/keep_prev_run.sh $COLO_RUNS $TAG || exit 3

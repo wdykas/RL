@@ -39,11 +39,17 @@ def _load(name):
     return OmegaConf.to_container(load_config(os.path.join(CFG_DIR, name)), resolve=False)
 
 
+# Baseline modes (levers_audit BASELINE_MODES): a thundersync.mode on the stock loop with no ThunderSync stage (sprsd =
+# SPR-BI + the XS-SD drafter); they route like the stock arms, with the band in policy.megatron_cfg.
+BASELINE_MODES = ("sprsd",)
+
+
 def _band(cfg):
     """The band an arm routes with: the thundersync block of a ThunderSync mode (apply_crossfade copies it into
-    policy.megatron_cfg), else policy.megatron_cfg (stock arms)."""
+    policy.megatron_cfg), else policy.megatron_cfg (stock arms and baseline modes)."""
     ts = cfg.get("thundersync") or {}
-    src = ts if ts.get("mode") else (cfg.get("policy") or {}).get("megatron_cfg") or {}
+    staged = ts.get("mode") and ts.get("mode") not in BASELINE_MODES
+    src = ts if staged else (cfg.get("policy") or {}).get("megatron_cfg") or {}
     return {k: src.get(k) for k in KEYS}
 
 
@@ -51,7 +57,7 @@ def test_every_colo_config_routes_with_the_colo_band():
     ref = _band(_load("colo.yaml"))
     assert ref["crossfade_routing_m"] is not None and ref["crossfade_routing_m"] > 0
     names = sorted(f for f in os.listdir(CFG_DIR) if f.endswith(".yaml"))
-    assert {"colo.yaml", "colo_sprbi.yaml", "colo_isspr.yaml"} <= set(names)
+    assert {"colo.yaml", "colo_sprbi.yaml", "colo_isspr.yaml", "colo_sprsd.yaml"} <= set(names)
     for name in names:
         assert _band(_load(name)) == ref, name
 

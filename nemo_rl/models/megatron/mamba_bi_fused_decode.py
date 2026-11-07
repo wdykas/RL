@@ -85,6 +85,26 @@ def lookahead_buffers(max_rows: int, device) -> tuple[torch.Tensor, torch.Tensor
         cur = _LOOK[key] = (off, chain)
     return cur
 
+
+def lookahead_rows(max_rows: int, device) -> torch.Tensor:
+    """srow [max_rows, LOOK_MAX] int32 of the decode entries, shared by every Mamba layer (tree_spec).
+
+    For a node entry e at offset (depth) d >= 1, srow[e, j] (j < d) is the scratch replay row holding chunk row
+    w0 + 1 + j of e's path (its ancestors' rows for j < d - 1, its own for j = d - 1): the node's prep program
+    writes its x / B / C / dt there instead of the slot's row, and the scan reads the path's rows from there. -1
+    (tail_mtd's chains, every one-token row) means the slot's own row, as before. Written by the layout before each
+    forward; fixed storage (CUDA-graph capturable).
+    """
+    dev = torch.device(device)
+    key = ("srow", dev.index if dev.index is not None else torch.cuda.current_device())
+    cur = _LOOK.get(key)
+    if cur is None or cur.shape[0] < max_rows:
+        t = torch.full((max_rows, LOOK_MAX), -1, dtype=torch.int32, device=dev)
+        if cur is not None:
+            t[: cur.shape[0]].copy_(cur)
+        cur = _LOOK[key] = t
+    return cur
+
 if HAVE_TRITON:
     from megatron.core.ssm.ops.mamba2.ssd_chunk_state import softplus as _mcore_softplus
 
@@ -105,6 +125,11 @@ if HAVE_TRITON:
         starts_ptr,
         look_off_ptr,
         look_chain_ptr,
+        look_srow_ptr,
+        scr_x_ptr,
+        scr_dt_ptr,
+        scr_b_ptr,
+        scr_c_ptr,
         A_ptr,
         dt_bias_ptr,
         dt_out_ptr,
@@ -123,6 +148,7 @@ if HAVE_TRITON:
         stride_cb_row: tl.int64,
         stride_cb_grp: tl.int64,
         stride_chain: tl.int64,
+        stride_srow: tl.int64,
         n_x,
         nheads: tl.constexpr,
         ngroups: tl.constexpr,
@@ -162,6 +188,9 @@ if HAVE_TRITON:
         off = tl.load(look_off_ptr + e)
         w0 = tl.load(nbuf_ptr + s)
         w = w0 + off
+        # Tree node rows (tree_spec): the node's own row goes to its scratch replay row (srow >= 0), never to the
+        # slot's row its siblings share; -1 (tail_mtd chains, one-token rows): the slot's row as before.
+        own = tl.load(look_srow_ptr + e * stride_srow + tl.maximum(off - 1, 0), mask=off > 0, other=-1)
         n_bc = ngroups * dstate
         if hb >= n_hblocks:
             # ---- CB row w: the pinned CB tile's per-element chain (fp32 / TF32 MMA over dstate, k ascending,
@@ -201,6 +230,16 @@ if HAVE_TRITON:
             )
             return
         row_buf = (s * CHUNK + w).to(tl.int64)
+        if own >= 0:
+            dx = scr_x_ptr + own.to(tl.int64) * n_x
+            db = scr_b_ptr + own.to(tl.int64) * n_bc
+            dc = scr_c_ptr + own.to(tl.int64) * n_bc
+            ddt = scr_dt_ptr + own.to(tl.int64) * nheads
+        else:
+            dx = sx_ptr + row_buf * n_x
+            db = sb_ptr + row_buf * n_bc
+            dc = sc_ptr + row_buf * n_bc
+            ddt = sdt_ptr + row_buf * nheads
         offs = tl.arange(0, BLOCK)
         # x and B / C shares of this program
         per_x = tl.cdiv(n_x, n_hblocks)
@@ -209,19 +248,19 @@ if HAVE_TRITON:
         for o in range(lo, hi, BLOCK):
             m = o + offs < hi
             v = tl.load(x_ptr + e * stride_x + o + offs, mask=m)
-            tl.store(sx_ptr + row_buf * n_x + o + offs, v, mask=m)
+            tl.store(dx + o + offs, v, mask=m)
         per_bc = tl.cdiv(n_bc, n_hblocks)
         lo = hb * per_bc
         hi = tl.minimum(lo + per_bc, n_bc)
         for o in range(lo, hi, BLOCK):
             m = o + offs < hi
             v = tl.load(b_ptr + e * stride_b + o + offs, mask=m)
-            tl.store(sb_ptr + row_buf * n_bc + o + offs, v, mask=m)
+            tl.store(db + o + offs, v, mask=m)
             v = tl.load(c_ptr + e * stride_c + o + offs, mask=m)
-            tl.store(sc_ptr + row_buf * n_bc + o + offs, v, mask=m)
+            tl.store(dc + o + offs, v, mask=m)
         offs_h = hb * BLOCK_SIZE_H + tl.arange(0, BLOCK_SIZE_H)
         v = tl.load(dt_ptr + e * stride_dt + offs_h, mask=offs_h < nheads)
-        tl.store(sdt_ptr + row_buf * nheads + offs_h, v, mask=offs_h < nheads)
+        tl.store(ddt + offs_h, v, mask=offs_h < nheads)
         if hb == 0:
             tl.store(rows_ptr + e, w)
             tl.store(flags_ptr + e, ((w + 1 == CHUNK) & (off == 0)).to(tl.int32))
@@ -239,6 +278,9 @@ if HAVE_TRITON:
             pj = tl.load(look_chain_ptr + e * stride_chain + j)
             pred_dt = dt_ptr + pj.to(tl.int64) * stride_dt + offs_h[:, None] + offs_c[None, :] * 0
             dt_ptrs = tl.where((offs_c[None, :] == w0 + j) & (j < off), pred_dt, dt_ptrs)
+        # a node's own dt is not in the slot's row (it went to its scratch row): read it from its step input
+        own_dt = dt_ptr + e * stride_dt + offs_h[:, None] + offs_c[None, :] * 0
+        dt_ptrs = tl.where((offs_c[None, :] == w) & (own >= 0), own_dt, dt_ptrs)
         A_ptrs = A_ptr + offs_h
         dt_out_ptrs = dt_out_ptr + (offs_h[:, None] * stride_dt_out_head + offs_c[None, :])
         dA_cs_ptrs = dA_cs_ptr + (offs_h[:, None] * stride_dA_cs_head + offs_c[None, :])
@@ -395,6 +437,11 @@ def decode_step(buffers, x, z, dt, B, C, A, D, dt_bias, batch_indices, ssm_state
     n_cb = 0 if small else ngroups * triton.cdiv(chunk, CB_BLOCK_N)
     sdt = buffers.dt.view(-1, nheads)
     look_off, look_chain = lookahead_buffers(buffers.out.shape[0], x.device)
+    look_srow = lookahead_rows(buffers.out.shape[0], x.device)
+    scr = getattr(buffers, "scratch", None)  # (x, dt, B, C) scratch replay rows (tree_kv), else none
+    tree = scr is not None
+    if scr is None:
+        scr = (buffers.x, buffers.dt, buffers.B, buffers.C)  # never written: every srow is -1 without scratch rows
     _prep_cb_kernel[(n, n_hb + n_cb)](
         batch_indices,
         buffers.num_buffered,
@@ -411,6 +458,11 @@ def decode_step(buffers, x, z, dt, B, C, A, D, dt_bias, batch_indices, ssm_state
         chunk_starts,
         look_off,
         look_chain,
+        look_srow,
+        scr[0],
+        scr[1],
+        scr[2],
+        scr[3],
         A,
         dt_bias,
         dt_out_all,
@@ -429,6 +481,7 @@ def decode_step(buffers, x, z, dt, B, C, A, D, dt_bias, batch_indices, ssm_state
         cb.stride(0),
         cb.stride(1),
         look_chain.stride(0),
+        look_srow.stride(0),
         nheads * headdim,
         nheads=nheads,
         ngroups=ngroups,
@@ -454,8 +507,12 @@ def decode_step(buffers, x, z, dt, B, C, A, D, dt_bias, batch_indices, ssm_state
     dt_out, dA = dt_out_all[:, :n], dA_all[:, :n]
     z2 = z[:, 0]
     assert z2.stride(-1) == 1
+    tree_args = (None,) * 5
+    if tree:
+        tree_args = (look_off, look_srow, scr[0].view(-1, nheads, headdim), scr[3].view(-1, ngroups, dstate),
+                     scr[2].view(-1, ngroups, dstate))
     scan.scan_rows(xs, Cs, dt_out, dA, cb, z2, D, ssm_state, out, batch_indices, target_rows, chunk_starts,
-                   chunk_flags, buffers.num_buffered, Bs, n, nheads // ngroups, small)
+                   chunk_flags, buffers.num_buffered, Bs, n, nheads // ngroups, small, *tree_args)
     if not small:
         # rows that filled their chunk (reads the state after the scan read it)
         sr.chunk_state_pass_rows(xs, Bs, dt_out, dA, chunk_starts, chunk_flags, batch_indices, ssm_state,
