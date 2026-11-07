@@ -239,6 +239,50 @@ normaliser biases by 0.003-0.015, and row + LOO std by 0.010-0.042. That is why 
 - lr 0 control: rescore and generation log-probs are bitwise equal, s ≡ 0 on every step (up to 3.57 M tokens/step).
   No stale-state or numerics path enters s.
 
+## 3a. IS-RLOO with row weights from the learner (this branch's IS-SPR code)
+
+The tree is the current release plus IS-RLOO (`configs/colo/colo_isrloo.yaml`). Row weights come from the learner's
+batch-invariant forward, so finished rows are no longer re-prefilled at the wake. The setup matches the Nano 8k
+sets above: PC and CP on, KV persist, TMS, no CHECKS. Each K is a same-job three-arm set: IS-RLOO with the wake
+recompute, IS-RLOO without it, and SPR-BI. Windows are whole cycles.
+
+| K | arm | s/step | vs SPR-BI | gen | train | row ESS (min) | Var(s) | clip |
+|---|---|---|---|---|---|---|---|---|
+| 1 | IS-RLOO (group weights, engine rescore) | 71.06 | 1.093 | 40.95 | 26.82 | 0.990 (0.974) | group 0.073 | 0 |
+| 1 | SPR-BI | 65.02 | 1 | 36.86 | 25.83 | | | |
+| 2 | IS-RLOO, wake recompute | 61.42 | 1.041 | 29.96 | 27.09 | 0.986 (0.954) | 0.015 | 0 |
+| 2 | **IS-RLOO, no recompute** | **59.39** | **1.006** | 29.18 | 26.72 | 0.977 (0.958) | 0.023 | 0 |
+| 2 | SPR-BI | 59.02 | 1 | 30.53 | 25.96 | | | |
+| 4 | IS-RLOO, wake recompute | 57.01 | 0.943 | 22.81 | 28.00 | 0.977 (0.931) | 0.023 | 0 |
+| 4 | **IS-RLOO, no recompute** | **51.67** | **0.854** | 20.56 | 27.07 | 0.961 (0.905) | 0.041 | 0 |
+| 4 | SPR-BI | 60.48 | 1 | 0.03 | 26.18 | | | |
+
+Findings:
+- The sweep before learner row weights measured K = 1 / 2 / 4 at 1.23 / 1.44 / 1.40x SPR-BI. Removing the
+  finished-row re-prefill, and skipping the resume prefill without recompute, brings K = 2 to parity with SPR-BI.
+- The training-side delta is now about 0.8-1.1 s per step, since SPR-BI also carries the F3 band.
+- K=4 below 1x is **not explained yet**. The IS arms generate in bursts (about 140 s every 5th step, then four steps
+  with no engine phase), while SPR-BI spends about 33 s of untimed engine work on every step. This is a schedule
+  difference between the ThunderSync stage loop and the stock loop, not an IS-RLOO effect. Do not claim < 1x until
+  it is root-caused.
+- **Why no-recompute is still unbiased:** with s_r from the learner, w_r = min(C, prod_t p_target(x_t) / q_t), where
+  q_t is the probability the engine actually drew token t with. That is standard importance sampling for any
+  proposal, including a stale-state one. The usual caveats remain: the clip, and for row weights the sibling
+  timing-coupling term. The cost is a slightly lower ESS and a higher Var(s) (table).
+- **Default on this branch:** `thundersync.wake_recompute=true`, so no-recompute is opt-in. Making it the default for
+  the row unit is a pending reviewed change. The group unit must keep recompute: its engine rescore reads target
+  state, and the validator refuses "off" for it.
+- **q integrity (CHECKS):**
+  - How it works: every sampled token's keyed draw is replayed with the sampler's own kernel on its stashed rows.
+    The recorded token and its raw log-prob must match bitwise.
+  - Excluded rows: requests part-way through a chunked prefill. Their drawn token is discarded, and the first token
+    is still checked.
+  - Gate: 760k tokens with recompute and 712k without, 0 mismatches each. A negative control (sampler at 1.5 T,
+    logged at T) is caught on 317k tokens.
+- **K=1, a learner pre-pass instead of the engine rescore:** priced at about 4.3 s against about 3.2 s of engine
+  re-prefill it would replace. It is slower, so it is not built. Group weights cannot come from the training forward
+  itself, because a group spans several micro-batches.
+
 ## 4. Exact speculative track at Nano 8k
 
 ### EX-T (tree speculation on the wake_verify fork tails)

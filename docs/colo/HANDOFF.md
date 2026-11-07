@@ -160,7 +160,8 @@ method lands only with its gate green and its negative red.
 - Nano real text, 8k, 4 nodes, K=1, same-job set run in both orders on this code, pooled: IS-SPR **1.11× SPR-BI**
   (kernel-normalized 1.10); XS 1.37× SPR-BI (kn 1.34); SPR-BI / SPR 1.13 (kn 1.02, the BI-numerics tax is almost all
   kernel speed); IS-SPR / SPR 1.24 (kn 1.12).
-- IS-SPR lag sweep K = 1 / 2 / 4: 1.23 / 1.44 / 1.40× SPR-BI, row ESS ≈ 0.97.
+- IS-RLOO with learner row weights (`colo_isrloo.yaml`), same-job vs SPR-BI: K=1 1.09×, K=2 1.01× and K=4 0.85×
+  without the wake recompute (K=4 < 1× not yet root-caused); row ESS ≥ 0.96. Earlier sweep: 1.23 / 1.44 / 1.40×.
 - Full tables, regimes and negative results: [`RESULTS.md`](RESULTS.md).
 
 Top next steps:

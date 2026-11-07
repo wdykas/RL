@@ -65,15 +65,22 @@ before measuring.
   config). Full table: `RESULTS.md` section 2.0.
 - **Next:** the K = 2 / 4 sets on this code; the 16k Nano and Ultra fair ladders.
 
-### B. IS-SPR / IS-RLOO, the near-on-policy arm (`handoff/isspr-dd`, `handoff/isspr-pc`)
-- **What:** stock pause / resume plus a keyed rescore at the wake and importance weights; unbiased, not exact in law.
-  Approved weighting: group weights at K=1, per-row + RLOO (no std, constant L_c) at K≥2.
-- **Measured (`handoff/isspr-pc`):** same-job lag sweep K = 1 / 2 / 4 = 1.23 / 1.44 / 1.40× SPR-BI. The estimator is
-  healthy: row ESS ≈ 0.97, ε ≤ 1.2%.
-- **Cost driver:** the wake re-prefill of 2-3 M tokens per step, ~80% of them in finished rows.
-- **In progress (`handoff/isspr-dd`):** take the rescore s_r from the BI training forward and re-prefill only
-  continuation rows (learner-forward row weights are in); non-finite-row dumps on raise; `clipped_weights` raises on
-  a non-finite s.
+### B. IS-SPR / IS-RLOO, the near-on-policy arm (in `colo-handoff`; history in `handoff/isspr-dd`, `handoff/isspr-pc`)
+- **What:** stock pause / resume plus importance weights; unbiased, not exact in law. Weighting: group weights at
+  K=1; per-row + RLOO (no std, constant L_c) at K≥2 (`configs/colo/colo_isrloo.yaml`, `thundersync.weight auto`).
+- **State (this branch):** row weights come from the learner's BI forward, so finished rows are no longer
+  re-prefilled. An engine q-integrity check (CHECKS) replays every keyed draw bitwise. Rows-once learner check;
+  non-finite rows are dumped.
+- **Measured (RESULTS §3a):**
+  - K=1: 1.09x SPR-BI.
+  - K=2 without wake recompute: 1.01x.
+  - K=4 without wake recompute: 0.85x (open: a schedule difference between the stage loop and the stock loop; not
+    yet root-caused).
+  - The earlier sweep, before learner weights, was 1.23 / 1.44 / 1.40x.
+- **Next:**
+  - Make no-recompute the row unit's default (pending review).
+  - Root-cause the K=4 < 1x schedule difference.
+  - Re-run the same-job sets on the final tip.
 - **Open:** a non-finite log-prob seen once at step 6 of one run; root cause unknown. Reproduce with the dump on.
 
 ### C. Tree speculation (`handoff/tree-spec`, `handoff/tree-prod`, `handoff/tree-prod-slim`)
