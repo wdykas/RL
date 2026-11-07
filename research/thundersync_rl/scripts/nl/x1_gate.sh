@@ -229,7 +229,7 @@ case $ARMX in
   # Negatives: cf_engine_m (engine routes with 2x the band: engine p != learner p), engine_q_genlp (accepted tokens
   # keep log q as generation log-prob); both must FAIL.
   ev|ev_mild|ev_neg)
-    EVXA="++thundersync.verify_on=engine ++thundersync.row_seeds=false ++thundersync.grpo_z=loo_c ++thundersync.train_overlap=true ++thundersync.edv_threshold=null"
+    EVXA="++thundersync.verify_on=engine ++thundersync.row_seeds=false ++thundersync.grpo_z=loo_c ++thundersync.train_overlap=true ++thundersync.edv_threshold=null ++thundersync.verify_stream_chunks=4"
     EVENV="TP=1 GEN_TP=1 EP=2 GEN_EP=2 GPS=2 GEN_GPUS=2 XE=THUNDERSYNC_ENGINE_VERIFY_CHECK=1${ADMIT_HOLD_XE}"
     [ $ARMX = ev ] && run1 ev 1 $STEPS "" "$EVXA $STRESS_XA" "$EVENV"
     [ $ARMX = ev_mild ] && run1 ev_mild 1 $STEPS "" "$EVXA $MILD_XA" "$EVENV"

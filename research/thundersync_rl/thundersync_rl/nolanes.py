@@ -218,6 +218,11 @@ class NolanesConfig:
     # every engine rank stashes at each refit); the learner trains from the start of the step while the engine
     # verifies (GRPO-Z units / group units on arrival).
     verify_on: str = "learner"
+    # Fork priority by admission (design DX, FIRSTPRINCIPLES_D §5.1 (4)): the sampler admits the next lookahead batch
+    # only after this step's optimizer step (its continuation tails are done), so the tails decode on an engine that
+    # carries only drafts admitted before the step. The admission gate reads min(engine version, max(k - 1, trainer
+    # version - 1)) during step k: a function of versions only; drafts may start at any version (any q is exact).
+    admit_after_tails: bool = False
 
     @classmethod
     def from_config(cls, config: Any) -> "NolanesConfig":

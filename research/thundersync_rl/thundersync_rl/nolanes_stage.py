@@ -141,7 +141,8 @@ class VerifyStage:
         # decoding at theta_k and are still decoding when the refit lands: mixed-version drafts (rejected / continued
         # under stress) with admit_after_refit on, at any row length and without an engine-step sleep (R35 2(e);
         # the pre-admit_after_refit admission timing). Timing only, content independent.
-        self.debug_admit_after_tails = os.environ.get("THUNDERSYNC_NL_DEBUG_ADMIT_AFTER_TAILS", "") == "1"
+        self.debug_admit_after_tails = (os.environ.get("THUNDERSYNC_NL_DEBUG_ADMIT_AFTER_TAILS", "") == "1"
+                                        or bool(getattr(cfg, "admit_after_tails", False)))
         self.admit_hold_version: Optional[int] = None
         self.g = int(master_config["grpo"]["num_generations_per_prompt"])
         self.n = nolanes.drafts_per_prompt(cfg, self.g)
@@ -943,6 +944,10 @@ class VerifyStage:
             for run_pks, run_pools, h in posted:
                 if h is not None:
                     tv = time.perf_counter()
+                    if "sync" in h:
+                        # Engine verify (verify_post defers the pool walk to collect): this chunk's slots, not the
+                        # last posted chunk's.
+                        spec._null_slots[int(version)] = {pk: slots[pk] for pk in run_pks}
                     await asyncio.to_thread(spec.verify_collect, h)
                     st.times["verify"] += time.perf_counter() - tv
                     if int(self.cfg.spare_prompts):
