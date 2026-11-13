@@ -1,0 +1,18 @@
+{
+  "pinned_commit": "3e95097b4a9ab6ea6b2a39eb2b2b24e4a6dfa54a",
+  "upstream_fix_commit": "0a513268eee94d8e903fecbc21fde862eecc31f3",
+  "files": {
+    "mtp_utils_pytorch.py": {
+      "pinned_sha256": "9c98a26a0274f71fd57362074da53ca87d85012dd2ac87c32ae062d55cf7394e",
+      "fixed_sha256": "b34b2e07fa17c7311f336b9a4a718453a594e1cfbe1907b6c89734c7816ea2ea",
+      "native_relative_path": "megatron/core/inference/text_generation_controllers/mtp_utils_pytorch.py",
+      "function": "prepare_next_forward_pass"
+    },
+    "mtp_utils_triton.py": {
+      "pinned_sha256": "009e382e3db5c7f5474f5805bbd293b223ef0c291bddc1d8c7297d6ddf25008f",
+      "fixed_sha256": "17a2b36e890dd6185cb7fbc481d93a3c704b57bd91031f92a8f64b7ebd7d0c50",
+      "native_relative_path": "megatron/core/inference/text_generation_controllers/mtp_utils_triton.py",
+      "function": "_prepare_next_forward_pass_kernel"
+    }
+  }
+}
