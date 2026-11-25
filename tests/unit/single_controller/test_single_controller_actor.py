@@ -436,6 +436,7 @@ def _grpo_chunk_cap_config(
             num_prompts_per_step=8,
             num_generations_per_prompt=num_generations_per_prompt,
         ),
+        loss_fn=ClippedPGLossConfig(),
         policy={
             "train_micro_batch_size": train_micro_batch_size,
             "dynamic_batching": {"enabled": dynamic_batching},
@@ -449,6 +450,33 @@ def _grpo_chunk_cap_config(
             max_groups_for_streaming_train=chunk_cap,
         ),
     )
+
+
+@pytest.mark.parametrize(
+    ("force_ratio", "reference_kl", "calibrates", "needs_logprob_batch"),
+    [
+        (True, 0, False, False),
+        (False, 0, False, True),
+        (True, 0.1, False, True),
+        (True, 0, True, True),
+    ],
+)
+def test_grpo_chunk_cap_uses_active_logprob_forwards(
+    force_ratio: bool, reference_kl: float, calibrates: bool, needs_logprob_batch: bool
+) -> None:
+    config = _grpo_chunk_cap_config(2, dynamic_batching=False)
+    config.loss_fn = ClippedPGLossConfig(
+        force_on_policy_ratio=force_ratio, reference_policy_kl_penalty=reference_kl
+    )
+    # The four-sample chunk fills training microbatches but cannot split by three.
+    config.policy["logprob_batch_size"] = 3
+    if needs_logprob_batch:
+        with pytest.raises(ValueError, match="max_groups_for_streaming_train"):
+            validate_grpo_chunk_cap_alignment(
+                config, 1, requires_kv_scale_sync=calibrates
+            )
+    else:
+        validate_grpo_chunk_cap_alignment(config, 1)
 
 
 def test_grpo_rejects_a_chunk_cap_that_cannot_shard_across_policy_dp() -> None:

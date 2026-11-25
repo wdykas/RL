@@ -2035,10 +2035,6 @@ def setup_single_controller(
             reserved_http_server_ports=reserved_http_server_ports,
         )
         if not is_ppo_run(master_config):
-            validate_grpo_chunk_cap_alignment(
-                master_config,
-                trainer.sharding_annotations.get_axis_size("data_parallel"),
-            )
             return trainer, None, time_metrics
 
         if not dedicated_value:
@@ -2408,6 +2404,14 @@ def setup_single_controller(
                         f"  ✓ Trainer warm-up (rank 0): {ray.get(refs)[0]}", flush=True
                     )
                     warmup_kwargs = None  # done; the controller must not run it again
+            if not is_ppo_run(master_config):
+                validate_grpo_chunk_cap_alignment(
+                    master_config,
+                    trainer.sharding_annotations.get_axis_size("data_parallel"),
+                    requires_kv_scale_sync=getattr(
+                        generation, "requires_kv_scale_sync", False
+                    ),
+                )
             if start_communicator_early:
                 communicator_future = _start_on_daemon_thread(
                     _init_communicator, name="refit-communicator"

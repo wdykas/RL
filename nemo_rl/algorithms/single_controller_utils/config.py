@@ -1908,7 +1908,9 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
         )
 
 
-def sample_multiple(config: PolicyConfig | ValueConfig, dp_size: int) -> int:
+def sample_multiple(
+    config: PolicyConfig | ValueConfig, dp_size: int, *, logprobs_required: bool = True
+) -> int:
     """Samples a dispatch must be a multiple of to split cleanly on this consumer.
 
     A dispatch is split twice: once across the DP ranks, and then on the static
@@ -1919,6 +1921,7 @@ def sample_multiple(config: PolicyConfig | ValueConfig, dp_size: int) -> int:
     Args:
         config: Policy or value configuration of the consuming trainer.
         dp_size: Data-parallel size of that trainer.
+        logprobs_required: Whether a forward uses the logprob microbatch size.
 
     Returns:
         The sample count both splits divide.
@@ -1928,8 +1931,9 @@ def sample_multiple(config: PolicyConfig | ValueConfig, dp_size: int) -> int:
     ):
         return dp_size
     train_micro_batch_size = config["train_micro_batch_size"]
-    logprob_batch_size = config.get("logprob_batch_size") or train_micro_batch_size
-    return dp_size * math.lcm(train_micro_batch_size, logprob_batch_size)
+    if logprobs_required and (logprob_batch_size := config.get("logprob_batch_size")):
+        return dp_size * math.lcm(train_micro_batch_size, logprob_batch_size)
+    return dp_size * train_micro_batch_size
 
 
 def resolve_ppo_chunk_alignment(
@@ -1987,7 +1991,7 @@ def resolve_ppo_chunk_alignment(
 
 
 def validate_grpo_chunk_cap_alignment(
-    master_config: MasterConfig, policy_dp: int
+    master_config: MasterConfig, policy_dp: int, *, requires_kv_scale_sync: bool = False
 ) -> None:
     """Reject a GRPO chunk cap whose samples cannot split across the policy.
 
@@ -2008,6 +2012,7 @@ def validate_grpo_chunk_cap_alignment(
     Args:
         master_config: The run configuration.
         policy_dp: Data-parallel size of the policy trainer.
+        requires_kv_scale_sync: Whether generation needs a calibration forward.
 
     Raises:
         ValueError: The capped chunk's sample count is not a multiple of the
@@ -2023,7 +2028,15 @@ def validate_grpo_chunk_cap_alignment(
         or chunk_cap >= algo_cfg.num_prompts_per_step
     ):
         return
-    chunk_multiple = sample_multiple(master_config.policy, policy_dp)
+    chunk_multiple = sample_multiple(
+        master_config.policy,
+        policy_dp,
+        logprobs_required=(
+            requires_kv_scale_sync
+            or opd_module.is_opd_enabled(master_config)
+            or any(logprob_passes_required(master_config, algo_cfg))
+        ),
+    )
     if (chunk_cap * algo_cfg.num_generations_per_prompt) % chunk_multiple != 0:
         raise ValueError(
             "GRPO async_rl.max_groups_for_streaming_train "
